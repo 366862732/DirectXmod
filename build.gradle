@@ -1,39 +1,39 @@
 plugins {
+    id 'fabric-loom' version '1.9.2'
     id 'java'
 }
 
 repositories {
     mavenCentral()
-    flatDir {
-        dirs 'libs'
+    maven {
+        name = "Fabric"
+        url = "https://maven.fabricmc.net/"
     }
 }
 
+group = 'com.dx12'
+version = '1.0.0'
+
 dependencies {
-    // 添加 Fabric Loader 作为编译依赖（从本地 Maven 或直接下载）
-    compileOnly 'net.fabricmc:fabric-loader:0.16.9'
+    minecraft "com.mojang:minecraft:1.21.3"
+    mappings "net.fabricmc:yarn:1.21.3+build.1:v2"
+    modImplementation "net.fabricmc:fabric-loader:0.16.9"
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_25
-    targetCompatibility = JavaVersion.VERSION_25
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
-tasks.withType(JavaCompile) {
-    options.encoding = 'UTF-8'
-    options.release = 25
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    it.options.release = 21
 }
 
-jar {
-    manifest {
-        attributes(
-            'MixinConfigs': 'mixins.gl4dx12.json',
-            'Fabric-Loom-Version': '0',
-            'Manifest-Version': '1.0'
-        )
+processResources {
+    inputs.property "version", project.version
+    filteringCharset "UTF-8"
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
     }
-    from {
-        // 不包含依赖，保持简单
-    }
-    archiveFileName = 'gl4dx12-1.0.0.jar'
 }

@@ -1,13 +1,10 @@
-﻿# Gradle
-.gradle/
+﻿.gradle/
 build/
-out/
+bin/
+run/
 *.log
-
-# Java
-*.class
-
-# IDE
-.idea/
-*.iml
-.vscode/
+*.bak
+.classpath
+.project
+.settings/
+.DS_Store
