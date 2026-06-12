@@ -13,20 +13,20 @@ public class Dx12Mod implements ClientModInitializer {
         System.out.println("[GL4DX12] OS: " + System.getProperty("os.name"));
         System.out.println("========================================");
         
-        // ??1: ??????????
+        // ??1: ?? DLL ????
         System.out.println("[GL4DX12] Step 1: Checking if DLL exists in JAR...");
         try {
             java.net.URL dllUrl = getClass().getResource("/native/windows/gl4dx12.dll");
             if (dllUrl != null) {
                 System.out.println("[GL4DX12] ? DLL found in JAR at: " + dllUrl);
             } else {
-                System.err.println("[GL4DX12] ? DLL NOT found in JAR at /native/windows/gl4dx12.dll");
+                System.err.println("[GL4DX12] ? DLL NOT found");
             }
         } catch (Throwable t) {
             System.err.println("[GL4DX12] ? Failed to check DLL: " + t.getMessage());
         }
         
-        // ??2: ?? Native ?
+        // ??2: ?? DLL??????????
         System.out.println("[GL4DX12] Step 2: Loading native library...");
         try {
             NativeUtils.loadLibraryFromJar("/native/windows/gl4dx12.dll");
@@ -36,15 +36,19 @@ public class Dx12Mod implements ClientModInitializer {
             t.printStackTrace();
         }
         
-        // ??3: ?? nativeInit
-        System.out.println("[GL4DX12] Step 3: Calling nativeInit()...");
+        // ??3: ??? DX12LibClient
+        System.out.println("[GL4DX12] Step 3: Initializing DX12LibClient...");
+        DX12LibClient.init();
+        
+        // ??4: ?? nativeInit
+        System.out.println("[GL4DX12] Step 4: Calling nativeInit()...");
         try {
             boolean result = DX12LibClient.nativeInit();
             System.out.println("[GL4DX12] ? nativeInit() returned: " + result);
             if (result) {
                 System.out.println("[GL4DX12] ? DirectX 12 backend initialized!");
             } else {
-                System.err.println("[GL4DX12] ? nativeInit() returned false - DX12 initialization failed");
+                System.err.println("[GL4DX12] ? nativeInit() returned false");
             }
         } catch (Throwable t) {
             System.err.println("[GL4DX12] ? nativeInit() threw exception");
