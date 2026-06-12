@@ -8,29 +8,26 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.nio.IntBuffer;
 import java.nio.ByteBuffer;
 
-@Mixin(targets = "org.lwjgl.opengl.GL15")
+@Mixin(targets = "org.lwjgl.opengl.GL15", remap = false)
 public class GlBufferMixin {
 
-    @Inject(method = "glGenBuffers", at = @At("HEAD"), cancellable = true, remap = false)
+    @Inject(method = "glGenBuffers", at = @At("HEAD"), cancellable = true)
     private static void onGlGenBuffers(IntBuffer buffers, CallbackInfo ci) {
         for (int i = 0; i < buffers.remaining(); i++) {
             int id = D3D12Bridge.glGenBuffers();
             buffers.put(buffers.position() + i, id);
-            System.out.println("[GL4DX12] glGenBuffers: " + id);
         }
         ci.cancel();
     }
 
-    @Inject(method = "glBindBuffer", at = @At("HEAD"), cancellable = true, remap = false)
+    @Inject(method = "glBindBuffer", at = @At("HEAD"), cancellable = true)
     private static void onGlBindBuffer(int target, int buffer, CallbackInfo ci) {
-        System.out.println("[GL4DX12] glBindBuffer: target=" + target + ", buffer=" + buffer);
         D3D12Bridge.glBindBuffer(target, buffer);
         ci.cancel();
     }
 
-    @Inject(method = "glBufferData", at = @At("HEAD"), cancellable = true, remap = false)
+    @Inject(method = "glBufferData", at = @At("HEAD"), cancellable = true)
     private static void onGlBufferData(int target, ByteBuffer data, int usage, CallbackInfo ci) {
-        System.out.println("[GL4DX12] glBufferData: target=" + target + ", size=" + (data != null ? data.remaining() : 0));
         if (data != null && data.remaining() > 0) {
             D3D12Bridge.glBufferData(target, data, usage);
         }

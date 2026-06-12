@@ -1,15 +1,16 @@
-﻿{
+{
   "schemaVersion": 1,
   "id": "gl4dx12",
-  "version": "1.0.0",
+  "version": "${version}",
   "name": "GL4DX12",
-  "description": "OpenGL to DirectX 12 translation layer",
+  "description": "OpenGL to DirectX 12 translation layer for Minecraft",
   "authors": ["366862732"],
   "license": "MIT",
   "environment": "client",
   "entrypoints": {
     "client": ["com.dx12.Dx12Mod"]
   },
+  "mixins": ["mixins.gl4dx12.json"],
   "depends": {
     "fabricloader": ">=0.19.2",
     "minecraft": ">=26.1.2",
