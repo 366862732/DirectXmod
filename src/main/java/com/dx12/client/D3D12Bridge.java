@@ -5,7 +5,7 @@ import com.dx12.DX12LibClient;
 public class D3D12Bridge {
     
     public static boolean nativeInit(long hwnd, int width, int height) {
-        return DX12LibClient.nativeInit();
+        return DX12LibClient.nativeInit(hwnd, width, height);
     }
     
     public static void nativeDestroy() {
@@ -21,6 +21,6 @@ public class D3D12Bridge {
     }
     
     public static void nativeResize(int width, int height) {
-        DX12LibClient.nativeResize();
+        DX12LibClient.nativeResize(width, height);
     }
 }

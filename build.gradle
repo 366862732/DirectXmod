@@ -15,14 +15,17 @@ group = 'com.dx12'
 version = '1.0.0'
 
 dependencies {
-    minecraft "com.mojang:minecraft:1.21.3"
-    mappings "net.fabricmc:yarn:1.21.3+build.1:v2"
-    modImplementation "net.fabricmc:fabric-loader:0.16.9"
+    minecraft "com.mojang:minecraft:26.1.2"
+    mappings "net.fabricmc:yarn:26.1.2+build.1:v2"
+    modImplementation "net.fabricmc:fabric-loader:0.19.2"
 }
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
