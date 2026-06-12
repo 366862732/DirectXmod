@@ -1,4 +1,4 @@
-﻿package com.dx12;
+package com.dx12;
 
 import java.io.*;
 import java.nio.file.*;
