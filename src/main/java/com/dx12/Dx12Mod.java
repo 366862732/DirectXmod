@@ -1,14 +1,13 @@
 package com.dx12;
 
-import net.fabricmc.api.ModInitializer;
-import java.io.File;
+import net.fabricmc.api.ClientModInitializer;
 
-public class Dx12Mod implements ModInitializer {
+public class Dx12Mod implements ClientModInitializer {
     
     @Override
-    public void onInitialize() {
+    public void onInitializeClient() {
         System.out.println("========================================");
-        System.out.println("[GL4DX12] Mod Initializing...");
+        System.out.println("[GL4DX12] Mod Initializing (Client)...");
         System.out.println("[GL4DX12] Minecraft Version: 26.1.2");
         System.out.println("[GL4DX12] Java Version: " + System.getProperty("java.version"));
         System.out.println("[GL4DX12] OS: " + System.getProperty("os.name"));
@@ -50,15 +49,6 @@ public class Dx12Mod implements ModInitializer {
         } catch (Throwable t) {
             System.err.println("[GL4DX12] ? nativeInit() threw exception");
             t.printStackTrace();
-        }
-        
-        // ??4: ???? native ??
-        System.out.println("[GL4DX12] Step 4: Testing other native methods...");
-        try {
-            DX12LibClient.nativeRender();
-            System.out.println("[GL4DX12] ? nativeRender() called");
-        } catch (Throwable t) {
-            System.err.println("[GL4DX12] ? nativeRender() failed: " + t.getMessage());
         }
         
         System.out.println("========================================");
