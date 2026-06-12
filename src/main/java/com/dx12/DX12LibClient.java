@@ -3,12 +3,13 @@ package com.dx12;
 public class DX12LibClient {
     
     static {
+        System.out.println("[DX12LibClient] Static initializer started");
+        System.out.println("[DX12LibClient] Attempting to load native library...");
         try {
-            System.out.println("Loading DX12LibClient");
             NativeUtils.loadLibraryFromJar("/native/windows/gl4dx12.dll");
-            System.out.println("DLL loaded successfully");
+            System.out.println("[DX12LibClient] ? DLL loaded successfully in static block");
         } catch (Throwable t) {
-            System.err.println("Failed to load DLL");
+            System.err.println("[DX12LibClient] ? Failed to load DLL in static block");
             t.printStackTrace();
         }
     }
@@ -18,4 +19,9 @@ public class DX12LibClient {
     public static native void nativeRender();
     public static native void nativePresent();
     public static native void nativeResize();
+    
+    // ????????
+    public static void test() {
+        System.out.println("[DX12LibClient] test() called");
+    }
 }
