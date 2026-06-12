@@ -1,4 +1,3 @@
-﻿// d3d12bridge.cpp - 简单测试版本
 #include <jni.h>
 #include <windows.h>
 #include <cstdio>
@@ -6,13 +5,12 @@
 extern "C" {
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit(JNIEnv* env, jobject obj) {
-    // 写入日志文件，确认被调用
-    FILE* log = fopen("C:\\temp\\d3d12_init.log", "w");
+    FILE* log = fopen("C:\\temp\\d3d12_test.log", "w");
     if (log) {
-        fprintf(log, "nativeInit called successfully!\n");
+        fprintf(log, "Test stub nativeInit called successfully!\n");
         fclose(log);
     }
-    return JNI_TRUE;  // 始终返回成功
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDestroy(JNIEnv* env, jobject obj) {}

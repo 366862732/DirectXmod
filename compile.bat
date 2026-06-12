@@ -1,20 +1,45 @@
 @echo off
-set JAVA_HOME=C:\Program Files\Zulu\zulu-26
+echo Setting up Java 25...
+set JAVA_HOME=C:\Program Files\BellSoft\LibericaJDK-25-Full
 set PATH=%JAVA_HOME%\bin;%PATH%
 
-echo Compiling GL4DX12...
+echo Java version:
+java -version
 
-REM 确保 libs 目录下有 JNA jar
-if not exist libs\jna-5.14.0.jar (
-    echo Downloading JNA...
-    powershell -Command "Invoke-WebRequest -Uri 'https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar' -OutFile 'libs/jna-5.14.0.jar'"
-    powershell -Command "Invoke-WebRequest -Uri 'https://repo1.maven.org/maven2/net/java/dev/jna/jna-platform/5.14.0/jna-platform-5.14.0.jar' -OutFile 'libs/jna-platform-5.14.0.jar'"
+echo.
+echo Starting compilation...
+echo.
+
+set CP=libs/fabric-loader-0.19.2.jar;D:\.minecraft\versions\26.1.2\26.1.2.jar
+
+javac -cp "%CP%" ^
+    -d build/classes ^
+    -sourcepath src/main/java ^
+    src/main/java/com/dx12/Dx12Mod.java ^
+    src/main/java/com/dx12/DX12LibClient.java ^
+    src/main/java/com/dx12/NativeUtils.java ^
+    src/main/java/com/dx12/client/D3D12Bridge.java
+
+if %errorlevel% equ 0 (
+    echo.
+    echo [SUCCESS] Compilation successful!
+    echo Copying resources...
+    xcopy /E /Y src\main\resources\* build\classes\
+    
+    echo Creating JAR...
+    cd build\classes
+    jar cf ..\gl4dx12-1.0.0.jar *
+    cd ..\..
+
+    echo.
+    echo [SUCCESS] JAR created: build\gl4dx12-1.0.0.jar
+    dir build\gl4dx12-1.0.0.jar
+) else (
+    echo.
+    echo [FAILED] Compilation failed with error code %errorlevel%
+    echo Check the errors above.
 )
 
-javac -cp "libs/jna-5.14.0.jar;libs/jna-platform-5.14.0.jar;libs/fabric-loader-0.16.10.jar" -d build/classes -encoding UTF-8 src/main/java/com/dx12/*.java
-if %errorlevel% neq 0 exit /b %errorlevel%
-
-echo Compilation successful!
-jar cvf build/libs/gl4dx12-1.0.0.jar -C build/classes . -C src/main/resources .
-copy build\libs\gl4dx12-1.0.0.jar D:\.minecraft\mods\
-echo Deployed!
+echo.
+echo Press any key to close this window...
+pause > nul
