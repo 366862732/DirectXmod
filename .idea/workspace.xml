@@ -93,6 +93,11 @@
     "settings.editor.selected.configurable": "reference.settingsdialog.project.gradle"
   }
 }]]></component>
+  <component name="RecentsManager">
+    <key name="MoveClassesOrPackagesDialog.RECENTS_KEY">
+      <recent name="com.dx12" />
+    </key>
+  </component>
   <component name="RunManager" selected="应用程序.Minecraft Client">
     <configuration default="true" type="JetRunConfigurationType">
       <method v="2">
