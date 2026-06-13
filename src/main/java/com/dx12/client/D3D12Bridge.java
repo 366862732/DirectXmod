@@ -19,18 +19,18 @@ public class D3D12Bridge {
     private static volatile boolean d3d12Ready = false;
 
     // Lifecycle
-    public static boolean nativeInit(long hwnd, int w, int h) {
-        return DX12LibClient.nativeInit(hwnd, w, h);
+    public static boolean nativeInit(long hwnd) {
+        return DX12LibClient.nativeInit(hwnd);
     }
     public static void nativeDestroy() { DX12LibClient.nativeDestroy(); }
 
     public static boolean isD3D12Ready() { return d3d12Ready; }
 
-    public static void ensureDeviceInitialized(long hwnd, int w, int h) {
+    public static void ensureDeviceInitialized(long hwnd) {
         if (d3d12Ready) return;
         System.out.println("[GL4DX12] Activating D3D12 overlay (HWND="
-            + Long.toHexString(hwnd) + " " + w + "x" + h + ")");
-        if (nativeInit(hwnd, w, h)) {
+            + Long.toHexString(hwnd) + ")");
+        if (nativeInit(hwnd)) {
             d3d12Ready = true;
             System.out.println("[GL4DX12] D3D12 OVERLAY ACTIVE");
         } else {

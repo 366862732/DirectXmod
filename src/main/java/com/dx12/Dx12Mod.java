@@ -36,11 +36,8 @@ public class Dx12Mod implements ClientModInitializer {
                 if (D3D12Bridge.isD3D12Ready()) {
                     D3D12Bridge.shutdownDevice();
                 } else {
-                    // Pass MC's native HWND and framebuffer size
                     long hwnd = GLFWNativeWin32.glfwGetWin32Window(window);
-                    int[] w = new int[1], h = new int[1];
-                    GLFW.glfwGetFramebufferSize(window, w, h);
-                    D3D12Bridge.ensureDeviceInitialized(hwnd, w[0], h[0]);
+                    D3D12Bridge.ensureDeviceInitialized(hwnd);
                 }
             }
             f6WasDown = f6Down;

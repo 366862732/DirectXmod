@@ -63,6 +63,13 @@ static ComPtr<ID3D12Resource> g_texDefault; // default heap texture (SRV)
 static int g_texW = 0, g_texH = 0;
 static CRITICAL_SECTION g_texLock;
 
+// MC framebuffer capture via GDI BitBlt
+static ComPtr<ID3D12Resource> g_texMCFrame; // MC window capture texture
+static UINT g_mcCaptureW = 0, g_mcCaptureH = 0;
+
+// Fullscreen quad for framebuffer mirror
+static ComPtr<ID3D12Resource> g_vbFSQuad; // 6 vertices (2 triangles)
+
 // PSO (textured quad)
 static ComPtr<ID3D12RootSignature> g_rs;
 static ComPtr<ID3D12PipelineState> g_pso;
@@ -780,8 +787,147 @@ static bool UploadTexture(const void* pixels, int w, int h) {
 }
 
 // === Render thread ===
+
+// Capture MC window content via GDI BitBlt → upload to D3D12 texture
+// Returns true if capture succeeded and texture is ready for rendering
+static bool CaptureMCFrame() {
+    if (!g_hwndMC) return false;
+
+    // Capture MC window content
+    HDC hdcWin = GetDC(g_hwndMC);
+    if (!hdcWin) return false;
+    HDC hdcMem = CreateCompatibleDC(hdcWin);
+    if (!hdcMem) { ReleaseDC(g_hwndMC, hdcWin); return false; }
+    HBITMAP hbm = CreateCompatibleBitmap(hdcWin, (int)g_w, (int)g_h);
+    if (!hbm) { DeleteDC(hdcMem); ReleaseDC(g_hwndMC, hdcWin); return false; }
+    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbm);
+    BitBlt(hdcMem, 0, 0, (int)g_w, (int)g_h, hdcWin, 0, 0, SRCCOPY);
+
+    // Read pixel data into buffer
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = (LONG)g_w;
+    bi.bmiHeader.biHeight = -(LONG)g_h; // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    UINT rowSize = g_w * 4;
+    UINT dataSize = rowSize * g_h;
+    BYTE* pixels = new BYTE[dataSize];
+    GetDIBits(hdcWin, hbm, 0, (UINT)g_h, pixels, &bi, DIB_RGB_COLORS);
+
+    // Cleanup GDI
+    SelectObject(hdcMem, hbmOld);
+    DeleteObject(hbm);
+    DeleteDC(hdcMem);
+    ReleaseDC(g_hwndMC, hdcWin);
+
+    // Check if we need to recreate the capture texture
+    bool needRecreate = (g_mcCaptureW != g_w || g_mcCaptureH != g_h || !g_texMCFrame);
+
+    if (needRecreate) {
+        g_texMCFrame.Reset();
+
+        D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = g_w; td.Height = g_h;
+        td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1; td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
+            &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_texMCFrame))))
+        { delete[] pixels; return false; }
+
+        // Recreate SRV for the capture texture (slot 0 in g_srvHeap)
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        g_dev->CreateShaderResourceView(g_texMCFrame.Get(), &srvDesc,
+            g_srvHeap->GetCPUDescriptorHandleForHeapStart());
+
+        g_mcCaptureW = g_w; g_mcCaptureH = g_h;
+        Log("MC capture texture created: %dx%d", g_w, g_h);
+    }
+
+    // Upload via separate command list
+    ComPtr<ID3D12CommandAllocator> capAlloc;
+    ComPtr<ID3D12GraphicsCommandList> capCL;
+    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&capAlloc));
+    g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, capAlloc.Get(), nullptr, IID_PPV_ARGS(&capCL));
+
+    // Upload buffer
+    UINT alignedRowSize = (rowSize + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    D3D12_HEAP_PROPERTIES hpUp = {}; hpUp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rdUp = {};
+    rdUp.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdUp.Width = alignedRowSize * (UINT64)g_h;
+    rdUp.Height = 1; rdUp.DepthOrArraySize = 1;
+    rdUp.MipLevels = 1; rdUp.SampleDesc.Count = 1;
+    rdUp.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> upBuf;
+    g_dev->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE,
+        &rdUp, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upBuf));
+
+    BYTE* dst = nullptr;
+    upBuf->Map(0, nullptr, (void**)&dst);
+    for (UINT y = 0; y < g_h; y++)
+        memcpy(dst + y * alignedRowSize, pixels + y * rowSize, rowSize);
+    upBuf->Unmap(0, nullptr);
+    delete[] pixels;
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = g_texMCFrame.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upBuf.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint.Offset = 0;
+    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srcLoc.PlacedFootprint.Footprint.Width = g_w;
+    srcLoc.PlacedFootprint.Footprint.Height = g_h;
+    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+    srcLoc.PlacedFootprint.Footprint.RowPitch = alignedRowSize;
+
+    capCL->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER rb = {};
+    rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    rb.Transition.pResource = g_texMCFrame.Get();
+    rb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    rb.Transition.Subresource = 0;
+    capCL->ResourceBarrier(1, &rb);
+
+    capCL->Close();
+    ID3D12CommandList* lists[] = { capCL.Get() };
+    g_queue->ExecuteCommandLists(1, lists);
+    WaitGPU();
+    return true;
+}
 static DWORD WINAPI RenderLoop(LPVOID) {
     Log("Render thread started");
+
+    // Fullscreen quad (2 triangles covering clip space [-1,1]^2)
+    Vertex2D fsQuad[] = {{-1,-1,0,1},{3,-1,2,1},{-1,3,0,-1}};
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = sizeof(fsQuad); rd.Height = 1;
+        rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_vbFSQuad));
+        void* p; g_vbFSQuad->Map(0, nullptr, &p);
+        memcpy(p, fsQuad, sizeof(fsQuad)); g_vbFSQuad->Unmap(0, nullptr);
+    }
+
     LARGE_INTEGER freq, last;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&last);
@@ -793,8 +939,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         if (dt < 0.016) { Sleep(1); continue; }
         last = now;
 
-        // Keep overlay aligned with MC window
         RepositionOverlay();
+        CaptureMCFrame();
 
         g_alloc->Reset();
         g_cl->Reset(g_alloc.Get(), nullptr);
@@ -812,7 +958,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
 
-        // Bind RTV + optional DSV
         bool hasDSV = (g_dsvHeap && g_depthBuf);
         D3D12_CPU_DESCRIPTOR_HANDLE dsvH = {};
         if (hasDSV) {
@@ -822,8 +967,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         }
 
-        // Clear to transparent black (MC's OpenGL renders underneath)
-        float bg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float bg[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
         if (hasDSV)
             g_cl->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -833,7 +977,23 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         g_cl->RSSetViewports(1, &vp);
         g_cl->RSSetScissorRects(1, &sc);
 
-        // --- GL→D3D12 translated geometry (sole layer, world-space via MVP) ---
+        // --- LAYER 0: MC window capture as fullscreen textured quad ---
+        if (g_texMCFrame && g_pso) {
+            g_cl->SetGraphicsRootSignature(g_rs.Get());
+            g_cl->SetPipelineState(g_pso.Get());
+            g_cl->SetDescriptorHeaps(1, g_srvHeap.GetAddressOf());
+            g_cl->SetGraphicsRootDescriptorTable(0,
+                g_srvHeap->GetGPUDescriptorHandleForHeapStart());
+            D3D12_VERTEX_BUFFER_VIEW fsVbv = {};
+            fsVbv.BufferLocation = g_vbFSQuad->GetGPUVirtualAddress();
+            fsVbv.StrideInBytes = sizeof(Vertex2D);
+            fsVbv.SizeInBytes = sizeof(Vertex2D) * 3;
+            g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_cl->IASetVertexBuffers(0, 1, &fsVbv);
+            g_cl->DrawInstanced(3, 1, 0, 0);
+        }
+
+        // --- LAYER 1: GL→D3D12 translated geometry (world-space via MVP) ---
         {
             EnterCriticalSection(&g_stateLock);
             auto chunks = g_drawChunks;
@@ -1047,15 +1207,21 @@ static DXGI_FORMAT PickDepthFormat() {
     return DXGI_FORMAT_UNKNOWN;
 }
 
-static bool InitD3D12(HWND hwndMC, int width, int height) {
-    Log("=== Init D3D12 overlay on MC window (HWND=0x%p, %dx%d) ===", hwndMC, width, height);
+static bool InitD3D12(HWND hwndMC) {
+    Log("=== Init D3D12 overlay on MC window (HWND=0x%p) ===", hwndMC);
     g_hwndMC = hwndMC;
-    g_w = (UINT)width;
-    g_h = (UINT)height;
-    if (!g_hwndMC || g_w == 0 || g_h == 0) {
-        Log("ERROR: invalid HWND or dimensions");
+    if (!g_hwndMC) { Log("ERROR: null HWND"); return false; }
+
+    // Get MC window client rect (PHYSICAL pixels) — NOT framebuffer size
+    RECT rc;
+    GetClientRect(g_hwndMC, &rc);
+    g_w = (UINT)(rc.right - rc.left);
+    g_h = (UINT)(rc.bottom - rc.top);
+    if (g_w == 0 || g_h == 0) {
+        Log("ERROR: client rect is zero %dx%d", g_w, g_h);
         return false;
     }
+    Log("MC client rect: %dx%d (physical pixels)", g_w, g_h);
 
     // Create borderless overlay window
     g_hwndOverlay = CreateOverlayWindow(g_hwndMC);
@@ -1229,6 +1395,7 @@ static void CleanupD3D12() {
         g_depthBuf.Reset(); g_dsvHeap.Reset();
         if (g_cbData) { g_cbUpload->Unmap(0, nullptr); g_cbData = nullptr; }
         g_cbUpload.Reset();
+        g_texMCFrame.Reset(); g_vbFSQuad.Reset();
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
@@ -1240,10 +1407,10 @@ static void CleanupD3D12() {
 extern "C" {
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
-    (JNIEnv*, jclass, jlong hwnd, jint width, jint height) {
+    (JNIEnv*, jclass, jlong hwnd) {
     CreateDirectoryA("C:\\temp", 0);
     if (g_ok) return JNI_TRUE;
-    return InitD3D12((HWND)hwnd, (int)width, (int)height) ? JNI_TRUE : JNI_FALSE;
+    return InitD3D12((HWND)hwnd) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDestroy(JNIEnv*, jclass) { CleanupD3D12(); }
