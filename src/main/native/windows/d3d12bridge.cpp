@@ -198,13 +198,24 @@ static void WaitGPU();
 
 static void RepositionOverlay() {
     if (!g_hwndOverlay || !g_hwndMC) return;
+
+    // Hide overlay when MC is minimized
+    if (IsIconic(g_hwndMC)) {
+        ShowWindow(g_hwndOverlay, SW_HIDE);
+        return;
+    }
+
     RECT rc;
     GetClientRect(g_hwndMC, &rc);
     POINT pt = {0, 0};
     ClientToScreen(g_hwndMC, &pt);
     int newW = rc.right - rc.left;
     int newH = rc.bottom - rc.top;
-    if (newW <= 0 || newH <= 0) return;
+    if (newW <= 0 || newH <= 0) { ShowWindow(g_hwndOverlay, SW_HIDE); return; }
+
+    // Ensure overlay is visible when MC is restored
+    if (!IsWindowVisible(g_hwndOverlay))
+        ShowWindow(g_hwndOverlay, SW_SHOWNOACTIVATE);
 
     // Check if size changed — invalidate capture texture + overwrite g_w/g_h
     bool sizeChanged = ((int)g_w != newW || (int)g_h != newH);

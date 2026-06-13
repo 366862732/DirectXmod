@@ -221,19 +221,23 @@ public class D3D12Bridge {
             int vertStride = (int) vsM.invoke(fmt);
             if (vertStride <= 0) return;
 
+            // Only render block geometry (stride=36). Particles/GUI use strides 16/20/24/28.
+            // Those are already visible via BitBlt capture.
+            if (vertStride < 36) return;
+
             java.lang.reflect.Method modeM = ds.getClass().getMethod("mode");
             Object modeObj = modeM.invoke(ds);
             String modeName = ((Enum<?>) modeObj).name();
 
             boolean isQuads = modeName.equals("QUADS"), isTriangles = modeName.equals("TRIANGLES");
-            boolean isTriStrip = modeName.equals("TRIANGLE_STRIP"), isTriFan = modeName.equals("TRIANGLE_FAN");
+            // Phase 2 filter: skip debug lines, particle billboards, GUI — they're in BitBlt capture already.
+            // Only render block geometry (standard stride=36, texture-enabled).
             boolean isLines = modeName.equals("LINES"), isLineStrip = modeName.equals("LINE_STRIP");
             boolean isLineLoop = modeName.equals("LINE_LOOP");
             boolean isDLine = modeName.equals("DEBUG_LINES"), isDLStrip = modeName.equals("DEBUG_LINE_STRIP");
-            if (!isQuads && !isTriangles && !isTriStrip && !isTriFan
-                && !isLines && !isLineStrip && !isLineLoop && !isDLine && !isDLStrip) return;
-            if (isDLine) isLines = true;
-            if (isDLStrip) isLineStrip = true;
+            if (isLines || isLineStrip || isLineLoop || isDLine || isDLStrip) return;
+            if (!isQuads && !isTriangles && modeName.equals("TRIANGLE_STRIP")) isTriangles = true;
+            if (!isQuads && !isTriangles) return; // skip all non-block draw modes
 
             int posOff = 0, colOff = -1, uvOff = -1, colSize = 0;
             if (VFE_POSITION != null && VFE_COLOR != null && VFE_UV0 != null) {
@@ -247,12 +251,8 @@ public class D3D12Bridge {
             }
 
             int drawVertCount, topologyNative;
+            // Only QUADS (blocks) and TRIANGLES (with stride>=36) reach here — lines/GUI filtered out
             if (isQuads)      { drawVertCount = vertexCount / 4 * 6; topologyNative = 4; }
-            else if (isTriStrip) { drawVertCount = (vertexCount - 2) * 3; topologyNative = 4; }
-            else if (isTriFan)   { drawVertCount = (vertexCount - 2) * 3; topologyNative = 4; }
-            else if (isLines)    { drawVertCount = vertexCount; topologyNative = 2; }
-            else if (isLineStrip){ drawVertCount = (vertexCount - 1) * 2; topologyNative = 2; }
-            else if (isLineLoop) { drawVertCount = vertexCount * 2; topologyNative = 2; }
             else               { drawVertCount = vertexCount; topologyNative = 4; }
             if (drawVertCount < 2 || drawVertCount > MAX_TRANSLATED_VERTS - translatedVertsThisFrame) return;
 
@@ -274,34 +274,8 @@ public class D3D12Bridge {
                     readV(work, v3, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
                     readV(work, v0, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
                 }
-            } else if (isTriStrip) {
-                for (int i = 0; i < vertexCount - 2; i++) {
-                    readV(work, i, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    if ((i & 1) != 0) {
-                        readV(work, i+2, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                        readV(work, i+1, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    } else {
-                        readV(work, i+1, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                        readV(work, i+2, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    }
-                }
-            } else if (isTriFan) {
-                for (int i = 0; i < vertexCount - 2; i++) {
-                    readV(work, 0, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    readV(work, i+1, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    readV(work, i+2, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                }
-            } else if (isLineStrip) {
-                for (int i = 0; i < vertexCount - 1; i++) {
-                    readV(work, i, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    readV(work, i+1, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                }
-            } else if (isLineLoop) {
-                for (int i = 0; i < vertexCount; i++) {
-                    readV(work, i, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                    readV(work, (i+1) % vertexCount, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
-                }
             } else {
+                // TRIANGLES (only remaining non-quad mode after filter)
                 for (int i = 0; i < vertexCount; i++)
                     readV(work, i, vertStride, posOff, colOff, colSize, uvOff, verts, outIdx++);
             }
