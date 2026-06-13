@@ -40,8 +40,8 @@ public class Dx12Mod implements ClientModInitializer {
             }
             f6WasDown = f6Down;
 
-            // Capture frame each tick when D3D12 is active
-            D3D12Bridge.captureFrame();
+            // Reset geometry counter each tick (DLL clears per-frame)
+            D3D12Bridge.resetTranslatedCounter();
         });
 
         System.out.println("[GL4DX12] Press F6 to toggle D3D12 rendering");

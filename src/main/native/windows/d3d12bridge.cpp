@@ -18,6 +18,8 @@
 #include <cstdarg>
 #include <cmath>
 #include <vector>
+#include <algorithm>
+#include <unordered_map>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -79,17 +81,55 @@ static CRITICAL_SECTION g_stateLock;
 // GL→D3D12 draw command recording
 static ComPtr<ID3D12Resource> g_imVB;        // immediate-mode vertex buffer (upload heap)
 static D3D12_VERTEX_BUFFER_VIEW g_imVbv = {};
-static const UINT  g_imVBCap = 4 * 1024 * 1024; // 4MB upload buffer
-static UINT        g_imVBSize = 0;           // bytes written this frame
-static UINT        g_imVertCount = 0;        // total vertices this frame
+static UINT  g_imVBCap = 16 * 1024 * 1024; // 16MB upload buffer (growable)
+static UINT  g_imVBSize = 0;           // bytes written this frame
+static UINT  g_imVertCount = 0;        // total vertices this frame
 
 // Per-draw chunk (supports multiple draw calls with different topologies)
-struct DrawChunk { UINT vertexStart; UINT vertexCount; D3D_PRIMITIVE_TOPOLOGY topo; };
+struct DrawChunk { UINT byteOffset; UINT vertexCount; D3D_PRIMITIVE_TOPOLOGY topo; bool textured; UINT vertexStride; bool blend; int textureId; };
 static std::vector<DrawChunk> g_drawChunks;
 static D3D_PRIMITIVE_TOPOLOGY g_pendingTopo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+static int  g_pendingTextureId = 0;
+
+// GL state bits for PSO variant selection
+static UINT g_glStateBits = 0; // bit0=blend, bit1=depth, bit2=cull, bit3=depthWrite
+#define GLB_BLEND        1
+#define GLB_DEPTH        2
+#define GLB_CULL         4
+#define GLB_DEPTH_WRITE  8
+
+// Depth buffer (format chosen at init via CheckFormatSupport)
+static ComPtr<ID3D12Resource>       g_depthBuf;
+static ComPtr<ID3D12DescriptorHeap> g_dsvHeap;
+static DXGI_FORMAT g_dsvFormat = DXGI_FORMAT_UNKNOWN;
+
+// Constant buffer for MVP transform
+struct MvpCB { float mvp[16]; };
+static ComPtr<ID3D12Resource> g_cbUpload; // upload buffer, 256-byte aligned
+static BYTE* g_cbData = nullptr;          // mapped pointer
+static const UINT g_cbSize = 256;
+
+// Blend func tracking (for future PSO variations)
+static D3D12_BLEND g_glSrcBlend = D3D12_BLEND_SRC_ALPHA;
+static D3D12_BLEND g_glDstBlend = D3D12_BLEND_INV_SRC_ALPHA;
+
+// PSO cache: indexed by (stateBits << 1) | textured
+static ComPtr<ID3D12PipelineState> g_psoSolidVariants[32]; // 16 states (4bits) × 2 (textured/solid)
+static ComPtr<ID3D12RootSignature> g_rsSolidVariants[16];
+// Line PSO cache (separate since PrimitiveTopologyType differs)
+static ComPtr<ID3D12PipelineState> g_psoLineVariants[32];
+// Line RS cache — reuses same layout as solid (CBV(b0)) but separate for line-specific variants if needed
+static ComPtr<ID3D12RootSignature> g_rsLineVariants[16];
 
 struct Vertex2D { float x,y,u,v; };
-struct VertexPC { float x,y,z; UINT color; };
+struct VertexPC { float x,y,z; UINT color; };               // 16 bytes: POS(12) + COL(4)
+struct VertexPT { float x,y,z; UINT color; float u,v; };    // 24 bytes: POS(12) + COL(4) + TEX(8)
+
+// Texture cache: GL texture ID → D3D12 SRV
+static std::unordered_map<int, ComPtr<ID3D12Resource>> g_texMap; // texture ID → default-heap texture
+static std::unordered_map<int, UINT> g_texSlotMap;  // texture ID → heap slot index
+static UINT g_texSlotNext = 0;                       // next free slot
+static int g_currentTexId = 0; // set by Java side
 
 // === Window ===
 static LRESULT CALLBACK WP(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h,m,w,l); }
@@ -191,6 +231,7 @@ static bool MkPSO() {
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
     pd.InputLayout = {ie,2};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
@@ -204,11 +245,12 @@ static bool MkPSO() {
 
 // === Solid-color PSO (for GL immediate-mode translation) ===
 static const char* kVS_Solid = R"(
+cbuffer Transform : register(b0) { float4x4 mvp; }
 struct VS_IN { float3 p : POS; uint c : COL; };
 struct PS_IN { float4 p : SV_POSITION; float4 c : COL; };
 PS_IN VSMain(VS_IN i) {
     PS_IN o;
-    o.p = float4(i.p, 1);
+    o.p = mul(float4(i.p, 1), mvp);
     o.c = float4(((i.c>>16)&0xff)/255.0, ((i.c>>8)&0xff)/255.0, (i.c&0xff)/255.0, ((i.c>>24)&0xff)/255.0);
     return o;
 }
@@ -218,34 +260,241 @@ struct PS_IN { float4 p : SV_POSITION; float4 c : COL; };
 float4 PSMain(PS_IN i) : SV_TARGET { return i.c; }
 )";
 
-static bool MkPSOSolid() {
+// Build a solid-color PSO variant with given blend/depth/cull/textured flags
+static bool BuildSolidPSO(UINT stateBits, bool textured) {
+    int idx = (int)((stateBits << 1) | (textured ? 1 : 0));
+    if (idx < 0 || idx >= 32) return false;
+    if (g_psoSolidVariants[idx]) return true; // already built
+
     ComPtr<ID3DBlob> vs, ps, err;
     if (FAILED(D3DCompile(kVS_Solid, strlen(kVS_Solid), 0, 0, 0, "VSMain", "vs_5_0", 0, 0, &vs, &err)))
     { Log("VS_solid fail: %s", err ? (char*)err->GetBufferPointer() : "?"); return false; }
     if (FAILED(D3DCompile(kPS_Solid, strlen(kPS_Solid), 0, 0, 0, "PSMain", "ps_5_0", 0, 0, &ps, &err)))
     { Log("PS_solid fail: %s", err ? (char*)err->GetBufferPointer() : "?"); return false; }
 
-    // Root signature: 0 parameters, just IA + VS/PS
-    D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    ComPtr<ID3DBlob> rb;
-    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
-    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(),
-        IID_PPV_ARGS(&g_rsSolid)))) return false;
+    // Root signature: CBV(b0) for MVP + IA input layout
+    ComPtr<ID3D12RootSignature>& rs = g_rsSolidVariants[stateBits & 0xF];
+    if (!rs) {
+        D3D12_ROOT_PARAMETER rpCB = {};
+        rpCB.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rpCB.Descriptor.ShaderRegister = 0;
+        rpCB.Descriptor.RegisterSpace = 0;
+        rpCB.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 1;
+        rsd.pParameters = &rpCB;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3DBlob> rb;
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
+        if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(),
+            IID_PPV_ARGS(&rs)))) return false;
+    }
+
+    UINT ieCount = textured ? 3 : 2;
     D3D12_INPUT_ELEMENT_DESC ie[] = {
         {"POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"COL", 0, DXGI_FORMAT_R8G8B8A8_UNORM,    0, 12,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEX", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
-    pd.pRootSignature = g_rsSolid.Get();
+    pd.pRootSignature = rs.Get();
     pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.BlendState.AlphaToCoverageEnable = FALSE;
     pd.BlendState.IndependentBlendEnable = FALSE;
-    // Enable alpha blending for translucency
+    if (stateBits & GLB_BLEND) {
+        pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        pd.BlendState.RenderTarget[0].SrcBlend  = g_glSrcBlend;
+        pd.BlendState.RenderTarget[0].DestBlend = g_glDstBlend;
+        pd.BlendState.RenderTarget[0].BlendOp   = D3D12_BLEND_OP_ADD;
+        pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+        pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    }
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = (stateBits & GLB_CULL) ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.DepthStencilState.DepthEnable = (stateBits & GLB_DEPTH) ? TRUE : FALSE;
+    pd.DepthStencilState.DepthWriteMask = (stateBits & GLB_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
+    pd.InputLayout = {ie, ieCount};
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoSolidVariants[idx])))) {
+        Log("PSO_variant fail idx=%d state=%d tex=%d", idx, stateBits, textured);
+        return false;
+    }
+    Log("PSO_variant OK  idx=%d state=%d tex=%d", idx, stateBits, textured);
+    return true;
+}
+
+// Build a line PSO variant with given state bits
+static bool BuildLinePSO(UINT stateBits, bool textured) {
+    int idx = (int)((stateBits << 1) | (textured ? 1 : 0));
+    if (idx < 0 || idx >= 32) return false;
+    if (g_psoLineVariants[idx]) return true;
+
+    ComPtr<ID3DBlob> vs, ps, err;
+    if (FAILED(D3DCompile(kVS_Solid, strlen(kVS_Solid), 0, 0, 0, "VSMain", "vs_5_0", 0, 0, &vs, &err)))
+    { Log("LineVS fail: %s", err ? (char*)err->GetBufferPointer() : "?"); return false; }
+    if (FAILED(D3DCompile(kPS_Solid, strlen(kPS_Solid), 0, 0, 0, "PSMain", "ps_5_0", 0, 0, &ps, &err)))
+    { Log("LinePS fail: %s", err ? (char*)err->GetBufferPointer() : "?"); return false; }
+
+    // Root signature — reuse same layout as solid (CBV b0)
+    ComPtr<ID3D12RootSignature>& rs = g_rsLineVariants[stateBits & 0xF];
+    if (!rs) {
+        D3D12_ROOT_PARAMETER rpCB = {};
+        rpCB.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rpCB.Descriptor.ShaderRegister = 0; rpCB.Descriptor.RegisterSpace = 0;
+        rpCB.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 1; rsd.pParameters = &rpCB;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3DBlob> rb2;
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb2, &err))) return false;
+        if (FAILED(g_dev->CreateRootSignature(0, rb2->GetBufferPointer(), rb2->GetBufferSize(),
+            IID_PPV_ARGS(&rs)))) return false;
+    }
+
+    UINT ieCount = textured ? 3 : 2;
+    D3D12_INPUT_ELEMENT_DESC ie[] = {
+        {"POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COL", 0, DXGI_FORMAT_R8G8B8A8_UNORM,    0, 12,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEX", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs.Get();
+    pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.BlendState.AlphaToCoverageEnable = FALSE;
+    pd.BlendState.IndependentBlendEnable = FALSE;
+    if (stateBits & GLB_BLEND) {
+        pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        pd.BlendState.RenderTarget[0].SrcBlend  = g_glSrcBlend;
+        pd.BlendState.RenderTarget[0].DestBlend = g_glDstBlend;
+        pd.BlendState.RenderTarget[0].BlendOp   = D3D12_BLEND_OP_ADD;
+        pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+        pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    }
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = (stateBits & GLB_CULL) ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+    // Lines: no depth clip needed; still respect depth test
+    pd.RasterizerState.DepthClipEnable = FALSE;
+    pd.DepthStencilState.DepthEnable = (stateBits & GLB_DEPTH) ? TRUE : FALSE;
+    pd.DepthStencilState.DepthWriteMask = (stateBits & GLB_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
+    pd.InputLayout = {ie, ieCount};
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; // KEY: line PSO
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoLineVariants[idx])))) {
+        Log("PSO_line fail idx=%d state=%d tex=%d", idx, stateBits, textured);
+        return false;
+    }
+    Log("PSO_line OK  idx=%d state=%d tex=%d", idx, stateBits, textured);
+    return true;
+}
+
+static bool MkPSOSolid() {
+    // Pre-build blend + no-depth + no-cull (default solid)
+    return BuildSolidPSO(GLB_BLEND, false);
+}
+
+// === Textured PSO (for GL→D3D12 with UV coordinates + texture lookup) ===
+static const char* kVS_Tex = R"(
+cbuffer Transform : register(b0) { float4x4 mvp; }
+struct VS_IN  { float3 p : POS; uint c : COL; float2 uv : TEX; };
+struct PS_IN  { float4 p : SV_POSITION; float4 c : COL; float2 uv : TEX; };
+PS_IN VSMain(VS_IN i) {
+    PS_IN o;
+    o.p = mul(float4(i.p, 1), mvp);
+    o.c = float4(((i.c>>16)&0xff)/255.0, ((i.c>>8)&0xff)/255.0, (i.c&0xff)/255.0, ((i.c>>24)&0xff)/255.0);
+    o.uv = i.uv;
+    return o;
+}
+)";
+static const char* kPS_Tex = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+struct PS_IN { float4 p : SV_POSITION; float4 c : COL; float2 uv : TEX; };
+float4 PSMain(PS_IN i) : SV_TARGET { return tex.Sample(samp, i.uv) * i.c; }
+)";
+static ComPtr<ID3D12RootSignature> g_rsTex;
+static ComPtr<ID3D12PipelineState> g_psoTex;
+static ComPtr<ID3D12DescriptorHeap> g_texSrvHeap;
+static UINT g_texSrvSize = 0;
+
+static bool MkPSOTex() {
+    ComPtr<ID3DBlob> vs, ps, err, rb;
+    err.Reset();
+    if (FAILED(D3DCompile(kVS_Tex, strlen(kVS_Tex), 0,0,0, "VSMain","vs_5_0",0,0,&vs,&err)))
+    { Log("VS_tex fail: %s", err?(char*)err->GetBufferPointer():"?"); return false; }
+    err.Reset();
+    if (FAILED(D3DCompile(kPS_Tex, strlen(kPS_Tex), 0,0,0, "PSMain","ps_5_0",0,0,&ps,&err)))
+    { Log("PS_tex fail: %s", err?(char*)err->GetBufferPointer():"?"); return false; }
+
+    // Root: descriptor table [0] with 1 SRV, CBV [1] for MVP
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER rpTex = {};
+    rpTex.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rpTex.DescriptorTable.NumDescriptorRanges = 1;
+    rpTex.DescriptorTable.pDescriptorRanges = &range;
+    rpTex.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_PARAMETER rpCBV = {};
+    rpCBV.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rpCBV.Descriptor.ShaderRegister = 0;
+    rpCBV.Descriptor.RegisterSpace = 0;
+    rpCBV.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    ss.ShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER params[] = {rpTex, rpCBV};
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 2; rsd.pParameters = params;
+    rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &ss;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    err.Reset();
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)))
+    { Log("Tex RS serialize fail: %s", err?(char*)err->GetBufferPointer():"?"); return false; }
+    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(),
+        IID_PPV_ARGS(&g_rsTex))))
+    { Log("Tex CreateRootSignature fail"); return false; }
+
+    // VertexPT layout: POS(12) + COL(4) + TEX(8) = 24 bytes
+    D3D12_INPUT_ELEMENT_DESC ie[] = {
+        {"POS",0,DXGI_FORMAT_R32G32B32_FLOAT, 0,0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+        {"COL",0,DXGI_FORMAT_R8G8B8A8_UNORM,     0,12,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+        {"TEX",0,DXGI_FORMAT_R32G32_FLOAT,       0,16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = g_rsTex.Get();
+    pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
     pd.BlendState.RenderTarget[0].SrcBlend  = D3D12_BLEND_SRC_ALPHA;
     pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -256,17 +505,116 @@ static bool MkPSOSolid() {
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = FALSE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
     pd.DepthStencilState.DepthEnable = FALSE;
-    pd.InputLayout = {ie, 2};
+    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
+    pd.InputLayout = {ie, 3};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoTex)))) { Log("PSO_tex fail"); return false; }
 
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoSolid)))) { Log("PSO_solid fail"); return false; }
-    Log("PSO_solid OK");
+    // Create descriptor heap for texture SRVs (max 64 textures)
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 64;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_texSrvHeap))))
+    { Log("Tex SRV heap fail"); return false; }
+    g_texSrvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    Log("PSO_tex OK");
     return true;
+}
+
+// Upload texture from raw RGBA data, create SRV, cache by GL tex ID
+static void UploadTextureEx(const void* pixels, int w, int h, int texId) {
+    if (!g_ok || w <= 0 || h <= 0 || texId <= 0) return;
+    auto it = g_texMap.find(texId);
+    if (it != g_texMap.end()) return; // already uploaded
+
+    UINT rowPitch = w * 4;
+    UINT uploadRowPitch = (rowPitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+                        & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    UINT uploadSize = uploadRowPitch * h;
+
+    D3D12_HEAP_PROPERTIES hpUp = {}; hpUp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rdUp = {};
+    rdUp.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdUp.Width = uploadSize; rdUp.Height = 1; rdUp.DepthOrArraySize = 1;
+    rdUp.MipLevels = 1; rdUp.SampleDesc.Count = 1;
+    rdUp.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> uploadBuf;
+    if (FAILED(g_dev->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &rdUp,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf)))) return;
+
+    void* dst = nullptr;
+    uploadBuf->Map(0, nullptr, &dst);
+    for (int y = 0; y < h; y++)
+        memcpy((BYTE*)dst + y * uploadRowPitch, (BYTE*)pixels + y * rowPitch, rowPitch);
+    uploadBuf->Unmap(0, nullptr);
+
+    D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w; td.Height = (UINT)h; td.DepthOrArraySize = 1;
+    td.MipLevels = 1; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ComPtr<ID3D12Resource> tex;
+    if (FAILED(g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)))) return;
+
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {}, dstLoc = {};
+    srcLoc.pResource = uploadBuf.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srcLoc.PlacedFootprint.Footprint.Width = w; srcLoc.PlacedFootprint.Footprint.Height = h;
+    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+    srcLoc.PlacedFootprint.Footprint.RowPitch = uploadRowPitch;
+    dstLoc.pResource = tex.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+
+    ComPtr<ID3D12CommandAllocator> ca;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ca));
+    g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.Get(), nullptr, IID_PPV_ARGS(&cl));
+    cl->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = tex.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cl->ResourceBarrier(1, &b);
+    cl->Close();
+    ID3D12CommandList* lists[] = {cl.Get()};
+    g_queue->ExecuteCommandLists(1, lists);
+    WaitGPU();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_texSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    // Allocate slot: reuse existing or get next
+    UINT slot;
+    auto slotIt = g_texSlotMap.find(texId);
+    if (slotIt != g_texSlotMap.end()) {
+        slot = slotIt->second;
+    } else {
+        if (g_texSlotNext >= 64) { Log("WARN: SRV heap full, id=%d", texId); return; }
+        slot = g_texSlotNext++;
+        g_texSlotMap[texId] = slot;
+    }
+    cpuHandle.ptr += (SIZE_T)slot * g_texSrvSize;
+    g_dev->CreateShaderResourceView(tex.Get(), &srvDesc, cpuHandle);
+
+    g_texMap[texId] = tex;
+    Log("Upload texture #%d %dx%d slot=%u", texId, w, h, slot);
 }
 
 // === Create default-heap texture from upload buffer ===
@@ -405,45 +753,39 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
-        g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-        // Fixed dark gray clear — framebuffer quad covers entire window,
-        // so clear color only shows when no texture is uploaded yet.
+        // Bind RTV + optional DSV
+        bool hasDSV = (g_dsvHeap && g_depthBuf);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvH = {};
+        if (hasDSV) {
+            dsvH = g_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_cl->OMSetRenderTargets(1, &rtv, TRUE, &dsvH);
+        } else {
+            g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        }
+
+        // Clear color + depth
         float bg[4] = {0.08f, 0.08f, 0.08f, 1.0f};
         g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
+        if (hasDSV)
+            g_cl->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
         D3D12_VIEWPORT vp = {0,0,(float)g_w,(float)g_h,0,1};
         D3D12_RECT     sc = {0,0,(LONG)g_w,(LONG)g_h};
         g_cl->RSSetViewports(1, &vp);
         g_cl->RSSetScissorRects(1, &sc);
 
-        // --- Layer 1: GL→D3D12 translated geometry (from BufferBuilder captures) ---
+        // --- Layer 1: Framebuffer-mirror textured quad (background) ---
+        bool hasTex = false;
         {
-            EnterCriticalSection(&g_stateLock);
-            auto chunks = g_drawChunks;   // copy for thread safety
-            LeaveCriticalSection(&g_stateLock);
-
-            if (!chunks.empty() && g_psoSolid) {
-                g_cl->SetGraphicsRootSignature(g_rsSolid.Get());
-                g_cl->SetPipelineState(g_psoSolid.Get());
-
-                for (auto& ch : chunks) {
-                    D3D12_VERTEX_BUFFER_VIEW chVbv = g_imVbv;
-                    chVbv.BufferLocation += (UINT64)ch.vertexStart * sizeof(VertexPC);
-                    chVbv.SizeInBytes = ch.vertexCount * sizeof(VertexPC);
-                    g_cl->IASetVertexBuffers(0, 1, &chVbv);
-                    g_cl->IASetPrimitiveTopology(ch.topo);
-                    g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
-                }
-            }
+            EnterCriticalSection(&g_texLock);
+            hasTex = (g_texDefault != nullptr && g_texW > 0);
+            LeaveCriticalSection(&g_texLock);
         }
 
-        // --- Layer 2: Framebuffer-mirror textured quad ---
-        EnterCriticalSection(&g_texLock);
-        bool hasTex = (g_texDefault != nullptr && g_texW > 0);
-        LeaveCriticalSection(&g_texLock);
-
         if (hasTex) {
+            static bool s_firstMirror = true;
+            if (s_firstMirror) { s_firstMirror = false; Log("Mirror quad active: %dx%d", g_w, g_h); }
             g_cl->SetGraphicsRootSignature(g_rs.Get());
             g_cl->SetPipelineState(g_pso.Get());
             g_cl->SetDescriptorHeaps(1, g_srvHeap.GetAddressOf());
@@ -454,12 +796,113 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_cl->DrawInstanced(3, 1, 0, 0);
         }
 
+        // --- Layer 2: GL→D3D12 translated geometry (foreground) ---
+        {
+            EnterCriticalSection(&g_stateLock);
+            auto chunks = g_drawChunks;
+            UINT stateSnapshot = g_glStateBits;
+            LeaveCriticalSection(&g_stateLock);
+
+            if (!chunks.empty()) {
+                for (auto& ch : chunks) {
+                    UINT state = stateSnapshot;
+                    int variantIdx = (int)((state << 1) | (ch.textured ? 1 : 0));
+                    bool isLine = (ch.topo == D3D_PRIMITIVE_TOPOLOGY_LINELIST || ch.topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
+
+                    // Per-chunk texture lookup with fallback
+                    bool useTex = false;
+                    D3D12_GPU_DESCRIPTOR_HANDLE texSrv = {};
+                    if (ch.textured && ch.textureId > 0) {
+                        auto it = g_texSlotMap.find(ch.textureId);
+                        if (it != g_texSlotMap.end()) {
+                            texSrv = g_texSrvHeap->GetGPUDescriptorHandleForHeapStart();
+                            texSrv.ptr += (SIZE_T)it->second * g_texSrvSize;
+                            useTex = true;
+                        }
+                    }
+
+                    if (useTex && g_psoTex) {
+                        g_cl->SetGraphicsRootSignature(g_rsTex.Get());
+                        g_cl->SetPipelineState(g_psoTex.Get());
+                        g_cl->SetDescriptorHeaps(1, g_texSrvHeap.GetAddressOf());
+                        g_cl->SetGraphicsRootDescriptorTable(0, texSrv);
+                        g_cl->SetGraphicsRootConstantBufferView(1, g_cbUpload->GetGPUVirtualAddress());
+                    } else {
+                        bool useLine = (isLine);
+                        if (useLine) {
+                            if (!g_psoLineVariants[variantIdx]) BuildLinePSO(state, ch.textured);
+                        } else {
+                            if (!g_psoSolidVariants[variantIdx]) BuildSolidPSO(state, ch.textured);
+                        }
+                        ComPtr<ID3D12PipelineState>& pso = useLine ? g_psoLineVariants[variantIdx] : g_psoSolidVariants[variantIdx];
+                        ComPtr<ID3D12RootSignature>& rs = useLine ? g_rsLineVariants[state & 0xF] : g_rsSolidVariants[state & 0xF];
+                        if (!pso || !rs) continue;
+                        g_cl->SetGraphicsRootSignature(rs.Get());
+                        g_cl->SetPipelineState(pso.Get());
+                        g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
+                    }
+
+                    D3D12_VERTEX_BUFFER_VIEW chVbv = g_imVbv;
+                    chVbv.BufferLocation += (UINT64)ch.byteOffset;
+                    chVbv.SizeInBytes = ch.vertexCount * ch.vertexStride;
+                    chVbv.StrideInBytes = ch.vertexStride;
+                    g_cl->IASetVertexBuffers(0, 1, &chVbv);
+                    g_cl->IASetPrimitiveTopology(ch.topo);
+                    g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
+                }
+            }
+        }
+
         // Reset translated geometry for next frame
         EnterCriticalSection(&g_stateLock);
         g_imVertCount = 0;
         g_imVBSize = 0;
         g_drawChunks.clear();
         LeaveCriticalSection(&g_stateLock);
+
+        // --- Screenshot capture: copy RT to readback before Present ---
+        static UINT s_shotCounter = 0; static bool s_readNeeded = false;
+        static ComPtr<ID3D12Resource> s_readback;
+        s_readNeeded = false;
+        if (++s_shotCounter % 300 == 0) {
+            D3D12_RESOURCE_BARRIER beforeCopy = {};
+            beforeCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            beforeCopy.Transition.pResource = g_rt[g_fi].Get();
+            beforeCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            beforeCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            beforeCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_cl->ResourceBarrier(1, &beforeCopy);
+
+            UINT64 rowSize = ((UINT64)g_w * 4 + 255) & ~255ULL;
+            if (!s_readback) {
+                D3D12_HEAP_PROPERTIES rbh = {}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC rbd = {};
+                rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rbd.Width = rowSize * g_h; rbd.Height = 1; rbd.DepthOrArraySize = 1;
+                rbd.MipLevels = 1; rbd.Format = DXGI_FORMAT_UNKNOWN;
+                rbd.SampleDesc.Count = 1; rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                g_dev->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &rbd,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s_readback));
+            }
+            D3D12_TEXTURE_COPY_LOCATION d = {}; d.pResource = s_readback.Get();
+            d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            d.PlacedFootprint.Footprint.Format = g_rt[g_fi]->GetDesc().Format;
+            d.PlacedFootprint.Footprint.Width = g_w; d.PlacedFootprint.Footprint.Height = g_h;
+            d.PlacedFootprint.Footprint.Depth = 1; d.PlacedFootprint.Footprint.RowPitch = (UINT)rowSize;
+            D3D12_TEXTURE_COPY_LOCATION s = {}; s.pResource = g_rt[g_fi].Get();
+            s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+            g_cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+
+            // Transition back to RT for the main Present transition
+            D3D12_RESOURCE_BARRIER afterCopy = {};
+            afterCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            afterCopy.Transition.pResource = g_rt[g_fi].Get();
+            afterCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            afterCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            afterCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_cl->ResourceBarrier(1, &afterCopy);
+            s_readNeeded = true;
+        }
 
         // Transition back
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -469,7 +912,14 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
         ID3D12CommandList* lists[] = {g_cl.Get()};
         g_queue->ExecuteCommandLists(1, lists);
-        g_swap->Present(1, 0);
+
+        HRESULT hr = g_swap->Present(1, 0);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            HRESULT dr = g_dev->GetDeviceRemovedReason();
+            Log("Device removed! HR=0x%08X reason=0x%08X", hr, dr);
+            g_run = false;
+            break;
+        }
 
         UINT64 fv = g_fenceVal;
         g_queue->Signal(g_fence.Get(), fv); g_fenceVal++;
@@ -477,12 +927,89 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_fence->SetEventOnCompletion(fv, g_fenceEv);
             WaitForSingleObject(g_fenceEv, INFINITE);
         }
+
+        // Read back screenshot BMP if capture was queued this frame
+        if (s_readNeeded && s_readback) {
+            void* mapped = nullptr;
+            s_readback->Map(0, nullptr, &mapped);
+            if (mapped) {
+                char path[256];
+                UINT rp = ((g_w * 4 + 255) & ~255);
+                snprintf(path, sizeof(path), "d:\\dx12-lib-template-26.1.2\\shot_%u.bmp", s_shotCounter);
+                FILE* f = fopen(path, "wb");
+                if (f) {
+                    UINT32 fs = 54 + g_h * rp;
+                    UINT8 hdr[54] = {};
+                    hdr[0] = 'B'; hdr[1] = 'M'; memcpy(hdr + 2, &fs, 4);
+                    hdr[10] = 54; hdr[14] = 40;
+                    memcpy(hdr + 18, &g_w, 4);
+                    INT32 negH = -(INT32)g_h; memcpy(hdr + 22, &negH, 4);
+                    hdr[26] = 1; hdr[28] = 32;
+                    fwrite(hdr, 1, 54, f);
+                    for (UINT y = 0; y < g_h; y++) {
+                        BYTE* row = (BYTE*)mapped + y * rp;
+                        for (UINT x = 0; x < g_w; x++) {
+                            BYTE t = row[x*4]; row[x*4] = row[x*4+2]; row[x*4+2] = t;
+                        }
+                        fwrite(row, 1, g_w * 4, f);
+                    }
+                    fclose(f);
+                    Log("Screenshot saved: shot_%u.bmp", s_shotCounter);
+                }
+                s_readback->Unmap(0, nullptr);
+            }
+            s_readNeeded = false;
+        }
     }
     Log("Render thread stopped");
     return 0;
 }
 
 // === Init ===
+// === Grow immediate-mode VB if needed (called from JNI, locked externally) ===
+static bool EnsureIMVBCapacity(UINT requiredBytes) {
+    if (requiredBytes <= g_imVBCap) return true;
+    UINT newCap = requiredBytes + (requiredBytes >> 1); // 1.5x
+    Log("VB grow: %uKB → %uKB", g_imVBCap / 1024, newCap / 1024);
+    // Create new buffer
+    ComPtr<ID3D12Resource> newVB;
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = newCap; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+        &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&newVB))))
+        return false;
+    g_imVB = newVB;
+    g_imVBCap = newCap;
+    g_imVbv.BufferLocation = g_imVB->GetGPUVirtualAddress();
+    return true;
+}
+
+// === Probe supported depth format (D32_FLOAT → D24_S8 → D16) ===
+static DXGI_FORMAT PickDepthFormat() {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+    fs.Format = DXGI_FORMAT_D32_FLOAT;
+    if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))
+        && (fs.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL))
+    { Log("Depth format: D32_FLOAT"); return DXGI_FORMAT_D32_FLOAT; }
+
+    fs.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))
+        && (fs.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL))
+    { Log("Depth format: D24_UNORM_S8_UINT"); return DXGI_FORMAT_D24_UNORM_S8_UINT; }
+
+    fs.Format = DXGI_FORMAT_D16_UNORM;
+    if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))
+        && (fs.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL))
+    { Log("Depth format: D16_UNORM"); return DXGI_FORMAT_D16_UNORM; }
+
+    Log("Depth: none");
+    return DXGI_FORMAT_UNKNOWN;
+}
+
 static bool InitD3D12() {
     Log("=== Init D3D12 mirror ===");
     g_hwnd = MakeWindow();
@@ -520,6 +1047,7 @@ static bool InitD3D12() {
     g_rtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     // SRV heap
+    rd = {};
     rd.NumDescriptors=1; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     rd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&g_srvHeap)))) return false;
@@ -538,10 +1066,56 @@ static bool InitD3D12() {
     if (FAILED(g_dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&g_fence)))) return false;
     g_fenceVal=1; g_fenceEv=CreateEventW(0,0,0,0);
 
+    // Probe depth format & create depth buffer
+    g_dsvFormat = PickDepthFormat();
+    if (g_dsvFormat != DXGI_FORMAT_UNKNOWN && g_w > 0 && g_h > 0) {
+        D3D12_DESCRIPTOR_HEAP_DESC dd = {};
+        dd.NumDescriptors = 1; dd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        if (FAILED(g_dev->CreateDescriptorHeap(&dd, IID_PPV_ARGS(&g_dsvHeap))))
+        { Log("DSV heap fail"); g_dsvFormat = DXGI_FORMAT_UNKNOWN; }
+        else {
+            D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC depthDesc = {};
+            depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            depthDesc.Width = g_w; depthDesc.Height = g_h; depthDesc.DepthOrArraySize = 1;
+            depthDesc.MipLevels = 1; depthDesc.Format = g_dsvFormat;
+            depthDesc.SampleDesc.Count = 1;
+            depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
+            cv.DepthStencil.Depth = 1.0f; cv.DepthStencil.Stencil = 0;
+            if (FAILED(g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
+                &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_depthBuf))))
+            { Log("Depth buf fail"); g_dsvFormat = DXGI_FORMAT_UNKNOWN; }
+            else {
+                g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
+                    g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+                Log("Depth buffer OK %dx%d", g_w, g_h);
+            }
+        }
+    }
+
+    // Constant buffer upload heap
+    D3D12_HEAP_PROPERTIES hpCB = {}; hpCB.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rdCB = {};
+    rdCB.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdCB.Width = g_cbSize; rdCB.Height = 1; rdCB.DepthOrArraySize = 1;
+    rdCB.MipLevels = 1; rdCB.SampleDesc.Count = 1;
+    rdCB.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (SUCCEEDED(g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
+        &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cbUpload)))) {
+        g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
+        // OpenGL→D3D12 NDC Z remap: z' = z*0.5 + 0.5
+        float gl2d3d[16] = {
+            1,0,0,0,  0,1,0,0,  0,0,0.5f,0.5f,  0,0,0,1
+        };
+        memcpy(g_cbData, gl2d3d, sizeof(gl2d3d));
+        Log("CB upload OK");
+    }
+
     if (!MkPSO()) return false;
     if (!MkPSOSolid()) { Log("WARN: Solid PSO failed, immediate-mode disabled"); }
     else {
-        // Create immediate-mode vertex buffer (upload heap, 1MB)
+        // Create immediate-mode vertex buffer (upload heap, 4MB)
         D3D12_HEAP_PROPERTIES hpIm = {}; hpIm.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rdIm = {};
         rdIm.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -555,6 +1129,7 @@ static bool InitD3D12() {
             g_imVbv.SizeInBytes = sizeof(VertexPC);
         }
     }
+    MkPSOTex(); // non-fatal if fails
 
     InitializeCriticalSection(&g_texLock);
     InitializeCriticalSection(&g_stateLock);
@@ -577,9 +1152,18 @@ static void CleanupD3D12() {
         DeleteCriticalSection(&g_texLock);
         DeleteCriticalSection(&g_stateLock);
         g_vbUpload.Reset(); g_pso.Reset(); g_rs.Reset();
-        g_imVB.Reset(); g_psoSolid.Reset(); g_rsSolid.Reset();
+        g_imVB.Reset();
+        for (auto& p : g_psoSolidVariants) p.Reset();
+        for (auto& p : g_rsSolidVariants) p.Reset();
+        for (auto& p : g_psoLineVariants) p.Reset();
+        for (auto& p : g_rsLineVariants) p.Reset();
+        g_psoTex.Reset(); g_rsTex.Reset(); g_texSrvHeap.Reset();
+        g_texMap.clear(); g_texSlotMap.clear(); g_texSlotNext = 0;
         for (auto& r : g_rt) r.Reset();
         g_rtvHeap.Reset(); g_srvHeap.Reset();
+        g_depthBuf.Reset(); g_dsvHeap.Reset();
+        if (g_cbData) { g_cbUpload->Unmap(0, nullptr); g_cbData = nullptr; }
+        g_cbUpload.Reset();
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
@@ -654,7 +1238,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices
     (JNIEnv* env, jclass, jfloatArray verts, jint count) {
     if (!g_ok || !g_imVB || !verts || count <= 0) return;
     UINT byteCount = (UINT)count * sizeof(VertexPC);
-    if (byteCount > g_imVBCap - g_imVBSize) return; // overflow
+    if (!EnsureIMVBCapacity(g_imVBSize + byteCount)) return; // grow or drop
 
     jsize len = env->GetArrayLength(verts);
     std::vector<jfloat> buf(len);
@@ -663,11 +1247,15 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices
     // Convert float[7] per vertex → VertexPC
     EnterCriticalSection(&g_stateLock);
 
-    // Record draw chunk BEFORE uploading vertices
+    // Record draw chunk BEFORE uploading vertices (use byte offset)
     DrawChunk ch;
-    ch.vertexStart = g_imVertCount;
+    ch.byteOffset = g_imVBSize;
     ch.vertexCount = (UINT)count;
     ch.topo = g_pendingTopo;
+    ch.textured = false;
+    ch.vertexStride = sizeof(VertexPC);
+    ch.blend = (g_glStateBits & GLB_BLEND) != 0;
+    ch.textureId = g_pendingTextureId;
     g_drawChunks.push_back(ch);
 
     void* dst = nullptr;
@@ -683,6 +1271,52 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices
         UINT b = (UINT)(buf[off + 5] * 255.0f) & 0xFF;
         UINT a = (UINT)(buf[off + 6] * 255.0f) & 0xFF;
         vtx[i].color = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    g_imVB->Unmap(0, nullptr);
+    g_imVertCount += count;
+    g_imVBSize += byteCount;
+    g_imVbv.SizeInBytes = g_imVBSize;
+    LeaveCriticalSection(&g_stateLock);
+}
+
+// Record vertices WITH UV (float[9] → VertexPT, 20 bytes)
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV
+    (JNIEnv* env, jclass, jfloatArray verts, jint count) {
+    if (!g_ok || !g_imVB || !verts || count <= 0) return;
+    UINT byteCount = (UINT)count * sizeof(VertexPT);
+    if (!EnsureIMVBCapacity(g_imVBSize + byteCount)) return;
+
+    jsize len = env->GetArrayLength(verts);
+    std::vector<jfloat> buf(len);
+    env->GetFloatArrayRegion(verts, 0, len, buf.data());
+
+    EnterCriticalSection(&g_stateLock);
+
+    DrawChunk ch;
+    ch.byteOffset = g_imVBSize;
+    ch.vertexCount = (UINT)count;
+    ch.topo = g_pendingTopo;
+    ch.textured = true;
+    ch.vertexStride = sizeof(VertexPT);
+    ch.blend = (g_glStateBits & GLB_BLEND) != 0;
+    ch.textureId = g_pendingTextureId;
+    g_drawChunks.push_back(ch);
+
+    void* dst = nullptr;
+    g_imVB->Map(0, nullptr, &dst);
+    VertexPT* vtx = (VertexPT*)((BYTE*)dst + g_imVBSize);
+    for (int i = 0; i < count; i++) {
+        int off = i * 9;
+        vtx[i].x = buf[off + 0];
+        vtx[i].y = buf[off + 1];
+        vtx[i].z = buf[off + 2];
+        UINT r = (UINT)(buf[off + 3] * 255.0f) & 0xFF;
+        UINT g = (UINT)(buf[off + 4] * 255.0f) & 0xFF;
+        UINT b = (UINT)(buf[off + 5] * 255.0f) & 0xFF;
+        UINT a = (UINT)(buf[off + 6] * 255.0f) & 0xFF;
+        vtx[i].color = (a << 24) | (r << 16) | (g << 8) | b;
+        vtx[i].u = buf[off + 7];
+        vtx[i].v = buf[off + 8];
     }
     g_imVB->Unmap(0, nullptr);
     g_imVertCount += count;
@@ -708,5 +1342,90 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetPrimitiveTopology
     if (topo >= 0 && topo <= 6) g_pendingTopo = map[topo];
     LeaveCriticalSection(&g_stateLock);
 }
+
+// Set texture ID for next draw chunk (per-chunk texture binding)
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDrawTexture
+    (JNIEnv*, jclass, jint texId) {
+    g_pendingTextureId = texId;
+}
+
+// Set active texture by GL texture ID
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetTexture
+    (JNIEnv*, jclass, jint texId) {
+    g_currentTexId = texId;
+}
+
+// Upload RGBA texture pixels and create D3D12 SRV, keyed by GL texture ID
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTextureEx
+    (JNIEnv* env, jclass, jbyteArray pixels, jint w, jint h, jint texId) {
+    if (!g_ok || !pixels) return;
+    jsize len = env->GetArrayLength(pixels);
+    std::vector<jbyte> buf(len);
+    env->GetByteArrayRegion(pixels, 0, len, buf.data());
+    UploadTextureEx(buf.data(), (int)w, (int)h, (int)texId);
+}
+
+// Set GL state bits (blend/depth/cull/depthWrite) for PSO variant selection
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetGlState
+    (JNIEnv*, jclass, jint enableBits, jint disableBits) {
+    EnterCriticalSection(&g_stateLock);
+    g_glStateBits |= (UINT)enableBits;
+    g_glStateBits &= ~(UINT)disableBits;
+    LeaveCriticalSection(&g_stateLock);
+}
+
+// Sync viewport from GL glViewport (tracked for future D3D12 viewport sync)
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetViewport
+    (JNIEnv*, jclass, jint x, jint y, jint w, jint h) {
+    // Note: GL viewport != D3D12 window size. Only track for logging.
+    // g_w/g_h are set by nativeInit/nativeResize and used for window viewport.
+}
+
+// Sync blend func
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetBlendFunc
+    (JNIEnv*, jclass, jint sfactor, jint dfactor) {
+    // Map GL blend factors → D3D12
+    auto map = [](int gl) -> D3D12_BLEND {
+        switch (gl) {
+        case 0:     return D3D12_BLEND_ZERO;          // GL_ZERO
+        case 1:     return D3D12_BLEND_ONE;           // GL_ONE
+        case 768:   return D3D12_BLEND_SRC_COLOR;     // GL_SRC_COLOR
+        case 769:   return D3D12_BLEND_INV_SRC_COLOR; // GL_ONE_MINUS_SRC_COLOR
+        case 770:   return D3D12_BLEND_SRC_ALPHA;     // GL_SRC_ALPHA
+        case 771:   return D3D12_BLEND_INV_SRC_ALPHA; // GL_ONE_MINUS_SRC_ALPHA
+        case 774:   return D3D12_BLEND_DEST_COLOR;    // GL_DST_COLOR
+        case 775:   return D3D12_BLEND_INV_DEST_COLOR;// GL_ONE_MINUS_DST_COLOR
+        default:    return D3D12_BLEND_ONE;
+        }
+    };
+    g_glSrcBlend = map(sfactor);
+    g_glDstBlend = map(dfactor);
+}
+
+// Sync depth mask
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDepthMask
+    (JNIEnv*, jclass, jboolean write) {
+    EnterCriticalSection(&g_stateLock);
+    if (write) g_glStateBits |= GLB_DEPTH_WRITE;
+    else       g_glStateBits &= ~GLB_DEPTH_WRITE;
+    LeaveCriticalSection(&g_stateLock);
+}
+
+// Upload MVP matrix (16 floats, column-major)
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp
+    (JNIEnv* env, jclass, jfloatArray matrix) {
+    if (!g_cbData) return;
+    jfloat* src = env->GetFloatArrayElements(matrix, nullptr);
+    if (src) {
+        memcpy(g_cbData, src, 64);
+        env->ReleaseFloatArrayElements(matrix, src, JNI_ABORT);
+    }
+}
+
+JNIEXPORT jint JNICALL Java_com_dx12_DX12LibClient_nativeGetWindowWidth
+    (JNIEnv*, jclass) { return (jint)g_w; }
+
+JNIEXPORT jint JNICALL Java_com_dx12_DX12LibClient_nativeGetWindowHeight
+    (JNIEnv*, jclass) { return (jint)g_h; }
 
 } // extern "C"

@@ -13,7 +13,7 @@
   "mixins": ["mixins.gl4dx12.json"],
   "depends": {
     "fabricloader": ">=0.19.2",
-    "minecraft": ">=26.1.2",
+    "minecraft": ">=1.21.5",
     "java": ">=25"
   }
 }

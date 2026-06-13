@@ -7,17 +7,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * Intercepts BufferBuilder.build() / buildOrThrow() to capture
- * MeshData BEFORE it reaches GL upload.
- *
- * Minecraft 26.1.2 (Mojang): com.mojang.blaze3d.vertex.BufferBuilder
- *  - build()    → MeshData
- *  - buildOrThrow() → MeshData
- *
- * MeshData.drawState() → DrawState { mode(), vertexCount(), indexCount(),
- *                                      format(), indexType() }
- * MeshData.vertexBuffer() → ByteBuffer
- * MeshData.indexBuffer()  → ByteBuffer
+ * MC 26.1.2: BufferBuilder.build() returns MeshData (not the old BuiltBuffer).
+ * Hook at RETURN to get the fully-built MeshData with sorted vertex buffer.
  */
 @Mixin(targets = "com.mojang.blaze3d.vertex.BufferBuilder", remap = false)
 public class BufferBuilderMixin {
@@ -25,12 +16,11 @@ public class BufferBuilderMixin {
     @Inject(method = "build", at = @At("RETURN"), remap = false)
     private void onBuild(CallbackInfoReturnable<Object> cir) {
         Object meshData = cir.getReturnValue();
-        if (meshData != null) D3D12Bridge.onMeshDataBuild(meshData);
+        if (meshData != null)
+            D3D12Bridge.processMeshData(meshData);
     }
 
-    @Inject(method = "buildOrThrow", at = @At("RETURN"), remap = false)
-    private void onBuildOrThrow(CallbackInfoReturnable<Object> cir) {
-        Object meshData = cir.getReturnValue();
-        if (meshData != null) D3D12Bridge.onMeshDataBuild(meshData);
+    static {
+        System.out.println("[GL4DX12] BufferBuilderMixin v23 loaded -> build()@RETURN");
     }
 }

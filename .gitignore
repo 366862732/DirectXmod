@@ -8,3 +8,18 @@ run/
 .project
 .settings/
 .DS_Store
+
+# Screenshots
+*.bmp
+shot_*/
+
+# C++ build artifacts
+*.obj
+*.exp
+*.lib
+
+# IDE workspace (auto-generated)
+.idea/workspace.xml
+
+# Backup dirs
+backup/
