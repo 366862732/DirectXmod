@@ -45,6 +45,19 @@ public class D3D12Bridge {
         System.out.println("[GL4DX12] D3D12 deactivated");
     }
 
+    /** Returns D3D12 adapter name + feature level string for F3 debug screen */
+    public static String getD3D12Info() {
+        if (!d3d12Ready) return null;
+        return DX12LibClient.nativeGetD3D12Info();
+    }
+
+    public static boolean isD3D12Active() {
+        return d3d12Ready && DX12LibClient.nativeIsD3D12Active();
+    }
+
+    public static int nativeGetWindowWidth() { return DX12LibClient.nativeGetWindowWidth(); }
+    public static int nativeGetWindowHeight() { return DX12LibClient.nativeGetWindowHeight(); }
+
     // ================================================================
     // Stage 2: MVP Matrix Sync
     // ================================================================

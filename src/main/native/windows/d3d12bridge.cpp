@@ -39,6 +39,8 @@ static void Log(const char* fmt, ...) {
 
 // === D3D12 state ===
 static ComPtr<ID3D12Device>          g_dev;
+// DX12 info for F3 debug screen
+static char g_d3d12Info[256] = "D3D12 not initialized";
 static ComPtr<ID3D12CommandQueue>    g_queue;
 static ComPtr<IDXGISwapChain3>       g_swap;
 static ComPtr<ID3D12Resource>        g_rt[2];
@@ -1057,7 +1059,26 @@ static bool InitD3D12(HWND hwndMC, int width, int height) {
     for (UINT i=0; dxgi->EnumAdapters1(i,&adp)!=DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d; adp->GetDesc1(&d);
         if (SUCCEEDED(D3D12CreateDevice(adp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_dev))))
-        { Log("Device: %S", d.Description); break; }
+        {
+            // Store adapter name + feature level for F3 debug screen
+            D3D12_FEATURE_DATA_FEATURE_LEVELS fl = { D3D_FEATURE_LEVEL_11_0 };
+            g_dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
+            const char* flNames[] = {
+                "Unknown",  "9.1", "9.2", "9.3", "10.0", "10.1",
+                "11.0", "11.1", "12.0", "12.1", "12.2"
+            };
+            int idx = (fl.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_2) ? 10 :
+                     (fl.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_1) ?  9 :
+                     (fl.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_0) ?  8 :
+                     (fl.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_11_1) ?  7 : 6;
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1,
+                g_d3d12Info, sizeof(g_d3d12Info), 0, 0);
+            snprintf(g_d3d12Info + strlen(g_d3d12Info),
+                sizeof(g_d3d12Info) - strlen(g_d3d12Info),
+                " (D3D12 FL_%s)", flNames[idx]);
+            Log("Device: %S (FL: %s)", d.Description, flNames[idx]);
+            break;
+        }
         adp.Reset();
     }
     if (!g_dev && FAILED(D3D12CreateDevice(0,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&g_dev)))) return false;
@@ -1483,5 +1504,17 @@ JNIEXPORT jint JNICALL Java_com_dx12_DX12LibClient_nativeGetWindowWidth
 
 JNIEXPORT jint JNICALL Java_com_dx12_DX12LibClient_nativeGetWindowHeight
     (JNIEnv*, jclass) { return (jint)g_h; }
+
+/** Return D3D12 adapter name + feature level string for F3 debug screen */
+JNIEXPORT jstring JNICALL Java_com_dx12_DX12LibClient_nativeGetD3D12Info
+    (JNIEnv* env, jclass) {
+    return env->NewStringUTF(g_d3d12Info);
+}
+
+/** Check if D3D12 overlay is active and rendering */
+JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsD3D12Active
+    (JNIEnv*, jclass) {
+    return g_ok ? JNI_TRUE : JNI_FALSE;
+}
 
 } // extern "C"

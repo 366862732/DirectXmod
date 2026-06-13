@@ -54,6 +54,12 @@ public class DX12LibClient {
     /** Upload MVP transform (16 floats, column-major) */
     public static native void nativeSetMvp(float[] mvp);
 
+    /** Get D3D12 adapter name + feature level for F3 debug screen */
+    public static native String nativeGetD3D12Info();
+
+    /** Check whether D3D12 overlay is active */
+    public static native boolean nativeIsD3D12Active();
+
     /** D3D12 window dimensions for pixel→clip transform */
     public static native int nativeGetWindowWidth();
     public static native int nativeGetWindowHeight();
