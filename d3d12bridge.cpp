@@ -1,5 +1,5 @@
 // d3d12bridge.cpp
-// ? AI-D3D12 ?? - ??? D3D12 ??
+// ? AI-D3D12 ??
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -64,6 +64,7 @@ bool CreateD3D12Device() {
     IDXGIFactory4* dxgiFactory = nullptr;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
     if (FAILED(hr)) return false;
+    
     IDXGIAdapter1* adapter = nullptr;
     for (UINT i = 0; dxgiFactory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc;
@@ -94,6 +95,7 @@ bool CreateSwapChain(HWND hwnd, int width, int height) {
     g_hwnd = hwnd;
     IDXGIFactory4* dxgiFactory = nullptr;
     CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
+    
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.BufferCount = 2;
     swapChainDesc.Width = width;
@@ -102,6 +104,7 @@ bool CreateSwapChain(HWND hwnd, int width, int height) {
     swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDesc.SampleDesc.Count = 1;
+    
     IDXGISwapChain1* swapChain1 = nullptr;
     HRESULT hr = dxgiFactory->CreateSwapChainForHwnd(g_commandQueue, hwnd, &swapChainDesc, nullptr, nullptr, &swapChain1);
     if (SUCCEEDED(hr)) {
@@ -165,6 +168,7 @@ void WaitForPreviousFrame() {
 void ClearRenderTarget() {
     g_commandAllocator->Reset();
     g_commandList->Reset(g_commandAllocator, nullptr);
+    
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = g_renderTargets[g_frameIndex];
@@ -172,13 +176,16 @@ void ClearRenderTarget() {
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g_commandList->ResourceBarrier(1, &barrier);
+    
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += g_frameIndex * g_rtvDescriptorSize;
     const float clearColor[] = { 1.0f, 0.0f, 0.0f, 1.0f };
     g_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_commandList->ResourceBarrier(1, &barrier);
+    
     g_commandList->Close();
     ID3D12CommandList* commandLists[] = { g_commandList };
     g_commandQueue->ExecuteCommandLists(1, commandLists);
@@ -204,12 +211,15 @@ extern "C" __declspec(dllexport) bool nativeRender() {
     HINSTANCE hInstance = GetModuleHandle(nullptr);
     HWND hwnd = CreateTestWindow(hInstance);
     if (!hwnd) return false;
+    
     if (!CreateD3D12Device() || !CreateCommandQueue()) { Cleanup(); return false; }
     RECT rect; GetClientRect(hwnd, &rect);
     if (!CreateSwapChain(hwnd, rect.right - rect.left, rect.bottom - rect.top)) { Cleanup(); return false; }
     if (!CreateRTVDescriptorHeap() || !CreateRenderTargets()) { Cleanup(); return false; }
     if (!CreateCommandObjects() || !CreateFence()) { Cleanup(); return false; }
+    
     ClearRenderTarget();
+    
     MSG msg = {};
     DWORD startTime = GetTickCount();
     while (GetTickCount() - startTime < 3000) {
@@ -218,6 +228,7 @@ extern "C" __declspec(dllexport) bool nativeRender() {
             DispatchMessage(&msg);
         }
     }
+    
     Cleanup();
     return true;
 }
