@@ -1,10 +1,10 @@
-// d3d12bridge.cpp — GL→D3D12 command translation + framebuffer mirror
+// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
-//   1. D3D12 owns independent window + render thread (~60fps)
-//   2. Framebuffer mirror: glReadPixels → Java → JNI → D3D12 texture → quad
-//   3. GL→D3D12 translation: intercepted GL commands drive native D3D12 draw calls
-//   4. Both layers composited: solid-color geometry on top of framebuffer copy
+//   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
+//   2. GL→D3D12 translation: intercepted MC BufferBuilder → vertex data → JNI → D3D12 draw
+//   3. Projection/modelView matrices synced from MC via JNI each frame
+//   4. Geometry uses MC world-space coords, transformed by MVP in VS shader
 //
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
@@ -38,7 +38,6 @@ static void Log(const char* fmt, ...) {
 }
 
 // === D3D12 state ===
-static HWND g_hwnd = nullptr;
 static ComPtr<ID3D12Device>          g_dev;
 static ComPtr<ID3D12CommandQueue>    g_queue;
 static ComPtr<IDXGISwapChain3>       g_swap;
@@ -131,17 +130,71 @@ static std::unordered_map<int, UINT> g_texSlotMap;  // texture ID → heap slot 
 static UINT g_texSlotNext = 0;                       // next free slot
 static int g_currentTexId = 0; // set by Java side
 
-// === Window ===
-static LRESULT CALLBACK WP(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h,m,w,l); }
-static HWND MakeWindow() {
-    const wchar_t* cn = L"GL4DX12_Mirror";
-    WNDCLASSW wc = {}; wc.lpfnWndProc=WP; wc.hInstance=GetModuleHandleW(0); wc.lpszClassName=cn;
+// === Window — borderless overlay child on MC's window (click-through) ===
+// We create a borderless popup as a child of MC's GLFW window.
+// Input passes through (WS_EX_TRANSPARENT) so MC stays interactive.
+static HWND g_hwndOverlay = nullptr; // our overlay
+static HWND g_hwndMC = nullptr;      // MC's window (from JNI)
+
+static LRESULT CALLBACK OverlayWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND: return 1; // no flicker
+    case WM_NCHITTEST:  return HTTRANSPARENT; // click-through
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static HWND CreateOverlayWindow(HWND hParent) {
+    const wchar_t* cn = L"GL4DX12_Overlay";
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = OverlayWndProc;
+    wc.hInstance = GetModuleHandleW(0);
+    wc.lpszClassName = cn;
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
     RegisterClassW(&wc);
-    HWND hw = CreateWindowExW(0, cn, L"GL4DX12 - Minecraft Mirror",
-        WS_OVERLAPPEDWINDOW&~WS_THICKFRAME, CW_USEDEFAULT,CW_USEDEFAULT,
-        g_w,g_h,0,0,wc.hInstance,0);
-    ShowWindow(hw, SW_SHOW);
+
+    HWND hw = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        cn, L"",
+        WS_POPUP,
+        0, 0, g_w, g_h,
+        nullptr, nullptr, wc.hInstance, nullptr);
+
+    // Make fully opaque (we draw with D3D12, not GDI)
+    SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
+    ShowWindow(hw, SW_SHOWNOACTIVATE);
+
+    // Position over parent
+    if (hParent) {
+        RECT rc;
+        GetClientRect(hParent, &rc);
+        POINT pt = {0, 0};
+        ClientToScreen(hParent, &pt);
+        SetWindowPos(hw, HWND_TOPMOST, pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    Log("Overlay window created (%dx%d)", g_w, g_h);
     return hw;
+}
+
+static void RepositionOverlay() {
+    if (!g_hwndOverlay || !g_hwndMC) return;
+    RECT rc;
+    GetClientRect(g_hwndMC, &rc);
+    POINT pt = {0, 0};
+    ClientToScreen(g_hwndMC, &pt);
+    int newW = rc.right - rc.left;
+    int newH = rc.bottom - rc.top;
+    if (newW <= 0) newW = (int)g_w;
+    if (newH <= 0) newH = (int)g_h;
+    SetWindowPos(g_hwndOverlay, HWND_TOPMOST, pt.x, pt.y, newW, newH,
+        SWP_NOACTIVATE | SWP_NOZORDER);
+
+    // If size changed, trigger resize
+    if ((int)g_w != newW || (int)g_h != newH) {
+        // g_w/g_h will be updated by nativeResize
+    }
 }
 
 // === GPU sync ===
@@ -722,21 +775,15 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&last);
 
-    // Fullscreen quad vertices
-    Vertex2D quad[] = {
-        {-1,-1, 0,1}, {3,-1, 2,1}, {-1,3, 0,-1},
-    };
-    MkUpload(g_vbUpload, quad, sizeof(quad));
-    g_vbv.BufferLocation = g_vbUpload->GetGPUVirtualAddress();
-    g_vbv.StrideInBytes = sizeof(Vertex2D);
-    g_vbv.SizeInBytes = sizeof(quad);
-
     while (g_run) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         double dt = (double)(now.QuadPart - last.QuadPart) / freq.QuadPart;
         if (dt < 0.016) { Sleep(1); continue; }
         last = now;
+
+        // Keep overlay aligned with MC window
+        RepositionOverlay();
 
         g_alloc->Reset();
         g_cl->Reset(g_alloc.Get(), nullptr);
@@ -764,8 +811,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         }
 
-        // Clear color + depth
-        float bg[4] = {0.08f, 0.08f, 0.08f, 1.0f};
+        // Clear to transparent black (MC's OpenGL renders underneath)
+        float bg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
         if (hasDSV)
             g_cl->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -775,28 +822,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         g_cl->RSSetViewports(1, &vp);
         g_cl->RSSetScissorRects(1, &sc);
 
-        // --- Layer 1: Framebuffer-mirror textured quad (background) ---
-        bool hasTex = false;
-        {
-            EnterCriticalSection(&g_texLock);
-            hasTex = (g_texDefault != nullptr && g_texW > 0);
-            LeaveCriticalSection(&g_texLock);
-        }
-
-        if (hasTex) {
-            static bool s_firstMirror = true;
-            if (s_firstMirror) { s_firstMirror = false; Log("Mirror quad active: %dx%d", g_w, g_h); }
-            g_cl->SetGraphicsRootSignature(g_rs.Get());
-            g_cl->SetPipelineState(g_pso.Get());
-            g_cl->SetDescriptorHeaps(1, g_srvHeap.GetAddressOf());
-            g_cl->SetGraphicsRootDescriptorTable(0,
-                g_srvHeap->GetGPUDescriptorHandleForHeapStart());
-            g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_cl->IASetVertexBuffers(0, 1, &g_vbv);
-            g_cl->DrawInstanced(3, 1, 0, 0);
-        }
-
-        // --- Layer 2: GL→D3D12 translated geometry (foreground) ---
+        // --- GL→D3D12 translated geometry (sole layer, world-space via MVP) ---
         {
             EnterCriticalSection(&g_stateLock);
             auto chunks = g_drawChunks;
@@ -1010,10 +1036,19 @@ static DXGI_FORMAT PickDepthFormat() {
     return DXGI_FORMAT_UNKNOWN;
 }
 
-static bool InitD3D12() {
-    Log("=== Init D3D12 mirror ===");
-    g_hwnd = MakeWindow();
-    if (!g_hwnd) return false;
+static bool InitD3D12(HWND hwndMC, int width, int height) {
+    Log("=== Init D3D12 overlay on MC window (HWND=0x%p, %dx%d) ===", hwndMC, width, height);
+    g_hwndMC = hwndMC;
+    g_w = (UINT)width;
+    g_h = (UINT)height;
+    if (!g_hwndMC || g_w == 0 || g_h == 0) {
+        Log("ERROR: invalid HWND or dimensions");
+        return false;
+    }
+
+    // Create borderless overlay window
+    g_hwndOverlay = CreateOverlayWindow(g_hwndMC);
+    if (!g_hwndOverlay) return false;
 
     ComPtr<IDXGIFactory4> dxgi;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi)))) return false;
@@ -1036,7 +1071,7 @@ static bool InitD3D12() {
     sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD; sd.SampleDesc.Count=1;
     ComPtr<IDXGISwapChain1> sc1;
-    if (FAILED(dxgi->CreateSwapChainForHwnd(g_queue.Get(),g_hwnd,&sd,0,0,&sc1)))
+    if (FAILED(dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndOverlay, &sd, 0, 0, &sc1)))
     { Log("SwapChain fail"); return false; }
     sc1.As(&g_swap); g_fi = g_swap->GetCurrentBackBufferIndex();
 
@@ -1104,12 +1139,12 @@ static bool InitD3D12() {
     if (SUCCEEDED(g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
         &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cbUpload)))) {
         g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
-        // OpenGL→D3D12 NDC Z remap: z' = z*0.5 + 0.5
-        float gl2d3d[16] = {
-            1,0,0,0,  0,1,0,0,  0,0,0.5f,0.5f,  0,0,0,1
+        // Identity MVP — will be overwritten each frame from Java via nativeSetMvp()
+        float identity[16] = {
+            1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1
         };
-        memcpy(g_cbData, gl2d3d, sizeof(gl2d3d));
-        Log("CB upload OK");
+        memcpy(g_cbData, identity, sizeof(identity));
+        Log("CB upload OK (identity MVP)");
     }
 
     if (!MkPSO()) return false;
@@ -1135,7 +1170,7 @@ static bool InitD3D12() {
     InitializeCriticalSection(&g_stateLock);
     g_ok = true; g_run = true;
     g_thread = CreateThread(0, 0, RenderLoop, 0, 0, 0);
-    Log("=== D3D12 Mirror Ready ===");
+    Log("=== D3D12 on MC window Ready ===");
     return true;
 }
 
@@ -1167,17 +1202,18 @@ static void CleanupD3D12() {
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
-    if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd=0; }
+    if (g_hwndOverlay) { DestroyWindow(g_hwndOverlay); g_hwndOverlay = nullptr; }
+    g_hwndMC = nullptr;
 }
 
 // === JNI ===
 extern "C" {
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
-    (JNIEnv*, jclass, jlong, jint, jint) {
+    (JNIEnv*, jclass, jlong hwnd, jint width, jint height) {
     CreateDirectoryA("C:\\temp", 0);
     if (g_ok) return JNI_TRUE;
-    return InitD3D12() ? JNI_TRUE : JNI_FALSE;
+    return InitD3D12((HWND)hwnd, (int)width, (int)height) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDestroy(JNIEnv*, jclass) { CleanupD3D12(); }
@@ -1186,8 +1222,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativePresent(JNIEnv*, jclass
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass, jint w, jint h) {
     if (!g_ok||!g_swap) return;
+    if (g_w == (UINT)w && g_h == (UINT)h) return; // no change
     WaitGPU();
     for (auto& r : g_rt) r.Reset();
+    g_depthBuf.Reset();
     g_cl.Reset(); g_alloc.Reset();
     g_swap->ResizeBuffers(2,(UINT)w,(UINT)h,DXGI_FORMAT_R8G8B8A8_UNORM,0);
     g_w=(UINT)w; g_h=(UINT)h; g_fi=g_swap->GetCurrentBackBufferIndex();
@@ -1196,6 +1234,24 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass,
     g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&g_alloc));
     g_dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,g_alloc.Get(),0,IID_PPV_ARGS(&g_cl));
     g_cl->Close();
+
+    // Recreate depth buffer at new size
+    if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
+        D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC depthDesc = {};
+        depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        depthDesc.Width = g_w; depthDesc.Height = g_h; depthDesc.DepthOrArraySize = 1;
+        depthDesc.MipLevels = 1; depthDesc.Format = g_dsvFormat;
+        depthDesc.SampleDesc.Count = 1;
+        depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
+        cv.DepthStencil.Depth = 1.0f; cv.DepthStencil.Stencil = 0;
+        g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
+            &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_depthBuf));
+        g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
+            g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+        Log("Resized depth buffer: %dx%d", g_w, g_h);
+    }
 }
 
 // Sync clear color from glClearColor hook
@@ -1219,7 +1275,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetGlColor
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsInitialized(JNIEnv*, jclass) { return g_ok?JNI_TRUE:JNI_FALSE; }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeShowDebugWindow(JNIEnv*, jclass, jboolean s) {
-    if (g_hwnd) ShowWindow(g_hwnd, s?SW_SHOW:SW_HIDE);
+    if (g_hwndOverlay) ShowWindow(g_hwndOverlay, s ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 
 // Upload RGBA pixel data from Java

@@ -16,7 +16,7 @@ cl /nologo /EHsc /O2 /MD /LD ^
   /I"%JAVA_HOME%\include" ^
   /I"%JAVA_HOME%\include\win32" ^
   d3d12bridge.cpp ^
-  /link d3d12.lib dxgi.lib d3dcompiler.lib user32.lib /OUT:gl4dx12.dll
+  /link d3d12.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib /OUT:gl4dx12.dll
 
 if %errorlevel% equ 0 (
     echo.

@@ -3,6 +3,7 @@ package com.dx12;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWNativeWin32;
 
 import com.dx12.client.D3D12Bridge;
 
@@ -26,7 +27,7 @@ public class Dx12Mod implements ClientModInitializer {
             return;
         }
 
-        // 2. Register F6 toggle + frame capture via tick event
+        // 2. Register F6 toggle + per-tick matrix sync
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             long window = client.getWindow().handle();
             boolean f6Down = GLFW.glfwGetKey(window, GLFW.GLFW_KEY_F6) == GLFW.GLFW_PRESS;
@@ -35,11 +36,17 @@ public class Dx12Mod implements ClientModInitializer {
                 if (D3D12Bridge.isD3D12Ready()) {
                     D3D12Bridge.shutdownDevice();
                 } else {
-                    D3D12Bridge.ensureDeviceInitialized();
+                    // Pass MC's native HWND and framebuffer size
+                    long hwnd = GLFWNativeWin32.glfwGetWin32Window(window);
+                    int[] w = new int[1], h = new int[1];
+                    GLFW.glfwGetFramebufferSize(window, w, h);
+                    D3D12Bridge.ensureDeviceInitialized(hwnd, w[0], h[0]);
                 }
             }
             f6WasDown = f6Down;
 
+            // Sync matrices to DLL each tick
+            D3D12Bridge.syncMatrices();
             // Reset geometry counter each tick (DLL clears per-frame)
             D3D12Bridge.resetTranslatedCounter();
         });
