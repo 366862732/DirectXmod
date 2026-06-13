@@ -1,3 +1,5 @@
 {
-    "java.configuration.updateBuildConfiguration": "disabled"
+    "java.configuration.updateBuildConfiguration": "disabled",
+    "java.compile.nullAnalysis.mode": "automatic",
+    "konveyor.genai.agentMode": true
 }
