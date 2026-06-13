@@ -6,8 +6,7 @@
   "client": [
     "GlBufferMixin",
     "GlDrawMixin",
-    "BufferBuilderMixin",
-    "DebugScreenMixin"
+    "BufferBuilderMixin"
   ],
   "injectors": {
     "defaultRequire": 1
