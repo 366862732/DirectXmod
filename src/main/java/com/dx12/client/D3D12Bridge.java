@@ -76,58 +76,97 @@ public class D3D12Bridge {
     // ================================================================
 
     private static final float[] mvpMatrix = new float[16];
-    private static boolean mvpDiagDone = false;
+    private static Object cachedMvMatrix = null;   // Matrix4f from RenderSystem.getModelViewMatrix()
+    private static Object cachedProjMatrix = null;  // Matrix4f computed manually
     private static boolean mvpWorking = false;
-    private static boolean mvpNotReadyLogged = false; // avoid spam
+    private static boolean mvpDiagDone = false;
+    private static boolean mvpInitTried = false;
+    private static int mvFailCount = 0;
     static { mvpMatrix[0]=1; mvpMatrix[5]=1; mvpMatrix[10]=1; mvpMatrix[15]=1; }
 
-    public static void syncMatrices() {
-        if (!d3d12Ready) {
-            if (!mvpNotReadyLogged) { mvpLog("MVP: d3d12Ready=" + d3d12Ready); mvpNotReadyLogged = true; }
-            return;
-        }
-        if (mvpWorking) { DX12LibClient.nativeSetMvp(mvpMatrix); return; }
-
-        if (!mvpDiagDone) mvpLog("MVP: attempting init...");
-
+    /** Build perspective projection matrix using org.joml.Matrix4f.setPerspective() */
+    private static Object buildProjectionMatrix(float fovDeg, float aspect, float near, float far) {
         try {
-            Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
-            Class<?> mat4fc = Class.forName("org.joml.Matrix4fc");
+            Class<?> mat4f = Class.forName("org.joml.Matrix4f");
+            Object m = mat4f.getConstructor().newInstance();
+            mat4f.getMethod("setPerspective", float.class, float.class, float.class, float.class)
+                .invoke(m, (float)Math.toRadians(fovDeg), aspect, near, far);
+            return m;
+        } catch (Exception e) { return null; }
+    }
 
-            Object proj = rs.getMethod("getProjectionMatrix").invoke(null);
-            Object mv = rs.getMethod("getModelViewMatrix").invoke(null);
-            if (proj == null || mv == null) {
-                mvpLog("MVP: null matrices — proj=" + proj + " mv=" + mv);
-                mvpDiagDone = true;
-                return;
-            }
+    public static void syncMatrices() {
+        if (!d3d12Ready) return;
 
-            Object mvp = proj.getClass().getMethod("mul", mat4fc).invoke(proj, mv);
-            mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
-            mvpWorking = true;
-            DX12LibClient.nativeSetMvp(mvpMatrix);
-            mvpLog("MVP SUCCESS: P*MV computed");
-            mvpDiagDone = true;
-            return;
-        } catch (NoSuchMethodException e) {
+        // One-time: initialize projection matrix from MC window + FOV
+        if (!mvpInitTried) {
+            mvpInitTried = true;
             try {
+                // Get modelView matrix (confirmed to exist in MC 26.1.2)
                 Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
-                Object mvp = rs.getMethod("getModelViewProjectionMatrix").invoke(null);
-                if (mvp != null) {
+                cachedMvMatrix = rs.getMethod("getModelViewMatrix").invoke(null);
+
+                // Get window dimensions for aspect ratio
+                float aspect = 1.777f; // default 16:9
+                float fovDeg = 70.0f;
+                try {
+                    Class<?> mc = Class.forName("net.minecraft.client.Minecraft");
+                    Object inst = mc.getMethod("getInstance").invoke(null);
+                    Object win = mc.getMethod("getWindow").invoke(inst);
+                    int fw = (int)win.getClass().getMethod("getWidth").invoke(win);
+                    int fh = (int)win.getClass().getMethod("getHeight").invoke(win);
+                    if (fw > 0 && fh > 0) aspect = (float)fw / (float)fh;
+                    Object opts = mc.getMethod("options").invoke(inst);
+                    Object fovOpt = opts.getClass().getMethod("fov").invoke(opts);
+                    // fov() returns an OptionInstance<Double> — .get() returns Double
+                    double fov = (double)fovOpt.getClass().getMethod("get").invoke(fovOpt);
+                    if (fov > 0 && fov < 360) fovDeg = (float)fov;
+                    mvpLog("MVP: window=" + fw + "x" + fh + " aspect=" + aspect + " fov=" + fovDeg);
+                } catch (Exception ex) {
+                    mvpLog("MVP: window/fov lookup failed: " + ex.getClass().getSimpleName());
+                }
+
+                cachedProjMatrix = buildProjectionMatrix(fovDeg, aspect, 0.05f, 1024.0f);
+                mvpLog("MVP: modelView=" + (cachedMvMatrix != null) + " proj=" + (cachedProjMatrix != null));
+
+                if (cachedMvMatrix != null && cachedProjMatrix != null) {
+                    // MVP = projection * modelView
+                    Class<?> mat4fc = Class.forName("org.joml.Matrix4fc");
+                    Object mvp = cachedProjMatrix.getClass().getMethod("mul", mat4fc)
+                        .invoke(cachedProjMatrix, cachedMvMatrix);
                     mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
                     mvpWorking = true;
-                    DX12LibClient.nativeSetMvp(mvpMatrix);
-                    mvpLog("MVP SUCCESS: getModelViewProjectionMatrix");
+                    mvpLog("MVP SUCCESS: P*MV active");
                     mvpDiagDone = true;
-                    return;
+                } else {
+                    mvpLog("MVP FAIL: missing matrix — mv=" + (cachedMvMatrix != null) + " proj=" + (cachedProjMatrix != null));
                 }
-            } catch (Exception e2) {}
-            mvpLog("MVP FAIL: no methods — " + e.getMessage());
-            mvpDiagDone = true;
-        } catch (Exception e) {
-            mvpLog("MVP FAIL: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            e.printStackTrace();
-            mvpDiagDone = true;
+            } catch (NoSuchMethodException e) {
+                mvpLog("MVP FAIL NoSuchMethod: " + e.getMessage());
+            } catch (Exception e) {
+                mvpLog("MVP FAIL: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+
+        // Re-read modelView each tick (camera moves)
+        if (mvpWorking && cachedProjMatrix != null) {
+            try {
+                Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
+                cachedMvMatrix = rs.getMethod("getModelViewMatrix").invoke(null);
+                if (cachedMvMatrix != null) {
+                    Class<?> mat4fc = Class.forName("org.joml.Matrix4fc");
+                    Object mvp = cachedProjMatrix.getClass().getMethod("mul", mat4fc)
+                        .invoke(cachedProjMatrix, cachedMvMatrix);
+                    mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
+                    DX12LibClient.nativeSetMvp(mvpMatrix);
+                    mvFailCount = 0;
+                } else {
+                    if (++mvFailCount <= 3) mvpLog("MVP: getModelViewMatrix returned null (tick " + mvFailCount + ")");
+                }
+            } catch (Exception e) {
+                if (++mvFailCount <= 1) mvpLog("MVP tick error: " + e.getMessage());
+            }
         }
     }
 
