@@ -434,11 +434,12 @@ public class D3D12Bridge {
         out[base + 1] = buf.getFloat(off + posOff + 4);
         out[base + 2] = buf.getFloat(off + posOff + 8);
 
-        // color: 3-4 ubytes → normalized float
+        // color: MC BufferBuilder stores ABGR as little-endian UINT
+        // byte[0]=B, byte[1]=G, byte[2]=R, byte[3]=A
         if (colOff >= 0 && off + colOff + colSize <= buf.limit()) {
-            out[base + 3] = (buf.get(off + colOff) & 0xFF) / 255f;
-            out[base + 4] = (buf.get(off + colOff + 1) & 0xFF) / 255f;
-            out[base + 5] = (buf.get(off + colOff + 2) & 0xFF) / 255f;
+            out[base + 3] = (buf.get(off + colOff + 2) & 0xFF) / 255f;  // R = byte[2]
+            out[base + 4] = (buf.get(off + colOff + 1) & 0xFF) / 255f;  // G = byte[1]
+            out[base + 5] = (buf.get(off + colOff) & 0xFF) / 255f;      // B = byte[0]
             out[base + 6] = (colSize >= 4) ? (buf.get(off + colOff + 3) & 0xFF) / 255f : 1f;
         } else {
             out[base + 3] = 1; out[base + 4] = 1;

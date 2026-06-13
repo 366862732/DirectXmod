@@ -162,11 +162,11 @@ static HWND CreateOverlayWindow(HWND hParent) {
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassW(&wc);
 
-    // NO WS_EX_LAYERED — it conflicts with D3D12 flip-model SwapChain.
-    // WS_EX_TRANSPARENT for click-through, WS_EX_TOPMOST to float above MC,
-    // WS_EX_NOACTIVATE so MC keeps keyboard focus.
+    // NO WS_EX_LAYERED — conflicts with D3D12 flip-model SwapChain.
+    // WS_EX_TRANSPARENT for click-through (mouse passes to MC below).
+    // WS_EX_TOPMOST to float above MC, WS_EX_NOACTIVATE so MC keeps keyboard focus.
     HWND hw = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         cn, L"",
         WS_POPUP,
         0, 0, g_w, g_h,
@@ -193,6 +193,9 @@ static HWND CreateOverlayWindow(HWND hParent) {
     return hw;
 }
 
+// Forward decl
+static void WaitGPU();
+
 static void RepositionOverlay() {
     if (!g_hwndOverlay || !g_hwndMC) return;
     RECT rc;
@@ -216,10 +219,46 @@ static void RepositionOverlay() {
 
     if (sizeChanged) {
         g_w = (UINT)newW; g_h = (UINT)newH;
-        // Force capture texture recreation next frame
+        // Force capture texture recreation
         g_texMCFrame.Reset();
         g_mcCaptureW = 0; g_mcCaptureH = 0;
-        Log("MC window resized -> %dx%d (capture tex reset)", g_w, g_h);
+
+        // Resize swap chain buffers to new window size
+        WaitGPU();
+        for (auto& r : g_rt) r.Reset();
+        g_depthBuf.Reset();
+        g_cl.Reset(); g_alloc.Reset();
+        HRESULT hr = g_swap->ResizeBuffers(2, g_w, g_h, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        if (FAILED(hr)) {
+            Log("ResizeBuffers FAILED: 0x%08X", hr);
+        } else {
+            g_fi = g_swap->GetCurrentBackBufferIndex();
+            D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT n = 0; n < 2; n++) {
+                g_swap->GetBuffer(n, IID_PPV_ARGS(&g_rt[n]));
+                g_dev->CreateRenderTargetView(g_rt[n].Get(), nullptr, rh);
+                rh.ptr += g_rtvSize;
+            }
+            if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
+                D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC depthDesc = {};
+                depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                depthDesc.Width = g_w; depthDesc.Height = g_h; depthDesc.DepthOrArraySize = 1;
+                depthDesc.MipLevels = 1; depthDesc.Format = g_dsvFormat;
+                depthDesc.SampleDesc.Count = 1;
+                depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
+                cv.DepthStencil.Depth = 1.0f; cv.DepthStencil.Stencil = 0;
+                g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
+                    &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_depthBuf));
+                g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
+                    g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+            }
+            g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_alloc));
+            g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(&g_cl));
+            g_cl->Close();
+            Log("SwapChain resized to %dx%d", g_w, g_h);
+        }
     }
 
     SetWindowPos(g_hwndOverlay, HWND_TOPMOST, pt.x, pt.y, newW, newH,
