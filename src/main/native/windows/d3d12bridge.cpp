@@ -203,16 +203,29 @@ static void RepositionOverlay() {
     int newH = rc.bottom - rc.top;
     if (newW <= 0 || newH <= 0) return;
 
-    // Only move/resize if actually changed
+    // Check if size changed — invalidate capture texture + overwrite g_w/g_h
+    bool sizeChanged = ((int)g_w != newW || (int)g_h != newH);
+
+    // Only move/resize if position/size actually changed
     static int s_lastW = 0, s_lastH = 0;
     static int s_lastX = -1, s_lastY = -1;
-    if (s_lastW == newW && s_lastH == newH && s_lastX == pt.x && s_lastY == pt.y) return;
+    if (!sizeChanged && s_lastW == newW && s_lastH == newH
+        && s_lastX == pt.x && s_lastY == pt.y) return;
     s_lastW = newW; s_lastH = newH;
     s_lastX = pt.x; s_lastY = pt.y;
 
+    if (sizeChanged) {
+        g_w = (UINT)newW; g_h = (UINT)newH;
+        // Force capture texture recreation next frame
+        g_texMCFrame.Reset();
+        g_mcCaptureW = 0; g_mcCaptureH = 0;
+        Log("MC window resized -> %dx%d (capture tex reset)", g_w, g_h);
+    }
+
     SetWindowPos(g_hwndOverlay, HWND_TOPMOST, pt.x, pt.y, newW, newH,
         SWP_NOACTIVATE | SWP_NOZORDER);
-    Log("Overlay repositioned: pos=(%d,%d) size=%dx%d", pt.x, pt.y, newW, newH);
+    if (sizeChanged)
+        Log("Overlay repositioned: pos=(%d,%d) size=%dx%d", pt.x, pt.y, newW, newH);
 }
 
 // === GPU sync ===
@@ -817,6 +830,13 @@ static bool CaptureMCFrame() {
     BYTE* pixels = new BYTE[dataSize];
     GetDIBits(hdcWin, hbm, 0, (UINT)g_h, pixels, &bi, DIB_RGB_COLORS);
 
+    // GDI returns BGRA; swap to RGBA for D3D12
+    for (UINT i = 0; i < dataSize; i += 4) {
+        BYTE tmp = pixels[i];
+        pixels[i] = pixels[i + 2];
+        pixels[i + 2] = tmp;
+    }
+
     // Cleanup GDI
     SelectObject(hdcMem, hbmOld);
     DeleteObject(hbm);
@@ -1057,50 +1077,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         g_drawChunks.clear();
         LeaveCriticalSection(&g_stateLock);
 
-        // --- Screenshot capture: copy RT to readback before Present ---
-        static UINT s_shotCounter = 0; static bool s_readNeeded = false;
-        static ComPtr<ID3D12Resource> s_readback;
-        s_readNeeded = false;
-        if (++s_shotCounter % 300 == 0) {
-            D3D12_RESOURCE_BARRIER beforeCopy = {};
-            beforeCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            beforeCopy.Transition.pResource = g_rt[g_fi].Get();
-            beforeCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            beforeCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            beforeCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            g_cl->ResourceBarrier(1, &beforeCopy);
-
-            UINT64 rowSize = ((UINT64)g_w * 4 + 255) & ~255ULL;
-            if (!s_readback) {
-                D3D12_HEAP_PROPERTIES rbh = {}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
-                D3D12_RESOURCE_DESC rbd = {};
-                rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                rbd.Width = rowSize * g_h; rbd.Height = 1; rbd.DepthOrArraySize = 1;
-                rbd.MipLevels = 1; rbd.Format = DXGI_FORMAT_UNKNOWN;
-                rbd.SampleDesc.Count = 1; rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                g_dev->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &rbd,
-                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s_readback));
-            }
-            D3D12_TEXTURE_COPY_LOCATION d = {}; d.pResource = s_readback.Get();
-            d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            d.PlacedFootprint.Footprint.Format = g_rt[g_fi]->GetDesc().Format;
-            d.PlacedFootprint.Footprint.Width = g_w; d.PlacedFootprint.Footprint.Height = g_h;
-            d.PlacedFootprint.Footprint.Depth = 1; d.PlacedFootprint.Footprint.RowPitch = (UINT)rowSize;
-            D3D12_TEXTURE_COPY_LOCATION s = {}; s.pResource = g_rt[g_fi].Get();
-            s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
-            g_cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
-
-            // Transition back to RT for the main Present transition
-            D3D12_RESOURCE_BARRIER afterCopy = {};
-            afterCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            afterCopy.Transition.pResource = g_rt[g_fi].Get();
-            afterCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            afterCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            afterCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            g_cl->ResourceBarrier(1, &afterCopy);
-            s_readNeeded = true;
-        }
-
         // Transition back
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -1123,39 +1099,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         if (g_fence->GetCompletedValue() < fv) {
             g_fence->SetEventOnCompletion(fv, g_fenceEv);
             WaitForSingleObject(g_fenceEv, INFINITE);
-        }
-
-        // Read back screenshot BMP if capture was queued this frame
-        if (s_readNeeded && s_readback) {
-            void* mapped = nullptr;
-            s_readback->Map(0, nullptr, &mapped);
-            if (mapped) {
-                char path[256];
-                UINT rp = ((g_w * 4 + 255) & ~255);
-                snprintf(path, sizeof(path), "d:\\dx12-lib-template-26.1.2\\shot_%u.bmp", s_shotCounter);
-                FILE* f = fopen(path, "wb");
-                if (f) {
-                    UINT32 fs = 54 + g_h * rp;
-                    UINT8 hdr[54] = {};
-                    hdr[0] = 'B'; hdr[1] = 'M'; memcpy(hdr + 2, &fs, 4);
-                    hdr[10] = 54; hdr[14] = 40;
-                    memcpy(hdr + 18, &g_w, 4);
-                    INT32 negH = -(INT32)g_h; memcpy(hdr + 22, &negH, 4);
-                    hdr[26] = 1; hdr[28] = 32;
-                    fwrite(hdr, 1, 54, f);
-                    for (UINT y = 0; y < g_h; y++) {
-                        BYTE* row = (BYTE*)mapped + y * rp;
-                        for (UINT x = 0; x < g_w; x++) {
-                            BYTE t = row[x*4]; row[x*4] = row[x*4+2]; row[x*4+2] = t;
-                        }
-                        fwrite(row, 1, g_w * 4, f);
-                    }
-                    fclose(f);
-                    Log("Screenshot saved: shot_%u.bmp", s_shotCounter);
-                }
-                s_readback->Unmap(0, nullptr);
-            }
-            s_readNeeded = false;
         }
     }
     Log("Render thread stopped");

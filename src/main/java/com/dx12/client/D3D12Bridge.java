@@ -63,40 +63,80 @@ public class D3D12Bridge {
     // ================================================================
 
     private static final float[] mvpMatrix = new float[16];
+    private static boolean mvpDiagDone = false;
+    private static boolean mvpWorking = false;
     static {
         // Identity
         mvpMatrix[0] = 1; mvpMatrix[5] = 1; mvpMatrix[10] = 1; mvpMatrix[15] = 1;
     }
 
-    /** Called each tick BEFORE geometry is submitted. Captures MC's projection
-     *  and modelView matrices, multiplies them, sends MVP to D3D12. */
     public static void syncMatrices() {
         if (!d3d12Ready) return;
+        if (mvpWorking) {
+            // MVP already captured — re-send each frame
+            DX12LibClient.nativeSetMvp(mvpMatrix);
+            return;
+        }
         try {
             Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
-            java.lang.reflect.Method getProj = rs.getMethod("getProjectionMatrix");
-            Object projMat = getProj.invoke(null); // org.joml.Matrix4f
-            java.lang.reflect.Method getMV = rs.getMethod("getModelViewMatrix");
-            Object mvMat = getMV.invoke(null);
 
-            if (projMat != null && mvMat != null) {
-                // Copy modelView into mvpMatrix (column-major)
-                float[] mv = new float[16];
-                java.lang.reflect.Method getMethod = projMat.getClass().getMethod("get", float[].class);
+            // Try MC 26.1.2 method names
+            java.lang.reflect.Method getProj = null, getMV = null;
+            String projMethod = null, mvMethod = null;
 
-                // MVP = projection * modelView
-                // org.joml.Matrix4f.mul(Matrix4fc) returns new Matrix4f
-                java.lang.reflect.Method mulMethod = projMat.getClass()
-                    .getMethod("mul", projMat.getClass());
-                Object mvp = mulMethod.invoke(projMat, mvMat);
-                java.lang.reflect.Method getArr = mvp.getClass().getMethod("get", float[].class);
-                getArr.invoke(mvp, (Object) mvpMatrix);
+            // Attempt 1: getProjectionMatrix / getModelViewMatrix (MC 1.21.4-)
+            try { getProj = rs.getMethod("getProjectionMatrix"); projMethod = "getProjectionMatrix"; } catch (NoSuchMethodException e) {}
+            try { getMV = rs.getMethod("getModelViewMatrix"); mvMethod = "getModelViewMatrix"; } catch (NoSuchMethodException e) {}
 
-                DX12LibClient.nativeSetMvp(mvpMatrix);
+            // Attempt 2: getProjectionMatrixStack / getModelViewMatrixStack (MC 1.21.5+ rename)
+            if (getProj == null) { try { getProj = rs.getMethod("getProjectionMatrixStack"); projMethod = "getProjectionMatrixStack"; } catch (NoSuchMethodException e) {} }
+            if (getMV == null) { try { getMV = rs.getMethod("getModelViewMatrixStack"); mvMethod = "getModelViewMatrixStack"; } catch (NoSuchMethodException e) {} }
+
+            // Attempt 3: field access via getModelViewProjectionMatrix (if it's a single combined getter)
+            if (getProj == null && getMV == null) {
+                try {
+                    java.lang.reflect.Method getMVP = rs.getMethod("getModelViewProjectionMatrix");
+                    Object mvpObj = getMVP.invoke(null);
+                    java.lang.reflect.Method getArr = mvpObj.getClass().getMethod("get", float[].class);
+                    getArr.invoke(mvpObj, (Object) mvpMatrix);
+                    mvpWorking = true;
+                    DX12LibClient.nativeSetMvp(mvpMatrix);
+                    if (!mvpDiagDone) {
+                        mvpDiagDone = true;
+                        System.out.println("[GL4DX12] MVP: using getModelViewProjectionMatrix()");
+                    }
+                    return;
+                } catch (NoSuchMethodException e) {}
+            }
+
+            if (getProj != null && getMV != null) {
+                Object projMat = getProj.invoke(null);
+                Object mvMat = getMV.invoke(null);
+                if (projMat != null && mvMat != null) {
+                    // MVP = projection * modelView
+                    java.lang.reflect.Method mulMethod = projMat.getClass()
+                        .getMethod("mul", projMat.getClass());
+                    Object mvp = mulMethod.invoke(projMat, mvMat);
+                    java.lang.reflect.Method getArr = mvp.getClass().getMethod("get", float[].class);
+                    getArr.invoke(mvp, (Object) mvpMatrix);
+                    mvpWorking = true;
+                    DX12LibClient.nativeSetMvp(mvpMatrix);
+                    if (!mvpDiagDone) {
+                        mvpDiagDone = true;
+                        System.out.println("[GL4DX12] MVP: " + projMethod + " * " + mvMethod + " OK");
+                    }
+                    return;
+                }
             }
         } catch (Exception e) {
-            // Fallback: identity MVP (NDC-space, no transform)
-            // Useful if reflection fails — geometry won't be transformed
+            if (!mvpDiagDone) {
+                mvpDiagDone = true;
+                System.out.println("[GL4DX12] MVP sync FAILED: " + e.getMessage());
+            }
+        }
+        if (!mvpDiagDone) {
+            mvpDiagDone = true;
+            System.out.println("[GL4DX12] MVP: ALL methods absent — geometry will be identity");
         }
     }
 
