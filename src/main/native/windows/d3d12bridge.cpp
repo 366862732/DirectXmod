@@ -152,31 +152,37 @@ static HWND CreateOverlayWindow(HWND hParent) {
     wc.lpfnWndProc = OverlayWndProc;
     wc.hInstance = GetModuleHandleW(0);
     wc.lpszClassName = cn;
-    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassW(&wc);
 
+    // NO WS_EX_LAYERED — it conflicts with D3D12 flip-model SwapChain.
+    // WS_EX_TRANSPARENT for click-through, WS_EX_TOPMOST to float above MC,
+    // WS_EX_NOACTIVATE so MC keeps keyboard focus.
     HWND hw = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         cn, L"",
         WS_POPUP,
         0, 0, g_w, g_h,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    // Make fully opaque (we draw with D3D12, not GDI)
-    SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
     ShowWindow(hw, SW_SHOWNOACTIVATE);
 
-    // Position over parent
+    // Position over parent's client area (in screen coordinates)
     if (hParent) {
         RECT rc;
         GetClientRect(hParent, &rc);
         POINT pt = {0, 0};
         ClientToScreen(hParent, &pt);
-        SetWindowPos(hw, HWND_TOPMOST, pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top,
+        RECT mcScreen = {pt.x, pt.y, pt.x + rc.right - rc.left, pt.y + rc.bottom - rc.top};
+        SetWindowPos(hw, HWND_TOPMOST,
+            mcScreen.left, mcScreen.top,
+            mcScreen.right - mcScreen.left, mcScreen.bottom - mcScreen.top,
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        Log("Overlay created at (%d,%d) %dx%d",
+            mcScreen.left, mcScreen.top,
+            mcScreen.right - mcScreen.left, mcScreen.bottom - mcScreen.top);
     }
 
-    Log("Overlay window created (%dx%d)", g_w, g_h);
     return hw;
 }
 
@@ -188,15 +194,18 @@ static void RepositionOverlay() {
     ClientToScreen(g_hwndMC, &pt);
     int newW = rc.right - rc.left;
     int newH = rc.bottom - rc.top;
-    if (newW <= 0) newW = (int)g_w;
-    if (newH <= 0) newH = (int)g_h;
+    if (newW <= 0 || newH <= 0) return;
+
+    // Only move/resize if actually changed
+    static int s_lastW = 0, s_lastH = 0;
+    static int s_lastX = -1, s_lastY = -1;
+    if (s_lastW == newW && s_lastH == newH && s_lastX == pt.x && s_lastY == pt.y) return;
+    s_lastW = newW; s_lastH = newH;
+    s_lastX = pt.x; s_lastY = pt.y;
+
     SetWindowPos(g_hwndOverlay, HWND_TOPMOST, pt.x, pt.y, newW, newH,
         SWP_NOACTIVATE | SWP_NOZORDER);
-
-    // If size changed, trigger resize
-    if ((int)g_w != newW || (int)g_h != newH) {
-        // g_w/g_h will be updated by nativeResize
-    }
+    Log("Overlay repositioned: pos=(%d,%d) size=%dx%d", pt.x, pt.y, newW, newH);
 }
 
 // === GPU sync ===
