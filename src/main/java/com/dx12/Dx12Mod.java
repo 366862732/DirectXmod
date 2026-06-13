@@ -76,7 +76,16 @@ public class Dx12Mod implements ClientModInitializer {
                 sig.append(")");
                 System.out.println(sig.toString());
             }
-            System.out.println("[GL4DX12] === End DSO enum ===");
+            System.out.println("=== End DSO enum ===");
+            // Also dump DSO fields containing "Text" or "text"
+            System.out.println("[GL4DX12] === DSO TEXT FIELDS ===");
+            for (java.lang.reflect.Field f : dso.getDeclaredFields()) {
+                String fn = f.getName();
+                if (fn.contains("ext") || fn.contains("ight") || fn.contains("eft")) {
+                    System.out.println("  " + f.getType().getSimpleName() + " " + fn);
+                }
+            }
+            System.out.println("[GL4DX12] === End DSO fields ===");
         } catch (Exception e) {
             System.out.println("[GL4DX12] DSO Enum FAILED: " + e);
         }

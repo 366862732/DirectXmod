@@ -1256,7 +1256,7 @@ static bool InitD3D12(HWND hwndMC) {
                 g_d3d12Info, sizeof(g_d3d12Info), 0, 0);
             snprintf(g_d3d12Info + strlen(g_d3d12Info),
                 sizeof(g_d3d12Info) - strlen(g_d3d12Info),
-                " (D3D12 FL_%s)", flNames[idx]);
+                " (FL%s)", flNames[idx]);
             Log("Device: %S (FL: %s)", d.Description, flNames[idx]);
             break;
         }

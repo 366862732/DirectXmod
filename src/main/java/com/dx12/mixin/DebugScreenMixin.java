@@ -9,43 +9,52 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.util.List;
 
 /**
- * Replaces OpenGL/Display lines on F3 debug screen with D3D12 adapter info.
+ * Replace OpenGL/Display lines on F3 debug screen with D3D12 adapter info.
  *
- * MC 26.1.2: DebugScreenOverlay.extractLines(GuiGraphicsExtractor m, List l, boolean left)
- * fills the list — left=false means right-side text (GPU/OpenGL/Display/Java).
+ * MC 26.1.2: hooks render() at HEAD — the right-side text list is built via
+ * extractLines() during graph extraction THEN drawRightText() renders it.
+ * By hooking render() we intercept between build and draw, once per frame.
  */
 @Mixin(targets = "net.minecraft.client.gui.components.DebugScreenOverlay", remap = false)
 public class DebugScreenMixin {
 
-    @Inject(method = "extractLines", at = @At("RETURN"), remap = false)
-    private void onExtractLines(
-            net.minecraft.client.gui.GuiGraphicsExtractor extractor,
-            List<String> lines, boolean left, CallbackInfo ci) {
-        if (lines == null || lines.isEmpty() || left) return;
+    @Inject(method = "render", at = @At("HEAD"), remap = false)
+    private void onRender(Object guiGraphics, CallbackInfo ci) {
+        try {
+            // Access the right-side text list via reflection
+            // MC 26.1.2: DebugScreenOverlay stores it, built by extractLines()
+            // The Sodium graph extraction runs before render(), so list is ready
+            java.lang.reflect.Field f = this.getClass().getDeclaredField("rightText");
+            f.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) f.get(this);
+            if (lines == null || lines.isEmpty()) return;
 
-        String d3d12Info = D3D12Bridge.getD3D12Info();
-        boolean active = D3D12Bridge.isD3D12Active();
+            String info = D3D12Bridge.getD3D12Info();
+            boolean active = D3D12Bridge.isD3D12Active();
 
-        for (int i = 0; i < lines.size(); i++) {
-            String line = lines.get(i);
+            for (int i = 0; i < lines.size(); i++) {
+                String line = lines.get(i);
+                if (line == null) continue;
 
-            if (active && d3d12Info != null) {
-                if (line.startsWith("OpenGL:") || line.startsWith("OpenGL ")) {
-                    lines.set(i, "\u00a7eD3D12\u00a7r: " + d3d12Info);
-                } else if (line.startsWith("Display:")) {
-                    String w = String.valueOf(D3D12Bridge.nativeGetWindowWidth());
-                    String h = String.valueOf(D3D12Bridge.nativeGetWindowHeight());
-                    lines.set(i, "D3D12 Overlay: " + w + "x" + h + " (click-through)");
-                }
-            } else {
-                if (line.startsWith("OpenGL:") || line.startsWith("OpenGL ")) {
-                    lines.set(i, line + "  \u00a77[D3D12 OFF — press F6]");
+                if (active && info != null) {
+                    if (line.startsWith("OpenGL:")) {
+                        lines.set(i, "\u00a7eD3D12\u00a7r: " + info);
+                    } else if (line.startsWith("Display:")) {
+                        lines.set(i, "D3D12 Overlay \u00a7aactive\u00a7r");
+                    }
+                } else {
+                    if (line.startsWith("OpenGL:")) {
+                        lines.set(i, line + " \u00a77[\u00a7cOFF\u00a77]");
+                    }
                 }
             }
+        } catch (Exception ignore) {
+            // Field name may differ — silent fallback
         }
     }
 
     static {
-        System.out.println("[GL4DX12] DebugScreenMixin loaded — F3 overlay patched (extractLines hook)");
+        System.out.println("[GL4DX12] DebugScreenMixin loaded (render hook)");
     }
 }
