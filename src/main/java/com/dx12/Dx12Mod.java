@@ -78,11 +78,11 @@ public class Dx12Mod implements ClientModInitializer {
             }
             System.out.println("=== End DSO enum ===");
             // Also dump DSO fields containing "Text" or "text"
-            System.out.println("[GL4DX12] === DSO TEXT FIELDS ===");
-            for (java.lang.reflect.Field f : dso.getDeclaredFields()) {
-                String fn = f.getName();
-                if (fn.contains("ext") || fn.contains("ight") || fn.contains("eft")) {
-                    System.out.println("  " + f.getType().getSimpleName() + " " + fn);
+            System.out.println("[GL4DX12] === DSO ALL FIELDS (incl parent) ===");
+            for (Class<?> c = dso; c != null; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    System.out.println("  [" + c.getSimpleName() + "] "
+                        + f.getType().getSimpleName() + " " + f.getName());
                 }
             }
             System.out.println("[GL4DX12] === End DSO fields ===");
