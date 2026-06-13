@@ -258,6 +258,10 @@ static void RepositionOverlay() {
             g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(&g_cl));
             g_cl->Close();
             Log("SwapChain resized to %dx%d", g_w, g_h);
+
+            // Force overlay window to repaint immediately
+            InvalidateRect(g_hwndOverlay, nullptr, FALSE);
+            UpdateWindow(g_hwndOverlay);
         }
     }
 

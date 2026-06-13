@@ -65,78 +65,52 @@ public class D3D12Bridge {
     private static final float[] mvpMatrix = new float[16];
     private static boolean mvpDiagDone = false;
     private static boolean mvpWorking = false;
-    static {
-        // Identity
-        mvpMatrix[0] = 1; mvpMatrix[5] = 1; mvpMatrix[10] = 1; mvpMatrix[15] = 1;
-    }
+    static { mvpMatrix[0]=1; mvpMatrix[5]=1; mvpMatrix[10]=1; mvpMatrix[15]=1; }
 
     public static void syncMatrices() {
         if (!d3d12Ready) return;
-        if (mvpWorking) {
-            // MVP already captured — re-send each frame
-            DX12LibClient.nativeSetMvp(mvpMatrix);
-            return;
-        }
+        if (mvpWorking) { DX12LibClient.nativeSetMvp(mvpMatrix); return; }
+
         try {
             Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
+            Class<?> mat4fc = Class.forName("org.joml.Matrix4fc");
 
-            // Try MC 26.1.2 method names
-            java.lang.reflect.Method getProj = null, getMV = null;
-            String projMethod = null, mvMethod = null;
-
-            // Attempt 1: getProjectionMatrix / getModelViewMatrix (MC 1.21.4-)
-            try { getProj = rs.getMethod("getProjectionMatrix"); projMethod = "getProjectionMatrix"; } catch (NoSuchMethodException e) {}
-            try { getMV = rs.getMethod("getModelViewMatrix"); mvMethod = "getModelViewMatrix"; } catch (NoSuchMethodException e) {}
-
-            // Attempt 2: getProjectionMatrixStack / getModelViewMatrixStack (MC 1.21.5+ rename)
-            if (getProj == null) { try { getProj = rs.getMethod("getProjectionMatrixStack"); projMethod = "getProjectionMatrixStack"; } catch (NoSuchMethodException e) {} }
-            if (getMV == null) { try { getMV = rs.getMethod("getModelViewMatrixStack"); mvMethod = "getModelViewMatrixStack"; } catch (NoSuchMethodException e) {} }
-
-            // Attempt 3: field access via getModelViewProjectionMatrix (if it's a single combined getter)
-            if (getProj == null && getMV == null) {
-                try {
-                    java.lang.reflect.Method getMVP = rs.getMethod("getModelViewProjectionMatrix");
-                    Object mvpObj = getMVP.invoke(null);
-                    java.lang.reflect.Method getArr = mvpObj.getClass().getMethod("get", float[].class);
-                    getArr.invoke(mvpObj, (Object) mvpMatrix);
-                    mvpWorking = true;
-                    DX12LibClient.nativeSetMvp(mvpMatrix);
-                    if (!mvpDiagDone) {
-                        mvpDiagDone = true;
-                        System.out.println("[GL4DX12] MVP: using getModelViewProjectionMatrix()");
-                    }
-                    return;
-                } catch (NoSuchMethodException e) {}
+            Object proj = rs.getMethod("getProjectionMatrix").invoke(null);
+            Object mv = rs.getMethod("getModelViewMatrix").invoke(null);
+            if (proj == null || mv == null) {
+                if (!mvpDiagDone) System.out.println("[GL4DX12] MVP: null matrices");
+                mvpDiagDone = true;
+                return;
             }
 
-            if (getProj != null && getMV != null) {
-                Object projMat = getProj.invoke(null);
-                Object mvMat = getMV.invoke(null);
-                if (projMat != null && mvMat != null) {
-                    // MVP = projection * modelView
-                    java.lang.reflect.Method mulMethod = projMat.getClass()
-                        .getMethod("mul", projMat.getClass());
-                    Object mvp = mulMethod.invoke(projMat, mvMat);
-                    java.lang.reflect.Method getArr = mvp.getClass().getMethod("get", float[].class);
-                    getArr.invoke(mvp, (Object) mvpMatrix);
+            // proj.mul(Matrix4fc) — interface, NOT concrete class
+            Object mvp = proj.getClass().getMethod("mul", mat4fc).invoke(proj, mv);
+            mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
+            mvpWorking = true;
+            DX12LibClient.nativeSetMvp(mvpMatrix);
+            System.out.println("[GL4DX12] MVP active: P*MV");
+            mvpDiagDone = true;
+            return;
+        } catch (NoSuchMethodException e) {
+            // try getModelViewProjectionMatrix fallback
+            try {
+                Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
+                Object mvp = rs.getMethod("getModelViewProjectionMatrix").invoke(null);
+                if (mvp != null) {
+                    mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
                     mvpWorking = true;
                     DX12LibClient.nativeSetMvp(mvpMatrix);
-                    if (!mvpDiagDone) {
-                        mvpDiagDone = true;
-                        System.out.println("[GL4DX12] MVP: " + projMethod + " * " + mvMethod + " OK");
-                    }
+                    System.out.println("[GL4DX12] MVP active: getModelViewProjectionMatrix");
+                    mvpDiagDone = true;
                     return;
                 }
-            }
-        } catch (Exception e) {
-            if (!mvpDiagDone) {
-                mvpDiagDone = true;
-                System.out.println("[GL4DX12] MVP sync FAILED: " + e.getMessage());
-            }
-        }
-        if (!mvpDiagDone) {
+            } catch (Exception e2) {}
+            System.out.println("[GL4DX12] MVP: methods absent — identity fallback. Error: " + e.getMessage());
             mvpDiagDone = true;
-            System.out.println("[GL4DX12] MVP: ALL methods absent — geometry will be identity");
+        } catch (Exception e) {
+            System.out.println("[GL4DX12] MVP FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            e.printStackTrace();
+            mvpDiagDone = true;
         }
     }
 
@@ -434,12 +408,11 @@ public class D3D12Bridge {
         out[base + 1] = buf.getFloat(off + posOff + 4);
         out[base + 2] = buf.getFloat(off + posOff + 8);
 
-        // color: MC BufferBuilder stores ABGR as little-endian UINT
-        // byte[0]=B, byte[1]=G, byte[2]=R, byte[3]=A
+        // color: BufferBuilder stores ABGR int, little-endian bytes: [R,G,B,A]
         if (colOff >= 0 && off + colOff + colSize <= buf.limit()) {
-            out[base + 3] = (buf.get(off + colOff + 2) & 0xFF) / 255f;  // R = byte[2]
-            out[base + 4] = (buf.get(off + colOff + 1) & 0xFF) / 255f;  // G = byte[1]
-            out[base + 5] = (buf.get(off + colOff) & 0xFF) / 255f;      // B = byte[0]
+            out[base + 3] = buf.get(off + colOff) & 0xFF; out[base + 3] /= 255f;
+            out[base + 4] = buf.get(off + colOff + 1) & 0xFF; out[base + 4] /= 255f;
+            out[base + 5] = buf.get(off + colOff + 2) & 0xFF; out[base + 5] /= 255f;
             out[base + 6] = (colSize >= 4) ? (buf.get(off + colOff + 3) & 0xFF) / 255f : 1f;
         } else {
             out[base + 3] = 1; out[base + 4] = 1;
