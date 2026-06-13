@@ -59,6 +59,28 @@ public class Dx12Mod implements ClientModInitializer {
             System.out.println("[GL4DX12] Enum FAILED: " + e);
         }
 
+        // 2b. Enumerate DebugScreenOverlay ALL methods (find correct hook target for F3 overlay)
+        try {
+            Class<?> dso = Class.forName("net.minecraft.client.gui.components.DebugScreenOverlay");
+            System.out.println("[GL4DX12] === DebugScreenOverlay ALL methods ===");
+            for (java.lang.reflect.Method m : dso.getDeclaredMethods()) {
+                StringBuilder sig = new StringBuilder("  ");
+                sig.append(java.lang.reflect.Modifier.toString(m.getModifiers())).append(" ");
+                sig.append(m.getReturnType().getSimpleName()).append(" ");
+                sig.append(m.getName()).append("(");
+                Class<?>[] params = m.getParameterTypes();
+                for (int i = 0; i < params.length; i++) {
+                    if (i > 0) sig.append(", ");
+                    sig.append(params[i].getSimpleName());
+                }
+                sig.append(")");
+                System.out.println(sig.toString());
+            }
+            System.out.println("[GL4DX12] === End DSO enum ===");
+        } catch (Exception e) {
+            System.out.println("[GL4DX12] DSO Enum FAILED: " + e);
+        }
+
         // 3. Register F6 toggle + per-tick matrix sync
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             long window = client.getWindow().handle();
