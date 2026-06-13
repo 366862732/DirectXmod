@@ -995,12 +995,21 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&last);
 
+    static bool s_diagOnce = false; // log window/CB info once
+
     while (g_run) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         double dt = (double)(now.QuadPart - last.QuadPart) / freq.QuadPart;
         if (dt < 0.016) { Sleep(1); continue; }
         last = now;
+
+        if (!s_diagOnce) {
+            s_diagOnce = true;
+            float* mvp = (float*)g_cbData;
+            Log("RenderDiag: w=%u h=%u, MVP[0]=%.3f [4]=%.3f [8]=%.3f [12]=%.3f [15]=%.3f",
+                g_w, g_h, mvp[0], mvp[4], mvp[8], mvp[12], mvp[15]);
+        }
 
         RepositionOverlay();
         CaptureMCFrame();

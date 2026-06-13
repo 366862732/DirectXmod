@@ -3,6 +3,9 @@ package com.dx12.client;
 import com.dx12.DX12LibClient;
 import org.lwjgl.opengl.GL11;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -14,6 +17,16 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class D3D12Bridge {
 
     static { System.out.println("[GL4DX12] BRIDGE v24 loaded (overlay + MVP matrix)"); }
+
+    // MVP diagnostic log to file (System.out may be captured differently in MC 26.1.2)
+    private static void mvpLog(String msg) {
+        System.out.println(msg);
+        try { Files.write(Paths.get("C:\\temp\\gl4dx12_mvp.log"),
+            (msg + "\n").getBytes(StandardCharsets.UTF_8),
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.APPEND);
+        } catch (Exception ign) {}
+    }
 
     private static final AtomicInteger bufferIdCounter = new AtomicInteger(1);
     private static volatile boolean d3d12Ready = false;
@@ -68,8 +81,10 @@ public class D3D12Bridge {
     static { mvpMatrix[0]=1; mvpMatrix[5]=1; mvpMatrix[10]=1; mvpMatrix[15]=1; }
 
     public static void syncMatrices() {
-        if (!d3d12Ready) return;
+        if (!d3d12Ready) { if (!mvpDiagDone) mvpLog("MVP: d3d12Ready=" + d3d12Ready); return; }
         if (mvpWorking) { DX12LibClient.nativeSetMvp(mvpMatrix); return; }
+
+        if (!mvpDiagDone) mvpLog("MVP: attempting init...");
 
         try {
             Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
@@ -78,21 +93,19 @@ public class D3D12Bridge {
             Object proj = rs.getMethod("getProjectionMatrix").invoke(null);
             Object mv = rs.getMethod("getModelViewMatrix").invoke(null);
             if (proj == null || mv == null) {
-                if (!mvpDiagDone) System.out.println("[GL4DX12] MVP: null matrices");
+                mvpLog("MVP: null matrices — proj=" + proj + " mv=" + mv);
                 mvpDiagDone = true;
                 return;
             }
 
-            // proj.mul(Matrix4fc) — interface, NOT concrete class
             Object mvp = proj.getClass().getMethod("mul", mat4fc).invoke(proj, mv);
             mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
             mvpWorking = true;
             DX12LibClient.nativeSetMvp(mvpMatrix);
-            System.out.println("[GL4DX12] MVP active: P*MV");
+            mvpLog("MVP SUCCESS: P*MV computed");
             mvpDiagDone = true;
             return;
         } catch (NoSuchMethodException e) {
-            // try getModelViewProjectionMatrix fallback
             try {
                 Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
                 Object mvp = rs.getMethod("getModelViewProjectionMatrix").invoke(null);
@@ -100,15 +113,15 @@ public class D3D12Bridge {
                     mvp.getClass().getMethod("get", float[].class).invoke(mvp, (Object) mvpMatrix);
                     mvpWorking = true;
                     DX12LibClient.nativeSetMvp(mvpMatrix);
-                    System.out.println("[GL4DX12] MVP active: getModelViewProjectionMatrix");
+                    mvpLog("MVP SUCCESS: getModelViewProjectionMatrix");
                     mvpDiagDone = true;
                     return;
                 }
             } catch (Exception e2) {}
-            System.out.println("[GL4DX12] MVP: methods absent — identity fallback. Error: " + e.getMessage());
+            mvpLog("MVP FAIL: no methods — " + e.getMessage());
             mvpDiagDone = true;
         } catch (Exception e) {
-            System.out.println("[GL4DX12] MVP FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            mvpLog("MVP FAIL: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             e.printStackTrace();
             mvpDiagDone = true;
         }
@@ -252,8 +265,22 @@ public class D3D12Bridge {
 
             if (firstDrawDiag) {
                 firstDrawDiag = false;
-                System.out.println("[GL4DX12] FIRST vtx: raw0=(" + verts[0] + "," + verts[1] + "," + verts[2]
-                    + ") stride=" + vertStride + " drawVerts=" + drawVertCount);
+                // Dump raw bytes of first vertex for format verification
+                StringBuilder hex = new StringBuilder("HEX[");
+                int maxDump = Math.min(vertStride + 8, work.limit());
+                for (int i = 0; i < maxDump; i++) {
+                    if (i > 0) hex.append(' ');
+                    hex.append(String.format("%02X", work.get(i) & 0xFF));
+                }
+                hex.append("]");
+                String msg = "[GL4DX12] FIRST draw: mode=" + modeName
+                    + " vCount=" + vertexCount + " stride=" + vertStride
+                    + " posOff=" + posOff + " colOff=" + colOff + " uvOff=" + uvOff
+                    + " drawVerts=" + drawVertCount + " topo=" + topologyNative
+                    + "\n  raw0=(" + verts[0] + "," + verts[1] + "," + verts[2] + ")"
+                    + " col=(" + verts[3] + "," + verts[4] + "," + verts[5] + "," + verts[6] + ")"
+                    + " uv=(" + verts[7] + "," + verts[8] + ")\n  " + hex.toString();
+                mvpLog(msg);
             }
 
             // Submit world-space vertices — VS shader applies MVP transform
