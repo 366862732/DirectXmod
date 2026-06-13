@@ -18,7 +18,9 @@ import java.util.List;
 public class DebugScreenMixin {
 
     @Inject(method = "extractLines", at = @At("RETURN"), remap = false)
-    private void onExtractLines(Object extractor, List<String> lines, boolean left, CallbackInfo ci) {
+    private void onExtractLines(
+            net.minecraft.client.gui.GuiGraphicsExtractor extractor,
+            List<String> lines, boolean left, CallbackInfo ci) {
         if (lines == null || lines.isEmpty() || left) return;
 
         String d3d12Info = D3D12Bridge.getD3D12Info();
