@@ -12,11 +12,16 @@ import java.util.List;
  * Replaces the "OpenGL" and "Display" entries on Minecraft's F3 debug screen
  * with D3D12 adapter info when the mod is active.
  */
-@Mixin(targets = "net.minecraft.client.gui.hud.DebugHud", remap = false)
+@Mixin(targets = "net.minecraft.client.gui.components.DebugScreenOverlay", remap = false)
 public class DebugScreenMixin {
 
-    @Inject(method = "getRightText", at = @At("RETURN"), remap = false)
-    private void onGetRightText(CallbackInfoReturnable<List<String>> cir) {
+    /**
+     * Hook getGameInformation() — Mojang name for the RIGHT-side F3 debug text
+     * (GPU name, OpenGL version, Display resolution, Java version).
+     * Yarn equivalent: getRightText()
+     */
+    @Inject(method = "getGameInformation", at = @At("RETURN"), remap = false)
+    private void onGetGameInformation(CallbackInfoReturnable<List<String>> cir) {
         List<String> lines = cir.getReturnValue();
         if (lines == null || lines.isEmpty()) return;
 
