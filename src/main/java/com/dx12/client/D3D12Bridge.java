@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -177,6 +178,7 @@ public class D3D12Bridge {
     private static final int MAX_TRANSLATED_VERTS = 262144;
     private static int translatedVertsThisFrame = 0;
     private static boolean firstDrawDiag = true;
+    private static final HashSet<String> seenFormats = new HashSet<>();
 
     // VertexFormatElement static instances for offset lookup
     private static Object VFE_POSITION, VFE_COLOR, VFE_UV0;
@@ -306,20 +308,18 @@ public class D3D12Bridge {
 
             translatedVertsThisFrame += drawVertCount;
 
-            if (firstDrawDiag) {
+            // Log EACH unique vertex format signature once (to identify blue-line formats)
+            String fmtSig = modeName + " s=" + vertStride + " po=" + posOff + " co=" + colOff + " uo=" + uvOff + " cs=" + colSize;
+            if (firstDrawDiag || seenFormats.add(fmtSig)) {
                 firstDrawDiag = false;
-                // Dump raw bytes of first vertex for format verification
                 StringBuilder hex = new StringBuilder("HEX[");
-                int maxDump = Math.min(vertStride + 8, work.limit());
-                for (int i = 0; i < maxDump; i++) {
+                for (int i = 0; i < Math.min(vertStride + 8, work.limit()); i++) {
                     if (i > 0) hex.append(' ');
                     hex.append(String.format("%02X", work.get(i) & 0xFF));
                 }
                 hex.append("]");
-                String msg = "[GL4DX12] FIRST draw: mode=" + modeName
-                    + " vCount=" + vertexCount + " stride=" + vertStride
-                    + " posOff=" + posOff + " colOff=" + colOff + " uvOff=" + uvOff
-                    + " drawVerts=" + drawVertCount + " topo=" + topologyNative
+                String msg = "[GL4DX12] " + fmtSig
+                    + " vN=" + vertexCount + " topo=" + topologyNative
                     + "\n  raw0=(" + verts[0] + "," + verts[1] + "," + verts[2] + ")"
                     + " col=(" + verts[3] + "," + verts[4] + "," + verts[5] + "," + verts[6] + ")"
                     + " uv=(" + verts[7] + "," + verts[8] + ")\n  " + hex.toString();
