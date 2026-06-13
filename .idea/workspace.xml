@@ -4,7 +4,29 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="" />
+    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="">
+      <change afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.main.iml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.test.iml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/LevelRendererMixin.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/render/ParticleExtractor.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/render/SkyboxExtractor.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/.name" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/.name" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/modules/GL4DX12-Fabric.main.iml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/modules/GL4DX12-Fabric.test.iml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/compile.bat" beforeDir="false" afterPath="$PROJECT_DIR$/compile.bat" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_14.58.19-client.txt" beforeDir="false" afterPath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_14.58.19-client.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_15.02.55-client.txt" beforeDir="false" afterPath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_15.02.55-client.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/client/D3D12Bridge.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/client/D3D12Bridge.java.bak" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/client/D3D12Bridge.java.bak" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12_backup/client/D3D12Bridge.java.bak" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12_backup/client/D3D12Bridge.java.bak" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/resources/mixins.gl4dx12.json" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/mixins.gl4dx12.json" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -15,7 +37,37 @@
       <ProjectState />
     </projectState>
   </component>
+  <component name="ExternalProjectsManager">
+    <system id="GRADLE">
+      <state>
+        <projects_view>
+          <tree_state>
+            <expand>
+              <path>
+                <item name="" type="6a2764b6:ExternalProjectsStructure$RootNode" />
+                <item name="gl4dx12" type="f1a62948:ProjectNode" />
+              </path>
+            </expand>
+            <select />
+          </tree_state>
+        </projects_view>
+      </state>
+    </system>
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Class" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
   <component name="GradleScriptDefinitionsStorage" workingDir="$PROJECT_DIR$" gradleHome="D:\gradle-9.5.1" javaHome="C:\Program Files\Zulu\zulu-26" gradleVersion="9.5.1" />
+  <component name="HighlightingSettingsPerFile">
+    <setting file="jar://$PROJECT_DIR$/.gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-merged-52430b475d/26.1.2/minecraft-merged-52430b475d-26.1.2-sources.jar!/net/minecraft/client/renderer/entity/EntityRenderDispatcher.java" root0="SKIP_INSPECTION" />
+  </component>
   <component name="ProjectColorInfo">{
   &quot;customColor&quot;: &quot;&quot;,
   &quot;associatedIndex&quot;: 5
@@ -28,8 +80,14 @@
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
     "Gradle.dx12-lib-template-26.1.2 [:net.fabricmc.devlaunchinjector.Main.main()].executor": "Run",
+    "Gradle.下载源代码.executor": "Run",
+    "Gradle.构建 dx12-lib-template-26.1.2.executor": "Run",
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
+    "git-widget-placeholder": "master",
     "ignore.virus.scanning.warn.message": "true",
     "kotlin-language-version-configured": "true",
     "settings.editor.selected.configurable": "reference.settingsdialog.project.gradle"

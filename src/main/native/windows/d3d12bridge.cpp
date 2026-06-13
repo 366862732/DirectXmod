@@ -1698,5 +1698,77 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsD3D12Active
     (JNIEnv*, jclass) {
     return g_ok ? JNI_TRUE : JNI_FALSE;
 }
+// 全局变量
+static float g_skyParams[7] = {0};
+static ID3D12Resource* g_particleBuffer = nullptr;
+static int g_particleCount = 0;
 
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters(JNIEnv* env, jclass cls, jfloatArray params) {
+    jsize len = env->GetArrayLength(params);
+    if (len >= 7) {
+        jfloat* arr = env->GetFloatArrayElements(params, nullptr);
+        memcpy(g_skyParams, arr, 7 * sizeof(float));
+        env->ReleaseFloatArrayElements(params, arr, JNI_ABORT);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSkybox(JNIEnv* env, jclass cls) {
+    if (!g_ok || !g_cmdList) return;
+
+    // 简单天空盒：全屏四边形，根据 skyColor 填充
+    // 实际应该渲染球体/穹顶，先简化
+    float r = ((g_skyParams[0] >> 16) & 0xFF) / 255.0f;
+    float g = ((g_skyParams[0] >> 8) & 0xFF) / 255.0f;
+    float b = (g_skyParams[0] & 0xFF) / 255.0f;
+
+    g_cmdList->ClearRenderTargetView(g_rtv, &r, 0, nullptr);
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles(JNIEnv* env, jclass cls, jfloatArray particles, jint count) {
+    g_particleCount = count;
+    if (count <= 0) return;
+
+    jsize floatCount = env->GetArrayLength(particles);
+    jfloat* arr = env->GetFloatArrayElements(particles, nullptr);
+
+    // 每粒子 14 floats: pos(3) + rot(4) + scale(1) + uv(4) + color(1) + light(1)
+    UINT bufferSize = count * 14 * sizeof(float);
+
+    // 创建或重建粒子缓冲
+    if (g_particleBuffer) {
+        g_particleBuffer->Release();
+    }
+
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+    CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+    g_device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&g_particleBuffer));
+
+    void* mapped;
+    g_particleBuffer->Map(0, nullptr, &mapped);
+    memcpy(mapped, arr, bufferSize);
+    g_particleBuffer->Unmap(0, nullptr);
+
+    env->ReleaseFloatArrayElements(particles, arr, JNI_ABORT);
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles(JNIEnv* env, jclass cls) {
+    if (!g_ok || !g_cmdList || g_particleCount == 0 || !g_particleBuffer) return;
+
+    // 设置粒子 VB
+    D3D12_VERTEX_BUFFER_VIEW vbView;
+    vbView.BufferLocation = g_particleBuffer->GetGPUVirtualAddress();
+    vbView.SizeInBytes = g_particleCount * 14 * sizeof(float);
+    vbView.StrideInBytes = 14 * sizeof(float);
+    g_cmdList->IASetVertexBuffers(0, 1, &vbView);
+
+    // 绘制每个粒子为一个四边形 (实例化或循环)
+    // 简化：每个粒子 6 个顶点 (2 三角形)
+    g_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (int i = 0; i < g_particleCount; i++) {
+        g_cmdList->DrawInstanced(6, 1, i * 6, 0);
+    }
+}
 } // extern "C"

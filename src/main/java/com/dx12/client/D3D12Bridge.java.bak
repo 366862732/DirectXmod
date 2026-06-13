@@ -1,6 +1,6 @@
 package com.dx12.client;
 
-public class D3D12Bridge {
+public class com.dx12.D3D12Bridge {
     static {
         // ?? DLL ??? Dx12Mod ? NativeUtils ????????
     }

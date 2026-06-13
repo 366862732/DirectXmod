@@ -4,8 +4,8 @@
 Time: 2026-06-10 14:58:19
 Description: Initializing game
 
-java.lang.UnsatisfiedLinkError: 'void com.dx12.client.D3D12Bridge.bindTexture(int, int)'
-	at knot//com.dx12.client.D3D12Bridge.bindTexture(Native Method)
+java.lang.UnsatisfiedLinkError: 'void com.dx12.client.com.dx12.D3D12Bridge.bindTexture(int, int)'
+	at knot//com.dx12.client.com.dx12.D3D12Bridge.bindTexture(Native Method)
 	at knot//org.lwjgl.opengl.GL11.handler$zzb000$gl4dx12$onGlBindTexture(GL11.java:10522)
 	at knot//org.lwjgl.opengl.GL11.glBindTexture(GL11.java)
 	at knot//com.mojang.blaze3d.platform.GlStateManager._bindTexture(GlStateManager.java:630)
@@ -27,7 +27,7 @@ A detailed walkthrough of the error, its code path and all known details is as f
 -- Head --
 Thread: Render thread
 Stacktrace:
-	at knot//com.dx12.client.D3D12Bridge.bindTexture(Native Method)
+	at knot//com.dx12.client.com.dx12.D3D12Bridge.bindTexture(Native Method)
 	at knot//org.lwjgl.opengl.GL11.handler$zzb000$gl4dx12$onGlBindTexture(GL11.java:10522)
 	at knot//org.lwjgl.opengl.GL11.glBindTexture(GL11.java)
 	at knot//com.mojang.blaze3d.platform.GlStateManager._bindTexture(GlStateManager.java:630)

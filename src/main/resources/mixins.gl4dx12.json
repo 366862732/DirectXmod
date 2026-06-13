@@ -3,12 +3,12 @@
   "minVersion": "0.8",
   "package": "com.dx12.mixin",
   "compatibilityLevel": "JAVA_25",
-  "client": [
-    "GlBufferMixin",
-    "GlDrawMixin",
+  "refmap": "mixins.gl4dx12.refmap.json",
+  "mixins": [
     "BufferBuilderMixin",
-    "DebugScreenMixin"
+    "LevelRendererMixin"
   ],
+  "client": [],
   "injectors": {
     "defaultRequire": 1
   }

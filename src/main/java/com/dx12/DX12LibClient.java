@@ -63,4 +63,9 @@ public class DX12LibClient {
     /** D3D12 window dimensions for pixel→clip transform */
     public static native int nativeGetWindowWidth();
     public static native int nativeGetWindowHeight();
+    /* this is new*/
+    public static native void nativeSetSkyParameters(float[] params);
+    public static native void nativeRenderSkybox();
+    public static native void nativeUploadParticles(float[] particles, int count);
+    public static native void nativeRenderParticles();
 }

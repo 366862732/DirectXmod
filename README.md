@@ -42,7 +42,7 @@
 |------|------|------|
 | C++ 核心 | `d3d12bridge.cpp` | D3D12 设备、SwapChain、PSO、顶点缓冲、纹理、GDI 捕获 |
 | JNI 桥接 | `DX12LibClient.java` | 25 个 native 方法声明 |
-| 业务逻辑 | `D3D12Bridge.java` | 顶点展开、矩阵同步、反射调用 |
+| 业务逻辑 | `com.dx12.D3D12Bridge.java` | 顶点展开、矩阵同步、反射调用 |
 | Mod 入口 | `Dx12Mod.java` | F6 热键、初始化、窗口句柄传递 |
 | Mixin | `BufferBuilderMixin` | 钩子 `build()` 提取 MeshData |
 
@@ -51,7 +51,7 @@
 ```
 BufferBuilder.build()
   → BufferBuilderMixin (反射读取 MeshData)
-    → D3D12Bridge.processMeshData() (quad→tri, strip→tri)
+    → com.dx12.D3D12Bridge.processMeshData() (quad→tri, strip→tri)
       → DX12LibClient.nativeRecordVertices/UV/Colors()
         → d3d12bridge.cpp: 写入 upload VB + 记录 DrawChunk
 ```

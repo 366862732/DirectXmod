@@ -18,7 +18,7 @@ javac -cp "%CP%" ^
     src/main/java/com/dx12/Dx12Mod.java ^
     src/main/java/com/dx12/DX12LibClient.java ^
     src/main/java/com/dx12/NativeUtils.java ^
-    src/main/java/com/dx12/client/D3D12Bridge.java
+    src/main/java/com/dx12/client/com.dx12.D3D12Bridge.java
 
 if %errorlevel% equ 0 (
     echo.
