@@ -27,7 +27,39 @@ public class Dx12Mod implements ClientModInitializer {
             return;
         }
 
-        // 2. Register F6 toggle + per-tick matrix sync
+        // 2. Enumerate ALL RenderSystem static methods (one-time diagnostic)
+        try {
+            Class<?> rs = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
+            System.out.println("[GL4DX12] === RenderSystem ALL static methods ===");
+            for (java.lang.reflect.Method m : rs.getDeclaredMethods()) {
+                if (java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
+                    StringBuilder sig = new StringBuilder("  static ");
+                    sig.append(m.getReturnType().getSimpleName()).append(" ");
+                    sig.append(m.getName()).append("(");
+                    Class<?>[] params = m.getParameterTypes();
+                    for (int i = 0; i < params.length; i++) {
+                        if (i > 0) sig.append(", ");
+                        sig.append(params[i].getSimpleName());
+                    }
+                    sig.append(")");
+                    System.out.println(sig.toString());
+                }
+            }
+            // Also check fields
+            System.out.println("[GL4DX12] === RenderSystem static FIELDS containing 'matrix' or 'proj' ===");
+            for (java.lang.reflect.Field f : rs.getDeclaredFields()) {
+                String fn = f.getName().toLowerCase();
+                if (fn.contains("matrix") || fn.contains("proj") || fn.contains("model") || fn.contains("view")) {
+                    System.out.println("  " + java.lang.reflect.Modifier.toString(f.getModifiers())
+                        + " " + f.getType().getSimpleName() + " " + f.getName());
+                }
+            }
+            System.out.println("[GL4DX12] === End enum ===");
+        } catch (Exception e) {
+            System.out.println("[GL4DX12] Enum FAILED: " + e);
+        }
+
+        // 3. Register F6 toggle + per-tick matrix sync
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             long window = client.getWindow().handle();
             boolean f6Down = GLFW.glfwGetKey(window, GLFW.GLFW_KEY_F6) == GLFW.GLFW_PRESS;

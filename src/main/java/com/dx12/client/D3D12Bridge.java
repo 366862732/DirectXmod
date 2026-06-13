@@ -78,10 +78,14 @@ public class D3D12Bridge {
     private static final float[] mvpMatrix = new float[16];
     private static boolean mvpDiagDone = false;
     private static boolean mvpWorking = false;
+    private static boolean mvpNotReadyLogged = false; // avoid spam
     static { mvpMatrix[0]=1; mvpMatrix[5]=1; mvpMatrix[10]=1; mvpMatrix[15]=1; }
 
     public static void syncMatrices() {
-        if (!d3d12Ready) { if (!mvpDiagDone) mvpLog("MVP: d3d12Ready=" + d3d12Ready); return; }
+        if (!d3d12Ready) {
+            if (!mvpNotReadyLogged) { mvpLog("MVP: d3d12Ready=" + d3d12Ready); mvpNotReadyLogged = true; }
+            return;
+        }
         if (mvpWorking) { DX12LibClient.nativeSetMvp(mvpMatrix); return; }
 
         if (!mvpDiagDone) mvpLog("MVP: attempting init...");
