@@ -123,10 +123,10 @@ public class D3D12Bridge {
                 uvs[i * 2 + 1] = vertexBuffer.getFloat(offset + 20);
             }
 
-            DX12LibClient.nativeRecordVertices(vertices);
+            DX12LibClient.nativeRecordVertices(vertices, vertexCount);
             // DX12LibClient.nativeRecordColors(colors);  // 暂时注释
             // DX12LibClient.nativeRecordUV(uvs);         // 暂时注释
-            DX12LibClient.nativeDraw(vertexCount);
+            // nativeDraw 已移除，改为在 renderFullFrame 中通过 nativeEndFrame 统一执行
 
         } catch (Exception e) {
             LOGGER.error("processMeshData failed: {}", e.getMessage());
@@ -140,6 +140,9 @@ public class D3D12Bridge {
         
         cachedLevelState = levelState;
         syncMatrices();
+        
+        DX12LibClient.nativeBeginFrame();   // 开始帧：重置 DrawCall 列表
+        DX12LibClient.nativeEndFrame();     // 执行所有缓存的 DrawCall
         DX12LibClient.nativePresent();
     }
 

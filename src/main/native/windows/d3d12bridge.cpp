@@ -55,6 +55,8 @@ static UINT     g_fi = 0, g_w = 1280, g_h = 720;
 static bool     g_ok = false;
 static HANDLE   g_thread = nullptr;
 static volatile bool g_run = false;
+static HANDLE   g_frameReadyEvent = nullptr;  // 帧数据就绪事件
+static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
 
 // Texture state
 static ComPtr<ID3D12Resource> g_tex;
@@ -783,7 +785,19 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
     while (g_run) {
-        Sleep(16);
+        // 等待 Java 端通知数据已准备好（最多等待 100ms 避免完全卡死）
+        DWORD waitResult = WaitForSingleObject(g_frameReadyEvent, 100);
+
+        if (waitResult == WAIT_OBJECT_0) {
+            // 数据已准备好，执行渲染
+        } else if (waitResult == WAIT_TIMEOUT) {
+            // 超时，跳过本帧（没有新数据）
+            continue;
+        } else {
+            // 错误
+            break;
+        }
+
         RepositionOverlay();
         CaptureMCFrame();
 
@@ -1103,6 +1117,8 @@ static void CleanupD3D12() {
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
+    if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
+    if (g_frameDoneEvent)   { CloseHandle(g_frameDoneEvent);   g_frameDoneEvent = nullptr; }
     if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) { DestroyWindow(g_hwndOverlay); }
     g_hwndOverlay = nullptr;
     g_hwndMC = nullptr;
@@ -1134,6 +1150,28 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRender(JNIEnv*, jclass) {}
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativePresent(JNIEnv*, jclass) {}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeBeginFrame(JNIEnv*, jclass) {
+    // 清空操作由 RenderLoop 后台线程负责，这里不做任何事
+    // 避免重复清空导致已录制的顶点数据丢失
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeEndFrame(JNIEnv*, jclass) {
+    // 通知 RenderLoop 线程：当前帧的顶点数据已经录制完成
+    if (g_ok && g_frameReadyEvent) {
+        SetEvent(g_frameReadyEvent);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeClearDrawList(JNIEnv*, jclass) {
+    // 手动清空 DrawCall 列表
+    if (!g_ok) return;
+    EnterCriticalSection(&g_stateLock);
+    g_drawChunks.clear();
+    g_imVertCount = 0;
+    g_imVBSize = 0;
+    LeaveCriticalSection(&g_stateLock);
+}
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass, jint w, jint h) {
     if (!g_ok||!g_swap) return;
@@ -1196,17 +1234,24 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadPixels(JNIEnv* en
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* env, jclass, jfloatArray verts, jint count) {
     if (!g_ok || !g_imVB || !verts || count <= 0) return;
-    UINT byteCount = (UINT)count * sizeof(VertexPC);
-    if (!EnsureIMVBCapacity(g_imVBSize + byteCount)) return;
 
     jsize len = env->GetArrayLength(verts);
+    if (len <= 0) return;
+    // 安全校验：从数组长度推导实际顶点数（Java 端只传 xyz，每顶点3个float）
+    UINT safeCount = (UINT)count;
+    if ((jsize)(safeCount * 3) > len) {
+        safeCount = (UINT)(len / 3);
+    }
+
+    UINT byteCount = safeCount * sizeof(VertexPC);
+    if (!EnsureIMVBCapacity(g_imVBSize + byteCount)) return;
     std::vector<jfloat> buf(len);
     env->GetFloatArrayRegion(verts, 0, len, buf.data());
 
     EnterCriticalSection(&g_stateLock);
     DrawChunk ch;
     ch.byteOffset = g_imVBSize;
-    ch.vertexCount = (UINT)count;
+    ch.vertexCount = safeCount;
     ch.topo = g_pendingTopo;
     ch.textured = false;
     ch.vertexStride = sizeof(VertexPC);
@@ -1217,19 +1262,15 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     void* dst = nullptr;
     g_imVB->Map(0, nullptr, &dst);
     VertexPC* vtx = (VertexPC*)((BYTE*)dst + g_imVBSize);
-    for (int i = 0; i < count; i++) {
-        int off = i * 7;
+    for (UINT i = 0; i < safeCount; i++) {
+        int off = i * 3;  // Java 端只传 xyz，每顶点3个float
         vtx[i].x = buf[off];
-        vtx[i].y = buf[off+1];
-        vtx[i].z = buf[off+2];
-        UINT r = (UINT)(buf[off+3] * 255.0f) & 0xFF;
-        UINT g = (UINT)(buf[off+4] * 255.0f) & 0xFF;
-        UINT b = (UINT)(buf[off+5] * 255.0f) & 0xFF;
-        UINT a = (UINT)(buf[off+6] * 255.0f) & 0xFF;
-        vtx[i].color = (a << 24) | (r << 16) | (g << 8) | b;
+        vtx[i].y = buf[off + 1];
+        vtx[i].z = buf[off + 2];
+        vtx[i].color = 0xFFFFFFFF;  // 默认不透明白色
     }
     g_imVB->Unmap(0, nullptr);
-    g_imVertCount += count;
+    g_imVertCount += safeCount;
     g_imVBSize += byteCount;
     g_imVbv.SizeInBytes = g_imVBSize;
     LeaveCriticalSection(&g_stateLock);

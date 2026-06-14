@@ -59,7 +59,7 @@ public class DX12LibClient {
     public static native void nativeEndFrame();
     public static native void nativePresent();
     public static native void nativeSetMvp(float[] matrix);
-    public static native void nativeRecordVertices(float[] vertices);
+    public static native void nativeRecordVertices(float[] vertices, int vertexCount);
     public static native void nativeRecordColors(float[] colors);
     public static native void nativeRecordUV(float[] uv);
     public static native void nativeDraw(int vertexCount);
