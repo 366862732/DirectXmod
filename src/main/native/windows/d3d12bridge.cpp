@@ -152,45 +152,55 @@ static HWND g_hwndMC = nullptr;
 
 static LRESULT CALLBACK OverlayWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_ERASEBKGND: return 1;
-    case WM_NCHITTEST:  return HTTRANSPARENT;
+    case WM_ERASEBKGND: 
+        return 1;  // 避免闪烁
+    case WM_PAINT:
+        // 让 D3D12 渲染，不需要 GDI 绘制
+        ValidateRect(h, nullptr);
+        return 0;
     }
-    return DefWindowProcW(h, w, m, l);
+    return DefWindowProcW(h, m, w, l);
 }
 
 static HWND CreateOverlayWindow(HWND hParent) {
-    const wchar_t* cn = L"GL4DX12_Overlay";
+    static int classCounter = 0;
+    wchar_t cn[64];
+    swprintf(cn, 64, L"GL4DX12_Overlay_%d", classCounter++);
+    
     WNDCLASSW wc = {};
     wc.lpfnWndProc = OverlayWndProc;
     wc.hInstance = GetModuleHandleW(0);
     wc.lpszClassName = cn;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-
-    // 注册窗口类
+    
     if (!RegisterClassW(&wc)) {
         DWORD err = GetLastError();
-        if (err != ERROR_CLASS_ALREADY_EXISTS) {
-            Log("ERROR: RegisterClassW failed, error=%d", err);
-            return nullptr;
-        }
+        Log("ERROR: RegisterClassW failed for %S, error=%d", cn, err);
+        return nullptr;
     }
-    Log("Window class registered/ok");
+    Log("Window class registered: %S", cn);
 
-    // 创建窗口
+    // 短暂延迟
+    Sleep(50);
+
+    // 创建子窗口
     HWND hw = CreateWindowExW(
-        WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        cn, L"GL4DX12 Overlay", WS_POPUP,
+        0,  // 无扩展样式
+        cn, L"GL4DX12 Overlay", 
+        WS_CHILD | WS_VISIBLE,  // 子窗口样式
         0, 0, (int)g_w, (int)g_h,
-        nullptr, nullptr, wc.hInstance, nullptr);
+        hParent,  // 父窗口
+        nullptr, GetModuleHandleW(0), nullptr);
 
     if (!hw) {
         DWORD err = GetLastError();
         Log("ERROR: CreateWindowExW failed, error=%d", err);
+        UnregisterClassW(cn, GetModuleHandleW(0));
         return nullptr;
     }
 
-    Log("Window created, HWND=0x%p", hw);
-    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    Log("Window created as child, HWND=0x%p, class=%S", hw, cn);
+    ShowWindow(hw, SW_SHOW);
     return hw;
 }
 
@@ -676,13 +686,12 @@ static bool CaptureMCFrame() {
 }
 
 static void RepositionOverlay() {
-    if (!g_hwndOverlay || !g_hwndMC) return;
-    if (IsIconic(g_hwndMC)) { ShowWindow(g_hwndOverlay, SW_HIDE); return; }
+    // 直接渲染到 MC 窗口，无需调整覆盖层位置，仅处理窗口大小变化
+    if (!g_hwndMC) return;
+    if (IsIconic(g_hwndMC)) return;
     RECT rc; GetClientRect(g_hwndMC, &rc);
-    POINT pt = {0,0}; ClientToScreen(g_hwndMC, &pt);
     int newW = rc.right - rc.left, newH = rc.bottom - rc.top;
-    if (newW <= 0 || newH <= 0) { ShowWindow(g_hwndOverlay, SW_HIDE); return; }
-    if (!IsWindowVisible(g_hwndOverlay)) ShowWindow(g_hwndOverlay, SW_SHOWNOACTIVATE);
+    if (newW <= 0 || newH <= 0) return;
     bool sizeChanged = ((int)g_w != newW || (int)g_h != newH);
     if (sizeChanged) {
         g_w = (UINT)newW; g_h = (UINT)newH;
@@ -717,10 +726,7 @@ static void RepositionOverlay() {
         g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_alloc));
         g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(&g_cl));
         g_cl->Close();
-        InvalidateRect(g_hwndOverlay, nullptr, FALSE);
-        UpdateWindow(g_hwndOverlay);
     }
-    SetWindowPos(g_hwndOverlay, HWND_TOPMOST, pt.x, pt.y, newW, newH, SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
 static DXGI_FORMAT PickDepthFormat() {
@@ -905,7 +911,31 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 }
 
 static bool InitD3D12(HWND hwndMC) {
+    MessageBoxA(NULL, "=== NEW VERSION ===", "DEBUG", MB_OK);
+    Log("=== !!! NEW VERSION WITH DIRECT RENDERING !!! ===");
     Log("=== INITD3D12 V2 START ===");
+
+    // --- 新增：强制清理所有可能的旧覆盖层窗口 ---
+    Log("Forcefully cleaning up any existing overlay windows...");
+    // 枚举所有顶级窗口
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        wchar_t className[256];
+        if (GetClassNameW(hwnd, className, 256)) {
+            // 如果窗口类名以 "GL4DX12_Overlay" 开头，就销毁它
+            if (wcsstr(className, L"GL4DX12_Overlay") == className) {
+                Log("Found and is destroying old overlay window (Class: %S, HWND: 0x%p)", className, hwnd);
+                DestroyWindow(hwnd);
+            }
+        }
+        return TRUE;
+    }, 0);
+    // 确保 g_hwndOverlay 全局变量也被清空
+    if (g_hwndOverlay) {
+        Log("Clearing global overlay handle");
+        g_hwndOverlay = nullptr;
+    }
+    // --- 强制清理结束 ---
+
     MessageBoxA(NULL, "InitD3D12 called!", "Debug", MB_OK);
     OutputDebugStringA("=== InitD3D12 ENTERED ===\n");
     Log("=== InitD3D12 ENTERED ===");
@@ -926,12 +956,8 @@ g_w = (UINT)(rc.right - rc.left);
 g_h = (UINT)(rc.bottom - rc.top);
 Log("Client rect: %dx%d", g_w, g_h);
 
-g_hwndOverlay = CreateOverlayWindow(g_hwndMC);
-if (!g_hwndOverlay) {
-    Log("ERROR: CreateOverlayWindow failed");
-    return false;
-}
-Log("Overlay created");
+g_hwndOverlay = g_hwndMC;  // 直接使用 MC 窗口，不创建覆盖层
+Log("Using MC window directly as overlay");
 
 ComPtr<IDXGIFactory4> dxgi;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi)))) {
@@ -967,7 +993,7 @@ ComPtr<IDXGIFactory4> dxgi;
     sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD; sd.SampleDesc.Count=1;
     ComPtr<IDXGISwapChain1> sc1;
-    if (FAILED(dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndOverlay, &sd, 0, 0, &sc1))) return false;
+    if (FAILED(dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndMC, &sd, 0, 0, &sc1))) return false;
     sc1.As(&g_swap); g_fi = g_swap->GetCurrentBackBufferIndex();
 
     D3D12_DESCRIPTOR_HEAP_DESC rd = {};
@@ -1077,7 +1103,8 @@ static void CleanupD3D12() {
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
-    if (g_hwndOverlay) { DestroyWindow(g_hwndOverlay); g_hwndOverlay = nullptr; }
+    if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) { DestroyWindow(g_hwndOverlay); }
+    g_hwndOverlay = nullptr;
     g_hwndMC = nullptr;
 }
 

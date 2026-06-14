@@ -133,6 +133,16 @@ public class D3D12Bridge {
         }
     }
 
+    // ========== 完整帧渲染 ==========
+    
+    public static void renderFullFrame(LevelRenderState levelState, CameraRenderState cameraState, float partialTick) {
+        if (!d3d12Ready || !d3d12Active) return;
+        
+        cachedLevelState = levelState;
+        syncMatrices();
+        DX12LibClient.nativePresent();
+    }
+
     // ========== 兼容旧代码 ==========
 
     public static void resetTranslatedCounter() {}
