@@ -5,7 +5,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
 
-import com.dx12.client.D3D12Bridge;
+import com.dx12.D3D12Bridge;
 
 public class Dx12Mod implements ClientModInitializer {
 

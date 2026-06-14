@@ -5,27 +5,24 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.main.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.test.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/LevelRendererMixin.java" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/render/ParticleExtractor.java" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/render/SkyboxExtractor.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/.name" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/.name" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules/GL4DX12-Fabric.main.iml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules/GL4DX12-Fabric.test.iml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/compile.bat" beforeDir="false" afterPath="$PROJECT_DIR$/compile.bat" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_14.58.19-client.txt" beforeDir="false" afterPath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_14.58.19-client.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_15.02.55-client.txt" beforeDir="false" afterPath="$PROJECT_DIR$/run/crash-reports/crash-2026-06-10_15.02.55-client.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/compile.bat" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/d3d12bridge.cpp" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/client/D3D12Bridge.java" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/client/D3D12Bridge.java.bak" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/client/D3D12Bridge.java.bak" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12_backup/client/D3D12Bridge.java.bak" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12_backup/client/D3D12Bridge.java.bak" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/Dx12Mod.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/Dx12Mod.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/BufferBuilderMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/BufferBuilderMixin.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/DebugScreenMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/DebugScreenMixin.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/GlBufferMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/GlBufferMixin.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/GlDrawMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/GlDrawMixin.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/LevelRendererMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/LevelRendererMixin.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/compile.bat" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/compile.bat" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/resources/mixins.gl4dx12.json" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/mixins.gl4dx12.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.exp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.exp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.lib" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.lib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -76,23 +73,25 @@
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
+    <option name="sortByType" value="true" />
+    <option name="sortKey" value="BY_TYPE" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Gradle.dx12-lib-template-26.1.2 [:net.fabricmc.devlaunchinjector.Main.main()].executor": "Run",
-    "Gradle.下载源代码.executor": "Run",
-    "Gradle.构建 dx12-lib-template-26.1.2.executor": "Run",
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
-    "git-widget-placeholder": "master",
-    "ignore.virus.scanning.warn.message": "true",
-    "kotlin-language-version-configured": "true",
-    "settings.editor.selected.configurable": "reference.settingsdialog.project.gradle"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Gradle.dx12-lib-template-26.1.2 [:net.fabricmc.devlaunchinjector.Main.main()].executor&quot;: &quot;Run&quot;,
+    &quot;Gradle.下载源代码.executor&quot;: &quot;Run&quot;,
+    &quot;Gradle.构建 dx12-lib-template-26.1.2.executor&quot;: &quot;Run&quot;,
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
+    &quot;kotlin-language-version-configured&quot;: &quot;true&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;reference.settingsdialog.project.gradle&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="MoveClassesOrPackagesDialog.RECENTS_KEY">
       <recent name="com.dx12" />
@@ -150,7 +149,34 @@
       <option name="presentableId" value="Default" />
       <updated>1781016552612</updated>
     </task>
+    <task id="LOCAL-00001" summary="移动位置准备重构">
+      <option name="closed" value="true" />
+      <created>1781355841414</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1781355841414</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
+  </component>
+  <component name="UnknownFeatures">
+    <option featureType="com.intellij.fileTypeFactory" implementationName="*.bat" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="移动位置准备重构" />
+    <option name="LAST_COMMIT_MESSAGE" value="移动位置准备重构" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>

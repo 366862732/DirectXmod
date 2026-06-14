@@ -1,9 +1,14 @@
-@echo off 
-set JAVA_HOME=C:\Program Files\BellSoft\LibericaJDK-25-Full 
-cl /nologo /EHsc /O2 /MD /LD /Fe:gl4dx12.dll /I"%C:\Program Files\BellSoft\LibericaJDK-25-Full%\include" /I"%C:\Program Files\BellSoft\LibericaJDK-25-Full%\include\win32" d3d12_simple.cpp /link d3d12.lib 
-if %0% equ 0 ( 
-    echo [SUCCESS] DLL compiled 
-    copy gl4dx12.dll ..\..\resources\native\windows\ /Y 
-) else ( 
-    echo [FAILED] Compilation failed 
-) 
+@echo off
+call "D:\Visual studio\VC\Auxiliary\Build\vcvars64.bat"
+
+cl /nologo /LD /EHsc /O2 /Fe:gl4dx12.dll d3d12bridge.cpp ^
+   /I "C:\Program Files\Amazon Corretto\jdk25.0.3_9\include" ^
+   /I "C:\Program Files\Amazon Corretto\jdk25.0.3_9\include\win32" ^
+   d3d12.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib
+
+if %errorlevel% == 0 (
+    echo [SUCCESS] gl4dx12.dll built
+    copy /Y gl4dx12.dll ..\..\resources\native\windows\
+) else (
+    echo [FAILED] Compilation failed
+)

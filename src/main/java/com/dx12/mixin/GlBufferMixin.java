@@ -1,6 +1,6 @@
 package com.dx12.mixin;
 
-import com.dx12.client.D3D12Bridge;
+import com.dx12.D3D12Bridge;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
