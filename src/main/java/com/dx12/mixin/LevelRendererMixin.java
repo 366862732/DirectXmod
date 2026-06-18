@@ -37,7 +37,7 @@ public class LevelRendererMixin {
 
             LevelRenderState levelState = getLevelRenderState((LevelRenderer)(Object)this);
             if (levelState != null) {
-                D3D12Bridge.renderFullFrame(levelState, cameraState, deltaTracker.getGameTimeDeltaPartialTick(false));
+                D3D12Bridge.renderFullFrame(levelState, cameraState, deltaTracker.getGameTimeDeltaPartialTick(false), modelViewMatrix);
             }
         }
     }

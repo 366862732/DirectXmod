@@ -1,11 +1,10 @@
 package com.dx12;
 
-import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
 
-import com.dx12.D3D12Bridge;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 
 public class Dx12Mod implements ClientModInitializer {
 
@@ -96,17 +95,26 @@ public class Dx12Mod implements ClientModInitializer {
             boolean f6Down = GLFW.glfwGetKey(window, GLFW.GLFW_KEY_F6) == GLFW.GLFW_PRESS;
 
             if (f6Down && !f6WasDown) {
-                if (D3D12Bridge.isD3D12Ready()) {
+                boolean ready = D3D12Bridge.isD3D12Ready();
+                System.out.println("[GL4DX12] F6 pressed, isD3D12Ready=" + ready);
+                if (ready) {
+                    // ===== 关闭 D3D12 =====
+                    System.out.println("[GL4DX12] Entering shutdown branch");
                     D3D12Bridge.shutdownDevice();
+                    D3D12Bridge.setD3D12Active(false);
+                    System.out.println("[GL4DX12] After shutdown, isD3D12Ready=" + D3D12Bridge.isD3D12Ready());
                 } else {
+                    // ===== 开启 D3D12 =====
+                    System.out.println("[GL4DX12] Entering init branch");
                     long hwnd = GLFWNativeWin32.glfwGetWin32Window(window);
                     D3D12Bridge.ensureDeviceInitialized(hwnd);
+                    D3D12Bridge.setD3D12Active(true);
+                    System.out.println("[GL4DX12] D3D12 activated successfully");
                 }
             }
             f6WasDown = f6Down;
 
-            // Sync matrices to DLL each tick
-            D3D12Bridge.syncMatrices();
+            // Matrices now synced inside renderFullFrame (triggered by LevelRendererMixin)
             // Reset geometry counter each tick (DLL clears per-frame)
             D3D12Bridge.resetTranslatedCounter();
         });

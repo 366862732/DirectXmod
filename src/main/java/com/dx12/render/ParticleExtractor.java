@@ -1,4 +1,5 @@
 package com.dx12.render;
+import com.dx12.render.ParticleExtractor;
 
 import net.minecraft.client.renderer.state.level.ParticleGroupRenderState;
 import net.minecraft.client.renderer.state.level.ParticlesRenderState;

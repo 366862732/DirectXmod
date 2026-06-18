@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <windows.h>
+#include <d3dx12.h>
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     return TRUE;

@@ -6,7 +6,9 @@
   "refmap": "mixins.gl4dx12.refmap.json",
   "mixins": [
     "BufferBuilderMixin",
-    "LevelRendererMixin"
+    "LevelRendererMixin",
+    "EntityRenderDispatcherMixin",
+    "ParticleEngineMixin"
   ],
   "client": [],
   "injectors": {

@@ -1,11 +1,26 @@
 package com.dx12;
 
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.dx12.render.SkyboxExtractor;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.Window;
+import net.minecraft.client.renderer.entity.state.EntityRenderState;
+
+import org.lwjgl.glfw.GLFWNativeWin32;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.state.level.ParticlesRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public class D3D12Bridge {
     private static final Logger LOGGER = LoggerFactory.getLogger("GL4DX12");
@@ -14,10 +29,11 @@ public class D3D12Bridge {
     private static boolean d3d12Active = false;
     private static LevelRenderState cachedLevelState;
     private static SkyRenderState cachedSkyState;
+    private static final List<EntityRenderState> cachedEntityStates = new ArrayList<>();
+    private static ParticlesRenderState cachedParticlesState;
 
-    private static float[] mvpMatrix = new float[16];
-
-    // ========== 初始化和状态 ==========
+    // 缓存窗口尺寸供矩阵计算
+    private static int g_cachedW = 1280, g_cachedH = 720;
 
     public static boolean isD3D12Ready() {
         return d3d12Ready;
@@ -28,35 +44,53 @@ public class D3D12Bridge {
     }
 
     public static void setD3D12Active(boolean active) {
+        System.out.println("[GL4DX12] setD3D12Active called: " + active + " (was " + d3d12Active + ")");
+        try {
+            throw new RuntimeException("Stack trace for setD3D12Active");
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+        }
         d3d12Active = active;
         LOGGER.info("D3D12 active: {}", active);
     }
 
-    public static void ensureDeviceInitialized(long hwnd) {
-        LOGGER.info("ensureDeviceInitialized called, hwnd={}, current d3d12Ready={}", hwnd, d3d12Ready);
-        if (!d3d12Ready) {
-            LOGGER.info("Calling nativeInit...");
-            boolean result = DX12LibClient.nativeInit(hwnd);
-            d3d12Ready = result;
-            LOGGER.info("D3D12 nativeInit returned: {}", result);
-            if (result) {
-                d3d12Active = true;
-                LOGGER.info("D3D12 activated successfully");
+    public static boolean ensureDeviceInitialized(long hwnd) {
+        if (d3d12Ready) {
+            return true;
+        }
+
+        System.out.println("[GL4DX12] ensureDeviceInitialized called, hwnd=" + hwnd + ", current d3d12Ready=" + d3d12Ready);
+        System.out.println("[GL4DX12] Calling nativeInit...");
+
+        try {
+            boolean success = DX12LibClient.nativeInit(hwnd);
+            d3d12Ready = success;
+            System.out.println("[GL4DX12] D3D12 nativeInit returned: " + success);
+            if (success) {
+                setD3D12Active(true);
+                System.out.println("[GL4DX12] D3D12 initialized and activated");
             } else {
                 LOGGER.error("D3D12 initialization FAILED! Check C:\\temp\\gl4dx12_d3d12.log for details");
             }
+            return success;
+        } catch (Throwable t) {
+            System.err.println("[GL4DX12] nativeInit threw exception: " + t.getMessage());
+            t.printStackTrace();
+            d3d12Ready = false;
+            return false;
         }
     }
 
     public static void shutdownDevice() {
-        if (d3d12Ready) {
-            DX12LibClient.nativeCleanup();
-            d3d12Ready = false;
-            d3d12Active = false;
-        }
+        System.out.println("[GL4DX12] shutdownDevice called");
+        d3d12Ready = false;
+        setD3D12Active(false);
+        DX12LibClient.nativeCleanup();
     }
 
     public static void onWindowResize(int width, int height) {
+        g_cachedW = width;
+        g_cachedH = height;
         if (d3d12Ready) {
             DX12LibClient.nativeResize(width, height);
         }
@@ -64,86 +98,298 @@ public class D3D12Bridge {
 
     // ========== 矩阵同步 ==========
 
-    public static void syncMatrices() {
+    public static void syncMatrices(Matrix4fc modelViewMatrix, CameraRenderState cameraState) {
         try {
-            for (int i = 0; i < 16; i++) {
-                mvpMatrix[i] = (i % 5 == 0) ? 1f : 0f;
+            // 从 MC 获取 ModelView 矩阵
+            float[] mv = new float[16];
+            if (modelViewMatrix != null) {
+                modelViewMatrix.get(mv);
+            } else {
+                // fallback: identity
+                for (int i = 0; i < 4; i++) mv[i * 5] = 1f;
             }
-            DX12LibClient.nativeSetMvp(mvpMatrix);
+
+            // 计算投影矩阵（从 cameraState 或默认 FOV）
+            float[] proj = new float[16];
+            if (cameraState != null) {
+                try {
+                    // 从 cameraState 获取投影矩阵
+                    java.lang.reflect.Field projField = cameraState.getClass().getDeclaredField("projectionMatrix");
+                    projField.setAccessible(true);
+                    Matrix4fc projMat = (Matrix4fc) projField.get(cameraState);
+                    if (projMat != null) {
+                        projMat.get(proj);
+                    }
+                } catch (Exception e) {
+                    // fallback: 使用 FOV 计算
+                    float fov = 70f;
+                    float aspect = (float)g_cachedW / (float)g_cachedH;
+                    try {
+                        java.lang.reflect.Field fovField = cameraState.getClass().getDeclaredField("fov");
+                        fovField.setAccessible(true);
+                        fov = fovField.getFloat(cameraState);
+                    } catch (Exception ignored) {}
+                    Matrix4f p = new Matrix4f().perspective(
+                        (float)Math.toRadians(fov), aspect, 0.05f, 1000f);
+                    p.get(proj);
+                }
+            } else {
+                new Matrix4f().identity().get(proj);
+            }
+
+            // 合并 MVP = projection * modelView
+            float[] mvp = new float[16];
+            Matrix4f pMat = new Matrix4f().set(proj);
+            Matrix4f mvMat = new Matrix4f().set(mv);
+            pMat.mul(mvMat).get(mvp);
+
+            DX12LibClient.nativeSetMvp(mvp);
         } catch (Exception e) {
             LOGGER.error("syncMatrices failed: {}", e.getMessage());
         }
     }
 
+    public static void setWindowSize(int w, int h) {
+        g_cachedW = w;
+        g_cachedH = h;
+    }
+
     // ========== 顶点数据处理 ==========
 
+    /**
+     * 处理从 BufferBuilder 捕获的 MeshData
+     * 提取顶点、UV、颜色数据并传递给 C++ 端
+     * 使用硬编码的顶点布局，绕过 VertexFormat.elements() 的兼容性问题
+     */
     public static void processMeshData(Object meshData) {
-        if (!DX12LibClient.isLibraryLoaded()) {
-            LOGGER.error("D3D12 library not loaded, cannot process mesh data");
+        // ===== 强制初始化和激活 =====
+        if (!d3d12Active) {
+            System.out.println("[GL4DX12] processMeshData: d3d12Active=false, attempting forced init...");
+            try {
+                Minecraft client = Minecraft.getInstance();
+                Window window = client.getWindow();
+                long glfwWindow = window.handle;
+                long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+                if (hwnd != 0) {
+                    boolean success = ensureDeviceInitialized(hwnd);
+                    if (success) {
+                        System.out.println("[GL4DX12] processMeshData: forced init succeeded");
+                        setD3D12Active(true);
+                    } else {
+                        System.out.println("[GL4DX12] processMeshData: forced init failed");
+                    }
+                } else {
+                    System.out.println("[GL4DX12] processMeshData: failed to get window handle");
+                }
+            } catch (Exception e) {
+                System.err.println("[GL4DX12] processMeshData: forced init exception: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+        System.out.println("[GL4DX12] processMeshData ENTERED, d3d12Active=" + d3d12Active + ", meshData=" + (meshData != null));
+        if (!d3d12Active || meshData == null) {
+            System.out.println("[GL4DX12] processMeshData: D3D12 not active or meshData null, returning");
             return;
         }
 
         try {
-            Class<?> meshDataClass = meshData.getClass();
-            java.lang.reflect.Method getVertexBuffer = meshDataClass.getMethod("vertexBuffer");
-            java.nio.ByteBuffer vertexBuffer = (java.nio.ByteBuffer) getVertexBuffer.invoke(meshData);
-            vertexBuffer.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            // === 1. 获取 DrawState ===
+            Method drawStateMethod = meshData.getClass().getMethod("drawState");
+            Object drawState = drawStateMethod.invoke(meshData);
+            if (drawState == null) {
+                System.err.println("[GL4DX12] processMeshData: drawState is null");
+                return;
+            }
 
-            java.lang.reflect.Method getDrawState = meshDataClass.getMethod("drawState");
-            Object drawState = getDrawState.invoke(meshData);
+            // === 2. 获取顶点信息 ===
+            Method formatMethod = drawState.getClass().getMethod("format");
+            Object vertexFormat = formatMethod.invoke(drawState);
 
-            Class<?> drawStateClass = drawState.getClass();
-            java.lang.reflect.Field vertexCountField = drawStateClass.getDeclaredField("vertexCount");
-            vertexCountField.setAccessible(true);
-            int vertexCount = vertexCountField.getInt(drawState);
+            Method vertexSizeMethod = vertexFormat.getClass().getMethod("getVertexSize");
+            int vertexSize = (int) vertexSizeMethod.invoke(vertexFormat);
 
-            java.lang.reflect.Field formatField = drawStateClass.getDeclaredField("format");
-            formatField.setAccessible(true);
-            Object format = formatField.get(drawState);
+            Method vertexCountMethod = drawState.getClass().getMethod("vertexCount");
+            int vertexCount = (int) vertexCountMethod.invoke(drawState);
 
-            java.lang.reflect.Field vertexSizeField = format.getClass().getDeclaredField("vertexSize");
-            vertexSizeField.setAccessible(true);
-            int vertexSize = vertexSizeField.getInt(format);
+            Method modeMethod = drawState.getClass().getMethod("mode");
+            Object mode = modeMethod.invoke(drawState);
+
+            System.out.println("[GL4DX12] processMeshData: vertexSize=" + vertexSize +
+                              ", vertexCount=" + vertexCount +
+                              ", mode=" + mode);
+
+            if (vertexCount == 0) {
+                System.out.println("[GL4DX12] processMeshData: vertexCount=0, skipping");
+                return;
+            }
+
+            // === 3. 获取顶点缓冲区 ===
+            Method vertexBufferMethod = meshData.getClass().getMethod("vertexBuffer");
+            ByteBuffer vertexBuffer = (ByteBuffer) vertexBufferMethod.invoke(meshData);
+
+            if (vertexBuffer == null || vertexBuffer.capacity() == 0) {
+                System.err.println("[GL4DX12] processMeshData: vertexBuffer is empty");
+                return;
+            }
+
+            // === 4. 硬编码顶点布局（根据 vertexSize 推断） ===
+            // MC 标准顶点布局：
+            //   - POSITION: 3 floats (12 bytes) @ offset 0
+            //   - COLOR: 4 bytes (ABGR) @ offset 12 (或 16)
+            //   - UV: 2 floats (8 bytes) @ offset 16 (或 20)
+            //
+            // vertexSize=24: 标准布局 (3*4 + 4 + 2*4 = 24)
+            // vertexSize=28: 有额外数据（可能是法线或光照）
+            // vertexSize=32: 有更多额外数据
+            int positionOffset = 0;
+            int colorOffset = 12;
+            int uvOffset = 16;
+
+            // 根据 vertexSize 调整偏移量
+            if (vertexSize == 24) {
+                positionOffset = 0;
+                colorOffset = 12;
+                uvOffset = 16;
+            } else if (vertexSize == 28) {
+                positionOffset = 0;
+                colorOffset = 16;
+                uvOffset = 20;
+            } else if (vertexSize == 32) {
+                positionOffset = 0;
+                colorOffset = 16;
+                uvOffset = 24;
+            }
+
+            System.out.println("[GL4DX12] Using layout: positionOffset=" + positionOffset +
+                              ", colorOffset=" + colorOffset +
+                              ", uvOffset=" + uvOffset);
+
+            // === 5. 提取顶点数据 ===
+            vertexBuffer.rewind();
 
             float[] vertices = new float[vertexCount * 3];
             float[] colors = new float[vertexCount * 4];
             float[] uvs = new float[vertexCount * 2];
 
             for (int i = 0; i < vertexCount; i++) {
-                int offset = i * vertexSize;
-                vertices[i * 3] = vertexBuffer.getFloat(offset);
-                vertices[i * 3 + 1] = vertexBuffer.getFloat(offset + 4);
-                vertices[i * 3 + 2] = vertexBuffer.getFloat(offset + 8);
-                int colorInt = vertexBuffer.getInt(offset + 12);
-                colors[i * 4] = ((colorInt >> 16) & 0xFF) / 255f;
-                colors[i * 4 + 1] = ((colorInt >> 8) & 0xFF) / 255f;
-                colors[i * 4 + 2] = (colorInt & 0xFF) / 255f;
-                colors[i * 4 + 3] = ((colorInt >> 24) & 0xFF) / 255f;
-                uvs[i * 2] = vertexBuffer.getFloat(offset + 16);
-                uvs[i * 2 + 1] = vertexBuffer.getFloat(offset + 20);
+                int baseOffset = i * vertexSize;
+
+                // 提取位置 (x, y, z)
+                for (int j = 0; j < 3; j++) {
+                    int pos = baseOffset + positionOffset + j * 4;
+                    if (pos + 4 <= vertexBuffer.capacity()) {
+                        vertices[i * 3 + j] = vertexBuffer.getFloat(pos);
+                    }
+                }
+
+                // 提取颜色 (ABGR → RGBA float)
+                int colorPos = baseOffset + colorOffset;
+                if (colorPos + 4 <= vertexBuffer.capacity()) {
+                    int abgr = vertexBuffer.getInt(colorPos);
+                    colors[i * 4]     = ((abgr >> 16) & 0xFF) / 255f;
+                    colors[i * 4 + 1] = ((abgr >> 8)  & 0xFF) / 255f;
+                    colors[i * 4 + 2] = (abgr         & 0xFF) / 255f;
+                    colors[i * 4 + 3] = ((abgr >> 24) & 0xFF) / 255f;
+                } else {
+                    colors[i * 4] = colors[i * 4 + 1] = colors[i * 4 + 2] = colors[i * 4 + 3] = 1f;
+                }
+
+                // 提取 UV (u, v)
+                for (int j = 0; j < 2; j++) {
+                    int uvPos = baseOffset + uvOffset + j * 4;
+                    if (uvPos + 4 <= vertexBuffer.capacity()) {
+                        uvs[i * 2 + j] = vertexBuffer.getFloat(uvPos);
+                    }
+                }
             }
 
-            DX12LibClient.nativeRecordVertices(vertices, vertexCount);
-            // DX12LibClient.nativeRecordColors(colors);  // 暂时注释
-            // DX12LibClient.nativeRecordUV(uvs);         // 暂时注释
-            // nativeDraw 已移除，改为在 renderFullFrame 中通过 nativeEndFrame 统一执行
+            // === 6. 传递给 C++ 端 ===
+            if (vertexCount > 0) {
+                DX12LibClient.nativeRecordVertices(vertices, vertexCount);
+                // colors 和 UV 暂不传递（C++ 端 stub 未实现）
+                // DX12LibClient.nativeRecordColors(colors);
+                // DX12LibClient.nativeRecordUV(uvs);
+
+                System.out.println("[GL4DX12] processMeshData: sent " + vertexCount +
+                                  " vertices to native (total bytes: " + vertexBuffer.capacity() + ")");
+            }
 
         } catch (Exception e) {
-            LOGGER.error("processMeshData failed: {}", e.getMessage());
+            System.err.println("[GL4DX12] processMeshData failed: " + e.getMessage() +
+                              " (" + e.getClass().getSimpleName() + ")");
+            e.printStackTrace();
         }
     }
 
     // ========== 完整帧渲染 ==========
     
-    public static void renderFullFrame(LevelRenderState levelState, CameraRenderState cameraState, float partialTick) {
+    public static void renderFullFrame(LevelRenderState levelState, CameraRenderState cameraState, float partialTick, Matrix4fc modelViewMatrix) {
         if (!d3d12Ready || !d3d12Active) return;
-        
-        cachedLevelState = levelState;
-        syncMatrices();
-        
-        DX12LibClient.nativeBeginFrame();   // 开始帧：重置 DrawCall 列表
-        DX12LibClient.nativeEndFrame();     // 执行所有缓存的 DrawCall
+
+        // 1. 开始帧
+        DX12LibClient.nativeBeginFrame();
+
+        // 2. 同步矩阵（使用 MC 的 modelView + cameraState 的投影）
+        syncMatrices(modelViewMatrix, cameraState);
+
+        // 3. 渲染天空盒
+        if (levelState.skyRenderState != null) {
+            renderSky(levelState.skyRenderState);
+        }
+
+        // 4. 渲染世界（方块）
+        if (levelState.chunkSectionsToRender != null) {
+            renderTerrain(levelState.chunkSectionsToRender);
+        }
+
+        // 5. 渲染实体
+        if (!cachedEntityStates.isEmpty()) {
+            renderEntities(cachedEntityStates, partialTick);
+            cachedEntityStates.clear();
+        }
+
+        // 6. 渲染粒子
+        if (cachedParticlesState != null) {
+            renderParticles(cachedParticlesState);
+            cachedParticlesState = null;
+        }
+
+        // 7. 结束帧并展示
+        DX12LibClient.nativeEndFrame();
         DX12LibClient.nativePresent();
+    }
+
+    private static void renderSky(SkyRenderState skyState) {
+        float[] skyData = SkyboxExtractor.extractSkyData(skyState);
+        if (skyData != null) {
+            DX12LibClient.nativeSetSkyParameters(skyData);
+            DX12LibClient.nativeRenderSky();
+        }
+    }
+
+    private static void renderTerrain(Object chunkSections) {
+        // 使用现有的 processMeshData 已经上传了顶点数据
+        // 这里只需要确保 C++ 层绘制它们
+    }
+
+    private static void renderEntities(List<EntityRenderState> entities, float partialTick) {
+        // 提取实体数据，批量上传到 C++ 层
+    }
+
+    private static void renderParticles(ParticlesRenderState particlesState) {
+        // 已有的粒子提取代码保持不变
+    }
+
+    // ========== Phase 3: 实体/粒子捕获 ==========
+
+    public static void captureEntityRenderState(EntityRenderState state) {
+        if (state != null) {
+            cachedEntityStates.add(state);
+        }
+    }
+
+    public static void captureParticles(ParticlesRenderState state) {
+        cachedParticlesState = state;
     }
 
     // ========== 兼容旧代码 ==========

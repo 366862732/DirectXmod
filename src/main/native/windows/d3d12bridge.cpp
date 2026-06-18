@@ -20,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <mutex>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -57,6 +58,14 @@ static HANDLE   g_thread = nullptr;
 static volatile bool g_run = false;
 static HANDLE   g_frameReadyEvent = nullptr;  // 帧数据就绪事件
 static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
+
+// ========== 新简单顶点数据存储（与 g_drawChunks 并行） ==========
+static std::vector<float> g_vertexData;      // 顶点位置 (x,y,z 连续)
+static std::vector<float> g_uvData;          // UV坐标 (u,v 连续)
+static float g_colorDataBuf[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+static int g_newVertexCount = 0;
+static bool g_hasNewVertexData = false;
+static std::mutex g_dataMutex;               // 线程安全
 
 // Texture state
 static ComPtr<ID3D12Resource> g_tex;
@@ -781,21 +790,87 @@ struct VertexPT { float x,y,z; UINT color; float u,v; };
 
 static DWORD WINAPI RenderLoop(LPVOID) {
     Log("Render thread started");
+    int loopCount = 0;
     Vertex2D fsQuad[] = {{-1,-1,0,1},{3,-1,2,1},{-1,3,0,-1}};
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
-    while (g_run) {
+    while (true) {
+        if (!g_run) {
+            // g_run 被设为 false（可能是 CleanupD3D12 调用），退出
+            Log("Render thread: g_run=false, exiting");
+            break;
+        }
+
+        loopCount++;
+        if (loopCount % 60 == 0) {
+            Log("Render loop iteration %d", loopCount);
+        }
         // 等待 Java 端通知数据已准备好（最多等待 100ms 避免完全卡死）
         DWORD waitResult = WaitForSingleObject(g_frameReadyEvent, 100);
 
         if (waitResult == WAIT_OBJECT_0) {
             // 数据已准备好，执行渲染
+            std::vector<float> vertices;
+            std::vector<float> uvs;
+            int vertexCount = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_dataMutex);
+                if (g_hasNewVertexData && !g_vertexData.empty()) {
+                    vertices = g_vertexData;
+                    uvs = g_uvData;
+                    vertexCount = g_newVertexCount;
+                    g_hasNewVertexData = false;
+                }
+            }
+
+            if (!vertices.empty() && vertexCount > 0) {
+                Log("RenderLoop: rendering %d vertices from new storage", vertexCount);
+
+                // 1. 更新顶点缓冲区
+                UINT byteCount = vertexCount * sizeof(VertexPC);
+                if (EnsureIMVBCapacity(byteCount)) {
+                    void* dst = nullptr;
+                    g_imVB->Map(0, nullptr, &dst);
+                    VertexPC* vtx = (VertexPC*)dst;
+                    for (int i = 0; i < vertexCount; i++) {
+                        vtx[i].x = vertices[i * 3];
+                        vtx[i].y = vertices[i * 3 + 1];
+                        vtx[i].z = vertices[i * 3 + 2];
+                        vtx[i].color = 0xFFFFFFFF;  // 白色
+                    }
+                    g_imVB->Unmap(0, nullptr);
+                    g_imVBSize = byteCount;
+                    g_imVbv.SizeInBytes = g_imVBSize;
+
+                    // 2. 记录绘制调用
+                    EnterCriticalSection(&g_stateLock);
+                    DrawChunk ch;
+                    ch.byteOffset = 0;
+                    ch.vertexCount = vertexCount;
+                    ch.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                    ch.textured = false;
+                    ch.vertexStride = sizeof(VertexPC);
+                    ch.blend = false;
+                    ch.textureId = 0;
+                    g_drawChunks.clear();
+                    g_drawChunks.push_back(ch);
+                    g_imVertCount = vertexCount;
+                    LeaveCriticalSection(&g_stateLock);
+                }
+            }
         } else if (waitResult == WAIT_TIMEOUT) {
             // 超时，跳过本帧（没有新数据）
             continue;
         } else {
             // 错误
+            Log("WaitForSingleObject error, result=%d", (int)waitResult);
             break;
+        }
+
+        // 安全检查：确保核心资源可用
+        if (!g_imVB || !g_cl || !g_swap || !g_dev) {
+            Sleep(16);
+            continue;
         }
 
         RepositionOverlay();
@@ -824,7 +899,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         }
 
-        float bg[4] = {0,0,0,1};
+        float bg[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // 黑色
         g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
         if (hasDSV) g_cl->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
@@ -920,7 +995,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             WaitForSingleObject(g_fenceEv, INFINITE);
         }
     }
-    Log("Render thread stopped");
+    Log("Render thread stopped, loopCount=%d, g_run=%d", loopCount, (int)g_run);
     return 0;
 }
 
@@ -1088,6 +1163,17 @@ ComPtr<IDXGIFactory4> dxgi;
     InitializeCriticalSection(&g_texLock);
     InitializeCriticalSection(&g_stateLock);
     g_ok = true; g_run = true;
+
+    // 创建帧同步事件（必须在 CreateThread 之前）
+    g_frameReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_frameDoneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_frameReadyEvent || !g_frameDoneEvent) {
+        Log("ERROR: CreateEventW failed, err=%d", GetLastError());
+        g_ok = false; g_run = false;
+        return false;
+    }
+    Log("Frame sync events created: ready=0x%p, done=0x%p", g_frameReadyEvent, g_frameDoneEvent);
+
     g_thread = CreateThread(0, 0, RenderLoop, 0, 0, 0);
     Log("=== D3D12 on MC window Ready ===");
     return true;
@@ -1273,6 +1359,16 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     g_imVertCount += safeCount;
     g_imVBSize += byteCount;
     g_imVbv.SizeInBytes = g_imVBSize;
+
+    // 同步拷贝到新存储（供 RenderLoop 直接使用）
+    {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_vertexData.assign(buf.data(), buf.data() + (jsize)(safeCount * 3));
+        g_newVertexCount = safeCount;
+        g_hasNewVertexData = true;
+    }
+    Log("nativeRecordVertices: stored %d floats (%d vertices)", (int)(safeCount * 3), (int)safeCount);
+
     LeaveCriticalSection(&g_stateLock);
 }
 
@@ -1317,6 +1413,36 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv
     g_imVBSize += byteCount;
     g_imVbv.SizeInBytes = g_imVBSize;
     LeaveCriticalSection(&g_stateLock);
+}
+
+// ========== 简单顶点数据接收（供 Java 端直接使用） ==========
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordUV(JNIEnv* env, jclass, jfloatArray uvs) {
+    if (!uvs) { OutputDebugStringA("nativeRecordUV: uvs is null\n"); return; }
+    jsize len = env->GetArrayLength(uvs);
+    if (len == 0) { OutputDebugStringA("nativeRecordUV: uvs is empty\n"); return; }
+    jfloat* data = env->GetFloatArrayElements(uvs, nullptr);
+    if (!data) { OutputDebugStringA("nativeRecordUV: GetFloatArrayElements failed\n"); return; }
+    {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_uvData.assign(data, data + len);
+    }
+    char buf[128]; snprintf(buf, sizeof(buf), "nativeRecordUV: %d floats\n", (int)len); OutputDebugStringA(buf);
+    env->ReleaseFloatArrayElements(uvs, data, JNI_ABORT);
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordColors(JNIEnv* env, jclass, jfloatArray colors) {
+    if (!colors) { OutputDebugStringA("nativeRecordColors: colors is null\n"); return; }
+    jsize len = env->GetArrayLength(colors);
+    if (len == 0) { OutputDebugStringA("nativeRecordColors: colors is empty\n"); return; }
+    jfloat* data = env->GetFloatArrayElements(colors, nullptr);
+    if (!data) { OutputDebugStringA("nativeRecordColors: GetFloatArrayElements failed\n"); return; }
+    if (len >= 4) {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_colorDataBuf[0] = data[0]; g_colorDataBuf[1] = data[1];
+        g_colorDataBuf[2] = data[2]; g_colorDataBuf[3] = data[3];
+    }
+    char buf[128]; snprintf(buf, sizeof(buf), "nativeRecordColors: %d floats\n", (int)len); OutputDebugStringA(buf);
+    env->ReleaseFloatArrayElements(colors, data, JNI_ABORT);
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetPrimitiveTopology(JNIEnv*, jclass, jint topo) {
@@ -1392,9 +1518,47 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsD3D12Active(JNIEn
     return g_ok ? JNI_TRUE : JNI_FALSE;
 }
 
-// === Phase 3: Skybox and Particle (empty stubs for now) ===
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv* env, jclass cls, jint vertexCount) {
-    // 空实现或调用现有绘制逻辑
+// === Phase 3: Sky, Terrain, Entity, Particle ===
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv*, jclass, jint vertexCount) {
+    (void)vertexCount;
+    OutputDebugStringA("nativeDraw: called, signaling render thread\n");
+    if (g_frameReadyEvent != nullptr) {
+        SetEvent(g_frameReadyEvent);
+    } else {
+        OutputDebugStringA("nativeDraw: g_frameReadyEvent is null!\n");
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jclass) {
+    // 使用 g_skyParams 渲染天空盒
+    // 目前用简单颜色填充，后续可扩展为球体/穹顶
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTerrain(JNIEnv*, jclass) {
+    // 渲染地形（方块）— 顶点数据已通过 nativeRecordVertices 上传
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadEntities(JNIEnv* env, jclass, jfloatArray entityData, jint count) {
+    // 批量上传实体数据到 GPU
+    (void)env; (void)entityData; (void)count;
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderEntities(JNIEnv*, jclass) {
+    // 绘制所有实体
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters(JNIEnv* env, jclass, jfloatArray params) {
+    // 存储天空参数供 RenderLoop 使用
+    (void)env; (void)params;
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles(JNIEnv* env, jclass, jfloatArray particles, jint count) {
+    // 上传粒子数据到 GPU
+    (void)env; (void)particles; (void)count;
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles(JNIEnv*, jclass) {
+    // 绘制所有粒子
 }
 
 }

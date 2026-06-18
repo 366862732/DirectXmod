@@ -69,6 +69,10 @@ public class DX12LibClient {
     // Phase 3 stubs
     public static native void nativeSetSkyParameters(float[] params);
     public static native void nativeRenderSkybox();
+    public static native void nativeRenderSky();
+    public static native void nativeRenderTerrain();
+    public static native void nativeUploadEntities(float[] entityData, int count);
+    public static native void nativeRenderEntities();
     public static native void nativeUploadParticles(float[] particles, int count);
     public static native void nativeRenderParticles();
 }
