@@ -1,6 +1,6 @@
 # GL4DX12 - Minecraft D3D12 渲染模组
 
-> 为 Minecraft 26.1.2 (1.21.5) 实现的 D3D12 渲染后端，通过覆盖层窗口 + LevelRenderer 拦截 + 全帧 D3D12 渲染实现完整渲染管线。
+> 为 Minecraft 26.1.2 实现的 D3D12 渲染后端，通过覆盖层窗口 + LevelRenderer 拦截 + 全帧 D3D12 渲染实现完整渲染管线。
 
 ---
 
