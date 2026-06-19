@@ -16,15 +16,25 @@ public class Dx12Mod implements ClientModInitializer {
         System.out.println("[GL4DX12] Mod Initializing (Client)...");
         System.out.println("========================================");
 
-        // 1. Load native DLL (no D3D12 device yet)
+
+        // === 直接加载新编译的DLL（调试用） ===
         try {
+            System.load("D:\\dx12-lib-template-26.1.2\\src\\main\\native\\windows\\gl4dx12.dll");
+            System.out.println("[GL4DX12] System.load SUCCESS");
+        } catch (Throwable t) {
+            System.err.println("[GL4DX12] System.load FAILED: " + t.getMessage());
+            t.printStackTrace();
+        }
+
+        // 1. Load native DLL (no D3D12 device yet)
+        /*try {
             NativeUtils.loadLibraryFromJar("/native/windows/gl4dx12.dll");
             System.out.println("[GL4DX12] Native library loaded");
         } catch (Throwable t) {
             System.err.println("[GL4DX12] Failed to load DLL: " + t.getMessage());
             t.printStackTrace();
             return;
-        }
+        }*/
 
         // 2. Enumerate ALL RenderSystem static methods (one-time diagnostic)
         try {

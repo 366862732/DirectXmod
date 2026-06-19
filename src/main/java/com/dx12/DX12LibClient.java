@@ -1,7 +1,9 @@
 package com.dx12;
 
-import java.io.*;
-import java.nio.file.*;
+import java.io.File;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 
 public class DX12LibClient {
 
@@ -59,7 +61,7 @@ public class DX12LibClient {
     public static native void nativeEndFrame();
     public static native void nativePresent();
     public static native void nativeSetMvp(float[] matrix);
-    public static native void nativeRecordVertices(float[] vertices, int vertexCount);
+    public static native void nativeRecordVertices(float[] vertices, int vertexCount, byte[] colors);
     public static native void nativeRecordColors(float[] colors);
     public static native void nativeRecordUV(float[] uv);
     public static native void nativeDraw(int vertexCount);

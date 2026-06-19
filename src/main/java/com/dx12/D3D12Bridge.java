@@ -7,16 +7,14 @@ import java.util.List;
 
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
+import org.lwjgl.glfw.GLFWNativeWin32;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.dx12.render.SkyboxExtractor;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.Window;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
-
-import org.lwjgl.glfw.GLFWNativeWin32;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.state.level.ParticlesRenderState;
@@ -99,6 +97,10 @@ public class D3D12Bridge {
     // ========== 矩阵同步 ==========
 
     public static void syncMatrices(Matrix4fc modelViewMatrix, CameraRenderState cameraState) {
+        if (modelViewMatrix == null) {
+            System.out.println("[GL4DX12] syncMatrices: modelView is NULL!");
+            return;
+        }
         try {
             // 从 MC 获取 ModelView 矩阵
             float[] mv = new float[16];
@@ -143,7 +145,19 @@ public class D3D12Bridge {
             Matrix4f mvMat = new Matrix4f().set(mv);
             pMat.mul(mvMat).get(mvp);
 
+            System.out.println("[GL4DX12] syncMatrices: calling nativeSetMvp with matrix");
             DX12LibClient.nativeSetMvp(mvp);
+
+            // 诊断：验证矩阵有效性
+            boolean hasNonZero = false;
+            for (int i = 0; i < 16; i++) {
+                if (Math.abs(mvp[i]) > 0.0001f) { hasNonZero = true; break; }
+            }
+            System.out.println("[GL4DX12] syncMatrices: modelView=" + (modelViewMatrix != null) +
+                               ", cameraState=" + (cameraState != null) +
+                               ", mvpHasNonZero=" + hasNonZero +
+                               ", mvp[0]=" + mvp[0] + ", mvp[5]=" + mvp[5] +
+                               ", mvp[10]=" + mvp[10] + ", mvp[15]=" + mvp[15]);
         } catch (Exception e) {
             LOGGER.error("syncMatrices failed: {}", e.getMessage());
         }
@@ -167,8 +181,19 @@ public class D3D12Bridge {
             System.out.println("[GL4DX12] processMeshData: d3d12Active=false, attempting forced init...");
             try {
                 Minecraft client = Minecraft.getInstance();
-                Window window = client.getWindow();
-                long glfwWindow = window.handle;
+                var window = client.getWindow();
+                
+                // 使用反射获取 handle 字段（最稳妥）
+                long glfwWindow;
+                try {
+                    java.lang.reflect.Field handleField = window.getClass().getDeclaredField("handle");
+                    handleField.setAccessible(true);
+                    glfwWindow = (long) handleField.get(window);
+                } catch (Exception e) {
+                    System.err.println("[GL4DX12] Failed to get window handle via reflection: " + e.getMessage());
+                    return;
+                }
+                
                 long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
                 if (hwnd != 0) {
                     boolean success = ensureDeviceInitialized(hwnd);
@@ -246,7 +271,22 @@ public class D3D12Bridge {
             int uvOffset = 16;
 
             // 根据 vertexSize 调整偏移量
-            if (vertexSize == 24) {
+            if (vertexSize == 12) {
+                // 仅位置数据 (3 floats)，无颜色和UV
+                positionOffset = 0;
+                colorOffset = -1;
+                uvOffset = -1;
+            } else if (vertexSize == 16) {
+                // 位置 + 颜色 (3 floats + 4 bytes ABGR)
+                positionOffset = 0;
+                colorOffset = 12;
+                uvOffset = -1;
+            } else if (vertexSize == 20) {
+                // 位置 + 颜色 + padding (3 floats + 4 bytes + 4 bytes padding)
+                positionOffset = 0;
+                colorOffset = 12;
+                uvOffset = -1;
+            } else if (vertexSize == 24) {
                 positionOffset = 0;
                 colorOffset = 12;
                 uvOffset = 16;
@@ -258,6 +298,16 @@ public class D3D12Bridge {
                 positionOffset = 0;
                 colorOffset = 16;
                 uvOffset = 24;
+            } else if (vertexSize == 72) {
+                // 大型顶点布局（如字体渲染），颜色在 offset 12
+                positionOffset = 0;
+                colorOffset = 12;
+                uvOffset = 16;
+            } else {
+                // 未知布局，尝试标准布局
+                positionOffset = 0;
+                colorOffset = 12;
+                uvOffset = 16;
             }
 
             System.out.println("[GL4DX12] Using layout: positionOffset=" + positionOffset +
@@ -283,32 +333,54 @@ public class D3D12Bridge {
                 }
 
                 // 提取颜色 (ABGR → RGBA float)
-                int colorPos = baseOffset + colorOffset;
-                if (colorPos + 4 <= vertexBuffer.capacity()) {
-                    int abgr = vertexBuffer.getInt(colorPos);
-                    colors[i * 4]     = ((abgr >> 16) & 0xFF) / 255f;
-                    colors[i * 4 + 1] = ((abgr >> 8)  & 0xFF) / 255f;
-                    colors[i * 4 + 2] = (abgr         & 0xFF) / 255f;
-                    colors[i * 4 + 3] = ((abgr >> 24) & 0xFF) / 255f;
+                if (colorOffset >= 0) {
+                    int colorPos = baseOffset + colorOffset;
+                    if (colorPos + 4 <= vertexBuffer.capacity()) {
+                        int abgr = vertexBuffer.getInt(colorPos);
+                        colors[i * 4]     = ((abgr >> 16) & 0xFF) / 255f;
+                        colors[i * 4 + 1] = ((abgr >> 8)  & 0xFF) / 255f;
+                        colors[i * 4 + 2] = (abgr         & 0xFF) / 255f;
+                        colors[i * 4 + 3] = ((abgr >> 24) & 0xFF) / 255f;
+                    } else {
+                        colors[i * 4] = colors[i * 4 + 1] = colors[i * 4 + 2] = colors[i * 4 + 3] = 1f;
+                    }
                 } else {
+                    // 没有颜色数据，使用默认白色
                     colors[i * 4] = colors[i * 4 + 1] = colors[i * 4 + 2] = colors[i * 4 + 3] = 1f;
                 }
 
                 // 提取 UV (u, v)
-                for (int j = 0; j < 2; j++) {
-                    int uvPos = baseOffset + uvOffset + j * 4;
-                    if (uvPos + 4 <= vertexBuffer.capacity()) {
-                        uvs[i * 2 + j] = vertexBuffer.getFloat(uvPos);
+                if (uvOffset >= 0) {
+                    for (int j = 0; j < 2; j++) {
+                        int uvPos = baseOffset + uvOffset + j * 4;
+                        if (uvPos + 4 <= vertexBuffer.capacity()) {
+                            uvs[i * 2 + j] = vertexBuffer.getFloat(uvPos);
+                        } else {
+                            uvs[i * 2 + j] = 0.0f;
+                        }
                     }
+                } else {
+                    // 没有UV数据，使用默认值
+                    uvs[i * 2] = 0.0f;
+                    uvs[i * 2 + 1] = 0.0f;
                 }
             }
 
             // === 6. 传递给 C++ 端 ===
             if (vertexCount > 0) {
-                DX12LibClient.nativeRecordVertices(vertices, vertexCount);
-                // colors 和 UV 暂不传递（C++ 端 stub 未实现）
-                // DX12LibClient.nativeRecordColors(colors);
-                // DX12LibClient.nativeRecordUV(uvs);
+                // 将 float[] 颜色转换为 byte[] (ABGR packed)
+                byte[] colorBytes = new byte[vertexCount * 4];
+                for (int i = 0; i < vertexCount; i++) {
+                    int r = (int)(colors[i * 4] * 255.0f) & 0xFF;
+                    int g = (int)(colors[i * 4 + 1] * 255.0f) & 0xFF;
+                    int b = (int)(colors[i * 4 + 2] * 255.0f) & 0xFF;
+                    int a = (int)(colors[i * 4 + 3] * 255.0f) & 0xFF;
+                    colorBytes[i * 4] = (byte)r;
+                    colorBytes[i * 4 + 1] = (byte)g;
+                    colorBytes[i * 4 + 2] = (byte)b;
+                    colorBytes[i * 4 + 3] = (byte)a;
+                }
+                DX12LibClient.nativeRecordVertices(vertices, vertexCount, colorBytes);
 
                 System.out.println("[GL4DX12] processMeshData: sent " + vertexCount +
                                   " vertices to native (total bytes: " + vertexBuffer.capacity() + ")");
@@ -324,6 +396,11 @@ public class D3D12Bridge {
     // ========== 完整帧渲染 ==========
     
     public static void renderFullFrame(LevelRenderState levelState, CameraRenderState cameraState, float partialTick, Matrix4fc modelViewMatrix) {
+        System.out.println("[GL4DX12] renderFullFrame called, modelView=" + (modelViewMatrix != null) + ", cameraState=" + (cameraState != null));
+        if (modelViewMatrix == null) {
+            System.out.println("[GL4DX12] renderFullFrame: modelView is NULL!");
+            return;
+        }
         if (!d3d12Ready || !d3d12Active) return;
 
         // 1. 开始帧
@@ -417,4 +494,18 @@ public class D3D12Bridge {
     public static void onGlCullFace(int mode) {}
     public static void onBindTexture(int texture) {}
     public static void onTexImage2D(int target, int level, int internalformat, int width, int height, int border, int format, java.nio.Buffer pixels) {}
+
+    // ========== glDrawArrays / glDrawElements 钩子 ==========
+
+    public static void onGlDrawArrays(int mode, int first, int count) {
+        if (!isD3D12Active()) return;
+        System.out.println("[GL4DX12] D3D12Bridge.onGlDrawArrays: mode=" + mode +
+                           ", first=" + first + ", count=" + count);
+    }
+
+    public static void onGlDrawElements(int mode, int count, int type, long indices) {
+        if (!isD3D12Active()) return;
+        System.out.println("[GL4DX12] D3D12Bridge.onGlDrawElements: mode=" + mode +
+                           ", count=" + count + ", type=" + type);
+    }
 }

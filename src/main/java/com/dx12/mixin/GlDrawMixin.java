@@ -70,7 +70,21 @@ public class GlDrawMixin {
                                        int width, int height, int border,
                                        int format, int type,
                                        java.nio.ByteBuffer pixels, CallbackInfo ci) {
-        // 调用 D3D12Bridge 的 8 参数版本（不传 type）
         D3D12Bridge.onTexImage2D(target, level, internalformat, width, height, border, format, pixels);
+    }
+
+    // === Draw calls ===
+    @Inject(method = "glDrawArrays", at = @At("HEAD"))
+    private static void onGlDrawArrays(int mode, int first, int count, CallbackInfo ci) {
+        System.out.println("[GL4DX12] glDrawArrays: mode=" + mode +
+                           ", first=" + first + ", count=" + count);
+        D3D12Bridge.onGlDrawArrays(mode, first, count);
+    }
+
+    @Inject(method = "glDrawElements", at = @At("HEAD"))
+    private static void onGlDrawElements(int mode, int count, int type, long indices, CallbackInfo ci) {
+        System.out.println("[GL4DX12] glDrawElements: mode=" + mode +
+                           ", count=" + count + ", type=" + type);
+        D3D12Bridge.onGlDrawElements(mode, count, type, indices);
     }
 }
