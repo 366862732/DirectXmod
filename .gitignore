@@ -23,3 +23,9 @@ shot_*/
 
 # Backup dirs
 backup/
+# Visual Studio 
+# Visual Studio 
+.vs/ 
+*.ipch 
+*.suo 
+*.user 
