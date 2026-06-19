@@ -60,7 +60,7 @@ public class DX12LibClient {
     public static native void nativeBeginFrame();
     public static native void nativeEndFrame();
     public static native void nativePresent();
-    public static native void nativeSetMvp(float[] matrix);
+    public static native void nativeSetMvp(float[] matrix, int coordType);
     public static native void nativeRecordVertices(float[] vertices, int vertexCount, byte[] colors, int coordType);
     public static native void nativeRecordColors(float[] colors);
     public static native void nativeRecordUV(float[] uv);
@@ -70,11 +70,14 @@ public class DX12LibClient {
 
     // Phase 3 stubs
     public static native void nativeSetSkyParameters(float[] params);
+    public static native void nativeSetSkyParameters(float r, float g, float b, float a, float sunAngle, float moonAngle);
     public static native void nativeRenderSkybox();
     public static native void nativeRenderSky();
     public static native void nativeRenderTerrain();
     public static native void nativeUploadEntities(float[] entityData, int count);
     public static native void nativeRenderEntities();
-    public static native void nativeUploadParticles(float[] particles, int count);
+    public static native void nativeUploadParticles(float[] vertices, int count, int vertexSize);
     public static native void nativeRenderParticles();
+    public static native void nativeUploadTransparent(float[] vertices, int count, int vertexSize, float distance);
+    public static native void nativeRenderTransparent();
 }

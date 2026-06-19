@@ -6,6 +6,8 @@
 //   3. Projection/modelView matrices synced from MC via JNI each frame
 //   4. Geometry uses MC world-space coords, transformed by MVP in VS shader
 //
+//在给我晚上编译闹鬼我清算你!d3d12bridge.cpp！
+//你C++端渲染再给老子抽风我收拾你
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <jni.h>
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cmath>
+#include <float.h>
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
@@ -36,6 +39,23 @@ static void Log(const char* fmt, ...) {
     FILE* f = fopen("C:\\temp\\gl4dx12_d3d12.log", "a");
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
     OutputDebugStringA(buf); OutputDebugStringA("\n");
+}
+
+// ===== 前向声明（供 RenderLoop 调用，必须放在文件顶部） =====
+extern "C" {
+    // 天空系统
+    JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFFF
+    (JNIEnv* env, jclass clazz, jfloat r, jfloat g, jfloat b, jfloat a, jfloat sunAngle, jfloat moonAngle);
+
+    JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky
+    (JNIEnv* env, jclass clazz);
+
+    // 半透明系统
+    JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
+    (JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize, jfloat distance);
+
+    JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
+    (JNIEnv* env, jclass clazz);
 }
 
 // === D3D12 state ===
@@ -101,10 +121,70 @@ static UINT  g_imVBCap = 16 * 1024 * 1024;
 static UINT  g_imVBSize = 0;
 static UINT  g_imVertCount = 0;
 
-struct DrawChunk { UINT byteOffset; UINT vertexCount; D3D_PRIMITIVE_TOPOLOGY topo; bool textured; UINT vertexStride; bool blend; int textureId; };
+struct DrawChunk { UINT byteOffset; UINT vertexCount; D3D_PRIMITIVE_TOPOLOGY topo; bool textured; UINT vertexStride; bool blend; int textureId; int vertexType; };
 static std::vector<DrawChunk> g_drawChunks;
 static D3D_PRIMITIVE_TOPOLOGY g_pendingTopo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 static int  g_pendingTextureId = 0;
+
+// ==============================================
+// 顶点类型定义（必须在所有结构体之前）
+// ==============================================
+enum VertexType {
+    VERTEX_TYPE_UNKNOWN = 0,
+    VERTEX_TYPE_WORLD   = 1,   // 3D世界物体（使用透视投影）
+    VERTEX_TYPE_SCREEN  = 2    // 2D GUI元素（使用正交投影）
+};
+
+// ==============================================
+// 粒子系统
+// ==============================================
+struct ParticleDrawCall {
+    ComPtr<ID3D12Resource> uploadBuffer;
+    UINT vertexCount;
+    UINT vertexSize;
+    D3D12_GPU_VIRTUAL_ADDRESS gpuAddress;
+    VertexType type = VERTEX_TYPE_UNKNOWN;
+};
+
+static std::vector<ParticleDrawCall> g_particleDrawCalls;
+static std::mutex g_particleMutex;
+static bool g_particlesPending = false;
+
+// ==============================================
+// 天空系统
+// ==============================================
+static float g_skyColor[4] = {0.5f, 0.7f, 1.0f, 1.0f};
+static float g_sunAngle = 0.0f;
+static float g_moonAngle = 0.0f;
+static std::mutex g_skyMutex;
+
+// ==============================================
+// 半透明渲染
+// ==============================================
+struct TransparentDrawCall {
+    ComPtr<ID3D12Resource> uploadBuffer;
+    UINT vertexCount;
+    UINT vertexSize;
+    D3D12_GPU_VIRTUAL_ADDRESS gpuAddress;
+    float distance;
+    long long textureId;
+    VertexType type = VERTEX_TYPE_UNKNOWN;
+};
+
+static std::vector<TransparentDrawCall> g_transparentDrawCalls;
+static std::mutex g_transparentMutex;
+
+// 矩阵乘法工具函数
+static void MatrixMultiply(float* out, const float* a, const float* b) {
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            out[i * 4 + j] = 0;
+            for (int k = 0; k < 4; k++) {
+                out[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+            }
+        }
+    }
+}
 
 static UINT g_glStateBits = 0;
 #define GLB_BLEND        1
@@ -124,10 +204,16 @@ static ComPtr<ID3D12Resource> g_cbUpload;
 static BYTE* g_cbData = nullptr;
 static const UINT g_cbSize = 256;
 
+// 三种坐标空间各自独立存储矩阵（避免互相覆盖）
+static float g_mvpWorld[16]  = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+static float g_mvpScreen[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+static float g_mvpNDC[16]    = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
 static D3D12_BLEND g_glSrcBlend = D3D12_BLEND_SRC_ALPHA;
 static D3D12_BLEND g_glDstBlend = D3D12_BLEND_INV_SRC_ALPHA;
 
 static ComPtr<ID3D12PipelineState> g_psoSolidVariants[32];
+static ComPtr<ID3D12PipelineState> g_psoAlphaBlend;  // 半透明/粒子/天空专用
 static ComPtr<ID3D12RootSignature> g_rsSolidVariants[16];
 static ComPtr<ID3D12PipelineState> g_psoLineVariants[32];
 static ComPtr<ID3D12RootSignature> g_rsLineVariants[16];
@@ -139,7 +225,8 @@ struct VS_IN  { float3 p : POS; uint c : COL; float2 uv : TEX; };
 struct PS_IN  { float4 p : SV_POSITION; float4 c : COL; float2 uv : TEX; };
 PS_IN VSMain(VS_IN i) {
     PS_IN o;
-    o.p = mul(float4(i.p, 1), mvp);
+    // 顶点已在 CPU 端预转换到 NDC，直接输出
+    o.p = float4(i.p, 1);
     o.c = float4(((i.c>>16)&0xff)/255.0, ((i.c>>8)&0xff)/255.0, (i.c&0xff)/255.0, ((i.c>>24)&0xff)/255.0);
     o.uv = i.uv;
     return o;
@@ -309,7 +396,8 @@ struct VS_IN { float3 p : POS; uint c : COL; };
 struct PS_IN { float4 p : SV_POSITION; float4 c : COL; };
 PS_IN VSMain(VS_IN i) {
     PS_IN o;
-    o.p = mul(float4(i.p, 1), mvp);
+    // 顶点已在 CPU 端预转换到 NDC，使用单位矩阵或直接输出
+    o.p = float4(i.p, 1);
     o.c = float4(((i.c>>16)&0xff)/255.0, ((i.c>>8)&0xff)/255.0, (i.c&0xff)/255.0, ((i.c>>24)&0xff)/255.0);
     return o;
 }
@@ -431,6 +519,64 @@ static bool BuildLinePSO(UINT stateBits, bool textured) {
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
     if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoLineVariants[idx])))) return false;
+    return true;
+}
+
+// 半透明渲染专用 PSO（始终启用 Alpha Blending）
+static bool BuildAlphaBlendPSO() {
+    if (g_psoAlphaBlend) return true;
+
+    ComPtr<ID3DBlob> vs, ps, err;
+    if (FAILED(D3DCompile(kVS_Solid, strlen(kVS_Solid), 0,0,0,"VSMain","vs_5_0",0,0,&vs,&err))) return false;
+    if (FAILED(D3DCompile(kPS_Solid, strlen(kPS_Solid), 0,0,0,"PSMain","ps_5_0",0,0,&ps,&err))) return false;
+
+    // 使用第一个 solid root signature（带 CBV）
+    if (!g_rsSolidVariants[0]) {
+        D3D12_ROOT_PARAMETER rpCB = {};
+        rpCB.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rpCB.Descriptor.ShaderRegister = 0;
+        rpCB.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 1; rsd.pParameters = &rpCB;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3DBlob> rb;
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
+        if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(),
+            IID_PPV_ARGS(&g_rsSolidVariants[0])))) return false;
+    }
+
+    D3D12_INPUT_ELEMENT_DESC ie[] = {
+        {"POS",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+        {"COL",0,DXGI_FORMAT_R8G8B8A8_UNORM,0,12,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = g_rsSolidVariants[0].Get();
+    pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    // 启用 Alpha Blending（标准 over 运算：src*alpha + dst*(1-alpha)）
+    pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
+    pd.InputLayout = {ie, 2};
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoAlphaBlend)))) return false;
+    Log("BuildAlphaBlendPSO: created alpha-blend PSO");
     return true;
 }
 
@@ -803,6 +949,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
     while (true) {
         Log("=== RenderLoop LOOP ITERATION ===");
+        if (!g_dev) {
+            Sleep(16);
+            continue;
+        }
         if (!g_run) {
             // g_run 被设为 false（可能是 CleanupD3D12 调用），退出
             Log("Render thread: g_run=false, exiting");
@@ -860,40 +1010,80 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     }
                 }
 
+                // ===== 自动修正：WORLD 误判 → SCREEN 自动纠正 =====
+                // 当 Java 端判定为 WORLD 但大部分顶点坐标在屏幕范围内时，自动修正
+                if (g_currentCoordType == 0 && vertexCount > 0) {
+                    int screenCount = 0;
+                    for (int i = 0; i < vertexCount; i++) {
+                        float vx = vertices[i * 3], vy = vertices[i * 3 + 1];
+                        if (vx >= 0 && vx <= 2000 && vy >= 0 && vy <= 2000) {
+                            screenCount++;
+                        }
+                    }
+                    if (screenCount > vertexCount / 2) {
+                        Log("  AUTO-CORRECT: %d/%d vertices in screen range, changing to SCREEN",
+                            screenCount, vertexCount);
+                        g_currentCoordType = 1;
+                    }
+                }
+
                 // ===== 根据顶点类型选择投影矩阵 =====
                 switch (g_currentCoordType) {
                     case 0: // COORD_WORLD — 使用 Java 端传入的 MVP 矩阵
                         Log("Using perspective projection for 3D vertices (WORLD coords)");
+                        if (g_cbData) {
+                            memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+                        }
+                        // 检查 MVP 变换后的 NDC 范围
+                        if (g_cbData && vertexCount > 0) {
+                            float* m = (float*)g_cbData;
+                            int outOfRange = 0;
+                            for (int i = 0; i < vertexCount; i++) {
+                                float vx = vertices[i * 3], vy = vertices[i * 3 + 1], vz = vertices[i * 3 + 2];
+                                float clipW = m[12]*vx + m[13]*vy + m[14]*vz + m[15];
+                                float ndcX = (clipW != 0) ? (m[0]*vx + m[1]*vy + m[2]*vz + m[3]) / clipW : 0;
+                                float ndcY = (clipW != 0) ? (m[4]*vx + m[5]*vy + m[6]*vz + m[7]) / clipW : 0;
+                                if (ndcX < -1.1f || ndcX > 1.1f || ndcY < -1.1f || ndcY > 1.1f) {
+                                    outOfRange++;
+                                }
+                            }
+                            if (outOfRange > 0) {
+                                Log("  WARNING: %d/%d vertices out of NDC range after WORLD transform",
+                                    outOfRange, vertexCount);
+                            }
+                        }
                         break;
 
-                    case 1: // COORD_SCREEN — 使用正交投影
-                        Log("Using orthographic projection for GUI vertices (SCREEN coords)");
-                        if (g_cbData) {
+                    case 1: // COORD_SCREEN — 使用窗口尺寸计算正交投影
+                        Log("Using orthographic projection for GUI vertices (SCREEN coords), window=%dx%d", g_w, g_h);
+                        {
+                            float w2 = (float)g_w / 2.0f;
+                            float h2 = (float)g_h / 2.0f;
                             float ortho[16] = {
-                                2.0f/854, 0, 0, -1,
-                                0, -2.0f/480, 0, 1,
+                                1.0f/w2, 0, 0, -1,
+                                0, -1.0f/h2, 0, 1,
                                 0, 0, 1, 0,
                                 0, 0, 0, 1
                             };
-                            memcpy(g_cbData, ortho, sizeof(ortho));
+                            memcpy(g_mvpScreen, ortho, sizeof(ortho));
+                            if (g_cbData) {
+                                memcpy(g_cbData, ortho, sizeof(ortho));
+                            }
                         }
                         break;
 
                     case 2: // COORD_NDC — 使用单位矩阵（不变换）
                         Log("Using identity matrix for NDC vertices (already in clip space)");
                         if (g_cbData) {
-                            float identity[16] = {
-                                1, 0, 0, 0,
-                                0, 1, 0, 0,
-                                0, 0, 1, 0,
-                                0, 0, 0, 1
-                            };
-                            memcpy(g_cbData, identity, sizeof(identity));
+                            memcpy(g_cbData, g_mvpNDC, sizeof(g_mvpNDC));
                         }
                         break;
 
                     default:
                         Log("WARNING: Unknown coordType=%d, using WORLD", g_currentCoordType);
+                        if (g_cbData) {
+                            memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+                        }
                         break;
                 }
                 // ===== 矩阵选择结束 =====
@@ -924,6 +1114,25 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     Log("Converted QUADS to TRIANGLES: %d vertices", vertexCount);
                 }
                 // ===== 四边形转换结束 =====
+
+                // ===== CPU端预转换顶点到NDC =====
+                if (g_cbData && vertexCount > 0) {
+                    float* mvp = (float*)g_cbData;
+                    for (int i = 0; i < vertexCount; i++) {
+                        float x = vertices[i * 3], y = vertices[i * 3 + 1], z = vertices[i * 3 + 2];
+                        float clipX = mvp[0]*x + mvp[1]*y + mvp[2]*z + mvp[3];
+                        float clipY = mvp[4]*x + mvp[5]*y + mvp[6]*z + mvp[7];
+                        float clipZ = mvp[8]*x + mvp[9]*y + mvp[10]*z + mvp[11];
+                        float clipW = mvp[12]*x + mvp[13]*y + mvp[14]*z + mvp[15];
+                        if (clipW != 0) {
+                            vertices[i * 3]     = clipX / clipW;
+                            vertices[i * 3 + 1] = clipY / clipW;
+                            vertices[i * 3 + 2] = clipZ / clipW;
+                        }
+                    }
+                    Log("Pre-transformed %d vertices to NDC on CPU", vertexCount);
+                }
+                // ===== NDC转换结束 =====
 
                 Log("RenderLoop: rendering %d vertices from new storage", vertexCount);
 
@@ -960,6 +1169,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     ch.vertexStride = sizeof(VertexPC);
                     ch.blend = false;
                     ch.textureId = 0;
+                    ch.vertexType = g_currentCoordType;
                     g_drawChunks.clear();
                     g_drawChunks.push_back(ch);
                     g_imVertCount = vertexCount;
@@ -1042,6 +1252,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
         // Layer 1: GL geometry
         {
+            // ===== Layer 0.5: 渲染天空 =====
+            Java_com_dx12_DX12LibClient_nativeRenderSky(nullptr, nullptr);
+            Log("  Sky rendered");
+
             EnterCriticalSection(&g_stateLock);
             auto chunks = g_drawChunks;
             UINT stateSnapshot = g_glStateBits;
@@ -1051,6 +1265,39 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             // 如需禁用，可通过 Java 端调用 nativeSetGlState(0, GLB_DEPTH)
 
             for (auto& ch : chunks) {
+                // ===== 每个 DrawChunk 独立设置常量缓冲区矩阵 =====
+                if (ch.vertexType == 0) { // COORD_WORLD
+                    if (g_cbData) {
+                        memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+                    }
+                } else if (ch.vertexType == 1) { // COORD_SCREEN
+                    float w = (float)g_w;
+                    float h = (float)g_h;
+                    float orthoMatrix[16] = {
+                        2.0f / w, 0.0f,       0.0f, -1.0f,
+                        0.0f,     -2.0f / h,  0.0f,  1.0f,
+                        0.0f,      0.0f,       1.0f,  0.0f,
+                        0.0f,      0.0f,       0.0f,  1.0f
+                    };
+                    if (g_cbData) {
+                        memcpy(g_cbData, orthoMatrix, sizeof(orthoMatrix));
+                    }
+                }
+                // 立即刷新常量缓冲区到 GPU（upload heap 写入可见性）
+                if (g_cbData) {
+                    void* cbMapped = nullptr;
+                    D3D12_RANGE writeRange = {};
+                    writeRange.Begin = 0;
+                    writeRange.End = g_cbSize;
+                    g_cbUpload->Map(0, &writeRange, &cbMapped);
+                    memcpy(cbMapped, g_cbData, g_cbSize);
+                    g_cbUpload->Unmap(0, &writeRange);
+                }
+                Log("DrawChunk: vertexType=%d (%s), vertices=%d",
+                    ch.vertexType,
+                    ch.vertexType == 0 ? "WORLD" : (ch.vertexType == 1 ? "SCREEN" : "NDC"),
+                    ch.vertexCount);
+
                 UINT state = stateSnapshot;
                 int variantIdx = (int)((state << 1) | (ch.textured ? 1 : 0));
                 bool isLine = (ch.topo == D3D_PRIMITIVE_TOPOLOGY_LINELIST || ch.topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
@@ -1089,15 +1336,52 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 chVbv.StrideInBytes = ch.vertexStride;
                 g_cl->IASetVertexBuffers(0, 1, &chVbv);
                 g_cl->IASetPrimitiveTopology(ch.topo);
+                Log("=== DRAW CALL: vertexCount=%d, stride=%d, bytes=%d, buffer=0x%llX, topo=%d",
+                    ch.vertexCount, ch.vertexStride, chVbv.SizeInBytes, chVbv.BufferLocation, ch.topo);
                 g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
+                Log("  DrawInstanced executed");
             }
         }
+
+        // ===== 渲染半透明物体 =====
+        Java_com_dx12_DX12LibClient_nativeRenderTransparent(nullptr, nullptr);
+        Log("  Transparent objects rendered");
 
         EnterCriticalSection(&g_stateLock);
         g_imVertCount = 0;
         g_imVBSize = 0;
         g_drawChunks.clear();
         LeaveCriticalSection(&g_stateLock);
+
+        // ===== 渲染粒子系统 =====
+        {
+            std::lock_guard<std::mutex> lock(g_particleMutex);
+            if (!g_particleDrawCalls.empty()) {
+                // 设置半透明 PSO
+                if (BuildAlphaBlendPSO() && g_rsSolidVariants[0]) {
+                    g_cl->SetGraphicsRootSignature(g_rsSolidVariants[0].Get());
+                    g_cl->SetPipelineState(g_psoAlphaBlend.Get());
+                    g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
+                }
+                Log("  Rendering %zu particle draw calls", g_particleDrawCalls.size());
+                for (size_t i = 0; i < g_particleDrawCalls.size(); i++) {
+                    auto& dc = g_particleDrawCalls[i];
+                    D3D12_VERTEX_BUFFER_VIEW vbView = {};
+                    vbView.BufferLocation = dc.gpuAddress;
+                    vbView.StrideInBytes = dc.vertexSize;
+                    vbView.SizeInBytes = dc.vertexCount * dc.vertexSize;
+                    g_cl->IASetVertexBuffers(0, 1, &vbView);
+                    g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    g_cl->DrawInstanced(dc.vertexCount, 1, 0, 0);
+                    Log("  Particle DC[%zu]: %d vertices, type=%s",
+                        i, dc.vertexCount,
+                        dc.type == VERTEX_TYPE_WORLD ? "WORLD" : "SCREEN");
+                }
+                g_particleDrawCalls.clear();
+                g_particlesPending = false;
+                Log("  All particles rendered, draw calls cleared");
+            }
+        }
 
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -1114,6 +1398,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_fence->SetEventOnCompletion(fv, g_fenceEv);
             WaitForSingleObject(g_fenceEv, INFINITE);
         }
+
+        // 确保GPU完成当前帧绘制后重置命令分配器和命令列表（防止CBV数据竞争）
+        g_alloc->Reset();
+        g_cl->Reset(g_alloc.Get(), nullptr);
     }
     Log("Render thread stopped, loopCount=%d, g_run=%d", loopCount, (int)g_run);
     return 0;
@@ -1312,6 +1600,7 @@ static void CleanupD3D12() {
         for (auto& p : g_rsSolidVariants) p.Reset();
         for (auto& p : g_psoLineVariants) p.Reset();
         for (auto& p : g_rsLineVariants) p.Reset();
+        g_psoAlphaBlend.Reset();
         g_psoTex.Reset(); g_rsTex.Reset(); g_texSrvHeap.Reset();
         g_texMap.clear(); g_texSlotMap.clear(); g_texSlotNext = 0;
         for (auto& r : g_rt) r.Reset();
@@ -1332,7 +1621,6 @@ static void CleanupD3D12() {
 
 // === JNI ===
 extern "C" {
-
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jclass cls) {
     // 调用 CleanupD3D12 清理资源
     CleanupD3D12();
@@ -1438,10 +1726,88 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadPixels(JNIEnv* en
     (void)buf; (void)w; (void)h;
 }
 
+// ==============================================
+// 自动判断顶点类型（C++ 端完整检测逻辑）
+// 在 vertexSize 字节的顶点数组中采样判断坐标空间
+// ==============================================
+static VertexType autoDetectVertexType(const float* vertices, UINT vertexCount, UINT vertexSize) {
+    if (vertexCount == 0 || vertexSize < 12) {
+        return VERTEX_TYPE_UNKNOWN;
+    }
+
+    float minX = 1e10f, maxX = -1e10f;
+    float minY = 1e10f, maxY = -1e10f;
+    float minZ = 1e10f, maxZ = -1e10f;
+
+    UINT stride = vertexSize / sizeof(float);
+    for (UINT i = 0; i < vertexCount; i++) {
+        UINT offset = i * stride;
+        float x = vertices[offset];
+        float y = vertices[offset + 1];
+        float z = vertices[offset + 2];
+
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+
+    float xRange = maxX - minX;
+    float yRange = maxY - minY;
+    float zRange = maxZ - minZ;
+
+    Log("=== 顶点类型自动检测 ===");
+    Log("  坐标范围: X[%.2f, %.2f] Y[%.2f, %.2f] Z[%.2f, %.2f]",
+        minX, maxX, minY, maxY, minZ, maxZ);
+    Log("  范围大小: X=%.2f, Y=%.2f, Z=%.2f", xRange, yRange, zRange);
+
+    // 条件0：天空盒特殊处理（Z值极大且范围固定）
+    if (minZ > 1000.0f && zRange < 1.0f) {
+        Log("  判定: 3D世界物体 (天空盒)");
+        return VERTEX_TYPE_WORLD;
+    }
+
+    // 条件0.5：粒子特殊处理（极小尺寸但有深度）
+    if (xRange < 1.0f && yRange < 1.0f && zRange > 0.01f) {
+        Log("  判定: 3D世界物体 (粒子)");
+        return VERTEX_TYPE_WORLD;
+    }
+
+    // 条件1：Z轴有明显深度变化 → 3D世界物体
+    if (zRange > 0.1f) {
+        Log("  判定: 3D世界物体 (Z轴深度变化明显)");
+        return VERTEX_TYPE_WORLD;
+    }
+
+    // 条件2：坐标超出屏幕范围 → 3D世界物体
+    const float SCREEN_MAX_X = 2560.0f;
+    const float SCREEN_MAX_Y = 1440.0f;
+    if (minX < -100.0f || maxX > SCREEN_MAX_X ||
+        minY < -100.0f || maxY > SCREEN_MAX_Y) {
+        Log("  判定: 3D世界物体 (坐标超出屏幕范围)");
+        return VERTEX_TYPE_WORLD;
+    }
+
+    // 条件3：Z值接近1.0（GUI常用深度值）且无深度变化 → 2D GUI
+    if (fabs(minZ - 1.0f) < 0.01f && fabs(maxZ - 1.0f) < 0.01f) {
+        Log("  判定: 2D GUI元素 (Z值固定为1.0)");
+        return VERTEX_TYPE_SCREEN;
+    }
+
+    // 条件4：极小尺寸且无深度变化 → 2D GUI
+    if (xRange < 50.0f && yRange < 50.0f && zRange < 0.01f) {
+        Log("  判定: 2D GUI元素 (极小尺寸且无深度变化)");
+        return VERTEX_TYPE_SCREEN;
+    }
+
+    // 默认：保守判定为3D世界物体
+    Log("  判定: 3D世界物体 (默认保守判定)");
+    return VERTEX_TYPE_WORLD;
+}
+
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* env, jclass, jfloatArray verts, jint count, jbyteArray colorArray, jint coordType) {
     // 存储坐标类型
     g_currentCoordType = coordType;
-    Log("nativeRecordVertices: coordType=%d (0=WORLD, 1=SCREEN, 2=NDC)", coordType);
+    Log("nativeRecordVertices: Java coordType=%d (0=WORLD, 1=SCREEN, 2=NDC)", coordType);
 
     if (!g_ok || !g_imVB || !verts || count <= 0) return;
 
@@ -1456,6 +1822,21 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     if (!EnsureIMVBCapacity(g_imVBSize + byteCount)) return;
     std::vector<jfloat> buf(len);
     env->GetFloatArrayRegion(verts, 0, len, buf.data());
+
+    // ===== C++ 端自动检测顶点类型，覆盖 Java 判定 =====
+    {
+        VertexType detected = autoDetectVertexType(buf.data(), safeCount, 3 * sizeof(float));
+        if (detected == VERTEX_TYPE_WORLD) {
+            g_currentCoordType = 0; // COORD_WORLD
+            Log("  C++ 检测结果: WORLD → 覆盖 coordType=0");
+        } else if (detected == VERTEX_TYPE_SCREEN) {
+            g_currentCoordType = 1; // COORD_SCREEN
+            Log("  C++ 检测结果: SCREEN → 覆盖 coordType=1");
+        } else {
+            Log("  C++ 检测结果: UNKNOWN → 保持 Java coordType=%d", coordType);
+        }
+    }
+    // ===== 顶点类型检测结束 =====
 
     // 读取颜色数据
     jbyte* colorData = nullptr;
@@ -1544,6 +1925,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv
     ch.vertexStride = sizeof(VertexPT);
     ch.blend = (g_glStateBits & GLB_BLEND) != 0;
     ch.textureId = g_pendingTextureId;
+    ch.vertexType = g_currentCoordType;
     g_drawChunks.push_back(ch);
 
     void* dst = nullptr;
@@ -1616,7 +1998,11 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDrawTexture(JNIEnv*,
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetTexture(JNIEnv*, jclass, jint texId) { g_currentTexId = texId; }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTextureEx(JNIEnv* env, jclass, jbyteArray pixels, jint w, jint h, jint texId) {
-    if (!g_ok || !pixels) return;
+    if (!g_dev || !g_queue || !g_rtvHeap) {
+        Log("WARN: nativeUploadTextureEx called before D3D12 full init, skip");
+        return;
+    }
+    if (!pixels) return;
     jsize len = env->GetArrayLength(pixels);
     std::vector<jbyte> buf(len);
     env->GetByteArrayRegion(pixels, 0, len, buf.data());
@@ -1655,15 +2041,21 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDepthMask(JNIEnv*, j
     LeaveCriticalSection(&g_stateLock);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jclass, jfloatArray matrix) {
-    Log("=== nativeSetMvp CALLED ===");
-    if (!g_cbData) {
-        Log("nativeSetMvp: g_cbData is NULL!");
-        return;
-    }
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jclass, jfloatArray matrix, jint coordType) {
+    Log("=== nativeSetMvp CALLED (coordType=%d) ===", coordType);
     jfloat* src = env->GetFloatArrayElements(matrix, nullptr);
     if (src) {
-        memcpy(g_cbData, src, 64);
+        // 根据 coordType 存储到不同的矩阵
+        switch (coordType) {
+            case 0: memcpy(g_mvpWorld, src, 64); break;
+            case 1: memcpy(g_mvpScreen, src, 64); break;
+            case 2: memcpy(g_mvpNDC, src, 64); break;
+            default: Log("nativeSetMvp: unknown coordType=%d", coordType); break;
+        }
+        // 同时更新 g_cbData（用于当前帧渲染）
+        if (g_cbData) {
+            memcpy(g_cbData, src, 64);
+        }
         Log("MVP matrix set: [%.3f %.3f %.3f %.3f]", src[0], src[1], src[2], src[3]);
         Log("MVP matrix set: [%.3f %.3f %.3f %.3f]", src[4], src[5], src[6], src[7]);
         Log("MVP matrix set: [%.3f %.3f %.3f %.3f]", src[8], src[9], src[10], src[11]);
@@ -1685,6 +2077,58 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsD3D12Active(JNIEn
 }
 
 // === Phase 3: Sky, Terrain, Entity, Particle ===
+
+// 通用顶点数据上传函数（供粒子、实体、天空盒复用）
+static bool UploadVertexData(const float* data, UINT count, UINT vertexSize,
+                              ComPtr<ID3D12Resource>& outUploadBuffer,
+                              D3D12_GPU_VIRTUAL_ADDRESS& outGpuAddress) {
+    UINT totalSize = count * vertexSize;
+
+    D3D12_HEAP_PROPERTIES uploadProps = {};
+    uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    uploadProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    uploadProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    uploadProps.CreationNodeMask = 1;
+    uploadProps.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = totalSize;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufferDesc.SampleDesc.Count = 1;
+    bufferDesc.SampleDesc.Quality = 0;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = g_dev->CreateCommittedResource(
+        &uploadProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&outUploadBuffer));
+
+    if (FAILED(hr)) {
+        Log("ERROR: Failed to create vertex upload buffer, hr=0x%08X", hr);
+        return false;
+    }
+
+    void* mappedData;
+    D3D12_RANGE readRange = {};
+    readRange.Begin = 0;
+    readRange.End = 0;
+    hr = outUploadBuffer->Map(0, &readRange, &mappedData);
+    if (FAILED(hr)) {
+        Log("ERROR: Failed to map upload buffer, hr=0x%08X", hr);
+        return false;
+    }
+
+    memcpy(mappedData, data, totalSize);
+    outUploadBuffer->Unmap(0, nullptr);
+    outGpuAddress = outUploadBuffer->GetGPUVirtualAddress();
+
+    return true;
+}
+
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv*, jclass, jint vertexCount) {
     (void)vertexCount;
     OutputDebugStringA("nativeDraw: called, signaling render thread\n");
@@ -1696,8 +2140,99 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv*, jclass, j
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jclass) {
-    // 使用 g_skyParams 渲染天空盒
-    // 目前用简单颜色填充，后续可扩展为球体/穹顶
+    if (!g_dev || !g_cl || !g_cbData) return;
+
+    // 设置半透明 PSO（支持带 alpha 的天空颜色）
+    if (!BuildAlphaBlendPSO() || !g_rsSolidVariants[0]) return;
+    g_cl->SetGraphicsRootSignature(g_rsSolidVariants[0].Get());
+    g_cl->SetPipelineState(g_psoAlphaBlend.Get());
+    g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
+
+    std::lock_guard<std::mutex> lock(g_skyMutex);
+
+    // 1. 渲染天空渐变背景（全屏四边形，使用 VertexPC 格式）
+    {
+        float r0 = g_skyColor[0], g0 = g_skyColor[1], b0 = g_skyColor[2], a0 = g_skyColor[3];
+        float r1 = r0 * 0.5f, g1 = g0 * 0.5f, b1 = b0 * 0.8f;
+        struct SkyVertex { float x, y, z; uint32_t color; };
+        SkyVertex skyVerts[4] = {
+            {-1, -1, 0, ((uint32_t)(uint8_t)(r0*255) | ((uint32_t)(uint8_t)(g0*255) << 8) | ((uint32_t)(uint8_t)(b0*255) << 16) | ((uint32_t)(uint8_t)(a0*255) << 24))},
+            { 1, -1, 0, ((uint32_t)(uint8_t)(r0*255) | ((uint32_t)(uint8_t)(g0*255) << 8) | ((uint32_t)(uint8_t)(b0*255) << 16) | ((uint32_t)(uint8_t)(a0*255) << 24))},
+            {-1,  1, 0, ((uint32_t)(uint8_t)(r1*255) | ((uint32_t)(uint8_t)(g1*255) << 8) | ((uint32_t)(uint8_t)(b1*255) << 16) | ((uint32_t)(uint8_t)(a0*255) << 24))},
+            { 1,  1, 0, ((uint32_t)(uint8_t)(r1*255) | ((uint32_t)(uint8_t)(g1*255) << 8) | ((uint32_t)(uint8_t)(b1*255) << 16) | ((uint32_t)(uint8_t)(a0*255) << 24))},
+        };
+        ComPtr<ID3D12Resource> skyBuf;
+        D3D12_GPU_VIRTUAL_ADDRESS skyAddr;
+        if (UploadVertexData((float*)skyVerts, 4, sizeof(SkyVertex), skyBuf, skyAddr)) {
+            float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            memcpy(g_cbData, ident, sizeof(ident));
+            void* cbMapped;
+            D3D12_RANGE writeRange = {};
+            writeRange.Begin = 0;
+            writeRange.End = g_cbSize;
+            g_cbUpload->Map(0, &writeRange, &cbMapped);
+            memcpy(cbMapped, g_cbData, g_cbSize);
+            g_cbUpload->Unmap(0, &writeRange);
+            D3D12_VERTEX_BUFFER_VIEW vbView = {};
+            vbView.BufferLocation = skyAddr;
+            vbView.StrideInBytes = sizeof(SkyVertex);
+            vbView.SizeInBytes = 4 * sizeof(SkyVertex);
+            g_cl->IASetVertexBuffers(0, 1, &vbView);
+            g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            g_cl->DrawInstanced(4, 1, 0, 0);
+        }
+    }
+
+    // 2. 渲染太阳
+    {
+        float sunSize = 0.15f;
+        float sunX = cosf(g_sunAngle) * 0.8f;
+        float sunY = sinf(g_sunAngle) * 0.8f;
+        struct SkyVertex { float x, y, z; uint32_t color; };
+        uint32_t sunCol = (255 | (255 << 8) | (200 << 16) | (255 << 24));
+        SkyVertex sunVerts[4] = {
+            {sunX - sunSize, sunY - sunSize, 0, sunCol},
+            {sunX + sunSize, sunY - sunSize, 0, sunCol},
+            {sunX - sunSize, sunY + sunSize, 0, sunCol},
+            {sunX + sunSize, sunY + sunSize, 0, sunCol},
+        };
+        ComPtr<ID3D12Resource> sunBuf;
+        D3D12_GPU_VIRTUAL_ADDRESS sunAddr;
+        if (UploadVertexData((float*)sunVerts, 4, sizeof(SkyVertex), sunBuf, sunAddr)) {
+            D3D12_VERTEX_BUFFER_VIEW vbView = {};
+            vbView.BufferLocation = sunAddr;
+            vbView.StrideInBytes = sizeof(SkyVertex);
+            vbView.SizeInBytes = 4 * sizeof(SkyVertex);
+            g_cl->IASetVertexBuffers(0, 1, &vbView);
+            g_cl->DrawInstanced(4, 1, 0, 0);
+        }
+    }
+
+    // 3. 渲染月亮
+    {
+        float moonSize = 0.1f;
+        float moonX = cosf(g_moonAngle) * 0.8f;
+        float moonY = sinf(g_moonAngle) * 0.8f;
+        struct SkyVertex { float x, y, z; uint32_t color; };
+        uint32_t moonCol = (230 | (230 << 8) | (255 << 16) | (255 << 24));
+        SkyVertex moonVerts[4] = {
+            {moonX - moonSize, moonY - moonSize, 0, moonCol},
+            {moonX + moonSize, moonY - moonSize, 0, moonCol},
+            {moonX - moonSize, moonY + moonSize, 0, moonCol},
+            {moonX + moonSize, moonY + moonSize, 0, moonCol},
+        };
+        ComPtr<ID3D12Resource> moonBuf;
+        D3D12_GPU_VIRTUAL_ADDRESS moonAddr;
+        if (UploadVertexData((float*)moonVerts, 4, sizeof(SkyVertex), moonBuf, moonAddr)) {
+            D3D12_VERTEX_BUFFER_VIEW vbView = {};
+            vbView.BufferLocation = moonAddr;
+            vbView.StrideInBytes = sizeof(SkyVertex);
+            vbView.SizeInBytes = 4 * sizeof(SkyVertex);
+            g_cl->IASetVertexBuffers(0, 1, &vbView);
+            g_cl->DrawInstanced(4, 1, 0, 0);
+        }
+    }
+    Log("nativeRenderSky: sky+sun+moon rendered");
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTerrain(JNIEnv*, jclass) {
@@ -1705,26 +2240,216 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTerrain(JNIEnv*, 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadEntities(JNIEnv* env, jclass, jfloatArray entityData, jint count) {
+    if (!g_dev || !g_queue || !g_rtvHeap) {
+        Log("WARN: nativeUploadEntities called before D3D12 full init, skip");
+        return;
+    }
     // 批量上传实体数据到 GPU
     (void)env; (void)entityData; (void)count;
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderEntities(JNIEnv*, jclass) {
+    if (!g_dev || !g_queue || !g_rtvHeap) {
+        Log("WARN: nativeRenderEntities called before D3D12 full init, skip");
+        return;
+    }
     // 绘制所有实体
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters(JNIEnv* env, jclass, jfloatArray params) {
-    // 存储天空参数供 RenderLoop 使用
-    (void)env; (void)params;
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFFF
+(JNIEnv* env, jclass clazz, jfloat r, jfloat g, jfloat b, jfloat a, jfloat sunAngle, jfloat moonAngle) {
+    if (!g_dev || !g_queue || !g_rtvHeap) {
+        Log("WARN: nativeSetSkyParameters called before D3D12 full init, skip");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_skyMutex);
+    g_skyColor[0] = r;
+    g_skyColor[1] = g;
+    g_skyColor[2] = b;
+    g_skyColor[3] = a;
+    g_sunAngle = sunAngle;
+    g_moonAngle = moonAngle;
+    Log("nativeSetSkyParameters: color[%.2f,%.2f,%.2f,%.2f] sun=%.2f moon=%.2f", r, g, b, a, sunAngle, moonAngle);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles(JNIEnv* env, jclass, jfloatArray particles, jint count) {
-    // 上传粒子数据到 GPU
-    (void)env; (void)particles; (void)count;
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
+(JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize) {
+    if (!g_dev) {
+        Log("ERROR: nativeUploadParticles called before D3D12 initialization");
+        return;
+    }
+
+    if (count <= 0 || vertexSize <= 0) {
+        Log("WARNING: nativeUploadParticles invalid params (count=%d, vertexSize=%d)", count, vertexSize);
+        return;
+    }
+
+    jfloat* data = env->GetFloatArrayElements(vertices, nullptr);
+    if (!data) {
+        Log("ERROR: nativeUploadParticles failed to get vertex array");
+        return;
+    }
+
+    Log("=== nativeUploadParticles ===");
+    Log("  count=%d, vertexSize=%d, totalBytes=%d", count, vertexSize, count * vertexSize);
+
+    VertexType vertexType = autoDetectVertexType(data, count, vertexSize);
+    Log("  vertexType=%s", vertexType == VERTEX_TYPE_WORLD ? "WORLD" : "SCREEN");
+
+    ParticleDrawCall drawCall;
+    drawCall.vertexCount = count;
+    drawCall.vertexSize = vertexSize;
+    drawCall.type = vertexType;
+
+    if (!UploadVertexData(data, count, vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
+        env->ReleaseFloatArrayElements(vertices, data, JNI_ABORT);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_particleMutex);
+        g_particleDrawCalls.push_back(std::move(drawCall));
+        g_particlesPending = true;
+        Log("  Particle draw call queued (total=%zu)", g_particleDrawCalls.size());
+    }
+
+    env->ReleaseFloatArrayElements(vertices, data, JNI_ABORT);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles(JNIEnv*, jclass) {
-    // 绘制所有粒子
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles
+(JNIEnv* env, jclass clazz) {
+    if (!g_dev || !g_cl) {
+        Log("ERROR: nativeRenderParticles called without D3D12 context");
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_particleMutex);
+
+    if (g_particleDrawCalls.empty()) {
+        return;
+    }
+
+    Log("=== nativeRenderParticles ===");
+    Log("  Rendering %zu particle draw calls", g_particleDrawCalls.size());
+
+    for (size_t i = 0; i < g_particleDrawCalls.size(); i++) {
+        auto& dc = g_particleDrawCalls[i];
+
+        D3D12_VERTEX_BUFFER_VIEW vbView = {};
+        vbView.BufferLocation = dc.gpuAddress;
+        vbView.StrideInBytes = dc.vertexSize;
+        vbView.SizeInBytes = dc.vertexCount * dc.vertexSize;
+
+        g_cl->IASetVertexBuffers(0, 1, &vbView);
+        g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_cl->DrawInstanced(dc.vertexCount, 1, 0, 0);
+
+        Log("  Particle DC[%zu]: %d vertices, type=%s",
+            i, dc.vertexCount,
+            dc.type == VERTEX_TYPE_WORLD ? "WORLD" : "SCREEN");
+    }
+
+    g_particleDrawCalls.clear();
+    g_particlesPending = false;
+    Log("  All particles rendered, draw calls cleared");
+}
+
+// ==============================================
+// 半透明渲染 JNI 函数
+// ==============================================
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
+(JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize, jfloat distance) {
+    if (!g_dev || count <= 0 || vertexSize <= 0) return;
+
+    jfloat* data = env->GetFloatArrayElements(vertices, nullptr);
+    if (!data) return;
+
+    TransparentDrawCall drawCall;
+    drawCall.vertexCount = count;
+    drawCall.vertexSize = vertexSize;
+    drawCall.distance = distance;
+    drawCall.type = autoDetectVertexType(data, count, vertexSize);
+
+    if (UploadVertexData(data, count, vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
+        std::lock_guard<std::mutex> lock(g_transparentMutex);
+        g_transparentDrawCalls.push_back(std::move(drawCall));
+        Log("nativeUploadTransparent: queued %d verts, distance=%.2f (total=%zu)",
+            count, distance, g_transparentDrawCalls.size());
+    }
+
+    env->ReleaseFloatArrayElements(vertices, data, JNI_ABORT);
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
+(JNIEnv* env, jclass clazz) {
+    if (!g_cl) return;
+
+    std::lock_guard<std::mutex> lock(g_transparentMutex);
+
+    if (g_transparentDrawCalls.empty()) return;
+
+    // 按距离相机从远到近排序（半透明物体必须先画远的再画近的）
+    std::sort(g_transparentDrawCalls.begin(), g_transparentDrawCalls.end(),
+        [](const TransparentDrawCall& a, const TransparentDrawCall& b) {
+            return a.distance > b.distance;
+        });
+
+    Log("nativeRenderTransparent: rendering %zu transparent draw calls",
+        g_transparentDrawCalls.size());
+
+    // 设置半透明 PSO
+    if (BuildAlphaBlendPSO() && g_rsSolidVariants[0]) {
+        g_cl->SetGraphicsRootSignature(g_rsSolidVariants[0].Get());
+        g_cl->SetPipelineState(g_psoAlphaBlend.Get());
+        g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
+    }
+
+    for (auto& dc : g_transparentDrawCalls) {
+        // 根据类型设置投影矩阵
+        if (dc.type == VERTEX_TYPE_WORLD) {
+            if (g_cbData) {
+                memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+            }
+        } else if (dc.type == VERTEX_TYPE_SCREEN) {
+            float w = (float)g_w;
+            float h = (float)g_h;
+            float ortho[16] = {
+                2.0f / w, 0.0f, 0.0f, -1.0f,
+                0.0f, -2.0f / h, 0.0f, 1.0f,
+                0.0f, 0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f
+            };
+            if (g_cbData) {
+                memcpy(g_cbData, ortho, sizeof(ortho));
+            }
+        }
+        // 刷新常量缓冲区
+        if (g_cbUpload && g_cbData) {
+            void* cbMapped;
+            D3D12_RANGE writeRange = {};
+            writeRange.Begin = 0;
+            writeRange.End = g_cbSize;
+            g_cbUpload->Map(0, &writeRange, &cbMapped);
+            memcpy(cbMapped, g_cbData, g_cbSize);
+            g_cbUpload->Unmap(0, &writeRange);
+        }
+
+        D3D12_VERTEX_BUFFER_VIEW vbView = {};
+        vbView.BufferLocation = dc.gpuAddress;
+        vbView.StrideInBytes = dc.vertexSize;
+        vbView.SizeInBytes = dc.vertexCount * dc.vertexSize;
+
+        g_cl->IASetVertexBuffers(0, 1, &vbView);
+        g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_cl->DrawInstanced(dc.vertexCount, 1, 0, 0);
+
+        Log("  Transparent DC: %d verts, distance=%.2f, type=%s",
+            dc.vertexCount, dc.distance,
+            dc.type == VERTEX_TYPE_WORLD ? "WORLD" : "SCREEN");
+    }
+
+    g_transparentDrawCalls.clear();
+    Log("  All transparent draw calls cleared");
 }
 
 }

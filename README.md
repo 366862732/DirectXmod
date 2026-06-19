@@ -6,17 +6,9 @@
 
 ## 当前状态
 
-**阶段 3 开发中** — 阶段 1+2 已完成并稳定运行，阶段 3 Java 侧已实现（LevelRenderer 拦截 + 多渲染对象捕获），C++ 侧天空/实体/粒子渲染待完成。
-
-好的，我已经仔细阅读了你提供的`README.md`文件。根据我们上一次对话中确认的进展——即**Java端`processMeshData`已成功运行并发送多种顶点数据**，以及**当前核心阻塞点在于C++端的数据接收与渲染**——我来帮你更新README，使其更准确地反映项目当前的真实状态。
-
-以下是更新后的`README.md`相关章节内容，你可以直接替换原有部分：
+**阶段 3 开发中** — 阶段 1+2 已完成并稳定运行。阶段 3 的 Java 侧数据提取与拦截已实现并验证通过，**C++ 侧核心渲染管线已打通**，粒子/实体/液体/纹理基础框架已实现，进入功能完善阶段。
 
 ---
-
-### 当前状态
-
-**阶段 3 开发中** — 阶段 1+2 已完成并稳定运行。阶段 3 的Java侧数据提取与拦截已实现并验证通过，**当前工作重心已转移至C++/D3D12端的顶点数据消费与绘制实现**。
 
 ### 功能进度一览
 
@@ -32,48 +24,58 @@
 | F3 调试信息注入 | ✅ 已完成 | DebugScreenOverlay 替换 OpenGL 为 D3D12 信息 |
 | GlDraw/GlBuffer 被动监听 | ✅ 已完成 | GL15/GL11 Mixin 跟踪 GL 状态变化 |
 | LevelRenderer 拦截 | ✅ 已完成 | `renderLevel` HEAD 拦截，取消 OpenGL 渲染 |
-| BufferBuilder 数据捕获与提取 | ✅ 已完成 | `build()` RETURN 钩子，支持多种顶点格式 (16/24/28/72字节) 解析并发送至C++端 |
-| 天空数据提取 | 🟡 Java 完成 | SkyboxExtractor 提取 skyColor/sunAngle/moonAngle 等，C++端待实现 |
-| 粒子数据提取 | 🟡 Java 完成 | ParticleExtractor 反射解析 QuadParticleRenderState，C++端待实现 |
-| 实体状态捕获 | 🟡 Java 完成 | EntityRenderDispatcherMixin 捕获 EntityRenderState，C++端待实现 |
-| **C++端顶点数据接收与GPU上传** | 🔴 **进行中** | **当前主要瓶颈**。需在`d3d12bridge.cpp`中完善JNI函数，创建顶点缓冲区并上传数据 |
-| **C++端绘制命令调用** | 🔴 **进行中** | 需在渲染循环中正确设置顶点缓冲区视图并调用`DrawInstanced` |
-| 天空 D3D12 渲染 | ❌ 待实现 | C++ 侧 nativeRenderSky 待实现 |
-| 实体 D3D12 渲染 | ❌ 待实现 | C++ 侧 nativeUploadEntities/nativeRenderEntities 待实现 |
-| 粒子 D3D12 渲染 | ❌ 待实现 | C++ 侧 nativeUploadParticles/nativeRenderParticles 待实现 |
+| BufferBuilder 数据捕获与提取 | ✅ 已完成 | 支持多种顶点格式 (16/24/28/72字节) 解析并发送至C++端 |
+| **顶点类型自动检测** | ✅ 已完成 | `autoDetectVertexType` 6条规则区分 WORLD/SCREEN/NDC |
+| **纹理采样基础** | ✅ 已完成 | 纹理上传、SRV管理、资源状态转换 |
+| **粒子系统基础** | ✅ 已完成 | `nativeUploadParticles`/`nativeRenderParticles` 框架 |
+| **实体渲染基础** | ✅ 已完成 | `nativeUploadEntities`/`nativeRenderEntities` 模型矩阵支持 |
+| **液体渲染框架** | ✅ 已完成 | `nativeUploadLiquid`/`nativeRenderLiquid` 水和岩浆支持 |
+| 天空盒 D3D12 渲染 | 🟡 开发中 | 天空参数已同步，渲染实现中 |
+| 半透明物体渲染 | 🟡 开发中 | 深度排序和混合状态待完善 |
+| 太阳/月亮/星星渲染 | 🟡 开发中 | 位置计算已实现，渲染待完善 |
 | 多 Pass 渲染（半透明/GUI） | ❌ 未开始 | |
 | Shader 系统 + 后处理 | ❌ 未开始 | |
+
+---
 
 ### 关键组件
 
 | 组件 | 文件 | 说明 |
 |------|------|------|
 | C++ 核心 | `d3d12bridge.cpp` | D3D12 设备、SwapChain、PSO、顶点缓冲、纹理、GDI 捕获、多线程渲染。**当前开发焦点** |
-| JNI 桥接 | `DX12LibClient.java` | 25 个 native 方法声明（含阶段 3 预留），**需验证数据传递正确性** |
-| 业务逻辑 | `D3D12Bridge.java` | 顶点展开、矩阵同步、全帧编排、反射调用。**Java端数据提取已稳定** |
+| JNI 桥接 | `DX12LibClient.java` | 35+ native 方法声明（纹理/实体/粒子/液体/天空） |
+| 业务逻辑 | `D3D12Bridge.java` | 顶点展开、矩阵同步、全帧编排、反射调用 |
 | Mod 入口 | `Dx12Mod.java` | F6 热键、DLL 加载、HWND 传递、启动诊断 |
 | 渲染提取器 | `SkyboxExtractor.java` | 从 SkyRenderState 提取天空参数 |
 | 渲染提取器 | `ParticleExtractor.java` | 反射解析 QuadParticleRenderState 粒子数据 |
 | 库加载 | `NativeUtils.java` | 从 JAR 提取 DLL 到临时目录并加载 |
 | Mixin | `LevelRendererMixin.java` | 拦截 `renderLevel()` 取消 OpenGL |
-| Mixin | `BufferBuilderMixin.java` | 拦截 `build()` 提取 MeshData，**已支持多种顶点格式** |
+| Mixin | `BufferBuilderMixin.java` | 拦截 `build()` 提取 MeshData，支持多种顶点格式 |
 | Mixin | `EntityRenderDispatcherMixin.java` | 拦截 `extractEntity()` 捕获实体状态 |
 | Mixin | `ParticleEngineMixin.java` | 拦截 `extract()` 捕获粒子状态 |
-| Mixin | `GlBufferMixin.java` | 被动监听 GL15 缓冲操作 |
-| Mixin | `GlDrawMixin.java` | 被动监听 GL11 渲染状态 |
-| Mixin | `DebugScreenMixin.java` | F3 调试屏幕注入 D3D12 信息 |
+
+---
 
 ### 顶点数据流
-
-```
 BufferBuilder.build()
-  → BufferBuilderMixin (RETURN 钩子)
-    → D3D12Bridge.processMeshData()
-      1. 反射读取 DrawState → VertexFormat → ByteBuffer
-      2. 动态识别vertexSize(16/24/28/72等)，按偏移量解析位置、颜色、UV
-      3. 提取 position(xyz), color(ABGR→RGBA), uv (已通过日志验证)
-      4. nativeRecordVertices() → 数据发送至C++端 (下一步需在C++端实现接收与GPU上传)
-```
+→ BufferBuilderMixin (RETURN 钩子)
+→ D3D12Bridge.processMeshData()
+
+反射读取 DrawState → VertexFormat → ByteBuffer
+
+动态识别vertexSize(16/24/28/72等)，按偏移量解析位置、颜色、UV
+
+提取 position(xyz), color(ABGR→RGBA), uv (已通过日志验证)
+
+autoDetectVertexType() → 自动判定 WORLD/SCREEN/NDC
+
+nativeRecordVertices() → 数据发送至C++端 (每个DrawCall独立存储类型)
+
+C++端根据类型使用透视/正交投影矩阵
+
+text
+
+---
 
 ### 已解决的问题
 
@@ -86,18 +88,39 @@ BufferBuilder.build()
 | 黑屏残留 | 窗口缩放后未强制重绘 | `InvalidateRect()` + `UpdateWindow()` |
 | 投影矩阵缺失 | MC 26.1.2 无 `getProjectionMatrix()` | CameraRenderState 反射 或 FOV 手动计算 |
 | 多线程渲染崩溃 | 顶点数据上传和渲染线程竞态 | `std::mutex` + `g_frameReadyEvent` 同步 |
-| VertexFormat 反射失败 | MC 26.1.2 类名变化 | **动态识别并硬编码多种顶点布局偏移量（16/24/28/72字节）** |
+| VertexFormat 反射失败 | MC 26.1.2 类名变化 | 动态识别并硬编码多种顶点布局偏移量 |
 | F3 闪烁/长文本 | Sodium 多 Pass 触发多次 extractLines | 节流 + 紧凑 GPU 名称 |
-| DebugScreenOverlay 类名 | MC 26.1.2 Mojang 映射未知 | 运行时反射枚举全部方法 + fields |
-| **Java端数据提取异常** | **索引越界** | **已修复。通过增加日志和动态偏移量适配，成功提取多种顶点格式** |
+| Java端数据提取异常 | 索引越界 | 增加日志和动态偏移量适配 |
+| **0xc010 空指针崩溃** | **JNI函数在D3D12初始化前被调用** | **所有JNI函数增加D3D核心对象空校验** |
+| **3D物品误判为2D GUI** | **顶点类型检测缺少Z轴深度** | **增加Z轴深度检测规则** |
+| **SRV堆管理错误** | **所有纹理共享同一描述符** | **每个纹理独立SRV偏移量** |
 
 ---
 
-### 🔍 核心更新说明
+### 近期更新
 
-1.  **状态更精确**：明确阶段3的Java侧工作（数据提取）已完成并通过日志验证，当前瓶颈已转移到**C++端的数据消费**。
-2.  **功能进度细化**：新增了“C++端顶点数据接收与GPU上传”和“C++端绘制命令调用”两项，并标注为“进行中”，清晰反映了当前最紧急的任务。
-3.  **技术细节更新**：在“顶点数据流”和“已解决的问题”中，补充了`vertexSize`动态识别和多种格式支持的信息，与你的日志输出（16, 24, 28, 72字节）保持一致。
-4.  **焦点明确**：在“关键组件”中高亮`d3d12bridge.cpp`为当前开发焦点，帮助团队或协作者快速抓住工作重心。
+| 日期 | 提交 | 内容 |
+|------|------|------|
+| 2026-06-19 | `v0.3.0` | 粒子/实体/液体/纹理基础框架；顶点类型自动检测；0xc010空指针修复 |
+| 2026-06-18 | `v0.2.0` | 阶段2完成：GDI背景捕获、几何叠加、MVP同步 |
+| 2026-06-17 | `v0.1.0` | 阶段1完成：D3D12覆盖层窗口、SwapChain渲染 |
 
-这份更新后的README能更真实地反映项目进展，特别是清晰地指出了下一个需要攻克的技术高地——C++/D3D12端的数据接收、上传与绘制集成。如果有其他部分需要调整，随时告诉我。
+---
+
+### 下一步计划
+
+1. **完成天空盒渲染** — `nativeRenderSky` 实现
+2. **完成半透明渲染** — 深度排序 + alpha混合
+3. **完善粒子系统** — 粒子动画和纹理支持
+4. **实体模型完整支持** — 骨骼动画和蒙皮
+5. **多Pass渲染** — 半透明/GUI分层渲染
+
+---
+
+## 许可证
+
+MIT
+
+## 仓库
+
+[https://github.com/366862732/DirectXmod](https://github.com/366862732/DirectXmod)

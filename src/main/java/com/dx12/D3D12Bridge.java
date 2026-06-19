@@ -1,3 +1,7 @@
+/*
+晚上编译不准给我报错
+**/
+//不准抽风
 package com.dx12;
 
 import java.lang.reflect.Method;
@@ -150,8 +154,8 @@ public class D3D12Bridge {
             Matrix4f mvMat = new Matrix4f().set(mv);
             pMat.mul(mvMat).get(mvp);
 
-            System.out.println("[GL4DX12] syncMatrices: calling nativeSetMvp with matrix");
-            DX12LibClient.nativeSetMvp(mvp);
+            System.out.println("[GL4DX12] syncMatrices: calling nativeSetMvp with WORLD matrix");
+            DX12LibClient.nativeSetMvp(mvp, 0); // 0 = COORD_WORLD
 
             // 诊断：验证矩阵有效性
             boolean hasNonZero = false;
@@ -181,16 +185,22 @@ public class D3D12Bridge {
      * 使用硬编码的顶点布局，绕过 VertexFormat.elements() 的兼容性问题
      */
     /**
-     * 检测顶点坐标空间类型
+     * 检测顶点坐标空间类型（改进版，使用 ByteBuffer 和窗口尺寸）
      */
+    private static int cachedWindowWidth = -1;
+    private static int cachedWindowHeight = -1;
+    private static long lastWindowCheck = 0;
+
     private static int detectCoordSpace(float[] vertices, int vertexCount) {
         if (vertexCount == 0) return COORD_WORLD;
 
+        // 采样前100个顶点或全部
+        int sampleCount = Math.min(vertexCount, 100);
         float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE;
         float minY = Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
         float minZ = Float.MAX_VALUE, maxZ = -Float.MAX_VALUE;
 
-        for (int i = 0; i < vertexCount; i++) {
+        for (int i = 0; i < sampleCount; i++) {
             int idx = i * 3;
             float x = vertices[idx], y = vertices[idx + 1], z = vertices[idx + 2];
             if (x < minX) minX = x; if (x > maxX) maxX = x;
@@ -198,21 +208,63 @@ public class D3D12Bridge {
             if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
         }
 
-        // 检测 NDC 坐标（在 [-1, 1] 范围内）
-        if (minX >= -1.1f && maxX <= 1.1f &&
-            minY >= -1.1f && maxY <= 1.1f &&
-            minZ >= -1.1f && maxZ <= 1.1f) {
+        // 规则1：NDC检测 - 所有值在 [-1.1, 1.1] 范围内
+        if (maxX <= 1.1f && minX >= -1.1f &&
+            maxY <= 1.1f && minY >= -1.1f &&
+            maxZ <= 1.1f && minZ >= -1.1f) {
+            System.out.printf("[GL4DX12] detectCoordSpace: NDC (X[%.1f,%.1f] Y[%.1f,%.1f])%n", minX, maxX, minY, maxY);
             return COORD_NDC;
         }
 
-        // 检测屏幕坐标（Z=0，X/Y 在 0-854/0-480 范围内）
-        if (minZ == 0.0f && maxZ == 0.0f &&
-            minX >= 0 && maxX <= 854 &&
-            minY >= 0 && maxY <= 480) {
+        // 规则2：屏幕坐标检测
+        int[] screenSize = getScreenSize();
+        int width = screenSize[0], height = screenSize[1];
+        float margin = 50.0f;
+        boolean likelyScreenX = (minX >= -margin && maxX <= width + margin);
+        boolean likelyScreenY = (minY >= -margin && maxY <= height + margin);
+        boolean likelyScreenZ = (minZ >= -0.1f && maxZ <= 0.1f);
+        boolean notTooLarge = (maxX < 5000 && maxY < 5000);
+
+        if (likelyScreenX && likelyScreenY && likelyScreenZ && notTooLarge) {
+            // 检测是否有深度变化：3D世界顶点通常有非零的Z值变化
+            // 而2D屏幕/HUD顶点Z值通常全部为0
+            boolean hasDepth = (maxZ - minZ) > 0.1f;
+            if (hasDepth) {
+                System.out.printf("[GL4DX12] detectCoordSpace: WORLD (has depth: Z[%.2f,%.2f])%n", minZ, maxZ);
+                return COORD_WORLD;
+            }
+            System.out.printf("[GL4DX12] detectCoordSpace: SCREEN (X[%.1f,%.1f] Y[%.1f,%.1f] screen=%dx%d)%n",
+                              minX, maxX, minY, maxY, width, height);
             return COORD_SCREEN;
         }
 
+        // 规则3：世界坐标 - 大范围值
+        if (maxX - minX > 100 || maxY - minY > 100 || maxZ - minZ > 1) {
+            System.out.printf("[GL4DX12] detectCoordSpace: WORLD (X[%.1f,%.1f] Y[%.1f,%.1f] Z[%.1f,%.1f])%n",
+                              minX, maxX, minY, maxY, minZ, maxZ);
+            return COORD_WORLD;
+        }
+
+        System.out.printf("[GL4DX12] detectCoordSpace: default WORLD (X[%.1f,%.1f] Y[%.1f,%.1f])%n", minX, maxX, minY, maxY);
         return COORD_WORLD;
+    }
+
+    private static int[] getScreenSize() {
+        long now = System.currentTimeMillis();
+        if (cachedWindowWidth < 0 || now - lastWindowCheck > 500) {
+            try {
+                Object mc = Class.forName("net.minecraft.client.Minecraft")
+                    .getMethod("getInstance").invoke(null);
+                Object window = mc.getClass().getMethod("getWindow").invoke(mc);
+                cachedWindowWidth = (int) window.getClass().getMethod("getWidth").invoke(window);
+                cachedWindowHeight = (int) window.getClass().getMethod("getHeight").invoke(window);
+                lastWindowCheck = now;
+            } catch (Exception e) {
+                cachedWindowWidth = 1920;
+                cachedWindowHeight = 1080;
+            }
+        }
+        return new int[]{cachedWindowWidth, cachedWindowHeight};
     }
 
     public static void processMeshData(Object meshData) {
