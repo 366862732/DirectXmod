@@ -4,25 +4,12 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="成功修复窗口拦截">
-      <change beforePath="$PROJECT_DIR$/.idea/modules/gl4dx12.main.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.main.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules/gl4dx12.test.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.test.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" afterDir="false" />
+    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="更新说明">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/3.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/8.md" beforeDir="false" afterPath="$PROJECT_DIR$/8.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/Dx12Mod.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/Dx12Mod.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/GlDrawMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/GlDrawMixin.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12_auto_hwnd.obj" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.exp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.exp" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.h" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.h" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.lib" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.lib" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/glfw3.lib" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/resources/fabric.mod.json" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/fabric.mod.json" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -123,7 +110,15 @@
       <option name="project" value="LOCAL" />
       <updated>1781407870655</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="更新说明">
+      <option name="closed" value="true" />
+      <created>1781849622923</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1781849622923</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="UnknownFeatures">
@@ -143,7 +138,9 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="移动位置准备重构" />
     <MESSAGE value="重新提交" />
-    <option name="LAST_COMMIT_MESSAGE" value="重新提交" />
+    <MESSAGE value="更新说明" />
+    <MESSAGE value="同步本地的修复与更改" />
+    <option name="LAST_COMMIT_MESSAGE" value="同步本地的修复与更改" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>

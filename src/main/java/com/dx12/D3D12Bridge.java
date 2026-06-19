@@ -252,6 +252,11 @@ public class D3D12Bridge {
             Method vertexBufferMethod = meshData.getClass().getMethod("vertexBuffer");
             ByteBuffer vertexBuffer = (ByteBuffer) vertexBufferMethod.invoke(meshData);
 
+            System.out.println("[GL4DX12] vertexBuffer class: " + vertexBuffer.getClass().getName());
+            System.out.println("[GL4DX12] vertexBuffer position: " + vertexBuffer.position() +
+                              ", limit: " + vertexBuffer.limit() +
+                              ", capacity: " + vertexBuffer.capacity());
+
             if (vertexBuffer == null || vertexBuffer.capacity() == 0) {
                 System.err.println("[GL4DX12] processMeshData: vertexBuffer is empty");
                 return;
@@ -367,6 +372,19 @@ public class D3D12Bridge {
             }
 
             // === 6. 传递给 C++ 端 ===
+            // 诊断：输出 Java 端顶点坐标范围
+            float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE;
+            float minY = Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+            float minZ = Float.MAX_VALUE, maxZ = -Float.MAX_VALUE;
+            for (int i = 0; i < vertexCount; i++) {
+                float x = vertices[i * 3], y = vertices[i * 3 + 1], z = vertices[i * 3 + 2];
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+                if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+            }
+            System.out.println("[GL4DX12] Vertex range: X[" + minX + ", " + maxX +
+                              "] Y[" + minY + ", " + maxY + "] Z[" + minZ + ", " + maxZ + "]");
+            // ===== 传递 =====
             if (vertexCount > 0) {
                 // 将 float[] 颜色转换为 byte[] (ABGR packed)
                 byte[] colorBytes = new byte[vertexCount * 4];
