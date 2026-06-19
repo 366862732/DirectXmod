@@ -112,6 +112,9 @@ static UINT g_glStateBits = 0;
 #define GLB_CULL         4
 #define GLB_DEPTH_WRITE  8
 
+// 顶点坐标空间类型（从 Java 端传入）
+static int g_currentCoordType = 0; // 0=WORLD, 1=SCREEN, 2=NDC
+
 static ComPtr<ID3D12Resource>       g_depthBuf;
 static ComPtr<ID3D12DescriptorHeap> g_dsvHeap;
 static DXGI_FORMAT g_dsvFormat = DXGI_FORMAT_UNKNOWN;
@@ -857,26 +860,46 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     }
                 }
 
-                // ===== 根据坐标范围选择投影矩阵 =====
-                bool isScreenCoords = (maxZ == 0.0f && minZ == 0.0f); // 所有Z为0 → GUI顶点，使用正交投影
-                if (isScreenCoords && g_cbData) {
-                    // 使用正交投影矩阵（直接映射到屏幕空间）
-                    float ortho[16] = {
-                        2.0f/854, 0, 0, -1,
-                        0, -2.0f/480, 0, 1,
-                        0, 0, 1, 0,
-                        0, 0, 0, 1
-                    };
-                    memcpy(g_cbData, ortho, sizeof(ortho));
-                    Log("Using orthographic projection for GUI vertices (screen coords)");
-                } else {
-                    // 使用Java端传来的MVP矩阵（已经包含在g_cbData中）
-                    Log("Using perspective projection for 3D vertices");
+                // ===== 根据顶点类型选择投影矩阵 =====
+                switch (g_currentCoordType) {
+                    case 0: // COORD_WORLD — 使用 Java 端传入的 MVP 矩阵
+                        Log("Using perspective projection for 3D vertices (WORLD coords)");
+                        break;
+
+                    case 1: // COORD_SCREEN — 使用正交投影
+                        Log("Using orthographic projection for GUI vertices (SCREEN coords)");
+                        if (g_cbData) {
+                            float ortho[16] = {
+                                2.0f/854, 0, 0, -1,
+                                0, -2.0f/480, 0, 1,
+                                0, 0, 1, 0,
+                                0, 0, 0, 1
+                            };
+                            memcpy(g_cbData, ortho, sizeof(ortho));
+                        }
+                        break;
+
+                    case 2: // COORD_NDC — 使用单位矩阵（不变换）
+                        Log("Using identity matrix for NDC vertices (already in clip space)");
+                        if (g_cbData) {
+                            float identity[16] = {
+                                1, 0, 0, 0,
+                                0, 1, 0, 0,
+                                0, 0, 1, 0,
+                                0, 0, 0, 1
+                            };
+                            memcpy(g_cbData, identity, sizeof(identity));
+                        }
+                        break;
+
+                    default:
+                        Log("WARNING: Unknown coordType=%d, using WORLD", g_currentCoordType);
+                        break;
                 }
-                // ===== 新增结束 =====
+                // ===== 矩阵选择结束 =====
 
                 // ===== 将四边形转换为三角形（GUI顶点） =====
-                if (isScreenCoords && vertexCount % 4 == 0 && vertexCount > 0) {
+                if (g_currentCoordType == 1 && vertexCount % 4 == 0 && vertexCount > 0) {
                     std::vector<float> triVertices;
                     triVertices.reserve(vertexCount * 6 / 4); // 4顶点 → 6顶点 (两个三角形)
 
@@ -1415,7 +1438,11 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadPixels(JNIEnv* en
     (void)buf; (void)w; (void)h;
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* env, jclass, jfloatArray verts, jint count, jbyteArray colorArray) {
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* env, jclass, jfloatArray verts, jint count, jbyteArray colorArray, jint coordType) {
+    // 存储坐标类型
+    g_currentCoordType = coordType;
+    Log("nativeRecordVertices: coordType=%d (0=WORLD, 1=SCREEN, 2=NDC)", coordType);
+
     if (!g_ok || !g_imVB || !verts || count <= 0) return;
 
     jsize len = env->GetArrayLength(verts);

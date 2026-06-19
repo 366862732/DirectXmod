@@ -21,9 +21,14 @@ import net.minecraft.client.renderer.state.level.ParticlesRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
 
 public class D3D12Bridge {
+    // 顶点坐标空间类型
+    public static final int COORD_WORLD = 0;   // 世界坐标，需要 MVP 变换
+    public static final int COORD_SCREEN = 1;  // 屏幕坐标，需要正交投影
+    public static final int COORD_NDC = 2;     // NDC 坐标，不需要变换
+
     private static final Logger LOGGER = LoggerFactory.getLogger("GL4DX12");
 
-    private static boolean d3d12Ready = false;
+    private static volatile boolean d3d12Ready = false;
     private static boolean d3d12Active = false;
     private static LevelRenderState cachedLevelState;
     private static SkyRenderState cachedSkyState;
@@ -175,6 +180,41 @@ public class D3D12Bridge {
      * 提取顶点、UV、颜色数据并传递给 C++ 端
      * 使用硬编码的顶点布局，绕过 VertexFormat.elements() 的兼容性问题
      */
+    /**
+     * 检测顶点坐标空间类型
+     */
+    private static int detectCoordSpace(float[] vertices, int vertexCount) {
+        if (vertexCount == 0) return COORD_WORLD;
+
+        float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE;
+        float minY = Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+        float minZ = Float.MAX_VALUE, maxZ = -Float.MAX_VALUE;
+
+        for (int i = 0; i < vertexCount; i++) {
+            int idx = i * 3;
+            float x = vertices[idx], y = vertices[idx + 1], z = vertices[idx + 2];
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+            if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+        }
+
+        // 检测 NDC 坐标（在 [-1, 1] 范围内）
+        if (minX >= -1.1f && maxX <= 1.1f &&
+            minY >= -1.1f && maxY <= 1.1f &&
+            minZ >= -1.1f && maxZ <= 1.1f) {
+            return COORD_NDC;
+        }
+
+        // 检测屏幕坐标（Z=0，X/Y 在 0-854/0-480 范围内）
+        if (minZ == 0.0f && maxZ == 0.0f &&
+            minX >= 0 && maxX <= 854 &&
+            minY >= 0 && maxY <= 480) {
+            return COORD_SCREEN;
+        }
+
+        return COORD_WORLD;
+    }
+
     public static void processMeshData(Object meshData) {
         // ===== 强制初始化和激活 =====
         if (!d3d12Active) {
@@ -392,6 +432,9 @@ public class D3D12Bridge {
             }
             System.out.println("[GL4DX12] Vertex range: X[" + minX + ", " + maxX +
                               "] Y[" + minY + ", " + maxY + "] Z[" + minZ + ", " + maxZ + "]");
+            // 检测顶点类型
+            int coordType = detectCoordSpace(vertices, vertexCount);
+            System.out.println("[GL4DX12] coordType=" + coordType + " (0=WORLD, 1=SCREEN, 2=NDC)");
             // ===== 传递 =====
             if (vertexCount > 0) {
                 // 将 float[] 颜色转换为 byte[] (ABGR packed)
@@ -406,7 +449,7 @@ public class D3D12Bridge {
                     colorBytes[i * 4 + 2] = (byte)b;
                     colorBytes[i * 4 + 3] = (byte)a;
                 }
-                DX12LibClient.nativeRecordVertices(vertices, vertexCount, colorBytes);
+                DX12LibClient.nativeRecordVertices(vertices, vertexCount, colorBytes, coordType);
 
                 System.out.println("[GL4DX12] processMeshData: sent " + vertexCount +
                                   " vertices to native (total bytes: " + vertexBuffer.capacity() + ")");

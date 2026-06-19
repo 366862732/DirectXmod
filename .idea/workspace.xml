@@ -5,23 +5,13 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
-      <change beforePath="$PROJECT_DIR$/.idea/.name" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/compiler.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/compiler.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/gradle.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/gradle.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/jarRepositories.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/kotlinc.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules/gl4dx12.main.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.main.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules/gl4dx12.test.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules/gl4dx12.test.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Client.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Client.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/runConfigurations/Minecraft_Server.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/8.md" beforeDir="false" afterPath="$PROJECT_DIR$/8.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -96,6 +86,7 @@
       <recent name="com.dx12" />
     </key>
   </component>
+  <component name="RunManager" selected="应用程序.Minecraft Client" />
   <component name="TaskManager">
     <task active="true" id="Default" summary="默认任务">
       <changelist id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="" />
