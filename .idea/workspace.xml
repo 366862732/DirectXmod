@@ -6,15 +6,11 @@
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/8.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.obj" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.exp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.exp" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.lib" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/gl4dx12.lib" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/native/windows/gl4dx12.dll" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/所需操作.md" beforeDir="false" afterPath="$PROJECT_DIR$/所需操作.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

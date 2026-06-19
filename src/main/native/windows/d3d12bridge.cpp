@@ -1,4 +1,4 @@
-// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
+﻿// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
@@ -76,6 +76,7 @@ static UINT     g_fi = 0, g_w = 1280, g_h = 720;
 static bool     g_ok = false;
 static HANDLE   g_thread = nullptr;
 static volatile bool g_run = false;
+static bool g_globalDeviceReady = false;
 static HANDLE   g_frameReadyEvent = nullptr;  // 帧数据就绪事件
 static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
 
@@ -242,6 +243,7 @@ static ComPtr<ID3D12RootSignature> g_rsTex;
 static ComPtr<ID3D12PipelineState> g_psoTex;
 static ComPtr<ID3D12DescriptorHeap> g_texSrvHeap;
 static UINT g_texSrvSize = 0;
+static std::mutex g_texMutex;
 static std::unordered_map<int, ComPtr<ID3D12Resource>> g_texMap;
 static std::unordered_map<int, UINT> g_texSlotMap;
 static UINT g_texSlotNext = 0;
@@ -326,7 +328,7 @@ static bool MkUpload(ComPtr<ID3D12Resource>& dst, const void* data, UINT sz) {
     if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
         &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&dst))))
         return false;
-    if (data) { void* m=nullptr; dst->Map(0,nullptr,&m); memcpy(m,data,sz); dst->Unmap(0,nullptr); }
+    if (data) { void* m=nullptr; HRESULT hr = dst->Map(0,nullptr,&m); if (FAILED(hr) || m == nullptr) { Log("[FATAL] MkUpload Map 返回空地址，阻断写入防止0地址崩溃"); return false; } D3D12_RESOURCE_DESC bufDesc = dst->GetDesc(); if ((UINT64)sz > bufDesc.Width) { Log("[FATAL] memory write out of buffer range"); dst->Unmap(0,nullptr); return false; } memcpy(m,data,sz); dst->Unmap(0,nullptr); }
     return true;
 }
 
@@ -667,7 +669,11 @@ static void UploadTextureEx(const void* pixels, int w, int h, int texId) {
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf)))) return;
 
     void* dst = nullptr;
-    uploadBuf->Map(0, nullptr, &dst);
+    HRESULT hr = uploadBuf->Map(0, nullptr, &dst);
+    if (FAILED(hr) || dst == nullptr) {
+        Log("[FATAL] UploadTextureEx Map 返回空地址，阻断写入防止0地址崩溃");
+        return;
+    }
     for (int y = 0; y < h; y++)
         memcpy((BYTE*)dst + y * uploadRowPitch, (BYTE*)pixels + y * rowPitch, rowPitch);
     uploadBuf->Unmap(0, nullptr);
@@ -719,17 +725,23 @@ static void UploadTextureEx(const void* pixels, int w, int h, int texId) {
     srvDesc.Texture2D.MipLevels = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_texSrvHeap->GetCPUDescriptorHandleForHeapStart();
     UINT slot;
-    auto slotIt = g_texSlotMap.find(texId);
-    if (slotIt != g_texSlotMap.end()) {
-        slot = slotIt->second;
-    } else {
-        if (g_texSlotNext >= 64) return;
-        slot = g_texSlotNext++;
-        g_texSlotMap[texId] = slot;
+    {
+        std::lock_guard<std::mutex> lock(g_texMutex);
+        auto slotIt = g_texSlotMap.find(texId);
+        if (slotIt != g_texSlotMap.end()) {
+            slot = slotIt->second;
+        } else {
+            if (g_texSlotNext >= 64) return;
+            slot = g_texSlotNext++;
+            g_texSlotMap[texId] = slot;
+        }
     }
     cpuHandle.ptr += (SIZE_T)slot * g_texSrvSize;
     g_dev->CreateShaderResourceView(tex.Get(), &srvDesc, cpuHandle);
-    g_texMap[texId] = tex;
+    {
+        std::lock_guard<std::mutex> lock(g_texMutex);
+        g_texMap[texId] = tex;
+    }
     Log("Upload texture #%d %dx%d slot=%u", texId, w, h, slot);
 }
 static bool CaptureMCFrame() {
@@ -805,7 +817,12 @@ static bool CaptureMCFrame() {
         &rdUp, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upBuf));
 
     BYTE* dst = nullptr;
-    upBuf->Map(0, nullptr, (void**)&dst);
+    HRESULT hr = upBuf->Map(0, nullptr, (void**)&dst);
+    if (FAILED(hr) || dst == nullptr) {
+        Log("[FATAL] CaptureMCFrame Map 返回空地址，阻断写入防止0地址崩溃");
+        delete[] pixels;
+        return false;
+    }
     for (UINT y = 0; y < g_h; y++)
         memcpy(dst + y * alignedRowSize, pixels + y * rowSize, rowSize);
     upBuf->Unmap(0, nullptr);
@@ -922,8 +939,17 @@ static bool EnsureIMVBCapacity(UINT requiredBytes) {
         return false;
     if (g_imVB && g_imVBSize > 0) {
         void* oldDst = nullptr, *newDst = nullptr;
-        g_imVB->Map(0, nullptr, &oldDst);
-        newVB->Map(0, nullptr, &newDst);
+        HRESULT hr = g_imVB->Map(0, nullptr, &oldDst);
+        if (FAILED(hr) || oldDst == nullptr) {
+            Log("[FATAL] EnsureIMVBCapacity old buffer Map null, abort write");
+            return false;
+        }
+        hr = newVB->Map(0, nullptr, &newDst);
+        if (FAILED(hr) || newDst == nullptr) {
+            g_imVB->Unmap(0, nullptr);
+            Log("[FATAL] EnsureIMVBCapacity new buffer Map null, abort write");
+            return false;
+        }
         memcpy(newDst, oldDst, g_imVBSize);
         newVB->Unmap(0, nullptr);
         g_imVB->Unmap(0, nullptr);
@@ -948,8 +974,9 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
     while (true) {
+        if (!g_globalDeviceReady) { Log("[ERROR] Device not ready, skip render"); Sleep(16); continue; }
         Log("=== RenderLoop LOOP ITERATION ===");
-        if (!g_dev) {
+        if (!g_dev || !g_queue || !g_rtvHeap || !g_srvHeap || !g_alloc || !g_cl) {
             Sleep(16);
             continue;
         }
@@ -1140,7 +1167,12 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 UINT byteCount = vertexCount * sizeof(VertexPC);
                 if (EnsureIMVBCapacity(byteCount)) {
                     void* dst = nullptr;
-                    g_imVB->Map(0, nullptr, &dst);
+                    HRESULT hr = g_imVB->Map(0, nullptr, &dst);
+                    if (FAILED(hr) || dst == nullptr) {
+                        Log("[FATAL] RenderLoop 实例顶点缓冲Map返回空地址，跳过当前帧");
+                        g_imVB->Unmap(0, nullptr);
+                        continue;
+                    }
                     VertexPC* vtx = (VertexPC*)dst;
                     for (int i = 0; i < vertexCount; i++) {
                         vtx[i].x = vertices[i * 3];
@@ -1194,8 +1226,16 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         RepositionOverlay();
         CaptureMCFrame();
 
-        g_alloc->Reset();
-        g_cl->Reset(g_alloc.Get(), nullptr);
+        HRESULT hr = g_alloc->Reset();
+        if (FAILED(hr)) {
+            Log("[ERROR] 命令分配器 Reset 失败");
+            continue;
+        }
+        hr = g_cl->Reset(g_alloc.Get(), nullptr);
+        if (FAILED(hr)) {
+            Log("[ERROR] 命令列表 Reset 失败");
+            continue;
+        }
         g_fi = g_swap->GetCurrentBackBufferIndex();
 
         D3D12_RESOURCE_BARRIER rb = {};
@@ -1289,8 +1329,18 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     D3D12_RANGE writeRange = {};
                     writeRange.Begin = 0;
                     writeRange.End = g_cbSize;
-                    g_cbUpload->Map(0, &writeRange, &cbMapped);
-                    memcpy(cbMapped, g_cbData, g_cbSize);
+                    HRESULT hr = g_cbUpload->Map(0, &writeRange, &cbMapped);
+                    if (FAILED(hr) || !cbMapped) {
+                        Log("[FATAL] DrawChunk CBV Map null, abort write");
+                    } else {
+                        D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
+                        if ((UINT64)g_cbSize > cbvDesc.Width) {
+                            Log("[FATAL] memory write out of buffer range");
+                            g_cbUpload->Unmap(0, &writeRange);
+                        } else {
+                            memcpy(cbMapped, g_cbData, g_cbSize);
+                        }
+                    }
                     g_cbUpload->Unmap(0, &writeRange);
                 }
                 Log("DrawChunk: vertexType=%d (%s), vertices=%d",
@@ -1400,8 +1450,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         }
 
         // 确保GPU完成当前帧绘制后重置命令分配器和命令列表（防止CBV数据竞争）
-        g_alloc->Reset();
-        g_cl->Reset(g_alloc.Get(), nullptr);
+        if (FAILED(g_alloc->Reset())) Log("WARN: end-of-frame allocator Reset failed");
+        if (FAILED(g_cl->Reset(g_alloc.Get(), nullptr))) Log("WARN: end-of-frame command list Reset failed");
     }
     Log("Render thread stopped, loopCount=%d, g_run=%d", loopCount, (int)g_run);
     return 0;
@@ -1545,8 +1595,11 @@ ComPtr<IDXGIFactory4> dxgi;
     rdCB.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     if (SUCCEEDED(g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
         &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cbUpload)))) {
-        g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
+        HRESULT hr = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
+        if (FAILED(hr) || !g_cbData) { Log("[FATAL] Init CBV Map null, abort write"); return false; }
         float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
+        if (sizeof(identity) > cbvDesc.Width) { Log("[FATAL] memory write out of buffer range"); g_cbUpload->Unmap(0, nullptr); return false; }
         memcpy(g_cbData, identity, sizeof(identity));
     }
 
@@ -1583,6 +1636,7 @@ ComPtr<IDXGIFactory4> dxgi;
     Log("Frame sync events created: ready=0x%p, done=0x%p", g_frameReadyEvent, g_frameDoneEvent);
 
     g_thread = CreateThread(0, 0, RenderLoop, 0, 0, 0);
+    g_globalDeviceReady = true;
     Log("=== D3D12 on MC window Ready ===");
     return true;
 }
@@ -1856,7 +1910,27 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     g_drawChunks.push_back(ch);
 
     void* dst = nullptr;
-    g_imVB->Map(0, nullptr, &dst);
+    HRESULT hr = g_imVB->Map(0, nullptr, &dst);
+    if (FAILED(hr) || dst == nullptr) {
+        Log("[FATAL] nativeRecordVertices 实例顶点缓冲Map返回空地址，阻断写入防止0地址崩溃");
+        if (colorData != nullptr) {
+            env->ReleaseByteArrayElements(colorArray, colorData, JNI_ABORT);
+        }
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+    // 容量校验：确保写入偏移+数据量不超出缓冲区总大小
+    D3D12_RESOURCE_DESC vbDesc = g_imVB->GetDesc();
+    UINT64 writeTotalBytes = (UINT64)g_imVBSize + (UINT64)byteCount;
+    if (writeTotalBytes > vbDesc.Width) {
+        Log("[FATAL] nativeRecordVertices vertex buffer overflow, need %llu bytes, buffer only %llu", writeTotalBytes, vbDesc.Width);
+        g_imVB->Unmap(0, nullptr);
+        if (colorData != nullptr) {
+            env->ReleaseByteArrayElements(colorArray, colorData, JNI_ABORT);
+        }
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
     VertexPC* vtx = (VertexPC*)((BYTE*)dst + g_imVBSize);
     for (UINT i = 0; i < safeCount; i++) {
         int off = i * 3;
@@ -1929,7 +2003,13 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv
     g_drawChunks.push_back(ch);
 
     void* dst = nullptr;
-    g_imVB->Map(0, nullptr, &dst);
+    HRESULT hr = g_imVB->Map(0, nullptr, &dst);
+    if (FAILED(hr) || dst == nullptr) {
+        Log("[FATAL] nativeRecordVerticesPT 实例顶点缓冲Map返回空地址，阻断写入防止0地址崩溃");
+        g_imVB->Unmap(0, nullptr);
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
     VertexPT* vtx = (VertexPT*)((BYTE*)dst + g_imVBSize);
     for (int i = 0; i < count; i++) {
         int off = i * 9;
@@ -2117,11 +2197,16 @@ static bool UploadVertexData(const float* data, UINT count, UINT vertexSize,
     readRange.Begin = 0;
     readRange.End = 0;
     hr = outUploadBuffer->Map(0, &readRange, &mappedData);
-    if (FAILED(hr)) {
-        Log("ERROR: Failed to map upload buffer, hr=0x%08X", hr);
+    if (FAILED(hr) || mappedData == nullptr) {
+        Log("[FATAL] Map return null pointer, block memory write");
         return false;
     }
-
+    D3D12_RESOURCE_DESC bufDesc = outUploadBuffer->GetDesc();
+    if ((UINT64)totalSize > bufDesc.Width) {
+        Log("[FATAL] memory write out of buffer range");
+        outUploadBuffer->Unmap(0, nullptr);
+        return false;
+    }
     memcpy(mappedData, data, totalSize);
     outUploadBuffer->Unmap(0, nullptr);
     outGpuAddress = outUploadBuffer->GetGPUVirtualAddress();
@@ -2163,6 +2248,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jcla
         };
         ComPtr<ID3D12Resource> skyBuf;
         D3D12_GPU_VIRTUAL_ADDRESS skyAddr;
+        Log("[SKY DEBUG] uploading sky background: 4 verts, %llu bytes", (UINT64)(4 * sizeof(SkyVertex)));
         if (UploadVertexData((float*)skyVerts, 4, sizeof(SkyVertex), skyBuf, skyAddr)) {
             float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             memcpy(g_cbData, ident, sizeof(ident));
@@ -2170,8 +2256,18 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jcla
             D3D12_RANGE writeRange = {};
             writeRange.Begin = 0;
             writeRange.End = g_cbSize;
-            g_cbUpload->Map(0, &writeRange, &cbMapped);
-            memcpy(cbMapped, g_cbData, g_cbSize);
+            HRESULT hr = g_cbUpload->Map(0, &writeRange, &cbMapped);
+            if (FAILED(hr) || !cbMapped) {
+                Log("[FATAL] nativeRenderSky CBV Map null, abort write");
+            } else {
+                D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
+                if ((UINT64)g_cbSize > cbvDesc.Width) {
+                    Log("[FATAL] memory write out of buffer range");
+                    g_cbUpload->Unmap(0, &writeRange);
+                } else {
+                    memcpy(cbMapped, g_cbData, g_cbSize);
+                }
+            }
             g_cbUpload->Unmap(0, &writeRange);
             D3D12_VERTEX_BUFFER_VIEW vbView = {};
             vbView.BufferLocation = skyAddr;
@@ -2198,6 +2294,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jcla
         };
         ComPtr<ID3D12Resource> sunBuf;
         D3D12_GPU_VIRTUAL_ADDRESS sunAddr;
+        Log("[SKY DEBUG] uploading sun: 4 verts, %llu bytes", (UINT64)(4 * sizeof(SkyVertex)));
         if (UploadVertexData((float*)sunVerts, 4, sizeof(SkyVertex), sunBuf, sunAddr)) {
             D3D12_VERTEX_BUFFER_VIEW vbView = {};
             vbView.BufferLocation = sunAddr;
@@ -2223,6 +2320,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jcla
         };
         ComPtr<ID3D12Resource> moonBuf;
         D3D12_GPU_VIRTUAL_ADDRESS moonAddr;
+        Log("[SKY DEBUG] uploading moon: 4 verts, %llu bytes", (UINT64)(4 * sizeof(SkyVertex)));
         if (UploadVertexData((float*)moonVerts, 4, sizeof(SkyVertex), moonBuf, moonAddr)) {
             D3D12_VERTEX_BUFFER_VIEW vbView = {};
             vbView.BufferLocation = moonAddr;
@@ -2429,8 +2527,18 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
             D3D12_RANGE writeRange = {};
             writeRange.Begin = 0;
             writeRange.End = g_cbSize;
-            g_cbUpload->Map(0, &writeRange, &cbMapped);
-            memcpy(cbMapped, g_cbData, g_cbSize);
+            HRESULT hr = g_cbUpload->Map(0, &writeRange, &cbMapped);
+            if (FAILED(hr) || !cbMapped) {
+                Log("[FATAL] nativeRenderTransparent CBV Map null, abort write");
+            } else {
+                D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
+                if ((UINT64)g_cbSize > cbvDesc.Width) {
+                    Log("[FATAL] memory write out of buffer range");
+                    g_cbUpload->Unmap(0, &writeRange);
+                } else {
+                    memcpy(cbMapped, g_cbData, g_cbSize);
+                }
+            }
             g_cbUpload->Unmap(0, &writeRange);
         }
 
