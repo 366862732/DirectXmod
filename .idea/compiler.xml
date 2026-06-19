@@ -3,10 +3,4 @@
   <component name="CompilerConfiguration">
     <bytecodeTargetLevel target="25" />
   </component>
-  <component name="JavacSettings">
-    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
-      <module name="dx12-lib.main" options="-AoutRefMapFile=D:\dx12-lib-template-26.1.2\build\classes\java\main\gl4dx12-refmap.json -AdefaultObfuscationEnv=named:intermediary -Aquiet=true -AoutMapFileNamedIntermediary=D:\dx12-lib-template-26.1.2\build\loom-cache\mixin-map-loom.mappings.1_21_3.layered+hash.2198-v2.main.tiny -AinMapFileNamedIntermediary=C:\Users\xiaozi\.gradle\caches\fabric-loom\1.21.3\loom.mappings.1_21_3.layered+hash.2198-v2\mappings.tiny" />
-      <module name="dx12-lib.test" options="-AoutRefMapFile=D:\dx12-lib-template-26.1.2\build\classes\java\test\test-gl4dx12-refmap.json -AdefaultObfuscationEnv=named:intermediary -Aquiet=true -AoutMapFileNamedIntermediary=D:\dx12-lib-template-26.1.2\build\loom-cache\mixin-map-loom.mappings.1_21_3.layered+hash.2198-v2.test.tiny -AinMapFileNamedIntermediary=C:\Users\xiaozi\.gradle\caches\fabric-loom\1.21.3\loom.mappings.1_21_3.layered+hash.2198-v2\mappings.tiny" />
-    </option>
-  </component>
 </project>

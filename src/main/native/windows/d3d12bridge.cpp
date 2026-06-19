@@ -858,7 +858,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 }
 
                 // ===== 根据坐标范围选择投影矩阵 =====
-                bool isScreenCoords = (minX >= 0 && maxX <= 854 && minY >= 0 && maxY <= 480 && minZ == 0 && maxZ == 0);
+                bool isScreenCoords = (maxZ == 0.0f && minZ == 0.0f); // 所有Z为0 → GUI顶点，使用正交投影
                 if (isScreenCoords && g_cbData) {
                     // 使用正交投影矩阵（直接映射到屏幕空间）
                     float ortho[16] = {

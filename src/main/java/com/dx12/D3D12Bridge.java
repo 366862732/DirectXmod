@@ -322,6 +322,14 @@ public class D3D12Bridge {
             // === 5. 提取顶点数据 ===
             vertexBuffer.rewind();
 
+            // 诊断：输出第一个顶点的原始浮点值
+            if (vertexBuffer.capacity() >= 12) {
+                float x0 = vertexBuffer.getFloat(0);
+                float y0 = vertexBuffer.getFloat(4);
+                float z0 = vertexBuffer.getFloat(8);
+                System.out.println("[GL4DX12] First vertex raw: " + x0 + ", " + y0 + ", " + z0);
+            }
+
             float[] vertices = new float[vertexCount * 3];
             float[] colors = new float[vertexCount * 4];
             float[] uvs = new float[vertexCount * 2];
