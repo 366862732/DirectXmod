@@ -1,4 +1,4 @@
-﻿// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
+// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
@@ -70,6 +70,8 @@ static ComPtr<ID3D12Device>          g_dev;
 inline bool IsDeviceValid() { return g_dev != nullptr; }
 // 全局原子设备丢失标记，线程安全
 std::atomic<bool> g_deviceLost = false;
+// 递归互斥锁，防止单线程重复加锁死锁
+std::recursive_mutex g_d3dGlobalMtx;
 static char g_d3d12Info[256] = "D3D12 not initialized";
 static ComPtr<ID3D12CommandQueue>    g_queue;
 static ComPtr<IDXGISwapChain3>       g_swap;
@@ -1037,7 +1039,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
     while (true) {
         if (g_deviceLost.load() || !IsDeviceValid()) {
-            OutputDebugStringA("[FATAL] Device lost, terminating render loop\n");
+            OutputDebugStringA("[FATAL] RenderThread 检测设备丢失，立即终止渲染循环");
+            g_run = false;
             break;
         }
         if (!g_globalDeviceReady) { Log("[ERROR] Device not ready, skip render"); Sleep(16); continue; }
@@ -1573,17 +1576,16 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         if (FAILED(presentHR)) {
             HRESULT devErr = g_dev->GetDeviceRemovedReason();
             char errBuf[512];
-            sprintf_s(errBuf, "[FATAL] Present failed, device removed reason: 0x%08X", devErr);
+            sprintf_s(errBuf, "[FATAL D3D Present 失败，错误码0x%08X，标记设备丢失", devErr);
             OutputDebugStringA(errBuf);
             switch (devErr) {
                 case DXGI_ERROR_DEVICE_REMOVED:
                 case DXGI_ERROR_DEVICE_HUNG:
-                    OutputDebugStringA("[FATAL] GPU timeout/device destroyed, marking device lost\n");
+                    OutputDebugStringA("[FATAL D3D Present 失败，标记设备丢失");
                     g_deviceLost.store(true);
                     g_run = false;
                     SetEvent(g_frameReadyEvent);
                     SetEvent(g_frameDoneEvent);
-                    SafeCleanD3D();
                     break;
                 case DXGI_ERROR_DEVICE_RESET:    OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_DEVICE_RESET\n"); break;
                 case DXGI_ERROR_ACCESS_DENIED:   OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_ACCESS_DENIED\n"); break;
@@ -1806,6 +1808,7 @@ ComPtr<IDXGIFactory4> dxgi;
 
 
 static void SafeCleanD3D() {
+    std::lock_guard<std::recursive_mutex> lock(g_d3dGlobalMtx);
     OutputDebugStringA("[CLEANUP] 开始安全销毁全部D3D资源\n");
     // 1. 标记渲染线程停止
     g_run = false;
@@ -2070,20 +2073,18 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     std::vector<jfloat> buf(len);
     env->GetFloatArrayRegion(verts, 0, len, buf.data());
 
-    // ===== C++ 端自动检测顶点类型，覆盖 Java 判定 =====
+    // ===== C++ 端自动检测顶点类型（仅日志，不覆盖Java判定） =====
     {
         VertexType detected = autoDetectVertexType(buf.data(), safeCount, 3 * sizeof(float));
         if (detected == VERTEX_TYPE_WORLD) {
-            g_currentCoordType = 0; // COORD_WORLD
-            Log("  C++ 检测结果: WORLD → 覆盖 coordType=0");
+            Log("  C++ 检测结果: WORLD（Java coordType=%d，不覆盖）", coordType);
         } else if (detected == VERTEX_TYPE_SCREEN) {
-            g_currentCoordType = 1; // COORD_SCREEN
-            Log("  C++ 检测结果: SCREEN → 覆盖 coordType=1");
+            Log("  C++ 检测结果: SCREEN（Java coordType=%d，不覆盖）", coordType);
         } else {
             Log("  C++ 检测结果: UNKNOWN → 保持 Java coordType=%d", coordType);
         }
     }
-    // ===== 顶点类型检测结束 =====
+    // ===== 顶点类型检测结束（渲染管线依赖Java传入值） =====
 
     // 读取颜色数据
     jbyte* colorData = nullptr;
