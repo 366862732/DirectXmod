@@ -1,4 +1,4 @@
-﻿// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
+// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
@@ -7,12 +7,13 @@
 //   4. Geometry uses MC world-space coords, transformed by MVP in VS shader
 //
 //在给我晚上编译闹鬼我清算你!d3d12bridge.cpp！
-//你C++端渲染再给老子抽风我收拾你
+//你C++端渲染再给老子抽风老子收拾你
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <jni.h>
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl.h>
@@ -24,12 +25,21 @@
 #include <algorithm>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
 using namespace Microsoft::WRL;
+
+// 设备有效性工具函数，全局可用
+inline bool IsDeviceValid()
+{
+    return g_dev != nullptr;
+}
+// 全局原子设备丢失标记，线程安全
+std::atomic<bool> g_deviceLost = false;
 
 static void Log(const char* fmt, ...) {
     char buf[1024];
@@ -77,7 +87,58 @@ static bool     g_ok = false;
 static HANDLE   g_thread = nullptr;
 static volatile bool g_run = false;
 static bool g_globalDeviceReady = false;
+enum InitStage {
+    STAGE_EMPTY = 0,
+    STAGE_BASE_DEVICE,        // 基础设备/交换链
+    ST_CMD_RES,               // 命令队列分配器
+    ST_UI_PSO_CBUF,           // UI管线+UI常量缓冲
+    ST_3D_PSO_CBUF,           // 3D透视管线+世界常量缓冲
+    ST_SKY_TEX,               // 天空盒纹理上传
+    ST_SKY_VB,                // 天空顶点缓冲
+    ST_ENTITY_STATIC_VB,      // 实体静态顶点
+    ST_INSTANCE_BUFFER,       // 实例缓冲
+    ST_PARTICLE_RES,          // 粒子资源
+    ST_TEXTURE_POOL,          // 通用贴图池
+    ST_ALPHA_PSO,             // 半透明管线
+    ST_FULL_READY             // 全部初始化完成
+};
+InitStage g_initStage = STAGE_EMPTY;
+bool g_renderInitDone = false;
 static HANDLE   g_frameReadyEvent = nullptr;  // 帧数据就绪事件
+
+// 强制GPU同步，分散负载（每个初始化阶段后调用）
+static void WaitForGpu() {
+    g_cl->Close();
+    ID3D12CommandList* cmdLists[] = {g_cl.Get()};
+    g_queue->ExecuteCommandLists(1, cmdLists);
+    g_swap->Present(1, 0);
+    UINT64 fv = g_fenceVal;
+    g_queue->Signal(g_fence.Get(), fv);
+    g_fenceVal++;
+    if (g_fence->GetCompletedValue() < fv) {
+        g_fence->SetEventOnCompletion(fv, g_fenceEv);
+        WaitForSingleObject(g_fenceEv, INFINITE);
+    }
+}
+
+// 分阶段资源创建：每阶段创建一类资源，分散GPU负载
+static void ProcessNextInitStage() {
+    switch (g_initStage) {
+        case STAGE_EMPTY:         OutputDebugStringA("[INIT STAGE] STAGE_EMPTY - wait for device ready\n"); break;
+        case STAGE_BASE_DEVICE:   OutputDebugStringA("[INIT STAGE] STAGE_BASE_DEVICE - base device/swapchain ready\n"); break;
+        case ST_CMD_RES:          OutputDebugStringA("[INIT STAGE] ST_CMD_RES - command queue/allocator ready\n"); break;
+        case ST_UI_PSO_CBUF:      OutputDebugStringA("[INIT STAGE] ST_UI_PSO_CBUF - UI PSO + CB ready\n"); break;
+        case ST_3D_PSO_CBUF:      OutputDebugStringA("[INIT STAGE] ST_3D_PSO_CBUF - 3D PSO + world CB ready\n"); break;
+        case ST_SKY_TEX:          OutputDebugStringA("[INIT STAGE] ST_SKY_TEX - sky texture uploaded\n"); break;
+        case ST_SKY_VB:           OutputDebugStringA("[INIT STAGE] ST_SKY_VB - sky vertex buffer ready\n"); break;
+        case ST_ENTITY_STATIC_VB: OutputDebugStringA("[INIT STAGE] ST_ENTITY_STATIC_VB - entity static VB ready\n"); break;
+        case ST_INSTANCE_BUFFER:  OutputDebugStringA("[INIT STAGE] ST_INSTANCE_BUFFER - instance buffer ready\n"); break;
+        case ST_PARTICLE_RES:     OutputDebugStringA("[INIT STAGE] ST_PARTICLE_RES - particle resources ready\n"); break;
+        case ST_TEXTURE_POOL:     OutputDebugStringA("[INIT STAGE] ST_TEXTURE_POOL - texture pool ready\n"); break;
+        case ST_ALPHA_PSO:        OutputDebugStringA("[INIT STAGE] ST_ALPHA_PSO - alpha blend PSO ready\n"); break;
+        default: break;
+    }
+}
 static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
 
 // ========== 新简单顶点数据存储（与 g_drawChunks 并行） ==========
@@ -328,7 +389,7 @@ static bool MkUpload(ComPtr<ID3D12Resource>& dst, const void* data, UINT sz) {
     if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
         &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&dst))))
         return false;
-    if (data) { void* m=nullptr; HRESULT hr = dst->Map(0,nullptr,&m); if (FAILED(hr) || m == nullptr) { Log("[FATAL] MkUpload Map 返回空地址，阻断写入防止0地址崩溃"); return false; } D3D12_RESOURCE_DESC bufDesc = dst->GetDesc(); if ((UINT64)sz > bufDesc.Width) { Log("[FATAL] memory write out of buffer range"); dst->Unmap(0,nullptr); return false; } memcpy(m,data,sz); dst->Unmap(0,nullptr); }
+    if (data) { void* m=nullptr; HRESULT hr = dst->Map(0,nullptr,&m); if (FAILED(hr) || m == nullptr) { Log("[FATAL] MkUpload Map failed, hr=0x%08X\n", hr); return false; } D3D12_RESOURCE_DESC bufDesc = dst->GetDesc(); if ((UINT64)sz > bufDesc.Width) { Log("[FATAL] memory write out of buffer range"); dst->Unmap(0,nullptr); return false; } memcpy(m,data,sz); dst->Unmap(0,nullptr); }
     return true;
 }
 
@@ -671,7 +732,7 @@ static void UploadTextureEx(const void* pixels, int w, int h, int texId) {
     void* dst = nullptr;
     HRESULT hr = uploadBuf->Map(0, nullptr, &dst);
     if (FAILED(hr) || dst == nullptr) {
-        Log("[FATAL] UploadTextureEx Map 返回空地址，阻断写入防止0地址崩溃");
+        Log("[FATAL] UploadTextureEx Map failed, hr=0x%08X\n", hr);
         return;
     }
     for (int y = 0; y < h; y++)
@@ -819,7 +880,7 @@ static bool CaptureMCFrame() {
     BYTE* dst = nullptr;
     HRESULT hr = upBuf->Map(0, nullptr, (void**)&dst);
     if (FAILED(hr) || dst == nullptr) {
-        Log("[FATAL] CaptureMCFrame Map 返回空地址，阻断写入防止0地址崩溃");
+        Log("[FATAL] CaptureMCFrame Map failed, hr=0x%08X\n", hr);
         delete[] pixels;
         return false;
     }
@@ -941,13 +1002,13 @@ static bool EnsureIMVBCapacity(UINT requiredBytes) {
         void* oldDst = nullptr, *newDst = nullptr;
         HRESULT hr = g_imVB->Map(0, nullptr, &oldDst);
         if (FAILED(hr) || oldDst == nullptr) {
-            Log("[FATAL] EnsureIMVBCapacity old buffer Map null, abort write");
+            Log("[FATAL] EnsureIMVBCapacity old buffer Map failed, hr=0x%08X\n", hr);
             return false;
         }
         hr = newVB->Map(0, nullptr, &newDst);
         if (FAILED(hr) || newDst == nullptr) {
             g_imVB->Unmap(0, nullptr);
-            Log("[FATAL] EnsureIMVBCapacity new buffer Map null, abort write");
+            Log("[FATAL] EnsureIMVBCapacity new buffer Map failed, hr=0x%08X\n", hr);
             return false;
         }
         memcpy(newDst, oldDst, g_imVBSize);
@@ -965,6 +1026,7 @@ struct VertexPC { float x,y,z; UINT color; };
 struct VertexPT { float x,y,z; UINT color; float u,v; };
 
 static DWORD WINAPI RenderLoop(LPVOID) {
+    OutputDebugStringA("[FATAL] TEST: RenderLoop entered (before any code)\n");
     MessageBoxA(NULL, "RenderLoop ENTERED", "DEBUG", MB_OK);
     Log("=== RenderLoop ENTERED (FORCED) ===");
     Log("=== RenderLoop DIAGNOSTIC VERSION 2 ===");
@@ -974,6 +1036,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
     while (true) {
+        if (g_deviceLost.load() || !IsDeviceValid()) {
+            OutputDebugStringA("[FATAL] Device lost, terminating render loop\n");
+            break;
+        }
         if (!g_globalDeviceReady) { Log("[ERROR] Device not ready, skip render"); Sleep(16); continue; }
         Log("=== RenderLoop LOOP ITERATION ===");
         if (!g_dev || !g_queue || !g_rtvHeap || !g_srvHeap || !g_alloc || !g_cl) {
@@ -984,6 +1050,57 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             // g_run 被设为 false（可能是 CleanupD3D12 调用），退出
             Log("Render thread: g_run=false, exiting");
             break;
+        }
+
+        // ===== 12阶段异步初始化状态机：每阶段独占1帧，创建资源+强制GPU同步，根除TDR =====
+        if (g_initStage < ST_FULL_READY) {
+            char stageLog[256];
+            sprintf_s(stageLog, "[INIT STATE MACHINE] 当前阶段:%d", (int)g_initStage);
+            OutputDebugStringA(stageLog);
+
+            HRESULT hr = g_alloc->Reset();
+            if (FAILED(hr)) {
+                Log("[ERROR] InitStateMachine: allocator Reset failed at stage %d", (int)g_initStage);
+                Sleep(16);
+                continue;
+            }
+            hr = g_cl->Reset(g_alloc.Get(), nullptr);
+            if (FAILED(hr)) {
+                Log("[ERROR] InitStateMachine: command list Reset failed at stage %d", (int)g_initStage);
+                Sleep(16);
+                continue;
+            }
+
+            // 清屏准备
+            auto bb = g_rt[g_swap->GetCurrentBackBufferIndex()];
+            D3D12_RESOURCE_BARRIER rb = {};
+            rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb.Transition.pResource = bb.Get();
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_cl->ResourceBarrier(1, &rb);
+            D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rh.ptr += g_swap->GetCurrentBackBufferIndex() * g_rtvSize;
+            float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            g_cl->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+            g_cl->ClearRenderTargetView(rh, clearColor, 0, nullptr);
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            g_cl->ResourceBarrier(1, &rb);
+
+            // 分阶段资源创建
+            ProcessNextInitStage();
+
+            // 强制GPU完全同步，分散负载
+            WaitForGpu();
+
+            g_initStage = (InitStage)((int)g_initStage + 1);
+            if (g_initStage >= ST_FULL_READY) {
+                g_renderInitDone = true;
+                OutputDebugStringA("[FATAL] 12-stage init complete, entering normal rendering\n");
+            }
+            continue;
         }
 
         loopCount++;
@@ -1037,21 +1154,31 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     }
                 }
 
-                // ===== 自动修正：WORLD 误判 → SCREEN 自动纠正 =====
-                // 当 Java 端判定为 WORLD 但大部分顶点坐标在屏幕范围内时，自动修正
+                // ===== 自动修正诊断：仅告警，不篡改Java传入坐标类型 =====
                 if (g_currentCoordType == 0 && vertexCount > 0) {
                     int screenCount = 0;
+                    float zMin = 1e10f, zMax = -1e10f;
                     for (int i = 0; i < vertexCount; i++) {
-                        float vx = vertices[i * 3], vy = vertices[i * 3 + 1];
+                        float vx = vertices[i * 3], vy = vertices[i * 3 + 1], vz = vertices[i * 3 + 2];
                         if (vx >= 0 && vx <= 2000 && vy >= 0 && vy <= 2000) {
                             screenCount++;
                         }
+                        if (vz < zMin) zMin = vz;
+                        if (vz > zMax) zMax = vz;
                     }
-                    if (screenCount > vertexCount / 2) {
-                        Log("  AUTO-CORRECT: %d/%d vertices in screen range, changing to SCREEN",
-                            screenCount, vertexCount);
-                        g_currentCoordType = 1;
+                    float zDelta = zMax - zMin;
+                    bool allXYInScreen = (screenCount > vertexCount / 2);
+                    static int suspectUICount = 0;
+                    if (allXYInScreen && fabs(zDelta) < 0.001f) {
+                        suspectUICount++;
+                        char warnBuf[512];
+                        sprintf_s(warnBuf, "[AUTO-CORRECT WARN#%d] XY screen-plane + Z=0, Java coordType=%d, NOT auto-switching pipeline",
+                            suspectUICount, g_currentCoordType);
+                        OutputDebugStringA(warnBuf);
+                    } else {
+                        OutputDebugStringA("[AUTO-CORRECT INFO] Vertex has depth, using Java-passed coordinate type");
                     }
+                    // 管线切换仅依赖Java传入值，不受顶点自动检测干扰
                 }
 
                 // ===== 根据顶点类型选择投影矩阵 =====
@@ -1169,7 +1296,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     void* dst = nullptr;
                     HRESULT hr = g_imVB->Map(0, nullptr, &dst);
                     if (FAILED(hr) || dst == nullptr) {
-                        Log("[FATAL] RenderLoop 实例顶点缓冲Map返回空地址，跳过当前帧");
+                        Log("[FATAL] RenderLoop vertex Map failed, hr=0x%08X\n", hr);
                         g_imVB->Unmap(0, nullptr);
                         continue;
                     }
@@ -1331,7 +1458,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     writeRange.End = g_cbSize;
                     HRESULT hr = g_cbUpload->Map(0, &writeRange, &cbMapped);
                     if (FAILED(hr) || !cbMapped) {
-                        Log("[FATAL] DrawChunk CBV Map null, abort write");
+                        Log("[FATAL] DrawChunk CBV Map failed, hr=0x%08X\n", hr);
                     } else {
                         D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
                         if ((UINT64)g_cbSize > cbvDesc.Width) {
@@ -1440,7 +1567,29 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
         ID3D12CommandList* lists[] = {g_cl.Get()};
         g_queue->ExecuteCommandLists(1, lists);
-        g_swap->Present(1, 0);
+
+        OutputDebugStringA("[FATAL] TEST: About to call Present(1, 0)\n");
+        HRESULT presentHR = g_swap->Present(1, 0);
+        if (FAILED(presentHR)) {
+            HRESULT devErr = g_dev->GetDeviceRemovedReason();
+            char errBuf[512];
+            sprintf_s(errBuf, "[FATAL] Present failed, device removed reason: 0x%08X", devErr);
+            OutputDebugStringA(errBuf);
+            switch (devErr) {
+                case DXGI_ERROR_DEVICE_REMOVED:
+                case DXGI_ERROR_DEVICE_HUNG:
+                    OutputDebugStringA("[FATAL] GPU timeout/device destroyed, marking device lost\n");
+                    g_deviceLost.store(true);
+                    g_run = false;
+                    break;
+                case DXGI_ERROR_DEVICE_RESET:    OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_DEVICE_RESET\n"); break;
+                case DXGI_ERROR_ACCESS_DENIED:   OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_ACCESS_DENIED\n"); break;
+                default: OutputDebugStringA("[FATAL] Reason: unknown error code\n"); break;
+            }
+            if (!g_run) break;
+        } else {
+            OutputDebugStringA("[FATAL] TEST: Present succeeded\n");
+        }
 
         UINT64 fv = g_fenceVal;
         g_queue->Signal(g_fence.Get(), fv); g_fenceVal++;
@@ -1512,6 +1661,17 @@ ComPtr<IDXGIFactory4> dxgi;
         return false;
     }
     Log("DXGI Factory created");
+
+    // 启用D3D12调试层（必须在创建设备之前调用）
+#ifdef _DEBUG
+    ID3D12Debug* debugController;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+        debugController->EnableDebugLayer();
+        debugController->Release();
+        OutputDebugStringA("[FATAL] D3D调试层已开启(仅Debug)\n");
+    }
+#endif
+
     ComPtr<IDXGIAdapter1> adp;
     for (UINT i=0; dxgi->EnumAdapters1(i,&adp)!=DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d; adp->GetDesc1(&d);
@@ -1596,7 +1756,7 @@ ComPtr<IDXGIFactory4> dxgi;
     if (SUCCEEDED(g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
         &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cbUpload)))) {
         HRESULT hr = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
-        if (FAILED(hr) || !g_cbData) { Log("[FATAL] Init CBV Map null, abort write"); return false; }
+        if (FAILED(hr) || !g_cbData) { Log("[FATAL] Init CBV Map failed, hr=0x%08X\n", hr); return false; }
         float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
         if (sizeof(identity) > cbvDesc.Width) { Log("[FATAL] memory write out of buffer range"); g_cbUpload->Unmap(0, nullptr); return false; }
@@ -1642,9 +1802,18 @@ ComPtr<IDXGIFactory4> dxgi;
 }
 
 
-static void CleanupD3D12() {
+static void SafeCleanD3D() {
+    OutputDebugStringA("[CLEANUP] 开始安全销毁全部D3D资源\n");
+    // 1. 标记渲染线程停止
     g_run = false;
-    if (g_thread) { WaitForSingleObject(g_thread, 3000); CloseHandle(g_thread); g_thread=0; }
+    g_deviceLost.store(true);
+    // 2. 等待渲染线程退出
+    if (g_thread) {
+        WaitForSingleObject(g_thread, 3000);
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+    }
+    // 3. 安全销毁 D3D 资源
     if (g_ok) {
         WaitGPU();
         CloseHandle(g_fenceEv);
@@ -1663,14 +1832,21 @@ static void CleanupD3D12() {
         if (g_cbData) { g_cbUpload->Unmap(0, nullptr); g_cbData = nullptr; }
         g_cbUpload.Reset();
         g_texMCFrame.Reset(); g_vbFSQuad.Reset(); g_imVB.Reset();
+        // ComPtr 自动释放全部 D3D 资源
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
+    // 4. 关闭同步事件、窗口附属资源
     if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
     if (g_frameDoneEvent)   { CloseHandle(g_frameDoneEvent);   g_frameDoneEvent = nullptr; }
     if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) { DestroyWindow(g_hwndOverlay); }
     g_hwndOverlay = nullptr;
     g_hwndMC = nullptr;
+    OutputDebugStringA("[CLEANUP] D3D资源销毁完成\n");
+}
+
+static void CleanupD3D12() {
+    SafeCleanD3D();
 }
 
 // === JNI ===
@@ -1682,7 +1858,11 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jc
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     (JNIEnv*, jclass, jlong hwnd) {
+    MessageBoxA(NULL, "nativeInit已执行，DLL加载正常", "DEBUG_LOAD_CHECK", MB_OK);
+    OutputDebugStringA("[FATAL] TEST nativeInit 入口日志\n");
+    OutputDebugStringA("[FATAL] TEST: nativeInit entered (before any code)\n");
     Log("=== nativeInit V2 START ===");
+    OutputDebugStringA("[RAW] nativeInit called - DLL loaded!\n");
     OutputDebugStringA("=== nativeInit ENTERED ===\n");
     Log("=== nativeInit ENTERED ===");
     CreateDirectoryA("C:\\temp", 0);
@@ -1859,6 +2039,10 @@ static VertexType autoDetectVertexType(const float* vertices, UINT vertexCount, 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* env, jclass, jfloatArray verts, jint count, jbyteArray colorArray, jint coordType) {
+    if (g_deviceLost.load() || !IsDeviceValid()) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+        return;
+    }
     // 存储坐标类型
     g_currentCoordType = coordType;
     Log("nativeRecordVertices: Java coordType=%d (0=WORLD, 1=SCREEN, 2=NDC)", coordType);
@@ -1912,7 +2096,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     void* dst = nullptr;
     HRESULT hr = g_imVB->Map(0, nullptr, &dst);
     if (FAILED(hr) || dst == nullptr) {
-        Log("[FATAL] nativeRecordVertices 实例顶点缓冲Map返回空地址，阻断写入防止0地址崩溃");
+        Log("[FATAL] nativeRecordVertices Map failed, hr=0x%08X\n", hr);
         if (colorData != nullptr) {
             env->ReleaseByteArrayElements(colorArray, colorData, JNI_ABORT);
         }
@@ -1982,6 +2166,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv* env, jclass, jfloatArray verts, jint count) {
+    if (g_deviceLost.load() || !IsDeviceValid()) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+        return;
+    }
     if (!g_ok || !g_imVB || !verts || count <= 0) return;
     UINT byteCount = (UINT)count * sizeof(VertexPT);
     if (!EnsureIMVBCapacity(g_imVBSize + byteCount)) return;
@@ -2005,7 +2193,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv
     void* dst = nullptr;
     HRESULT hr = g_imVB->Map(0, nullptr, &dst);
     if (FAILED(hr) || dst == nullptr) {
-        Log("[FATAL] nativeRecordVerticesPT 实例顶点缓冲Map返回空地址，阻断写入防止0地址崩溃");
+        Log("[FATAL] nativeRecordVerticesPT Map failed, hr=0x%08X\n", hr);
         g_imVB->Unmap(0, nullptr);
         LeaveCriticalSection(&g_stateLock);
         return;
@@ -2033,6 +2221,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv
 
 // ========== 简单顶点数据接收（供 Java 端直接使用） ==========
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordUV(JNIEnv* env, jclass, jfloatArray uvs) {
+    if (g_deviceLost.load() || !IsDeviceValid()) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+        return;
+    }
     if (!uvs) { OutputDebugStringA("nativeRecordUV: uvs is null\n"); return; }
     jsize len = env->GetArrayLength(uvs);
     if (len == 0) { OutputDebugStringA("nativeRecordUV: uvs is empty\n"); return; }
@@ -2047,6 +2239,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordUV(JNIEnv* env, j
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordColors(JNIEnv* env, jclass, jfloatArray colors) {
+    if (g_deviceLost.load() || !IsDeviceValid()) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+        return;
+    }
     if (!colors) { OutputDebugStringA("nativeRecordColors: colors is null\n"); return; }
     jsize len = env->GetArrayLength(colors);
     if (len == 0) { OutputDebugStringA("nativeRecordColors: colors is empty\n"); return; }
@@ -2078,6 +2274,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDrawTexture(JNIEnv*,
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetTexture(JNIEnv*, jclass, jint texId) { g_currentTexId = texId; }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTextureEx(JNIEnv* env, jclass, jbyteArray pixels, jint w, jint h, jint texId) {
+    if (g_deviceLost.load() || !IsDeviceValid()) return;
     if (!g_dev || !g_queue || !g_rtvHeap) {
         Log("WARN: nativeUploadTextureEx called before D3D12 full init, skip");
         return;
@@ -2122,6 +2319,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDepthMask(JNIEnv*, j
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jclass, jfloatArray matrix, jint coordType) {
+    if (g_deviceLost.load() || !IsDeviceValid()) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+        return;
+    }
     Log("=== nativeSetMvp CALLED (coordType=%d) ===", coordType);
     jfloat* src = env->GetFloatArrayElements(matrix, nullptr);
     if (src) {
@@ -2198,7 +2399,7 @@ static bool UploadVertexData(const float* data, UINT count, UINT vertexSize,
     readRange.End = 0;
     hr = outUploadBuffer->Map(0, &readRange, &mappedData);
     if (FAILED(hr) || mappedData == nullptr) {
-        Log("[FATAL] Map return null pointer, block memory write");
+        Log("[FATAL] UploadVertexData Map failed, hr=0x%08X\n", hr);
         return false;
     }
     D3D12_RESOURCE_DESC bufDesc = outUploadBuffer->GetDesc();
@@ -2215,6 +2416,10 @@ static bool UploadVertexData(const float* data, UINT count, UINT vertexSize,
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv*, jclass, jint vertexCount) {
+    if (g_deviceLost.load() || !IsDeviceValid()) {
+        OutputDebugStringA("[FATAL] nativeDraw: device lost, abort\n");
+        return;
+    }
     (void)vertexCount;
     OutputDebugStringA("nativeDraw: called, signaling render thread\n");
     if (g_frameReadyEvent != nullptr) {
@@ -2225,6 +2430,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv*, jclass, j
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jclass) {
+    if (!g_globalDeviceReady) {
+        Log("[ERROR] Device not ready, skip rendering in nativeRenderSky");
+        return;
+    }
     if (!g_dev || !g_cl || !g_cbData) return;
 
     // 设置半透明 PSO（支持带 alpha 的天空颜色）
@@ -2258,7 +2467,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky(JNIEnv*, jcla
             writeRange.End = g_cbSize;
             HRESULT hr = g_cbUpload->Map(0, &writeRange, &cbMapped);
             if (FAILED(hr) || !cbMapped) {
-                Log("[FATAL] nativeRenderSky CBV Map null, abort write");
+                Log("[FATAL] nativeRenderSky CBV Map failed, hr=0x%08X\n", hr);
             } else {
                 D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
                 if ((UINT64)g_cbSize > cbvDesc.Width) {
@@ -2347,6 +2556,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadEntities(JNIEnv* 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderEntities(JNIEnv*, jclass) {
+    if (!g_globalDeviceReady) {
+        Log("[ERROR] Device not ready, skip rendering in nativeRenderEntities");
+        return;
+    }
     if (!g_dev || !g_queue || !g_rtvHeap) {
         Log("WARN: nativeRenderEntities called before D3D12 full init, skip");
         return;
@@ -2372,6 +2585,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFF
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
 (JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize) {
+    if (g_deviceLost.load() || !IsDeviceValid()) return;
     if (!g_dev) {
         Log("ERROR: nativeUploadParticles called before D3D12 initialization");
         return;
@@ -2416,6 +2630,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles
 (JNIEnv* env, jclass clazz) {
+    if (!g_globalDeviceReady) {
+        Log("[ERROR] Device not ready, skip rendering in nativeRenderParticles");
+        return;
+    }
     if (!g_dev || !g_cl) {
         Log("ERROR: nativeRenderParticles called without D3D12 context");
         return;
@@ -2457,6 +2675,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles
 // ==============================================
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
 (JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize, jfloat distance) {
+    if (g_deviceLost.load() || !IsDeviceValid()) return;
     if (!g_dev || count <= 0 || vertexSize <= 0) return;
 
     jfloat* data = env->GetFloatArrayElements(vertices, nullptr);
@@ -2480,6 +2699,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
 (JNIEnv* env, jclass clazz) {
+    if (!g_globalDeviceReady) {
+        Log("[ERROR] Device not ready, skip rendering in nativeRenderTransparent");
+        return;
+    }
     if (!g_cl) return;
 
     std::lock_guard<std::mutex> lock(g_transparentMutex);
@@ -2529,7 +2752,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
             writeRange.End = g_cbSize;
             HRESULT hr = g_cbUpload->Map(0, &writeRange, &cbMapped);
             if (FAILED(hr) || !cbMapped) {
-                Log("[FATAL] nativeRenderTransparent CBV Map null, abort write");
+                Log("[FATAL] nativeRenderTransparent CBV Map failed, hr=0x%08X\n", hr);
             } else {
                 D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
                 if ((UINT64)g_cbSize > cbvDesc.Width) {
