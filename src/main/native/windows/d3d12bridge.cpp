@@ -1,4 +1,4 @@
-// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
+﻿// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
@@ -67,7 +67,14 @@ extern "C" {
 // === D3D12 state ===
 static ComPtr<ID3D12Device>          g_dev;
 // 设备有效性工具函数，全局可用（必须在g_dev声明之后）
-inline bool IsDeviceValid() { return g_dev != nullptr; }
+inline bool IsDeviceValid()
+{
+    if (!g_dev)
+        return false;
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    // 仅设备正常返回true；设备移除/重置/故障全部判定失效
+    return devErr == S_OK;
+}
 // 全局原子设备丢失标记，线程安全
 std::atomic<bool> g_deviceLost = false;
 // 递归互斥锁，防止单线程重复加锁死锁
@@ -1037,13 +1044,39 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     Vertex2D fsQuad[] = {{-1,-1,0,1},{3,-1,2,1},{-1,3,0,-1}};
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
-    while (true) {
-        if (g_deviceLost.load() || !IsDeviceValid()) {
-            OutputDebugStringA("[FATAL] RenderThread 检测设备丢失，立即终止渲染循环");
+    while (true)
+    {
+        // 第一层：全局原子标记快速拦截
+        if (g_deviceLost.load())
+        {
+            OutputDebugStringA("[FATAL] RenderThread 全局标记判定设备丢失，立即终止渲染循环");
             g_run = false;
             break;
         }
-        if (!g_globalDeviceReady) { Log("[ERROR] Device not ready, skip render"); Sleep(16); continue; }
+        // 新增：g_dev空指针防护，防止空指针调用API
+        if (!g_dev)
+        {
+            OutputDebugStringA("[FATAL] g_dev设备句柄已置空，显卡销毁，终止渲染");
+            g_deviceLost.store(true);
+            g_run = false;
+            SetEvent(g_frameReadyEvent);
+            SetEvent(g_frameDoneEvent);
+            break;
+        }
+        // 第二层：直接读取驱动真实GPU销毁状态，捕获Draw中途TDR
+        HRESULT devErr = g_dev->GetDeviceRemovedReason();
+        if (devErr != S_OK)
+        {
+            char logBuf[512] = {0};
+            sprintf_s(logBuf, "[FATAL TDR] 驱动上报GPU已销毁，错误码0x%08X，终止所有渲染", devErr);
+            OutputDebugStringA(logBuf);
+            g_deviceLost.store(true);
+            g_run = false;
+            SetEvent(g_frameReadyEvent);
+            SetEvent(g_frameDoneEvent);
+            break;
+        }
+        if (!g_globalDeviceReady) { Log("[INFO] Device not ready, exiting render thread."); g_run = false; break; }
         Log("=== RenderLoop LOOP ITERATION ===");
         if (!g_dev || !g_queue || !g_rtvHeap || !g_srvHeap || !g_alloc || !g_cl) {
             Sleep(16);
@@ -1596,6 +1629,19 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             OutputDebugStringA("[FATAL] TEST: Present succeeded\n");
         }
 
+        // Present完成兜底检测，捕获帧内中途触发的TDR
+        HRESULT frameCheck = g_dev->GetDeviceRemovedReason();
+        if (frameCheck != S_OK) {
+            char buf[512] = {0};
+            sprintf_s(buf, "[FATAL TDR] Present后检测到GPU销毁，错误码0x%08X", frameCheck);
+            OutputDebugStringA(buf);
+            g_deviceLost.store(true);
+            g_run = false;
+            SetEvent(g_frameReadyEvent);
+            SetEvent(g_frameDoneEvent);
+            break;
+        }
+
         UINT64 fv = g_fenceVal;
         g_queue->Signal(g_fence.Get(), fv); g_fenceVal++;
         if (g_fence->GetCompletedValue() < fv) {
@@ -1813,14 +1859,15 @@ static void SafeCleanD3D() {
     // 1. 标记渲染线程停止
     g_run = false;
     g_deviceLost.store(true);
+    g_globalDeviceReady = false;   // 立即阻止新渲染请求
     // 唤醒阻塞事件，消除线程死锁
     SetEvent(g_frameReadyEvent);
     SetEvent(g_frameDoneEvent);
-    // 2. 等待渲染线程退出（限时2秒，超时不阻塞主程序）
+    // 2. 等待渲染线程退出（限时3秒，超时不阻塞主程序）
     if (g_thread) {
-        DWORD waitRet = WaitForSingleObject(g_thread, 2000);
+        DWORD waitRet = WaitForSingleObject(g_thread, 3000);
         if (waitRet == WAIT_TIMEOUT) {
-            OutputDebugStringA("[WARN CLEANUP: 渲染线程2秒未退出，跳过等待直接释放资源");
+            OutputDebugStringA("[WARN CLEANUP: 渲染线程3秒未退出，跳过等待直接释放资源");
         }
         CloseHandle(g_thread);
         g_thread = nullptr;
@@ -1845,6 +1892,7 @@ static void SafeCleanD3D() {
         g_cbUpload.Reset();
         g_texMCFrame.Reset(); g_vbFSQuad.Reset(); g_imVB.Reset();
         // ComPtr 自动释放全部 D3D 资源
+        // 优先释放D3D设备，IsDeviceValid立刻返回false
         g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
@@ -2051,8 +2099,20 @@ static VertexType autoDetectVertexType(const float* vertices, UINT vertexCount, 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* env, jclass, jfloatArray verts, jint count, jbyteArray colorArray, jint coordType) {
-    if (g_deviceLost.load() || !IsDeviceValid()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+    if (!g_globalDeviceReady) return;
+    // 顶层快速拦截，主线程Mesh构建直接阻断空设备
+    if (!g_dev || g_deviceLost.load())
+    {
+        OutputDebugStringA("[JNI拦截] nativeRecordVertices：检测显卡设备销毁，拒绝顶点提交");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D显卡设备已销毁，禁止上传顶点");
+        return;
+    }
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    if (devErr != S_OK)
+    {
+        g_deviceLost.store(true);
+        OutputDebugStringA("[JNI拦截] nativeRecordVertices：TDR显卡驱动重置，渲染已关闭");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "TDR显卡驱动重置，渲染已关闭");
         return;
     }
     // 存储坐标类型
@@ -2176,6 +2236,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv* env, jclass, jfloatArray verts, jint count) {
+    if (!g_globalDeviceReady) return;
     if (g_deviceLost.load() || !IsDeviceValid()) {
         env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
         return;
@@ -2231,6 +2292,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVerticesUV(JNIEnv
 
 // ========== 简单顶点数据接收（供 Java 端直接使用） ==========
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordUV(JNIEnv* env, jclass, jfloatArray uvs) {
+    if (!g_globalDeviceReady) return;
     if (g_deviceLost.load() || !IsDeviceValid()) {
         env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
         return;
@@ -2249,6 +2311,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordUV(JNIEnv* env, j
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordColors(JNIEnv* env, jclass, jfloatArray colors) {
+    if (!g_globalDeviceReady) return;
     if (g_deviceLost.load() || !IsDeviceValid()) {
         env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
         return;
@@ -2284,7 +2347,22 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDrawTexture(JNIEnv*,
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetTexture(JNIEnv*, jclass, jint texId) { g_currentTexId = texId; }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTextureEx(JNIEnv* env, jclass, jbyteArray pixels, jint w, jint h, jint texId) {
-    if (g_deviceLost.load() || !IsDeviceValid()) return;
+    if (!g_globalDeviceReady) return;
+    // 顶层快速拦截
+    if (!g_dev || g_deviceLost.load())
+    {
+        OutputDebugStringA("[JNI拦截] nativeUploadTextureEx：检测显卡设备销毁，拒绝纹理上传");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D显卡设备已销毁");
+        return;
+    }
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    if (devErr != S_OK)
+    {
+        g_deviceLost.store(true);
+        OutputDebugStringA("[JNI拦截] nativeUploadTextureEx：TDR显卡驱动重置");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "TDR显卡驱动重置");
+        return;
+    }
     if (!g_dev || !g_queue || !g_rtvHeap) {
         Log("WARN: nativeUploadTextureEx called before D3D12 full init, skip");
         return;
@@ -2329,8 +2407,20 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetDepthMask(JNIEnv*, j
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jclass, jfloatArray matrix, jint coordType) {
-    if (g_deviceLost.load() || !IsDeviceValid()) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D device lost, rendering stopped");
+    if (!g_globalDeviceReady) return;
+    // 顶层快速拦截
+    if (!g_dev || g_deviceLost.load())
+    {
+        OutputDebugStringA("[JNI拦截] nativeSetMvp：检测显卡设备销毁，拒绝MVP更新");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D显卡设备已销毁");
+        return;
+    }
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    if (devErr != S_OK)
+    {
+        g_deviceLost.store(true);
+        OutputDebugStringA("[JNI拦截] nativeSetMvp：TDR显卡驱动重置");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "TDR显卡驱动重置");
         return;
     }
     Log("=== nativeSetMvp CALLED (coordType=%d) ===", coordType);
@@ -2364,7 +2454,7 @@ JNIEXPORT jstring JNICALL Java_com_dx12_DX12LibClient_nativeGetD3D12Info(JNIEnv*
 }
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsD3D12Active(JNIEnv*, jclass) {
-    return g_ok ? JNI_TRUE : JNI_FALSE;
+    return (g_ok && g_globalDeviceReady) ? JNI_TRUE : JNI_FALSE;
 }
 
 // === Phase 3: Sky, Terrain, Entity, Particle ===
@@ -2425,9 +2515,21 @@ static bool UploadVertexData(const float* data, UINT count, UINT vertexSize,
     return true;
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv*, jclass, jint vertexCount) {
-    if (g_deviceLost.load() || !IsDeviceValid()) {
-        OutputDebugStringA("[FATAL] nativeDraw: device lost, abort\n");
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv* env, jclass, jint vertexCount) {
+    if (!g_globalDeviceReady) return;
+    // 顶层快速拦截，主线程Mesh构建直接阻断空设备
+    if (!g_dev || g_deviceLost.load())
+    {
+        OutputDebugStringA("[JNI拦截] nativeDraw：检测显卡设备销毁，拒绝绘制调用");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D显卡设备已销毁，禁止绘制");
+        return;
+    }
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    if (devErr != S_OK)
+    {
+        g_deviceLost.store(true);
+        OutputDebugStringA("[JNI拦截] nativeDraw：TDR显卡驱动重置，渲染已关闭");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "TDR显卡驱动重置，渲染已关闭");
         return;
     }
     (void)vertexCount;
@@ -2557,6 +2659,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTerrain(JNIEnv*, 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadEntities(JNIEnv* env, jclass, jfloatArray entityData, jint count) {
+    if (!g_globalDeviceReady) return;
     if (!g_dev || !g_queue || !g_rtvHeap) {
         Log("WARN: nativeUploadEntities called before D3D12 full init, skip");
         return;
@@ -2579,6 +2682,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderEntities(JNIEnv*,
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFFF
 (JNIEnv* env, jclass clazz, jfloat r, jfloat g, jfloat b, jfloat a, jfloat sunAngle, jfloat moonAngle) {
+    if (!g_globalDeviceReady) return;
     if (!g_dev || !g_queue || !g_rtvHeap) {
         Log("WARN: nativeSetSkyParameters called before D3D12 full init, skip");
         return;
@@ -2595,6 +2699,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFF
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
 (JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize) {
+    if (!g_globalDeviceReady) return;
     if (g_deviceLost.load() || !IsDeviceValid()) return;
     if (!g_dev) {
         Log("ERROR: nativeUploadParticles called before D3D12 initialization");
@@ -2640,8 +2745,20 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles
 (JNIEnv* env, jclass clazz) {
-    if (!g_globalDeviceReady) {
-        Log("[ERROR] Device not ready, skip rendering in nativeRenderParticles");
+    if (!g_globalDeviceReady) return;
+    // 顶层快速拦截
+    if (!g_dev || g_deviceLost.load())
+    {
+        OutputDebugStringA("[JNI拦截] nativeRenderParticles：检测显卡设备销毁，拒绝粒子渲染");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D显卡设备已销毁");
+        return;
+    }
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    if (devErr != S_OK)
+    {
+        g_deviceLost.store(true);
+        OutputDebugStringA("[JNI拦截] nativeRenderParticles：TDR显卡驱动重置");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "TDR显卡驱动重置");
         return;
     }
     if (!g_dev || !g_cl) {
@@ -2685,6 +2802,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderParticles
 // ==============================================
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
 (JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize, jfloat distance) {
+    if (!g_globalDeviceReady) return;
     if (g_deviceLost.load() || !IsDeviceValid()) return;
     if (!g_dev || count <= 0 || vertexSize <= 0) return;
 
@@ -2709,8 +2827,20 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
 (JNIEnv* env, jclass clazz) {
-    if (!g_globalDeviceReady) {
-        Log("[ERROR] Device not ready, skip rendering in nativeRenderTransparent");
+    if (!g_globalDeviceReady) return;
+    // 顶层快速拦截
+    if (!g_dev || g_deviceLost.load())
+    {
+        OutputDebugStringA("[JNI拦截] nativeRenderTransparent：检测显卡设备销毁，拒绝透明渲染");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "D3D显卡设备已销毁");
+        return;
+    }
+    HRESULT devErr = g_dev->GetDeviceRemovedReason();
+    if (devErr != S_OK)
+    {
+        g_deviceLost.store(true);
+        OutputDebugStringA("[JNI拦截] nativeRenderTransparent：TDR显卡驱动重置");
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "TDR显卡驱动重置");
         return;
     }
     if (!g_cl) return;

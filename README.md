@@ -1,17 +1,13 @@
-# GL4DX12 - Minecraft D3D12 渲染模组
-
-> 为 Minecraft 26.1.2 实现的 D3D12 渲染后端，通过覆盖层窗口 + LevelRenderer 拦截 + 全帧 D3D12 渲染实现完整渲染管线。
-
----
-
-## 当前状态
-
-**阶段 3 开发中** — 阶段 1+2 已完成并稳定运行。阶段 3 的 Java 侧数据提取与拦截已实现并验证通过，**C++ 侧核心渲染管线已打通**，粒子/实体/液体/纹理基础框架已实现，进入功能完善阶段。
+# DirectXmod - Minecraft D3D12 渲染模组
+> 为 Minecraft 26.1.2 实现的 D3D12 渲染后端，通过覆盖层窗口 + LevelRenderer 拦截 + 全帧 D3D12 渲染实现完整渲染管线。并且阻止 OpenGL 渲染。
 
 ---
 
-### 功能进度一览
+## 项目整体进度
+### 开发阶段
+**阶段 3 功能完善中** — 阶段 1（基础渲染窗口）、阶段 2（核心渲染能力）已完成并稳定运行；阶段 3 已完成 Java 侧数据提取/拦截、C++ 侧核心渲染管线打通，粒子/实体/液体/纹理基础框架落地，进入细分功能攻坚阶段。
 
+### 核心功能进度
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | D3D12 覆盖层窗口 | ✅ 已完成 | 无边框、点击穿透、自动追踪 MC 窗口 |
@@ -25,102 +21,90 @@
 | GlDraw/GlBuffer 被动监听 | ✅ 已完成 | GL15/GL11 Mixin 跟踪 GL 状态变化 |
 | LevelRenderer 拦截 | ✅ 已完成 | `renderLevel` HEAD 拦截，取消 OpenGL 渲染 |
 | BufferBuilder 数据捕获与提取 | ✅ 已完成 | 支持多种顶点格式 (16/24/28/72字节) 解析并发送至C++端 |
-| **顶点类型自动检测** | ✅ 已完成 | `autoDetectVertexType` 6条规则区分 WORLD/SCREEN/NDC |
-| **纹理采样基础** | ✅ 已完成 | 纹理上传、SRV管理、资源状态转换 |
-| **粒子系统基础** | ✅ 已完成 | `nativeUploadParticles`/`nativeRenderParticles` 框架 |
-| **实体渲染基础** | ✅ 已完成 | `nativeUploadEntities`/`nativeRenderEntities` 模型矩阵支持 |
-| **液体渲染框架** | ✅ 已完成 | `nativeUploadLiquid`/`nativeRenderLiquid` 水和岩浆支持 |
-| 天空盒 D3D12 渲染 | 🟡 开发中 | 天空参数已同步，渲染实现中 |
-| 半透明物体渲染 | 🟡 开发中 | 深度排序和混合状态待完善 |
-| 太阳/月亮/星星渲染 | 🟡 开发中 | 位置计算已实现，渲染待完善 |
-| 多 Pass 渲染（半透明/GUI） | ❌ 未开始 | |
-| Shader 系统 + 后处理 | ❌ 未开始 | |
+| 顶点类型自动检测 | ✅ 已完成 | `autoDetectVertexType` 6条规则区分 WORLD/SCREEN/NDC |
+| 纹理采样基础 | ✅ 已完成 | 纹理上传、SRV管理、资源状态转换 |
+| 粒子系统基础 | ✅ 已完成 | `nativeUploadParticles`/`nativeRenderParticles` 框架 |
+| 实体渲染基础 | ✅ 已完成 | `nativeUploadEntities`/`nativeRenderEntities` 模型矩阵支持 |
+| 液体渲染框架 | ✅ 已完成 | `nativeUploadLiquid`/`nativeRenderLiquid` 水和岩浆支持 |
+| 天空盒 D3D12 渲染 | 🟡 开发中 | 天空参数已同步，渲染逻辑落地中 |
+| 半透明物体渲染 | 🟡 开发中 | 深度排序和混合状态待完善（当前核心攻坚点） |
+| 太阳/月亮/星星渲染 | 🟡 开发中 | 位置计算已实现，渲染管线待整合 |
+| 多 Pass 渲染（半透明/GUI） | ❌ 未开始 | 需基于半透明渲染成果扩展 |
+| Shader 系统 + 后处理 | ❌ 未开始 | 阶段 3 完成后启动规划 |
+
+### 关键组件落地情况
+| 组件 | 文件 | 状态 | 说明 |
+|------|------|------|------|
+| C++ 核心 | `d3d12bridge.cpp` | 🟡 迭代中 | D3D12 设备/渲染管线核心，当前聚焦天空盒/半透明渲染实现 |
+| JNI 桥接 | `DX12LibClient.java` | ✅ 已完成 | 35+ native 方法声明（纹理/实体/粒子/液体/天空） |
+| 业务逻辑 | `D3D12Bridge.java` | ✅ 已完成 | 顶点展开、矩阵同步、全帧编排、反射调用 |
+| Mod 入口 | `Dx12Mod.java` | ✅ 已完成 | F6 热键、DLL 加载、HWND 传递、启动诊断 |
+| 渲染提取器 | `SkyboxExtractor.java` | ✅ 已完成 | 从 SkyRenderState 提取天空参数（待C++侧对接） |
+| 渲染提取器 | `ParticleExtractor.java` | ✅ 已完成 | 反射解析 QuadParticleRenderState 粒子数据 |
+| Mixin 拦截 | `LevelRendererMixin.java`/`BufferBuilderMixin.java` 等 | ✅ 已完成 | 全核心渲染流程拦截、数据提取逻辑 |
 
 ---
 
-### 关键组件
+## 当前核心难题与卡点
+### 1. 半透明物体渲染（最高优先级）
+- **问题描述**：Minecraft 半透明物体（如玻璃、水纹、树叶）需基于深度排序实现 alpha 混合，但 D3D12 渲染管线中深度缓冲区与混合状态的联动逻辑未打通，当前渲染存在“透层错误”“渲染顺序混乱”问题。
+- **核心难点**：
+  - 需适配 MC 原有半透明渲染逻辑，提取并同步“绘制顺序优先级”数据；
+  - D3D12 混合状态（Blend State）配置需精准匹配 OpenGL 效果，避免色彩偏差；
+  - 深度排序需兼顾性能，防止多物体场景下渲染帧率暴跌。
 
-| 组件 | 文件 | 说明 |
-|------|------|------|
-| C++ 核心 | `d3d12bridge.cpp` | D3D12 设备、SwapChain、PSO、顶点缓冲、纹理、GDI 捕获、多线程渲染。**当前开发焦点** |
-| JNI 桥接 | `DX12LibClient.java` | 35+ native 方法声明（纹理/实体/粒子/液体/天空） |
-| 业务逻辑 | `D3D12Bridge.java` | 顶点展开、矩阵同步、全帧编排、反射调用 |
-| Mod 入口 | `Dx12Mod.java` | F6 热键、DLL 加载、HWND 传递、启动诊断 |
-| 渲染提取器 | `SkyboxExtractor.java` | 从 SkyRenderState 提取天空参数 |
-| 渲染提取器 | `ParticleExtractor.java` | 反射解析 QuadParticleRenderState 粒子数据 |
-| 库加载 | `NativeUtils.java` | 从 JAR 提取 DLL 到临时目录并加载 |
-| Mixin | `LevelRendererMixin.java` | 拦截 `renderLevel()` 取消 OpenGL |
-| Mixin | `BufferBuilderMixin.java` | 拦截 `build()` 提取 MeshData，支持多种顶点格式 |
-| Mixin | `EntityRenderDispatcherMixin.java` | 拦截 `extractEntity()` 捕获实体状态 |
-| Mixin | `ParticleEngineMixin.java` | 拦截 `extract()` 捕获粒子状态 |
+### 2. 天空盒渲染管线整合
+- **问题描述**：已完成天空参数（如天空颜色、太阳/月亮位置、星图数据）从 Java 侧提取，但 C++ 端 `nativeRenderSky` 实现中，天空盒纹理映射、半球渐变渲染、昼夜周期动画联动存在卡点。
+- **核心难点**：
+  - MC 26.1.2 天空渲染的非线性渐变逻辑难以直接移植到 D3D12；
+  - 星图的稀疏顶点渲染需适配 D3D12 顶点缓冲格式，避免显存浪费。
 
----
+### 3. 粒子系统动画与纹理适配
+- **问题描述**：基础粒子渲染框架已完成，但粒子的帧动画（如火焰粒子、烟雾粒子）、纹理采样偏移、生命周期渐变未实现。
+- **核心难点**：
+  - Java 侧粒子动画参数（帧间隔、纹理分块）提取后，C++ 端需高效映射到 Shader 阶段；
+  - 粒子透明通道与场景深度的叠加逻辑易出现“粒子穿透实体”问题。
 
-### 顶点数据流
-BufferBuilder.build()
-→ BufferBuilderMixin (RETURN 钩子)
-→ D3D12Bridge.processMeshData()
+### 4. 实体模型骨骼动画与蒙皮
+- **问题描述**：实体基础渲染（静态模型）已实现，但带骨骼动画的实体（如玩家、生物）蒙皮渲染未落地。
+- **核心难点**：
+  - MC 实体骨骼矩阵的反射提取需兼容不同实体类型的骨骼结构；
+  - D3D12 顶点蒙皮需结合常量缓冲区（CBV）实现，需平衡性能与精度。
 
-反射读取 DrawState → VertexFormat → ByteBuffer
-
-动态识别vertexSize(16/24/28/72等)，按偏移量解析位置、颜色、UV
-
-提取 position(xyz), color(ABGR→RGBA), uv (已通过日志验证)
-
-autoDetectVertexType() → 自动判定 WORLD/SCREEN/NDC
-
-nativeRecordVertices() → 数据发送至C++端 (每个DrawCall独立存储类型)
-
-C++端根据类型使用透视/正交投影矩阵
-
-text
+### 5. 历史遗留风险（已解决但需警惕）
+| 已解决问题 | 根因 | 解决方案 | 风险提示 |
+|------------|------|----------|----------|
+| 0xc010 空指针崩溃 | JNI函数在D3D12初始化前被调用 | 所有JNI函数增加D3D核心对象空校验 | 新增JNI方法需同步添加空校验 |
+| 3D物品误判为2D GUI | 顶点类型检测缺少Z轴深度 | 增加Z轴深度检测规则 | 新增顶点格式需更新检测规则 |
+| SRV堆管理错误 | 所有纹理共享同一描述符 | 每个纹理独立SRV偏移量 | 纹理批量上传需校验SRV偏移 |
 
 ---
 
-### 已解决的问题
-
-| 问题 | 根因 | 解决方案 |
+## 近期里程碑
+| 日期 | 版本 | 核心成果 |
 |------|------|----------|
-| 灰色覆盖层 | `WS_EX_LAYERED` + D3D12 flip-model 冲突 | 移除 Layered，改用 GDI BitBlt 捕获 |
-| 1/4 色块 | HiDPI 下尺寸不匹配 + MVP identity | 物理尺寸检测 + 手动投影矩阵计算 |
-| 红色移动色块 | 顶点颜色 ABGR 序错误 | `readV()` 中交换 R/B 通道 |
-| 缩放窗口崩溃 | SwapChain RT 未重建 | `ResizeBuffers()` + RTV/深度缓冲重建 |
-| 黑屏残留 | 窗口缩放后未强制重绘 | `InvalidateRect()` + `UpdateWindow()` |
-| 投影矩阵缺失 | MC 26.1.2 无 `getProjectionMatrix()` | CameraRenderState 反射 或 FOV 手动计算 |
-| 多线程渲染崩溃 | 顶点数据上传和渲染线程竞态 | `std::mutex` + `g_frameReadyEvent` 同步 |
-| VertexFormat 反射失败 | MC 26.1.2 类名变化 | 动态识别并硬编码多种顶点布局偏移量 |
-| F3 闪烁/长文本 | Sodium 多 Pass 触发多次 extractLines | 节流 + 紧凑 GPU 名称 |
-| Java端数据提取异常 | 索引越界 | 增加日志和动态偏移量适配 |
-| **0xc010 空指针崩溃** | **JNI函数在D3D12初始化前被调用** | **所有JNI函数增加D3D核心对象空校验** |
-| **3D物品误判为2D GUI** | **顶点类型检测缺少Z轴深度** | **增加Z轴深度检测规则** |
-| **SRV堆管理错误** | **所有纹理共享同一描述符** | **每个纹理独立SRV偏移量** |
+| 2026-06-19 | `v0.3.0` | 粒子/实体/液体/纹理基础框架落地；顶点类型自动检测；0xc010空指针修复 |
+| 2026-06-18 | `v0.2.0` | 阶段2完成：GDI背景捕获、几何叠加、MVP矩阵同步 |
+| 2026-06-17 | `v0.1.0` | 阶段1完成：D3D12覆盖层窗口、SwapChain基础渲染 |
 
 ---
 
-### 近期更新
+## 短期攻坚计划（1-2周）
+1. **突破半透明渲染卡点**：完成深度排序逻辑 + alpha混合状态配置，验证玻璃/树叶渲染效果；
+2. **完成天空盒核心渲染**：落地 `nativeRenderSky` 实现，打通天空参数→C++渲染管线；
+3. **粒子动画基础支持**：实现纹理分块采样、帧动画时间插值，修复粒子穿透问题；
+4. **实体蒙皮预研**：提取典型实体（如玩家）骨骼矩阵，完成基础蒙皮渲染验证。
 
-| 日期 | 提交 | 内容 |
-|------|------|------|
-| 2026-06-19 | `v0.3.0` | 粒子/实体/液体/纹理基础框架；顶点类型自动检测；0xc010空指针修复 |
-| 2026-06-18 | `v0.2.0` | 阶段2完成：GDI背景捕获、几何叠加、MVP同步 |
-| 2026-06-17 | `v0.1.0` | 阶段1完成：D3D12覆盖层窗口、SwapChain渲染 |
-
----
-
-### 下一步计划
-
-1. **完成天空盒渲染** — `nativeRenderSky` 实现
-2. **完成半透明渲染** — 深度排序 + alpha混合
-3. **完善粒子系统** — 粒子动画和纹理支持
-4. **实体模型完整支持** — 骨骼动画和蒙皮
-5. **多Pass渲染** — 半透明/GUI分层渲染
+## 中长期规划
+1. 完善多Pass渲染体系，支持半透明/GUI分层渲染；
+2. 搭建Shader系统，接入后处理效果（抗锯齿、色彩校正）；
+3. 性能优化：顶点数据批量处理、渲染线程调度优化；
+4. 兼容性扩展：适配更多Minecraft版本/模组（如Sodium）。
 
 ---
 
 ## 许可证
-
 MIT
 
 ## 仓库
-
 [https://github.com/366862732/DirectXmod](https://github.com/366862732/DirectXmod)
