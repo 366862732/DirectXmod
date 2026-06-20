@@ -1,4 +1,4 @@
-// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
+﻿// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
@@ -33,13 +33,9 @@
 
 using namespace Microsoft::WRL;
 
-// 设备有效性工具函数，全局可用
-inline bool IsDeviceValid()
-{
-    return g_dev != nullptr;
-}
-// 全局原子设备丢失标记，线程安全
-std::atomic<bool> g_deviceLost = false;
+// 前向声明（供 SafeCleanD3D 和状态机使用）
+void SafeCleanD3D();
+void ProcessNextInitStage();
 
 static void Log(const char* fmt, ...) {
     char buf[1024];
@@ -70,6 +66,10 @@ extern "C" {
 
 // === D3D12 state ===
 static ComPtr<ID3D12Device>          g_dev;
+// 设备有效性工具函数，全局可用（必须在g_dev声明之后）
+inline bool IsDeviceValid() { return g_dev != nullptr; }
+// 全局原子设备丢失标记，线程安全
+std::atomic<bool> g_deviceLost = false;
 static char g_d3d12Info[256] = "D3D12 not initialized";
 static ComPtr<ID3D12CommandQueue>    g_queue;
 static ComPtr<IDXGISwapChain3>       g_swap;
@@ -428,7 +428,7 @@ float4 PSMain(PS_IN i) : SV_TARGET { return gTex.Sample(gSamp, i.uv); }
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rb;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
-    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&g_rs)))) return false;
+    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(g_rs.GetAddressOf())))) return false;
 
     D3D12_INPUT_ELEMENT_DESC ie[] = {
         {"POS",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
@@ -449,7 +449,7 @@ float4 PSMain(PS_IN i) : SV_TARGET { return gTex.Sample(gSamp, i.uv); }
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_pso)))) return false;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_pso.GetAddressOf())))) return false;
     return true;
 }
 
@@ -524,7 +524,7 @@ static bool BuildSolidPSO(UINT stateBits, bool textured) {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoSolidVariants[idx])))) return false;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoSolidVariants[idx].GetAddressOf())))) return false;
     return true;
 }
 
@@ -581,7 +581,7 @@ static bool BuildLinePSO(UINT stateBits, bool textured) {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoLineVariants[idx])))) return false;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoLineVariants[idx].GetAddressOf())))) return false;
     return true;
 }
 
@@ -605,7 +605,7 @@ static bool BuildAlphaBlendPSO() {
         ComPtr<ID3DBlob> rb;
         if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
         if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(),
-            IID_PPV_ARGS(&g_rsSolidVariants[0])))) return false;
+            IID_PPV_ARGS(g_rsSolidVariants[0].GetAddressOf())))) return false;
     }
 
     D3D12_INPUT_ELEMENT_DESC ie[] = {
@@ -638,7 +638,7 @@ static bool BuildAlphaBlendPSO() {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoAlphaBlend)))) return false;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoAlphaBlend.GetAddressOf())))) return false;
     Log("BuildAlphaBlendPSO: created alpha-blend PSO");
     return true;
 }
@@ -675,7 +675,7 @@ static bool MkPSOTex() {
     rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &ss;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
-    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&g_rsTex)))) return false;
+    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(g_rsTex.GetAddressOf())))) return false;
 
     D3D12_INPUT_ELEMENT_DESC ie[] = {
         {"POS",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
@@ -700,13 +700,13 @@ static bool MkPSOTex() {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_psoTex)))) return false;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoTex.GetAddressOf())))) return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = 64;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_texSrvHeap)))) return false;
+    if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(g_texSrvHeap.GetAddressOf())))) return false;
     g_texSrvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
 }
@@ -851,7 +851,7 @@ static bool CaptureMCFrame() {
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.SampleDesc.Count = 1;
         if (FAILED(g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
-            &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_texMCFrame)))) {
+            &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(g_texMCFrame.GetAddressOf())))) {
             delete[] pixels;
             return false;
         }
@@ -943,7 +943,7 @@ static void RepositionOverlay() {
         g_fi = g_swap->GetCurrentBackBufferIndex();
         D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
         for (UINT n = 0; n < 2; n++) {
-            g_swap->GetBuffer(n, IID_PPV_ARGS(&g_rt[n]));
+            g_swap->GetBuffer(n, IID_PPV_ARGS(g_rt[n].GetAddressOf()));
             g_dev->CreateRenderTargetView(g_rt[n].Get(), nullptr, rh);
             rh.ptr += g_rtvSize;
         }
@@ -958,12 +958,12 @@ static void RepositionOverlay() {
             D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
             cv.DepthStencil.Depth = 1.0f;
             g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
-                &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_depthBuf));
+                &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
             g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
                 g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
         }
-        g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_alloc));
-        g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(&g_cl));
+        g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf()));
+        g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(g_cl.GetAddressOf()));
         g_cl->Close();
     }
 }
@@ -1168,15 +1168,15 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     }
                     float zDelta = zMax - zMin;
                     bool allXYInScreen = (screenCount > vertexCount / 2);
-                    static int suspectUICount = 0;
+                    static std::atomic<int> warnCount{0};
                     if (allXYInScreen && fabs(zDelta) < 0.001f) {
-                        suspectUICount++;
-                        char warnBuf[512];
-                        sprintf_s(warnBuf, "[AUTO-CORRECT WARN#%d] XY screen-plane + Z=0, Java coordType=%d, NOT auto-switching pipeline",
-                            suspectUICount, g_currentCoordType);
+                        int cnt = warnCount.fetch_add(1);
+                        char warnBuf[512] = {0};
+                        sprintf_s(warnBuf, "[AUTO-CORRECT WARN#%d:平面UI顶点，Java传入coordType=%d，不再自动强制切换渲染管线",
+                            cnt, g_currentCoordType);
                         OutputDebugStringA(warnBuf);
                     } else {
-                        OutputDebugStringA("[AUTO-CORRECT INFO] Vertex has depth, using Java-passed coordinate type");
+                        OutputDebugStringA("[AUTO-CORRECT INFO:顶点存在深度差值，沿用Java上层指定3D管线");
                     }
                     // 管线切换仅依赖Java传入值，不受顶点自动检测干扰
                 }
@@ -1581,6 +1581,9 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     OutputDebugStringA("[FATAL] GPU timeout/device destroyed, marking device lost\n");
                     g_deviceLost.store(true);
                     g_run = false;
+                    SetEvent(g_frameReadyEvent);
+                    SetEvent(g_frameDoneEvent);
+                    SafeCleanD3D();
                     break;
                 case DXGI_ERROR_DEVICE_RESET:    OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_DEVICE_RESET\n"); break;
                 case DXGI_ERROR_ACCESS_DENIED:   OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_ACCESS_DENIED\n"); break;
@@ -1675,7 +1678,7 @@ ComPtr<IDXGIFactory4> dxgi;
     ComPtr<IDXGIAdapter1> adp;
     for (UINT i=0; dxgi->EnumAdapters1(i,&adp)!=DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d; adp->GetDesc1(&d);
-        if (SUCCEEDED(D3D12CreateDevice(adp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_dev)))) {
+        if (SUCCEEDED(D3D12CreateDevice(adp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf())))) {
             D3D12_FEATURE_DATA_FEATURE_LEVELS fl = {};
             g_dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
             const char* flNames[] = {"Unknown","9.1","9.2","9.3","10.0","10.1","11.0","11.1","12.0","12.1","12.2"};
@@ -1689,10 +1692,10 @@ ComPtr<IDXGIFactory4> dxgi;
         }
         adp.Reset();
     }
-    if (!g_dev && FAILED(D3D12CreateDevice(0, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_dev)))) return false;
+    if (!g_dev && FAILED(D3D12CreateDevice(0, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf())))) return false;
 
     D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)))) return false;
+    if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(g_queue.GetAddressOf())))) return false;
 
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.BufferCount=2; sd.Width=g_w; sd.Height=g_h;
@@ -1705,32 +1708,32 @@ ComPtr<IDXGIFactory4> dxgi;
 
     D3D12_DESCRIPTOR_HEAP_DESC rd = {};
     rd.NumDescriptors=2; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&g_rtvHeap)))) return false;
+    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_rtvHeap.GetAddressOf())))) return false;
     g_rtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     rd = {}; rd.NumDescriptors=1; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     rd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&g_srvHeap)))) return false;
+    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_srvHeap.GetAddressOf())))) return false;
     g_srvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     for (UINT n=0; n<2; n++) {
-        g_swap->GetBuffer(n, IID_PPV_ARGS(&g_rt[n]));
+        g_swap->GetBuffer(n, IID_PPV_ARGS(g_rt[n].GetAddressOf()));
         g_dev->CreateRenderTargetView(g_rt[n].Get(), nullptr, rh);
         rh.ptr += g_rtvSize;
     }
 
-    if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_alloc)))) return false;
-    if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), 0, IID_PPV_ARGS(&g_cl)))) return false;
+    if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf())))) return false;
+    if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), 0, IID_PPV_ARGS(g_cl.GetAddressOf())))) return false;
     g_cl->Close();
-    if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) return false;
+    if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(g_fence.GetAddressOf())))) return false;
     g_fenceVal=1; g_fenceEv=CreateEventW(0,0,0,0);
 
     g_dsvFormat = PickDepthFormat();
     if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
         D3D12_DESCRIPTOR_HEAP_DESC dd = {};
         dd.NumDescriptors = 1; dd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        if (SUCCEEDED(g_dev->CreateDescriptorHeap(&dd, IID_PPV_ARGS(&g_dsvHeap)))) {
+        if (SUCCEEDED(g_dev->CreateDescriptorHeap(&dd, IID_PPV_ARGS(g_dsvHeap.GetAddressOf())))) {
             D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC depthDesc = {};
             depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1741,7 +1744,7 @@ ComPtr<IDXGIFactory4> dxgi;
             D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
             cv.DepthStencil.Depth = 1.0f;
             g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
-                &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_depthBuf));
+                &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
             g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
                 g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
         }
@@ -1754,7 +1757,7 @@ ComPtr<IDXGIFactory4> dxgi;
     rdCB.MipLevels = 1; rdCB.SampleDesc.Count = 1;
     rdCB.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     if (SUCCEEDED(g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
-        &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cbUpload)))) {
+        &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_cbUpload.GetAddressOf())))) {
         HRESULT hr = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
         if (FAILED(hr) || !g_cbData) { Log("[FATAL] Init CBV Map failed, hr=0x%08X\n", hr); return false; }
         float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -1774,7 +1777,7 @@ ComPtr<IDXGIFactory4> dxgi;
     rdIm.MipLevels = 1; rdIm.SampleDesc.Count = 1;
     rdIm.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     g_dev->CreateCommittedResource(&hpIm, D3D12_HEAP_FLAG_NONE,
-        &rdIm, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_imVB));
+        &rdIm, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_imVB.GetAddressOf()));
     if (g_imVB) {
         g_imVbv.BufferLocation = g_imVB->GetGPUVirtualAddress();
         g_imVbv.StrideInBytes = sizeof(VertexPC);
@@ -1807,9 +1810,15 @@ static void SafeCleanD3D() {
     // 1. 标记渲染线程停止
     g_run = false;
     g_deviceLost.store(true);
-    // 2. 等待渲染线程退出
+    // 唤醒阻塞事件，消除线程死锁
+    SetEvent(g_frameReadyEvent);
+    SetEvent(g_frameDoneEvent);
+    // 2. 等待渲染线程退出（限时2秒，超时不阻塞主程序）
     if (g_thread) {
-        WaitForSingleObject(g_thread, 3000);
+        DWORD waitRet = WaitForSingleObject(g_thread, 2000);
+        if (waitRet == WAIT_TIMEOUT) {
+            OutputDebugStringA("[WARN CLEANUP: 渲染线程2秒未退出，跳过等待直接释放资源");
+        }
         CloseHandle(g_thread);
         g_thread = nullptr;
     }
@@ -1911,9 +1920,9 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass,
     g_swap->ResizeBuffers(2,(UINT)w,(UINT)h,DXGI_FORMAT_R8G8B8A8_UNORM,0);
     g_w=(UINT)w; g_h=(UINT)h; g_fi=g_swap->GetCurrentBackBufferIndex();
     D3D12_CPU_DESCRIPTOR_HANDLE rh=g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT n=0;n<2;n++) { g_swap->GetBuffer(n,IID_PPV_ARGS(&g_rt[n])); g_dev->CreateRenderTargetView(g_rt[n].Get(),0,rh); rh.ptr+=g_rtvSize; }
-    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&g_alloc));
-    g_dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,g_alloc.Get(),0,IID_PPV_ARGS(&g_cl));
+    for (UINT n=0;n<2;n++) { g_swap->GetBuffer(n,IID_PPV_ARGS(g_rt[n].GetAddressOf())); g_dev->CreateRenderTargetView(g_rt[n].Get(),0,rh); rh.ptr+=g_rtvSize; }
+    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(g_alloc.GetAddressOf()));
+    g_dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,g_alloc.Get(),0,IID_PPV_ARGS(g_cl.GetAddressOf()));
     g_cl->Close();
 
     if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
@@ -1927,7 +1936,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass,
         D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
         cv.DepthStencil.Depth = 1.0f;
         g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
-            &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_depthBuf));
+            &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
         g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
             g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
     }
