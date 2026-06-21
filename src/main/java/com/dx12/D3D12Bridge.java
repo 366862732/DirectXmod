@@ -66,6 +66,11 @@ public class D3D12Bridge {
             return true;
         }
 
+        // hwnd 有效性校验
+        if (hwnd == 0) {
+            throw new IllegalStateException("[GL4DX12] Invalid window handle (hwnd=0)");
+        }
+
         System.out.println("[GL4DX12] ensureDeviceInitialized called, hwnd=" + hwnd + ", current d3d12Ready=" + d3d12Ready);
         System.out.println("[GL4DX12] Calling nativeInit...");
 
@@ -92,10 +97,10 @@ public class D3D12Bridge {
             }
             return success;
         } catch (Throwable t) {
-            System.err.println("[GL4DX12] nativeInit threw exception: " + t.getMessage());
+            // 不吞没，向上抛出并记录详细信息
+            System.err.println("[GL4DX12] nativeInit FAILED: " + t.getMessage());
             t.printStackTrace();
-            d3d12Ready = false;
-            return false;
+            throw new RuntimeException("D3D12 nativeInit failed", t);
         }
     }
 

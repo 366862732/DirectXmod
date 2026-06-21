@@ -12,6 +12,16 @@ public class DX12LibClient {
     }
 
     private static void loadLibrary() {
+        // 方法0: 使用最新编译的 DLL 绝对路径（最高优先级）
+        try {
+            String dllPath = "D:\\dx12-lib-template-26.1.2\\src\\main\\native\\windows\\gl4dx12.dll";
+            System.load(dllPath);
+            System.out.println("[GL4DX12] DLL loaded from build output: " + dllPath);
+            return;
+        } catch (UnsatisfiedLinkError e) {
+            System.err.println("[GL4DX12] Build output DLL not found: " + e.getMessage());
+        }
+
         // 方法1: 从 JAR 中提取
         try (InputStream in = DX12LibClient.class.getResourceAsStream("/native/windows/gl4dx12.dll")) {
             if (in != null) {

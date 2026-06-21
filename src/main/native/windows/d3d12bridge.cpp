@@ -49,6 +49,19 @@ constexpr UINT  RETRY_DELAY_MS                 = 100;  // 重试间隔100ms
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+// DLL 入口点 — 加载/卸载时自动输出日志，确保 DLL 被加载即使 nativeInit 未调用
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+        case DLL_PROCESS_ATTACH:
+            OutputDebugStringA("[GL4DX12] DLL_LOADED via DllMain\n");
+            break;
+        case DLL_PROCESS_DETACH:
+            OutputDebugStringA("[GL4DX12] DLL_UNLOADED\n");
+            break;
+    }
+    return TRUE;
+}
+
 using namespace Microsoft::WRL;
 
 // 前向声明（供 SafeCleanD3D 和状态机使用）
