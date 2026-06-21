@@ -1990,8 +1990,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jc
     CleanupD3D12();
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
+extern "C" __declspec(dllexport) JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     (JNIEnv*, jclass, jlong hwnd) {
+    // 第一行：弹出消息框，确认函数被调用
+    MessageBoxA(NULL, "nativeInit ENTERED", "GL4DX12 DEBUG", MB_OK);
     OutputDebugStringA("[nativeInit] === STEP 0: ENTER ===\n");
     MessageBoxA(NULL, "nativeInit已执行，DLL加载正常", "DEBUG_LOAD_CHECK", MB_OK);
     OutputDebugStringA("[FATAL] TEST nativeInit 入口日志\n");
