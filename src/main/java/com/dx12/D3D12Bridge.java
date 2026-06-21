@@ -69,6 +69,17 @@ public class D3D12Bridge {
         System.out.println("[GL4DX12] ensureDeviceInitialized called, hwnd=" + hwnd + ", current d3d12Ready=" + d3d12Ready);
         System.out.println("[GL4DX12] Calling nativeInit...");
 
+        // 确保FramerateLimitTracker已初始化，避免早期NPE
+        Minecraft mc = Minecraft.getInstance();
+        while (mc.getFramerateLimitTracker() == null) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
         try {
             boolean success = DX12LibClient.nativeInit(hwnd);
             d3d12Ready = success;

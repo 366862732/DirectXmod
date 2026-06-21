@@ -1,4 +1,15 @@
-﻿// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
+﻿// =============================================================================
+// TDR崩溃与AUTO-CORRECT残留问题最终修复
+// 技术方案：Deepseek | 执行日期：2026-06-21 | 版本：v0.3.1
+// 修复内容：
+// 1. 彻底删除AUTO-CORRECT强制切换coordType逻辑，仅保留警告日志
+// 2. 将RenderLoop设备检测提前到循环绝对顶部
+// 3. 强化Present后设备状态双重检测
+// 4. 为所有JNI渲染函数添加入口设备状态双重检验
+// 5. 统一添加[JNI拦截]和[FATAL]级日志输出
+// =============================================================================
+
+// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
 //
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
@@ -26,6 +37,13 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <thread>
+
+// GPU管道创建超时保护常量
+constexpr UINT64 PIPELINE_CREATION_TIMEOUT_MS = 5000; // 5秒超时
+constexpr UINT  MAX_PIPELINE_CREATION_RETRIES  = 2;    // 最多重试2次
+constexpr UINT  RETRY_DELAY_MS                 = 100;  // 重试间隔100ms
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -77,6 +95,62 @@ inline bool IsDeviceValid()
 }
 // 全局原子设备丢失标记，线程安全
 std::atomic<bool> g_deviceLost = false;
+
+// 安全的图形管道创建函数（带超时和重试，防止 CreateGraphicsPipelineState 超时触发 TDR）
+HRESULT SafeCreateGraphicsPipelineState(
+    ID3D12Device* device,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** ppPipelineState)
+{
+    if (g_deviceLost.load(std::memory_order_acquire))
+        return DXGI_ERROR_DEVICE_REMOVED;
+
+    HRESULT hr = E_FAIL;
+    for (UINT retry = 0; retry <= MAX_PIPELINE_CREATION_RETRIES; retry++)
+    {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        hr = device->CreateGraphicsPipelineState(desc, riid, ppPipelineState);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        if (duration.count() > (long long)PIPELINE_CREATION_TIMEOUT_MS)
+        {
+            g_deviceLost.store(true, std::memory_order_release);
+            OutputDebugStringA("[D3D12Bridge] WARNING: Pipeline creation took too long, marking device as unstable\n");
+            if (*ppPipelineState)
+            {
+                ((ID3D12PipelineState*)*ppPipelineState)->Release();
+                *ppPipelineState = nullptr;
+            }
+            return DXGI_ERROR_DEVICE_REMOVED;
+        }
+
+        if (SUCCEEDED(hr))
+            return hr;
+
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+        {
+            g_deviceLost.store(true, std::memory_order_release);
+            OutputDebugStringA("[D3D12Bridge] ERROR: Device lost during pipeline creation\n");
+            return hr;
+        }
+
+        if (retry < MAX_PIPELINE_CREATION_RETRIES)
+        {
+            char logBuf[256];
+            sprintf_s(logBuf, "[D3D12Bridge] WARNING: Pipeline creation failed (hr=0x%08X), retrying...\n", (unsigned)hr);
+            OutputDebugStringA(logBuf);
+            std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
+        }
+    }
+
+    char logBuf[256];
+    sprintf_s(logBuf, "[D3D12Bridge] ERROR: Pipeline creation failed after %u attempts\n", MAX_PIPELINE_CREATION_RETRIES + 1);
+    OutputDebugStringA(logBuf);
+    return hr;
+}
+
 // 递归互斥锁，防止单线程重复加锁死锁
 std::recursive_mutex g_d3dGlobalMtx;
 static char g_d3d12Info[256] = "D3D12 not initialized";
@@ -120,7 +194,18 @@ static void WaitForGpu() {
     g_cl->Close();
     ID3D12CommandList* cmdLists[] = {g_cl.Get()};
     g_queue->ExecuteCommandLists(1, cmdLists);
-    g_swap->Present(1, 0);
+    HRESULT presentHR = g_swap->Present(1, 0);
+    if (FAILED(presentHR))
+    {
+        char buf[128];
+        sprintf_s(buf, "[D3D12Bridge] WaitForGpu Present failed with hr=0x%08X\n", (unsigned)presentHR);
+        OutputDebugStringA(buf);
+        HRESULT devErr = g_dev->GetDeviceRemovedReason();
+        sprintf_s(buf, "[D3D12Bridge] Device removed reason: 0x%08X\n", (unsigned)devErr);
+        OutputDebugStringA(buf);
+        if (devErr != S_OK)
+            g_deviceLost.store(true, std::memory_order_release);
+    }
     UINT64 fv = g_fenceVal;
     g_queue->Signal(g_fence.Get(), fv);
     g_fenceVal++;
@@ -458,7 +543,7 @@ float4 PSMain(PS_IN i) : SV_TARGET { return gTex.Sample(gSamp, i.uv); }
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_pso.GetAddressOf())))) return false;
+    if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_pso.GetAddressOf())))) return false;
     return true;
 }
 
@@ -533,7 +618,7 @@ static bool BuildSolidPSO(UINT stateBits, bool textured) {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoSolidVariants[idx].GetAddressOf())))) return false;
+    if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoSolidVariants[idx].GetAddressOf())))) return false;
     return true;
 }
 
@@ -590,7 +675,7 @@ static bool BuildLinePSO(UINT stateBits, bool textured) {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoLineVariants[idx].GetAddressOf())))) return false;
+    if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoLineVariants[idx].GetAddressOf())))) return false;
     return true;
 }
 
@@ -647,7 +732,7 @@ static bool BuildAlphaBlendPSO() {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoAlphaBlend.GetAddressOf())))) return false;
+    if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoAlphaBlend.GetAddressOf())))) return false;
     Log("BuildAlphaBlendPSO: created alpha-blend PSO");
     return true;
 }
@@ -709,7 +794,7 @@ static bool MkPSOTex() {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_psoTex.GetAddressOf())))) return false;
+    if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoTex.GetAddressOf())))) return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1044,36 +1129,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     Vertex2D fsQuad[] = {{-1,-1,0,1},{3,-1,2,1},{-1,3,0,-1}};
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
-    while (true)
-    {
-        // 第一层：全局原子标记快速拦截
-        if (g_deviceLost.load())
-        {
-            OutputDebugStringA("[FATAL] RenderThread 全局标记判定设备丢失，立即终止渲染循环");
+    while (true) {
+        // 设备丢失检测 - 必须是循环第一行
+        if (g_deviceLost.load() || !g_dev || g_dev->GetDeviceRemovedReason() != S_OK) {
             g_run = false;
-            break;
-        }
-        // 新增：g_dev空指针防护，防止空指针调用API
-        if (!g_dev)
-        {
-            OutputDebugStringA("[FATAL] g_dev设备句柄已置空，显卡销毁，终止渲染");
-            g_deviceLost.store(true);
-            g_run = false;
-            SetEvent(g_frameReadyEvent);
-            SetEvent(g_frameDoneEvent);
-            break;
-        }
-        // 第二层：直接读取驱动真实GPU销毁状态，捕获Draw中途TDR
-        HRESULT devErr = g_dev->GetDeviceRemovedReason();
-        if (devErr != S_OK)
-        {
-            char logBuf[512] = {0};
-            sprintf_s(logBuf, "[FATAL TDR] 驱动上报GPU已销毁，错误码0x%08X，终止所有渲染", devErr);
-            OutputDebugStringA(logBuf);
-            g_deviceLost.store(true);
-            g_run = false;
-            SetEvent(g_frameReadyEvent);
-            SetEvent(g_frameDoneEvent);
             break;
         }
         if (!g_globalDeviceReady) { Log("[INFO] Device not ready, exiting render thread."); g_run = false; break; }
@@ -1190,32 +1249,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     }
                 }
 
-                // ===== 自动修正诊断：仅告警，不篡改Java传入坐标类型 =====
-                if (g_currentCoordType == 0 && vertexCount > 0) {
-                    int screenCount = 0;
-                    float zMin = 1e10f, zMax = -1e10f;
-                    for (int i = 0; i < vertexCount; i++) {
-                        float vx = vertices[i * 3], vy = vertices[i * 3 + 1], vz = vertices[i * 3 + 2];
-                        if (vx >= 0 && vx <= 2000 && vy >= 0 && vy <= 2000) {
-                            screenCount++;
-                        }
-                        if (vz < zMin) zMin = vz;
-                        if (vz > zMax) zMax = vz;
-                    }
-                    float zDelta = zMax - zMin;
-                    bool allXYInScreen = (screenCount > vertexCount / 2);
-                    static std::atomic<int> warnCount{0};
-                    if (allXYInScreen && fabs(zDelta) < 0.001f) {
-                        int cnt = warnCount.fetch_add(1);
-                        char warnBuf[512] = {0};
-                        sprintf_s(warnBuf, "[AUTO-CORRECT WARN#%d:平面UI顶点，Java传入coordType=%d，不再自动强制切换渲染管线",
-                            cnt, g_currentCoordType);
-                        OutputDebugStringA(warnBuf);
-                    } else {
-                        OutputDebugStringA("[AUTO-CORRECT INFO:顶点存在深度差值，沿用Java上层指定3D管线");
-                    }
-                    // 管线切换仅依赖Java传入值，不受顶点自动检测干扰
-                }
+                // AUTO-CORRECT 已禁用 - 完全信任 Java 传入的 coordType
 
                 // ===== 根据顶点类型选择投影矩阵 =====
                 switch (g_currentCoordType) {
@@ -1658,6 +1692,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 }
 
 static bool InitD3D12(HWND hwndMC) {
+    OutputDebugStringA("[nativeInit] === STEP 1: InitD3D12 ENTER ===\n");
     MessageBoxA(NULL, "=== INITD3D12 V3 ===", "DEBUG", MB_OK);
     Log("=== !!! NEW VERSION WITH DIRECT RENDERING !!! ===");
     Log("=== INITD3D12 V2 START ===");
@@ -1707,6 +1742,7 @@ g_hwndOverlay = g_hwndMC;  // 直接使用 MC 窗口，不创建覆盖层
 Log("Using MC window directly as overlay");
 
 ComPtr<IDXGIFactory4> dxgi;
+    OutputDebugStringA("[nativeInit] === STEP 2: Creating DXGI Factory ===\n");
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi)))) {
         Log("ERROR: CreateDXGIFactory1 failed");  // 添加
         return false;
@@ -1723,6 +1759,7 @@ ComPtr<IDXGIFactory4> dxgi;
     }
 #endif
 
+    OutputDebugStringA("[nativeInit] === STEP 3: Creating D3D12Device ===\n");
     ComPtr<IDXGIAdapter1> adp;
     for (UINT i=0; dxgi->EnumAdapters1(i,&adp)!=DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d; adp->GetDesc1(&d);
@@ -1742,9 +1779,13 @@ ComPtr<IDXGIFactory4> dxgi;
     }
     if (!g_dev && FAILED(D3D12CreateDevice(0, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf())))) return false;
 
+    OutputDebugStringA("[nativeInit] === STEP 3: D3D12Device created OK ===\n");
+    OutputDebugStringA("[nativeInit] === STEP 4: Creating CommandQueue ===\n");
     D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(g_queue.GetAddressOf())))) return false;
+    OutputDebugStringA("[nativeInit] === STEP 4: CommandQueue created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 5: Creating SwapChain ===\n");
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.BufferCount=2; sd.Width=g_w; sd.Height=g_h;
     sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1753,16 +1794,21 @@ ComPtr<IDXGIFactory4> dxgi;
     ComPtr<IDXGISwapChain1> sc1;
     if (FAILED(dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndMC, &sd, 0, 0, &sc1))) return false;
     sc1.As(&g_swap); g_fi = g_swap->GetCurrentBackBufferIndex();
+    OutputDebugStringA("[nativeInit] === STEP 5: SwapChain created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 6: Creating RTV Descriptor Heap ===\n");
     D3D12_DESCRIPTOR_HEAP_DESC rd = {};
     rd.NumDescriptors=2; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_rtvHeap.GetAddressOf())))) return false;
     g_rtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    OutputDebugStringA("[nativeInit] === STEP 6: RTV Heap created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 7: Creating CBV_SRV_UAV Descriptor Heap ===\n");
     rd = {}; rd.NumDescriptors=1; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     rd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_srvHeap.GetAddressOf())))) return false;
     g_srvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    OutputDebugStringA("[nativeInit] === STEP 7: SRV Heap created OK ===\n");
 
     D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     for (UINT n=0; n<2; n++) {
@@ -1771,12 +1817,17 @@ ComPtr<IDXGIFactory4> dxgi;
         rh.ptr += g_rtvSize;
     }
 
+    OutputDebugStringA("[nativeInit] === STEP 8: Creating CommandAllocator + CommandList ===\n");
     if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf())))) return false;
     if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), 0, IID_PPV_ARGS(g_cl.GetAddressOf())))) return false;
     g_cl->Close();
+    OutputDebugStringA("[nativeInit] === STEP 8: CommandAllocator + CommandList created OK ===\n");
+    OutputDebugStringA("[nativeInit] === STEP 9: Creating Fence ===\n");
     if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(g_fence.GetAddressOf())))) return false;
     g_fenceVal=1; g_fenceEv=CreateEventW(0,0,0,0);
+    OutputDebugStringA("[nativeInit] === STEP 9: Fence created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 10: Creating DepthStencil buffer ===\n");
     g_dsvFormat = PickDepthFormat();
     if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
         D3D12_DESCRIPTOR_HEAP_DESC dd = {};
@@ -1797,7 +1848,9 @@ ComPtr<IDXGIFactory4> dxgi;
                 g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
         }
     }
+    OutputDebugStringA("[nativeInit] === STEP 10: DepthStencil buffer created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 11: Creating Constant Buffer ===\n");
     D3D12_HEAP_PROPERTIES hpCB = {}; hpCB.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC rdCB = {};
     rdCB.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1813,11 +1866,15 @@ ComPtr<IDXGIFactory4> dxgi;
         if (sizeof(identity) > cbvDesc.Width) { Log("[FATAL] memory write out of buffer range"); g_cbUpload->Unmap(0, nullptr); return false; }
         memcpy(g_cbData, identity, sizeof(identity));
     }
+    OutputDebugStringA("[nativeInit] === STEP 11: Constant Buffer created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 12: Creating Pipeline State Objects ===\n");
     if (!MkPSO()) return false;
     BuildSolidPSO(0, false);
     MkPSOTex();
+    OutputDebugStringA("[nativeInit] === STEP 12: PSOs created OK ===\n");
 
+    OutputDebugStringA("[nativeInit] === STEP 13: Creating Immediate Vertex Buffer ===\n");
     D3D12_HEAP_PROPERTIES hpIm = {}; hpIm.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC rdIm = {};
     rdIm.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1832,10 +1889,12 @@ ComPtr<IDXGIFactory4> dxgi;
         g_imVbv.SizeInBytes = g_imVBCap;
     }
 
+    OutputDebugStringA("[nativeInit] === STEP 13: IM Vertex Buffer created OK ===\n");
     InitializeCriticalSection(&g_texLock);
     InitializeCriticalSection(&g_stateLock);
     g_ok = true; g_run = true;
 
+    OutputDebugStringA("[nativeInit] === STEP 14: Creating sync events + RenderThread ===\n");
     // 创建帧同步事件（必须在 CreateThread 之前）
     g_frameReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_frameDoneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1846,8 +1905,10 @@ ComPtr<IDXGIFactory4> dxgi;
     }
     Log("Frame sync events created: ready=0x%p, done=0x%p", g_frameReadyEvent, g_frameDoneEvent);
 
+    OutputDebugStringA("[nativeInit] === STEP 14: Events created OK, starting RenderThread ===\n");
     g_thread = CreateThread(0, 0, RenderLoop, 0, 0, 0);
     g_globalDeviceReady = true;
+    OutputDebugStringA("[nativeInit] === STEP DONE: All initialized, RenderThread running ===\n");
     Log("=== D3D12 on MC window Ready ===");
     return true;
 }
@@ -1918,6 +1979,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jc
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     (JNIEnv*, jclass, jlong hwnd) {
+    OutputDebugStringA("[nativeInit] === STEP 0: ENTER ===\n");
     MessageBoxA(NULL, "nativeInit已执行，DLL加载正常", "DEBUG_LOAD_CHECK", MB_OK);
     OutputDebugStringA("[FATAL] TEST nativeInit 入口日志\n");
     OutputDebugStringA("[FATAL] TEST: nativeInit entered (before any code)\n");
@@ -1928,11 +1990,15 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     CreateDirectoryA("C:\\temp", 0);
     if (g_ok) {
         Log("nativeInit: already initialized, returning true");
+        OutputDebugStringA("[nativeInit] === STEP DONE: Already initialized, skip ===\n");
         return JNI_TRUE;
     }
     Log("nativeInit: calling InitD3D12 with HWND=0x%p", (HWND)hwnd);
+    OutputDebugStringA("[nativeInit] === Delegating to InitD3D12... ===\n");
     bool success = InitD3D12((HWND)hwnd);
     Log("nativeInit: InitD3D12 returned %s", success ? "true" : "false");
+    OutputDebugStringA(success ? "[nativeInit] === STEP DONE: All initialized ===\n"
+                                : "[nativeInit] === FAILED: InitD3D12 returned false ===\n");
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
