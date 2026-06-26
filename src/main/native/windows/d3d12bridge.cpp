@@ -541,7 +541,11 @@ float4 PSMain(PS_IN i) : SV_TARGET { return gTex.Sample(gSamp, i.uv); }
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;  // 纹理 PSO 不需要深度缓冲
     pd.SampleDesc.Count = 1;
+    pd.SampleDesc.Quality = 0;
+    Log("[MkPSO] Creating PSO with: RTVFormat=R8G8B8A8_UNORM, DSVFormat=%d, SampleCount=%d",
+        (int)pd.DSVFormat, pd.SampleDesc.Count);
     if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_pso.GetAddressOf())))) return false;
     return true;
 }
@@ -597,26 +601,31 @@ static bool BuildSolidPSO(UINT stateBits, bool textured) {
     pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    if (stateBits & GLB_BLEND) {
+ //禁用混合，是混合的问题导致失败吗？
+/*    if (stateBits & GLB_BLEND) {
         pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
         pd.BlendState.RenderTarget[0].SrcBlend = g_glSrcBlend;
         pd.BlendState.RenderTarget[0].DestBlend = g_glDstBlend;
         pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
     }
+*/
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = (stateBits & GLB_CULL) ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
-    // 临时强制禁用深度测试，诊断黑屏问题
-    pd.DepthStencilState.DepthEnable = FALSE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    // 先启用深度测试
+    pd.DepthStencilState.DepthEnable = (stateBits & GLB_DEPTH) ? TRUE : FALSE;
+    pd.DepthStencilState.DepthWriteMask = (stateBits & GLB_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
     pd.InputLayout = {ie, ieCount};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = (stateBits & GLB_DEPTH) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
     pd.SampleDesc.Count = 1;
+    pd.SampleDesc.Quality = 0;
+    Log("[BuildSolidPSO] Creating PSO idx=%d: DSVFormat=%d, SampleCount=%d, DepthEnable=%d",
+        idx, (int)pd.DSVFormat, pd.SampleDesc.Count, pd.DepthStencilState.DepthEnable);
     if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoSolidVariants[idx].GetAddressOf())))) return false;
     return true;
 }
@@ -655,12 +664,14 @@ static bool BuildLinePSO(UINT stateBits, bool textured) {
     pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    if (stateBits & GLB_BLEND) {
+    // 禁用混合，是混合的问题导致失败吗？
+/*    if (stateBits & GLB_BLEND) {
         pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
         pd.BlendState.RenderTarget[0].SrcBlend = g_glSrcBlend;
         pd.BlendState.RenderTarget[0].DestBlend = g_glDstBlend;
         pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
     }
+ */
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = (stateBits & GLB_CULL) ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
@@ -668,12 +679,15 @@ static bool BuildLinePSO(UINT stateBits, bool textured) {
     pd.DepthStencilState.DepthEnable = (stateBits & GLB_DEPTH) ? TRUE : FALSE;
     pd.DepthStencilState.DepthWriteMask = (stateBits & GLB_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
     pd.InputLayout = {ie, ieCount};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = (stateBits & GLB_DEPTH) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
     pd.SampleDesc.Count = 1;
+    pd.SampleDesc.Quality = 0;
+    Log("[BuildLinePSO] Creating PSO idx=%d: DSVFormat=%d, SampleCount=%d, DepthEnable=%d",
+        idx, (int)pd.DSVFormat, pd.SampleDesc.Count, pd.DepthStencilState.DepthEnable);
     if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoLineVariants[idx].GetAddressOf())))) return false;
     return true;
 }
@@ -725,12 +739,15 @@ static bool BuildAlphaBlendPSO() {
     pd.DepthStencilState.DepthEnable = FALSE;
     pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    pd.DSVFormat = (g_dsvFormat != DXGI_FORMAT_UNKNOWN) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;  // 半透明 PSO 不需要深度缓冲
     pd.InputLayout = {ie, 2};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
+    pd.SampleDesc.Quality = 0;
+    Log("[BuildAlphaBlendPSO] Creating PSO with: DSVFormat=%d, SampleCount=%d, AlphaBlend=TRUE",
+        (int)pd.DSVFormat, pd.SampleDesc.Count);
     if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoAlphaBlend.GetAddressOf())))) return false;
     Log("BuildAlphaBlendPSO: created alpha-blend PSO");
     return true;
@@ -738,8 +755,24 @@ static bool BuildAlphaBlendPSO() {
 
 static bool MkPSOTex() {
     ComPtr<ID3DBlob> vs, ps, err, rb;
-    if (FAILED(D3DCompile(kVS_Tex, strlen(kVS_Tex), 0,0,0,"VSMain","vs_5_0",0,0,&vs,&err))) return false;
-    if (FAILED(D3DCompile(kPS_Tex, strlen(kPS_Tex), 0,0,0,"PSMain","ps_5_0",0,0,&ps,&err))) return false;
+    HRESULT hr;
+
+    hr = D3DCompile(kVS_Tex, strlen(kVS_Tex), 0,0,0,"VSMain","vs_5_0",0,0,&vs,&err);
+    if (FAILED(hr)) {
+        Log("[ERROR] MkPSOTex: D3DCompile for VS failed, hr=0x%08X", hr);
+        if (err) {
+            Log("[ERROR] MkPSOTex: VS compile error: %s", (const char*)err->GetBufferPointer());
+        }
+        return false;
+    }
+    hr = D3DCompile(kPS_Tex, strlen(kPS_Tex), 0,0,0,"PSMain","ps_5_0",0,0,&ps,&err);
+    if (FAILED(hr)) {
+        Log("[ERROR] MkPSOTex: D3DCompile for PS failed, hr=0x%08X", hr);
+        if (err) {
+            Log("[ERROR] MkPSOTex: PS compile error: %s", (const char*)err->GetBufferPointer());
+        }
+        return false;
+    }
 
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -767,22 +800,66 @@ static bool MkPSOTex() {
     rsd.NumParameters = 2; rsd.pParameters = params;
     rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &ss;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err))) return false;
-    if (FAILED(g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(g_rsTex.GetAddressOf())))) return false;
+    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err);
+    if (FAILED(hr)) {
+        Log("[ERROR] MkPSOTex: D3D12SerializeRootSignature failed, hr=0x%08X", hr);
+        if (err) {
+            Log("[ERROR] MkPSOTex: Serialize error: %s", (const char*)err->GetBufferPointer());
+        }
+        return false;
+    }
+    hr = g_dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(g_rsTex.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("[ERROR] MkPSOTex: CreateRootSignature failed, hr=0x%08X", hr);
+        return false;
+    }
 
     D3D12_INPUT_ELEMENT_DESC ie[] = {
         {"POS",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
         {"COL",0,DXGI_FORMAT_R8G8B8A8_UNORM,0,12,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
         {"TEX",0,DXGI_FORMAT_R32G32_FLOAT,0,16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
     };
+
+    // ===== 诊断用最简化 PSO 测试 =====
+    {
+        ComPtr<ID3D12PipelineState> testPso;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC testPd = {};
+        testPd.pRootSignature = g_rs.Get(); // 使用基础根签名（无纹理描述符表）
+        testPd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        testPd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        testPd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        testPd.SampleMask = UINT_MAX;
+        testPd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        testPd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        testPd.RasterizerState.DepthClipEnable = TRUE;
+        testPd.DepthStencilState.DepthEnable = FALSE;
+        testPd.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        testPd.InputLayout = {ie, 3};
+        testPd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        testPd.NumRenderTargets = 1;
+        testPd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        testPd.SampleDesc.Count = 1;
+        testPd.SampleDesc.Quality = 0;
+
+        Log("[MkPSOTex] Testing simplified PSO...");
+        HRESULT testHr = g_dev->CreateGraphicsPipelineState(&testPd, IID_PPV_ARGS(testPso.GetAddressOf()));
+        if (SUCCEEDED(testHr)) {
+            Log("[MkPSOTex] Simplified PSO succeeded!");
+        } else {
+            Log("[MkPSOTex] Simplified PSO failed, hr=0x%08X", testHr);
+        }
+    }
+    // ====================================
+
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
     pd.pRootSignature = g_rsTex.Get();
     pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
-    pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    // Alpha 混合暂时注释掉，诊断 PSO 创建失败原因
+    // pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    // pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    // pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -792,15 +869,28 @@ static bool MkPSOTex() {
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;  // 纹理 PSO 不需要深度缓冲
     pd.SampleDesc.Count = 1;
-    if (FAILED(SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoTex.GetAddressOf())))) return false;
+    pd.SampleDesc.Quality = 0;
+    Log("[MkPSOTex] Creating PSO with: RTVFormat=R8G8B8A8_UNORM, DSVFormat=%d, SampleCount=%d",
+        (int)pd.DSVFormat, pd.SampleDesc.Count);
+    hr = SafeCreateGraphicsPipelineState(g_dev.Get(), &pd, IID_PPV_ARGS(g_psoTex.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("[ERROR] MkPSOTex: CreateGraphicsPipelineState failed, hr=0x%08X", hr);
+        return false;
+    }
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = 64;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(g_texSrvHeap.GetAddressOf())))) return false;
+    hr = g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(g_texSrvHeap.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("[ERROR] MkPSOTex: CreateDescriptorHeap failed, hr=0x%08X", hr);
+        return false;
+    }
     g_texSrvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    Log("MkPSOTex: SUCCESS");
     return true;
 }
 
@@ -1131,6 +1221,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     while (true) {
         // 设备丢失检测 - 必须是循环第一行
         if (g_deviceLost.load() || !g_dev || g_dev->GetDeviceRemovedReason() != S_OK) {
+            Log("[RenderLoop] EXIT: Device lost at loop top, g_deviceLost=%d, g_dev=%p, reason=0x%08X",
+                g_deviceLost.load(), g_dev.Get(), g_dev ? g_dev->GetDeviceRemovedReason() : 0);
             g_run = false;
             break;
         }
@@ -1587,7 +1679,20 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 g_cl->IASetPrimitiveTopology(ch.topo);
                 Log("=== DRAW CALL: vertexCount=%d, stride=%d, bytes=%d, buffer=0x%llX, topo=%d",
                     ch.vertexCount, ch.vertexStride, chVbv.SizeInBytes, chVbv.BufferLocation, ch.topo);
-                g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
+                // 如果顶点数超过 1024，拆分为多次 Draw 以减轻 GPU 压力
+                const int kBatchSize = 1024;
+                if (ch.vertexCount > kBatchSize) {
+                    for (int offset = 0; offset < ch.vertexCount; offset += kBatchSize) {
+                        int count = min(kBatchSize, int(ch.vertexCount - offset));
+                        D3D12_VERTEX_BUFFER_VIEW batchVbv = chVbv;
+                        batchVbv.BufferLocation += (UINT64)offset * ch.vertexStride;
+                        batchVbv.SizeInBytes = count * ch.vertexStride;
+                        g_cl->IASetVertexBuffers(0, 1, &batchVbv);
+                        g_cl->DrawInstanced(count, 1, 0, 0);
+                    }
+                } else {
+                    g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
+                }
                 Log("  DrawInstanced executed");
             }
         }
@@ -1643,7 +1748,9 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         OutputDebugStringA("[FATAL] TEST: About to call Present(1, 0)\n");
         HRESULT presentHR = g_swap->Present(1, 0);
         if (FAILED(presentHR)) {
+            Log("[RenderLoop] EXIT: Present failed, presentHR=0x%08X", presentHR);
             HRESULT devErr = g_dev->GetDeviceRemovedReason();
+            Log("[RenderLoop] EXIT: Device removed reason after Present fail = 0x%08X", devErr);
             char errBuf[512];
             sprintf_s(errBuf, "[FATAL D3D Present 失败，错误码0x%08X，标记设备丢失", devErr);
             OutputDebugStringA(errBuf);
@@ -1668,6 +1775,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         // Present完成兜底检测，捕获帧内中途触发的TDR
         HRESULT frameCheck = g_dev->GetDeviceRemovedReason();
         if (frameCheck != S_OK) {
+            Log("[RenderLoop] EXIT: Post-Present device check failed, reason=0x%08X", frameCheck);
             char buf[512] = {0};
             sprintf_s(buf, "[FATAL TDR] Present后检测到GPU销毁，错误码0x%08X", frameCheck);
             OutputDebugStringA(buf);
@@ -1678,16 +1786,28 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             break;
         }
 
-        UINT64 fv = g_fenceVal;
-        g_queue->Signal(g_fence.Get(), fv); g_fenceVal++;
-        if (g_fence->GetCompletedValue() < fv) {
-            g_fence->SetEventOnCompletion(fv, g_fenceEv);
+        // 强制 GPU 完全空闲后再 Reset
+        g_queue->Signal(g_fence.Get(), g_fenceVal);
+        g_fenceVal++;
+        if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
+            g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
             WaitForSingleObject(g_fenceEv, INFINITE);
         }
 
         // 确保GPU完成当前帧绘制后重置命令分配器和命令列表（防止CBV数据竞争）
-        if (FAILED(g_alloc->Reset())) Log("WARN: end-of-frame allocator Reset failed");
-        if (FAILED(g_cl->Reset(g_alloc.Get(), nullptr))) Log("WARN: end-of-frame command list Reset failed");
+        HRESULT hrReset;
+        hrReset = g_alloc->Reset();
+        if (FAILED(hrReset)) {
+            Log("[ERROR] Command allocator Reset failed at frame end, hr=0x%08X", hrReset);
+            g_run = false;
+            break;
+        }
+        hrReset = g_cl->Reset(g_alloc.Get(), nullptr);
+        if (FAILED(hrReset)) {
+            Log("[ERROR] Command list Reset failed at frame end, hr=0x%08X", hrReset);
+            g_run = false;
+            break;
+        }
     }
     Log("Render thread stopped, loopCount=%d, g_run=%d", loopCount, (int)g_run);
     return 0;
