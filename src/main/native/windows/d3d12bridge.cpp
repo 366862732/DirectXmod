@@ -19,6 +19,11 @@
 //
 //在给我晚上编译闹鬼我清算你!d3d12bridge.cpp！
 //你C++端渲染再给老子抽风老子收拾你
+//Visual Studio再给我抽风拿命来！！！！！！！
+//Visual Studio再给我抽风拿命来！！！！！！！
+//Visual Studio再给我抽风拿命来！！！！！！！
+//Visual Studio再给我抽风拿命来！！！！！！！
+//Visual Studio再给我抽风拿命来！！！！！！！
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <jni.h>
@@ -225,25 +230,6 @@ static void WaitForGpu() {
     if (g_fence->GetCompletedValue() < fv) {
         g_fence->SetEventOnCompletion(fv, g_fenceEv);
         WaitForSingleObject(g_fenceEv, INFINITE);
-    }
-}
-
-// 分阶段资源创建：每阶段创建一类资源，分散GPU负载
-static void ProcessNextInitStage() {
-    switch (g_initStage) {
-        case STAGE_EMPTY:         OutputDebugStringA("[INIT STAGE] STAGE_EMPTY - wait for device ready\n"); break;
-        case STAGE_BASE_DEVICE:   OutputDebugStringA("[INIT STAGE] STAGE_BASE_DEVICE - base device/swapchain ready\n"); break;
-        case ST_CMD_RES:          OutputDebugStringA("[INIT STAGE] ST_CMD_RES - command queue/allocator ready\n"); break;
-        case ST_UI_PSO_CBUF:      OutputDebugStringA("[INIT STAGE] ST_UI_PSO_CBUF - UI PSO + CB ready\n"); break;
-        case ST_3D_PSO_CBUF:      OutputDebugStringA("[INIT STAGE] ST_3D_PSO_CBUF - 3D PSO + world CB ready\n"); break;
-        case ST_SKY_TEX:          OutputDebugStringA("[INIT STAGE] ST_SKY_TEX - sky texture uploaded\n"); break;
-        case ST_SKY_VB:           OutputDebugStringA("[INIT STAGE] ST_SKY_VB - sky vertex buffer ready\n"); break;
-        case ST_ENTITY_STATIC_VB: OutputDebugStringA("[INIT STAGE] ST_ENTITY_STATIC_VB - entity static VB ready\n"); break;
-        case ST_INSTANCE_BUFFER:  OutputDebugStringA("[INIT STAGE] ST_INSTANCE_BUFFER - instance buffer ready\n"); break;
-        case ST_PARTICLE_RES:     OutputDebugStringA("[INIT STAGE] ST_PARTICLE_RES - particle resources ready\n"); break;
-        case ST_TEXTURE_POOL:     OutputDebugStringA("[INIT STAGE] ST_TEXTURE_POOL - texture pool ready\n"); break;
-        case ST_ALPHA_PSO:        OutputDebugStringA("[INIT STAGE] ST_ALPHA_PSO - alpha blend PSO ready\n"); break;
-        default: break;
     }
 }
 static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
@@ -1162,21 +1148,26 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
         // ===== 12阶段异步初始化状态机：每阶段独占1帧，创建资源+强制GPU同步，根除TDR =====
         if (g_initStage < ST_FULL_READY) {
-            char stageLog[256];
-            sprintf_s(stageLog, "[INIT STATE MACHINE] 当前阶段:%d", (int)g_initStage);
-            OutputDebugStringA(stageLog);
+            // 如果设备已丢失，提前退出
+            if (g_deviceLost.load()) {
+                g_run = false;
+                break;
+            }
 
+            // 重置命令分配器和列表（为当前帧准备）
             HRESULT hr = g_alloc->Reset();
             if (FAILED(hr)) {
-                Log("[ERROR] InitStateMachine: allocator Reset failed at stage %d", (int)g_initStage);
-                Sleep(16);
-                continue;
+                Log("[ERROR] InitStateMachine: allocator Reset failed at stage %d, hr=0x%08X", (int)g_initStage, hr);
+                g_deviceLost.store(true);
+                g_run = false;
+                break;
             }
             hr = g_cl->Reset(g_alloc.Get(), nullptr);
             if (FAILED(hr)) {
-                Log("[ERROR] InitStateMachine: command list Reset failed at stage %d", (int)g_initStage);
-                Sleep(16);
-                continue;
+                Log("[ERROR] InitStateMachine: command list Reset failed at stage %d, hr=0x%08X", (int)g_initStage, hr);
+                g_deviceLost.store(true);
+                g_run = false;
+                break;
             }
 
             // 清屏准备
@@ -1197,16 +1188,14 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             g_cl->ResourceBarrier(1, &rb);
 
-            // 分阶段资源创建
+            // 分阶段资源创建（ProcessNextInitStage 内部会调用 WaitForGpu 执行+同步）
             ProcessNextInitStage();
 
-            // 强制GPU完全同步，分散负载
-            WaitForGpu();
-
+            // 阶段递增
             g_initStage = (InitStage)((int)g_initStage + 1);
             if (g_initStage >= ST_FULL_READY) {
                 g_renderInitDone = true;
-                OutputDebugStringA("[FATAL] 12-stage init complete, entering normal rendering\n");
+                OutputDebugStringA("[INIT] 12-stage init complete, entering normal rendering\n");
             }
             continue;
         }
@@ -1881,11 +1870,8 @@ ComPtr<IDXGIFactory4> dxgi;
     }
     OutputDebugStringA("[nativeInit] === STEP 11: Constant Buffer created OK ===\n");
 
-    OutputDebugStringA("[nativeInit] === STEP 12: Creating Pipeline State Objects ===\n");
-    if (!MkPSO()) return false;
-    BuildSolidPSO(0, false);
-    MkPSOTex();
-    OutputDebugStringA("[nativeInit] === STEP 12: PSOs created OK ===\n");
+    OutputDebugStringA("[nativeInit] === STEP 12: Pipeline State Objects will be created in init stages ===\n");
+    // PSO（MkPSO/BuildSolidPSO/MkPSOTex/BuildAlphaBlendPSO）已移至 ProcessNextInitStage 分阶段创建
 
     OutputDebugStringA("[nativeInit] === STEP 13: Creating Immediate Vertex Buffer ===\n");
     D3D12_HEAP_PROPERTIES hpIm = {}; hpIm.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -1906,6 +1892,10 @@ ComPtr<IDXGIFactory4> dxgi;
     InitializeCriticalSection(&g_texLock);
     InitializeCriticalSection(&g_stateLock);
     g_ok = true; g_run = true;
+
+    // 设置状态机从第一阶段开始，后续由 RenderLoop 驱动分阶段初始化
+    g_initStage = STAGE_BASE_DEVICE;
+    g_renderInitDone = false;
 
     OutputDebugStringA("[nativeInit] === STEP 14: Creating sync events + RenderThread ===\n");
     // 创建帧同步事件（必须在 CreateThread 之前）
@@ -1983,6 +1973,170 @@ static void CleanupD3D12() {
     SafeCleanD3D();
 }
 
+// 分阶段资源创建：每阶段创建一类资源，分散GPU负载
+static void ProcessNextInitStage() {
+    if (g_deviceLost.load() || !g_dev || !g_queue) {
+        Log("[ERROR] ProcessNextInitStage: device invalid, aborting");
+        g_deviceLost.store(true);
+        g_run = false;
+        return;
+    }
+
+    HRESULT hr = S_OK;
+
+    switch (g_initStage) {
+        case STAGE_BASE_DEVICE:
+            // 基础设备、交换链、RTV/SRV堆、命令分配器、命令列表、Fence 等已在 InitD3D12 中创建
+            // 此阶段仅做日志，不需要额外操作
+            Log("[INIT STAGE] STAGE_BASE_DEVICE - already done by InitD3D12");
+            break;
+
+        case ST_CMD_RES:
+            // 命令分配器、命令列表、Fence 已在 InitD3D12 中创建，此处不需要重复
+            Log("[INIT STAGE] ST_CMD_RES - already done");
+            break;
+
+        case ST_UI_PSO_CBUF: {
+            // 创建纹理 PSO（用于 MC 捕获显示）
+            Log("[INIT STAGE] ST_UI_PSO_CBUF - creating textured PSO");
+            if (!MkPSO()) {
+                Log("[ERROR] MkPSO() failed");
+                g_deviceLost.store(true);
+                g_run = false;
+                return;
+            }
+            // 创建常量缓冲（如果还没创建的话，实际上 InitD3D12 已创建，但保证只创建一次）
+            if (!g_cbUpload) {
+                D3D12_HEAP_PROPERTIES hpCB = {}; hpCB.Type = D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC rdCB = {};
+                rdCB.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rdCB.Width = g_cbSize; rdCB.Height = 1; rdCB.DepthOrArraySize = 1;
+                rdCB.MipLevels = 1; rdCB.SampleDesc.Count = 1;
+                rdCB.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                hr = g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
+                    &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_cbUpload.GetAddressOf()));
+                if (FAILED(hr)) {
+                    Log("[ERROR] CreateCommittedResource for CB failed, hr=0x%08X", hr);
+                    g_deviceLost.store(true);
+                    g_run = false;
+                    return;
+                }
+                hr = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
+                if (FAILED(hr) || !g_cbData) {
+                    Log("[FATAL] Map CB failed, hr=0x%08X", hr);
+                    g_deviceLost.store(true);
+                    g_run = false;
+                    return;
+                }
+                // 初始化为单位矩阵
+                float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                memcpy(g_cbData, identity, sizeof(identity));
+            }
+            // 创建固体 PSO（默认）
+            if (!BuildSolidPSO(0, false)) {
+                Log("[ERROR] BuildSolidPSO(0,false) failed");
+                g_deviceLost.store(true);
+                g_run = false;
+                return;
+            }
+            // 创建纹理 PSO（带纹理）
+            if (!MkPSOTex()) {
+                Log("[ERROR] MkPSOTex() failed");
+                g_deviceLost.store(true);
+                g_run = false;
+                return;
+            }
+            Log("[INIT STAGE] ST_UI_PSO_CBUF - completed");
+            break;
+        }
+
+        case ST_3D_PSO_CBUF: {
+            // 创建 3D 管线需要的 PSO 变体（带深度、混合等）
+            Log("[INIT STAGE] ST_3D_PSO_CBUF - creating solid PSO variants");
+            // 预先创建几种常用的状态组合，避免运行时延迟
+            for (UINT state = 0; state < 8; state++) {
+                if (!BuildSolidPSO(state, false)) {
+                    Log("[ERROR] BuildSolidPSO(%d,false) failed", state);
+                    g_deviceLost.store(true);
+                    g_run = false;
+                    return;
+                }
+                if (!BuildSolidPSO(state, true)) {
+                    Log("[ERROR] BuildSolidPSO(%d,true) failed", state);
+                    g_deviceLost.store(true);
+                    g_run = false;
+                    return;
+                }
+            }
+            Log("[INIT STAGE] ST_3D_PSO_CBUF - completed");
+            break;
+        }
+
+        case ST_SKY_TEX: {
+            // 上传天空盒纹理（如果有预设纹理的话，暂时留空，以后可从文件加载）
+            Log("[INIT STAGE] ST_SKY_TEX - no sky texture loaded yet (skip)");
+            break;
+        }
+
+        case ST_SKY_VB: {
+            // 创建天空盒顶点缓冲（目前天空盒使用 CPU 上传临时缓冲，不预先创建）
+            Log("[INIT STAGE] ST_SKY_VB - no static sky VB needed (skip)");
+            break;
+        }
+
+        case ST_ENTITY_STATIC_VB: {
+            // 创建实体静态顶点缓冲（预留）
+            Log("[INIT STAGE] ST_ENTITY_STATIC_VB - skip (not implemented)");
+            break;
+        }
+
+        case ST_INSTANCE_BUFFER: {
+            // 实例缓冲（预留）
+            Log("[INIT STAGE] ST_INSTANCE_BUFFER - skip (not implemented)");
+            break;
+        }
+
+        case ST_PARTICLE_RES: {
+            // 粒子资源（预留）
+            Log("[INIT STAGE] ST_PARTICLE_RES - skip (not implemented)");
+            break;
+        }
+
+        case ST_TEXTURE_POOL: {
+            // 通用贴图池（即 g_texMap 初始化，目前为空）
+            Log("[INIT STAGE] ST_TEXTURE_POOL - done (empty pool)");
+            break;
+        }
+
+        case ST_ALPHA_PSO: {
+            // 创建半透明 PSO（用于粒子、天空）
+            Log("[INIT STAGE] ST_ALPHA_PSO - creating alpha blend PSO");
+            if (!BuildAlphaBlendPSO()) {
+                Log("[ERROR] BuildAlphaBlendPSO() failed");
+                g_deviceLost.store(true);
+                g_run = false;
+                return;
+            }
+            Log("[INIT STAGE] ST_ALPHA_PSO - completed");
+            break;
+        }
+
+        case ST_FULL_READY:
+            Log("[INIT STAGE] ST_FULL_READY - all resources initialized");
+            g_renderInitDone = true;
+            break;
+
+        default:
+            Log("[INIT STAGE] Unknown stage %d, skipping", (int)g_initStage);
+            break;
+    }
+
+    // 每个阶段结束后强制 GPU 同步，确保资源真正就绪，防止 TDR
+    if (g_queue && g_fence) {
+        WaitForGpu();
+    }
+}
+
 // === JNI ===
 extern "C" {
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jclass cls) {
@@ -1992,10 +2146,23 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jc
 
 extern "C" __declspec(dllexport) JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     (JNIEnv*, jclass, jlong hwnd) {
-    // 第一行：弹出消息框，确认函数被调用
-    MessageBoxA(NULL, "nativeInit ENTERED", "GL4DX12 DEBUG", MB_OK);
+    // 第一行：立即写入文件，证明函数被调用
+    HANDLE hFile = CreateFileA("C:\\temp\\nativeInit_called.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(hFile, "nativeInit called", 17, &written, NULL);
+        CloseHandle(hFile);
+    }
+    // 然后才是 MessageBoxA
+    MessageBoxA(NULL, "nativeInit ENTERED V4", "GL4DX12 DEBUG", MB_OK);
+
+    // ===== 最原始的输出，不依赖 Log() 函数 =====
+    char buf[256];
+    sprintf_s(buf, "[nativeInit] ENTERED with hwnd=0x%p\n", (HWND)hwnd);
+    OutputDebugStringA(buf);
+    // ============================================
+
     OutputDebugStringA("[nativeInit] === STEP 0: ENTER ===\n");
-    MessageBoxA(NULL, "nativeInit已执行，DLL加载正常", "DEBUG_LOAD_CHECK", MB_OK);
     OutputDebugStringA("[FATAL] TEST nativeInit 入口日志\n");
     OutputDebugStringA("[FATAL] TEST: nativeInit entered (before any code)\n");
     Log("=== nativeInit V2 START ===");

@@ -30,6 +30,10 @@ public class D3D12Bridge {
     public static final int COORD_SCREEN = 1;  // 屏幕坐标，需要正交投影
     public static final int COORD_NDC = 2;     // NDC 坐标，不需要变换
 
+    static {
+        System.out.println("[GL4DX12] ===== D3D12Bridge CLASS LOADED (NEW VERSION 20:45) =====");
+    }
+
     private static final Logger LOGGER = LoggerFactory.getLogger("GL4DX12");
 
     private static volatile boolean d3d12Ready = false;
@@ -62,28 +66,29 @@ public class D3D12Bridge {
     }
 
     public static boolean ensureDeviceInitialized(long hwnd) {
+        System.out.println("[GL4DX12] ensureDeviceInitialized ENTER, hwnd=" + hwnd);
+
         if (d3d12Ready) {
+            System.out.println("[GL4DX12] ensureDeviceInitialized: already ready, returning true");
             return true;
         }
 
         // hwnd 有效性校验
         if (hwnd == 0) {
+            System.err.println("[GL4DX12] ensureDeviceInitialized: hwnd is 0, throwing exception");
             throw new IllegalStateException("[GL4DX12] Invalid window handle (hwnd=0)");
         }
 
-        // 确保FramerateLimitTracker已初始化，避免早期NPE
-        Minecraft mc = Minecraft.getInstance();
-        while (mc.getFramerateLimitTracker() == null) {
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-
-        System.out.println("[GL4DX12] BEFORE calling nativeInit, hwnd=" + hwnd);
+        System.out.println("[GL4DX12] ensureDeviceInitialized: BEFORE try block");
         try {
+            System.out.println("[GL4DX12] ensureDeviceInitialized: BEFORE nativeInit, hwnd=" + hwnd);
+            System.out.println("[GL4DX12] DX12LibClient class: " + DX12LibClient.class);
+            try {
+                java.lang.reflect.Method m = DX12LibClient.class.getDeclaredMethod("nativeInit", long.class);
+                System.out.println("[GL4DX12] nativeInit method: " + m);
+            } catch (NoSuchMethodException e) {
+                System.err.println("[GL4DX12] nativeInit method NOT FOUND: " + e);
+            }
             boolean result = DX12LibClient.nativeInit(hwnd);
             System.out.println("[GL4DX12] AFTER nativeInit, result=" + result);
             d3d12Ready = result;
@@ -91,13 +96,17 @@ public class D3D12Bridge {
                 setD3D12Active(true);
                 System.out.println("[GL4DX12] D3D12 initialized and activated");
             } else {
-                LOGGER.error("D3D12 initialization FAILED! Check C:\\temp\\gl4dx12_d3d12.log for details");
+                System.err.println("[GL4DX12] D3D12 initialization FAILED! Check C:\\temp\\gl4dx12_d3d12.log for details");
             }
             return result;
+        } catch (UnsatisfiedLinkError e) {
+            System.err.println("[GL4DX12] nativeInit UNSATISFIED_LINK_ERROR: " + e.getMessage());
+            e.printStackTrace();
+            return false;
         } catch (Throwable t) {
-            System.err.println("[GL4DX12] nativeInit threw exception: " + t.getMessage());
+            System.err.println("[GL4DX12] nativeInit threw: " + t.getClass().getName() + ": " + t.getMessage());
             t.printStackTrace();
-            throw new RuntimeException("nativeInit failed", t);
+            return false;
         }
     }
 
