@@ -1,34 +1,14 @@
 ﻿// =============================================================================
-// TDR崩溃与AUTO-CORRECT残留问题最终修复
-// 技术方案：Deepseek | 执行日期：2026-06-27 | 版本：v1.0.0
-// 修复内容：
-// 1. 彻底删除AUTO-CORRECT强制切换coordType逻辑，仅保留警告日志
-// 2. 将RenderLoop设备检测提前到循环绝对顶部
-// 3. 强化Present后设备状态双重检测
-// 4. 为所有JNI渲染函数添加入口设备状态双重检验
-// 5. 统一添加[JNI拦截]和[FATAL]级日志输出
-// =============================================================================
-
-// d3d12bridge.cpp — MC D3D12 Renderer (Phase 2: render to MC window + MVP matrix)
-//
+// d3d12bridge.cpp — MC 26.1.2 D3D12 High-Performance Renderer
+// 
 // Architecture:
 //   1. D3D12 renders directly INTO Minecraft's GLFW window (SwapChain on MC HWND)
-//   2. GL→D3D12 translation: intercepted MC BufferBuilder → vertex data → JNI → D3D12 draw
-//   3. Projection/modelView matrices synced from MC via JNI each frame
-//   4. Geometry uses MC world-space coords, transformed by MVP in VS shader
-//
-//在给我晚上编译闹鬼我清算你!d3d12bridge.cpp！
-//你C++端渲染再给老子抽风老子收拾你
-//Visual Studio再给我抽风拿命来！！！！！！！
-//Visual Studio再给我抽风拿命来！！！！！！！
-//Visual Studio再给我抽风拿命来！！！！！！！
-//空指针拿命来！！！
-//空指针拿命来！！！
-//空指针拿命来！！！
-//空指针拿命来！！！
-//空指针拿命来！！！
-//空指针拿命来！！！
+//   2. MC BufferBuilder → vertex data intercepted via Mixin → JNI → D3D12
+//   3. MVP matrices synced from MC via JNI each frame (Java owns matrix authority)
+//   4. World-space geometry transformed by MVP on GPU (shader: o.p = mul(mvp, ...))
+// =============================================================================
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
 #include <jni.h>
 #include <windows.h>
@@ -244,14 +224,6 @@ static void WaitForGpu() {
 static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
 
 
-// ========== 新简单顶点数据存储（与 g_drawChunks 并行） ==========
-static std::vector<float> g_vertexData;      // 顶点位置 (x,y,z 连续)
-static std::vector<float> g_uvData;          // UV坐标 (u,v 连续)
-static float g_colorDataBuf[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-static int g_newVertexCount = 0;
-static bool g_hasNewVertexData = false;
-static std::mutex g_dataMutex;               // 线程安全
-
 // Texture state
 static ComPtr<ID3D12Resource> g_tex;
 static ComPtr<ID3D12Resource> g_texDefault;
@@ -391,7 +363,7 @@ struct PS_IN  { float4 p : SV_POSITION; float4 c : COL; float2 uv : TEX; };
 PS_IN VSMain(VS_IN i) {
     PS_IN o;
     // 顶点已在 CPU 端预转换到 NDC，直接输出
-    o.p = float4(i.p, 1);
+    o.p = mul(mvp, float4(i.p, 1));
     o.c = float4(((i.c>>16)&0xff)/255.0, ((i.c>>8)&0xff)/255.0, (i.c&0xff)/255.0, ((i.c>>24)&0xff)/255.0);
     o.uv = i.uv;
     return o;
@@ -500,7 +472,7 @@ static bool MkPSO() {
     const char* kVS = R"(
 struct VS_IN { float2 p : POS; float2 uv : TEX; };
 struct PS_IN { float4 p : SV_POSITION; float2 uv : TEX; };
-PS_IN VSMain(VS_IN i) { PS_IN o; o.p=float4(i.p,0,1); o.uv=i.uv; return o; }
+PS_IN VSMain(VS_IN i) { PS_IN o; o.p = mul(mvp, float4(i.p, 0, 1)); o.uv = i.uv; return o; }
 )";
     const char* kPS = R"(
 struct PS_IN { float4 p : SV_POSITION; float2 uv : TEX; };
@@ -566,8 +538,7 @@ struct VS_IN { float3 p : POS; uint c : COL; };
 struct PS_IN { float4 p : SV_POSITION; float4 c : COL; };
 PS_IN VSMain(VS_IN i) {
     PS_IN o;
-    // 顶点已在 CPU 端预转换到 NDC，使用单位矩阵或直接输出
-    o.p = float4(i.p, 1);
+    o.p = mul(mvp, float4(i.p, 1));
     o.c = float4(((i.c>>16)&0xff)/255.0, ((i.c>>8)&0xff)/255.0, (i.c&0xff)/255.0, ((i.c>>24)&0xff)/255.0);
     return o;
 }
@@ -1382,226 +1353,12 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         if (loopCount % 60 == 0) {
             Log("Render loop iteration %d", loopCount);
         }
-        // 等待 Java 端通知数据已准备好（最多等待 100ms 避免完全卡死）
+        // 等待 Java 端通知数据已准备好（最多等待 100ms）
         DWORD waitResult = WaitForSingleObject(g_frameReadyEvent, 100);
 
         if (waitResult == WAIT_OBJECT_0) {
-            // 数据已准备好，执行渲染
-            std::vector<float> vertices;
-            std::vector<float> uvs;
-            int vertexCount = 0;
-            {
-                std::lock_guard<std::mutex> lock(g_dataMutex);
-                if (g_hasNewVertexData && !g_vertexData.empty()) {
-                    vertices = g_vertexData;
-                    uvs = g_uvData;
-                    vertexCount = g_newVertexCount;
-                    g_hasNewVertexData = false;
-                }
-            }
-
-            if (!vertices.empty() && vertexCount > 0) {
-                // 诊断：输出顶点坐标范围
-                float minX = 1e10f, maxX = -1e10f, minY = 1e10f, maxY = -1e10f, minZ = 1e10f, maxZ = -1e10f;
-                for (int i = 0; i < vertexCount; i++) {
-                    float x = vertices[i * 3], y = vertices[i * 3 + 1], z = vertices[i * 3 + 2];
-                    if (x < minX) minX = x; if (x > maxX) maxX = x;
-                    if (y < minY) minY = y; if (y > maxY) maxY = y;
-                    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
-                }
-                Log("Vertex range: X[%.1f, %.1f] Y[%.1f, %.1f] Z[%.1f, %.1f] (count=%d)", minX, maxX, minY, maxY, minZ, maxZ, vertexCount);
-
-                // 诊断：CPU端模拟MVP变换，输出前3个顶点的NDC坐标
-                if (g_cbData && vertexCount > 0) {
-                    float* m = (float*)g_cbData;
-                    Log("Current MVP row0: [%.4f %.4f %.4f %.4f]", m[0], m[1], m[2], m[3]);
-                    Log("Current MVP row1: [%.4f %.4f %.4f %.4f]", m[4], m[5], m[6], m[7]);
-                    for (int i = 0; i < min(vertexCount, 3); i++) {
-                        float vx = vertices[i * 3], vy = vertices[i * 3 + 1], vz = vertices[i * 3 + 2];
-                        float clipX = m[0]*vx + m[1]*vy + m[2]*vz + m[3];
-                        float clipY = m[4]*vx + m[5]*vy + m[6]*vz + m[7];
-                        float clipZ = m[8]*vx + m[9]*vy + m[10]*vz + m[11];
-                        float clipW = m[12]*vx + m[13]*vy + m[14]*vz + m[15];
-                        float ndcX = (clipW != 0) ? clipX / clipW : clipX;
-                        float ndcY = (clipW != 0) ? clipY / clipW : clipY;
-                        float ndcZ = (clipW != 0) ? clipZ / clipW : clipZ;
-                        Log("  vertex[%d] world(%.1f,%.1f,%.1f) -> ndc(%.3f,%.3f,%.3f)", i, vx, vy, vz, ndcX, ndcY, ndcZ);
-                    }
-                }
-
-                // AUTO-CORRECT 已禁用 - 完全信任 Java 传入的 coordType
-
-                // ===== 根据顶点类型选择投影矩阵 =====
-                switch (g_currentCoordType) {
-                    case 0: // COORD_WORLD — 直接构建投影矩阵
-                        Log("Using perspective projection for 3D vertices (WORLD coords)");
-                        if (g_cbData) {
-                            // 直接构建投影矩阵，不依赖 Java 端传递
-                            float fov = 70.0f * 3.14159265f / 180.0f;
-                            float aspect = (float)g_w / (float)g_h;
-                            float zNear = 0.1f, zFar = 1000.0f;
-                            float tanHalfFov = tanf(fov / 2.0f);
-                            float proj[16] = {
-                                1.0f / (tanHalfFov * aspect), 0, 0, 0,
-                                0, 1.0f / tanHalfFov, 0, 0,
-                                0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
-                                0, 0, -1.0f, 0
-                            };
-                            memcpy(g_cbData, proj, sizeof(proj));
-                            Log("[RenderLoop] 强制使用投影矩阵，m[3][2]=%.4f", ((float*)g_cbData)[11]);
-                        }
-                        // 检查 MVP 变换后的 NDC 范围
-                        if (g_cbData && vertexCount > 0) {
-                            float* m = (float*)g_cbData;
-                            int outOfRange = 0;
-                            for (int i = 0; i < vertexCount; i++) {
-                                float vx = vertices[i * 3], vy = vertices[i * 3 + 1], vz = vertices[i * 3 + 2];
-                                float clipW = m[12]*vx + m[13]*vy + m[14]*vz + m[15];
-                                float ndcX = (clipW != 0) ? (m[0]*vx + m[1]*vy + m[2]*vz + m[3]) / clipW : 0;
-                                float ndcY = (clipW != 0) ? (m[4]*vx + m[5]*vy + m[6]*vz + m[7]) / clipW : 0;
-                                if (ndcX < -1.1f || ndcX > 1.1f || ndcY < -1.1f || ndcY > 1.1f) {
-                                    outOfRange++;
-                                }
-                            }
-                            if (outOfRange > 0) {
-                                Log("  WARNING: %d/%d vertices out of NDC range after WORLD transform",
-                                    outOfRange, vertexCount);
-                            }
-                        }
-                        break;
-
-                    case 1: // COORD_SCREEN — 使用窗口尺寸计算正交投影
-                        Log("Using orthographic projection for GUI vertices (SCREEN coords), window=%dx%d", g_w, g_h);
-                        {
-                            float w2 = (float)g_w / 2.0f;
-                            float h2 = (float)g_h / 2.0f;
-                            float ortho[16] = {
-                                1.0f/w2, 0, 0, -1,
-                                0, -1.0f/h2, 0, 1,
-                                0, 0, 1, 0,
-                                0, 0, 0, 1
-                            };
-                            memcpy(g_mvpScreen, ortho, sizeof(ortho));
-                            if (g_cbData) {
-                                memcpy(g_cbData, ortho, sizeof(ortho));
-                            }
-                        }
-                        break;
-
-                    case 2: // COORD_NDC — 使用单位矩阵（不变换）
-                        Log("Using identity matrix for NDC vertices (already in clip space)");
-                        // NDC 顶点范围诊断
-                        if (vertexCount > 0) {
-                            Log("  NDC vertex range: X[%.3f, %.3f] Y[%.3f, %.3f] Z[%.3f, %.3f] count=%d",
-                                minX, maxX, minY, maxY, minZ, maxZ, vertexCount);
-                        }
-                        if (g_cbData) {
-                            memcpy(g_cbData, g_mvpNDC, sizeof(g_mvpNDC));
-                        }
-                        break;
-
-                    default:
-                        Log("WARNING: Unknown coordType=%d, using WORLD", g_currentCoordType);
-                        if (g_cbData) {
-                            memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
-                        }
-                        break;
-                }
-                // ===== 矩阵选择结束 =====
-
-                // ===== 将四边形转换为三角形（GUI顶点） =====
-                if (g_currentCoordType == 1 && vertexCount % 4 == 0 && vertexCount > 0) {
-                    std::vector<float> triVertices;
-                    triVertices.reserve(vertexCount * 6 / 4); // 4顶点 → 6顶点 (两个三角形)
-
-                    for (int i = 0; i < vertexCount; i += 4) {
-                        // 四边形顶点: v0, v1, v2, v3
-                        // 转换为两个三角形: v0, v1, v2 和 v2, v3, v0
-                        int idx0 = i * 3, idx1 = (i+1) * 3, idx2 = (i+2) * 3, idx3 = (i+3) * 3;
-
-                        // 三角形1: v0, v1, v2
-                        triVertices.push_back(vertices[idx0]); triVertices.push_back(vertices[idx0+1]); triVertices.push_back(vertices[idx0+2]);
-                        triVertices.push_back(vertices[idx1]); triVertices.push_back(vertices[idx1+1]); triVertices.push_back(vertices[idx1+2]);
-                        triVertices.push_back(vertices[idx2]); triVertices.push_back(vertices[idx2+1]); triVertices.push_back(vertices[idx2+2]);
-
-                        // 三角形2: v2, v3, v0
-                        triVertices.push_back(vertices[idx2]); triVertices.push_back(vertices[idx2+1]); triVertices.push_back(vertices[idx2+2]);
-                        triVertices.push_back(vertices[idx3]); triVertices.push_back(vertices[idx3+1]); triVertices.push_back(vertices[idx3+2]);
-                        triVertices.push_back(vertices[idx0]); triVertices.push_back(vertices[idx0+1]); triVertices.push_back(vertices[idx0+2]);
-                    }
-
-                    vertices = triVertices;
-                    vertexCount = (int)vertices.size() / 3;
-                    Log("Converted QUADS to TRIANGLES: %d vertices", vertexCount);
-                }
-                // ===== 四边形转换结束 =====
-
-                // ===== CPU端预转换顶点到NDC =====
-                if (g_cbData && vertexCount > 0) {
-                    float* mvp = (float*)g_cbData;
-                    for (int i = 0; i < vertexCount; i++) {
-                        float x = vertices[i * 3], y = vertices[i * 3 + 1], z = vertices[i * 3 + 2];
-                        float clipX = mvp[0]*x + mvp[1]*y + mvp[2]*z + mvp[3];
-                        float clipY = mvp[4]*x + mvp[5]*y + mvp[6]*z + mvp[7];
-                        float clipZ = mvp[8]*x + mvp[9]*y + mvp[10]*z + mvp[11];
-                        float clipW = mvp[12]*x + mvp[13]*y + mvp[14]*z + mvp[15];
-                        if (clipW != 0) {
-                            vertices[i * 3]     = clipX / clipW;
-                            vertices[i * 3 + 1] = clipY / clipW;
-                            vertices[i * 3 + 2] = clipZ / clipW;
-                        }
-                    }
-                    Log("Pre-transformed %d vertices to NDC on CPU", vertexCount);
-                }
-                // ===== NDC转换结束 =====
-
-                Log("RenderLoop: rendering %d vertices from new storage", vertexCount);
-
-                // 1. 更新顶点缓冲区
-                UINT byteCount = vertexCount * sizeof(VertexPC);
-                if (EnsureIMVBCapacity(byteCount)) {
-                    void* dst = nullptr;
-                    HRESULT hr = g_imVB->Map(0, nullptr, &dst);
-                    if (FAILED(hr) || dst == nullptr) {
-                        Log("[FATAL] RenderLoop vertex Map failed, hr=0x%08X\n", hr);
-                        g_imVB->Unmap(0, nullptr);
-                        continue;
-                    }
-                    VertexPC* vtx = (VertexPC*)dst;
-                    for (int i = 0; i < vertexCount; i++) {
-                        vtx[i].x = vertices[i * 3];
-                        vtx[i].y = vertices[i * 3 + 1];
-                        vtx[i].z = vertices[i * 3 + 2];
-                        // ===== 强制颜色测试 =====
-                        unsigned char r = (i % 2 == 0) ? 255 : 0;
-                        unsigned char g = (i % 3 == 0) ? 255 : 0;
-                        unsigned char b = (i % 5 == 0) ? 255 : 0;
-                        vtx[i].color = (0xFF << 24) | (r << 16) | (g << 8) | b;
-                        // 验证立即写入的值
-                        if (i == 0) Log("=== WRITE VERIFY: i=0, color=0x%08X ===", vtx[0].color);
-                    }
-                    Log("=== FORCE COLOR TEST: vertex[0].color = 0x%08X ===", vtx[0].color);
-                    g_imVB->Unmap(0, nullptr);
-                    g_imVBSize = byteCount;
-                    g_imVbv.SizeInBytes = g_imVBSize;
-
-                    // 2. 记录绘制调用
-                    EnterCriticalSection(&g_stateLock);
-                    DrawChunk ch;
-                    ch.byteOffset = 0;
-                    ch.vertexCount = vertexCount;
-                    ch.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                    ch.textured = false;
-                    ch.vertexStride = sizeof(VertexPC);
-                    ch.blend = false;
-                    ch.textureId = 0;
-                    ch.vertexType = g_currentCoordType;
-                    g_drawChunks.clear();
-                    g_drawChunks.push_back(ch);
-                    g_imVertCount = vertexCount;
-                    LeaveCriticalSection(&g_stateLock);
-                }
-            }
+            // 顶点已通过 nativeRecordVertices → g_drawChunks 路径存储
+            // RenderLoop 在 Layer1 绘制循环中处理所有 g_drawChunks
         } else if (waitResult == WAIT_TIMEOUT) {
             // 超时，跳过本帧（没有新数据）
             continue;
@@ -1700,32 +1457,14 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
             for (auto& ch : chunks) {
                 // ===== 每个 DrawChunk 独立设置常量缓冲区矩阵 =====
-                if (ch.vertexType == 0) { // COORD_WORLD — 直接构建投影矩阵
-                    float fov = 70.0f * 3.14159265f / 180.0f;
-                    float aspect = (float)g_w / (float)g_h;
-                    float zNear = 0.1f, zFar = 1000.0f;
-                    float tanHalfFov = tanf(fov / 2.0f);
-                    float proj[16] = {
-                        1.0f / (tanHalfFov * aspect), 0, 0, 0,
-                        0, 1.0f / tanHalfFov, 0, 0,
-                        0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
-                        0, 0, -1.0f, 0
-                    };
+                if (ch.vertexType == 0) { // COORD_WORLD — 使用 Java MVP 矩阵
                     if (g_cbData) {
-                        memcpy(g_cbData, proj, sizeof(proj));
+                        memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
                     }
-                    Log("[DrawChunk WORLD] m[3][2]=%.4f", proj[11]);
-                } else if (ch.vertexType == 1) { // COORD_SCREEN
-                    float w = (float)g_w;
-                    float h = (float)g_h;
-                    float orthoMatrix[16] = {
-                        2.0f / w, 0.0f,       0.0f, -1.0f,
-                        0.0f,     -2.0f / h,  0.0f,  1.0f,
-                        0.0f,      0.0f,       1.0f,  0.0f,
-                        0.0f,      0.0f,       0.0f,  1.0f
-                    };
+                    Log("[DrawChunk WORLD] using Java MVP, m[3][2]=%.4f", g_mvpWorld[11]);
+                } else if (ch.vertexType == 1) { // COORD_SCREEN — 使用 Java 正交矩阵
                     if (g_cbData) {
-                        memcpy(g_cbData, orthoMatrix, sizeof(orthoMatrix));
+                        memcpy(g_cbData, g_mvpScreen, sizeof(g_mvpScreen));
                     }
                 } else if (ch.vertexType == 2) { // COORD_NDC — 单位矩阵
                     if (g_cbData) {
@@ -1803,7 +1542,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     Log("  Batch splitting: %d vertices → %d batches of %d", ch.vertexCount,
                         (ch.vertexCount + kBatchSize - 1) / kBatchSize, kBatchSize);
                     for (UINT offset = 0; offset < ch.vertexCount; offset += kBatchSize) {
-                        UINT count = min(kBatchSize, ch.vertexCount - offset);
+                        UINT count = (ch.vertexCount - offset < (int)kBatchSize) ? (UINT)(ch.vertexCount - offset) : kBatchSize;
                         D3D12_VERTEX_BUFFER_VIEW batchVbv = chVbv;
                         batchVbv.BufferLocation += (UINT64)offset * ch.vertexStride;
                         batchVbv.SizeInBytes = count * ch.vertexStride;
@@ -1986,8 +1725,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
 static bool InitD3D12(HWND hwndMC) {
     OutputDebugStringA("[nativeInit] === STEP 1: InitD3D12 ENTER ===\n");
-    MessageBoxA(NULL, "=== INITD3D12 V3 ===", "DEBUG", MB_OK);
-    Log("=== !!! NEW VERSION WITH DIRECT RENDERING !!! ===");
+    Log("=== INITD3D12 - Direct rendering mode ===");
     Log("=== INITD3D12 V2 START ===");
 
     // --- 新增：强制清理所有可能的旧覆盖层窗口 ---
@@ -2011,7 +1749,6 @@ static bool InitD3D12(HWND hwndMC) {
     }
     // --- 强制清理结束 ---
 
-    MessageBoxA(NULL, "InitD3D12 called!", "Debug", MB_OK);
     OutputDebugStringA("=== InitD3D12 ENTERED ===\n");
     Log("=== InitD3D12 ENTERED ===");
     Log("=== Init D3D12 overlay on MC window (HWND=0x%p) ===", hwndMC);
@@ -2630,29 +2367,9 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jc
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     (JNIEnv*, jclass, jlong hwnd) {
-    // 第一行：立即写入文件，证明函数被调用
-    HANDLE hFile = CreateFileA("C:\\temp\\nativeInit_called.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD written;
-        WriteFile(hFile, "nativeInit called", 17, &written, NULL);
-        CloseHandle(hFile);
-    }
-    // 然后才是 MessageBoxA
-    MessageBoxA(NULL, "nativeInit ENTERED V4", "GL4DX12 DEBUG", MB_OK);
-
-    // ===== 最原始的输出，不依赖 Log() 函数 =====
-    char buf[256];
-    sprintf_s(buf, "[nativeInit] ENTERED with hwnd=0x%p\n", (HWND)hwnd);
-    OutputDebugStringA(buf);
-    // ============================================
-
-    OutputDebugStringA("[nativeInit] === STEP 0: ENTER ===\n");
-    OutputDebugStringA("[FATAL] TEST nativeInit 入口日志\n");
-    OutputDebugStringA("[FATAL] TEST: nativeInit entered (before any code)\n");
-    Log("=== nativeInit V2 START ===");
-    OutputDebugStringA("[RAW] nativeInit called - DLL loaded!\n");
-    OutputDebugStringA("=== nativeInit ENTERED ===\n");
-    Log("=== nativeInit ENTERED ===");
+    OutputDebugStringA("[nativeInit] Entered with hwnd");
+    OutputDebugStringA("=== InitD3D12 ENTERED ===\n");
+    Log("=== nativeInit START ===");
     CreateDirectoryA("C:\\temp", 0);
     if (g_ok) {
         Log("nativeInit: already initialized, returning true");
@@ -2670,20 +2387,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRender(JNIEnv*, jclass) {}
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativePresent(JNIEnv*, jclass) {
-    if (!g_ok || !g_globalDeviceReady || g_deviceLost.load()) {
-        Log("[nativePresent] skipped - device not ready or lost");
-        return;
-    }
-    if (g_swap) {
-        HRESULT hr = g_swap->Present(0, 0);
-        if (FAILED(hr)) {
-            Log("[nativePresent] Present failed, hr=0x%08X", hr);
-        } else {
-            Log("[nativePresent] Present succeeded");
-        }
-    } else {
-        Log("[nativePresent] g_swap is null");
-    }
+    // Present is handled exclusively by the RenderLoop thread.
+    // This JNI entry is a no-op to avoid double-Present race conditions.
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeBeginFrame(JNIEnv*, jclass) {
@@ -2979,16 +2684,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
     g_imVBSize += byteCount;
     g_imVbv.SizeInBytes = g_imVBSize;
 
-    // 同步拷贝到新存储（供 RenderLoop 直接使用）
-    {
-        std::lock_guard<std::mutex> lock(g_dataMutex);
-        g_vertexData.assign(buf.data(), buf.data() + (jsize)(safeCount * 3));
-        g_newVertexCount = safeCount;
-        g_hasNewVertexData = true;
-    }
+    // 顶点已通过 g_drawChunks 路径存储，RenderLoop 统一处理
     Log("nativeRecordVertices: stored %d floats (%d vertices), byteCount=%d", (int)(safeCount * 3), (int)safeCount, (int)byteCount);
     // 打印前几个顶点的坐标用于诊断
-    int logCount = (int)min(safeCount, (UINT)5);
+    int logCount = (safeCount < 5) ? (int)safeCount : 5;
     for (UINT i = 0; i < (UINT)logCount; i++) {
         int off = i * 3;
         Log("  [JNI]Received vertex[%d]: %.4f, %.4f, %.4f", i, buf[off], buf[off+1], buf[off+2]);
@@ -3069,11 +2768,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordUV(JNIEnv* env, j
     if (len == 0) { OutputDebugStringA("nativeRecordUV: uvs is empty\n"); return; }
     jfloat* data = env->GetFloatArrayElements(uvs, nullptr);
     if (!data) { OutputDebugStringA("nativeRecordUV: GetFloatArrayElements failed\n"); return; }
-    {
-        std::lock_guard<std::mutex> lock(g_dataMutex);
-        g_uvData.assign(data, data + len);
-    }
-    char buf[128]; snprintf(buf, sizeof(buf), "nativeRecordUV: %d floats\n", (int)len); OutputDebugStringA(buf);
+    // PathA removed - UV/Color data no longer stored separately (vertices carry color in VertexPC)
     env->ReleaseFloatArrayElements(uvs, data, JNI_ABORT);
 }
 
@@ -3088,12 +2783,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordColors(JNIEnv* en
     if (len == 0) { OutputDebugStringA("nativeRecordColors: colors is empty\n"); return; }
     jfloat* data = env->GetFloatArrayElements(colors, nullptr);
     if (!data) { OutputDebugStringA("nativeRecordColors: GetFloatArrayElements failed\n"); return; }
-    if (len >= 4) {
-        std::lock_guard<std::mutex> lock(g_dataMutex);
-        g_colorDataBuf[0] = data[0]; g_colorDataBuf[1] = data[1];
-        g_colorDataBuf[2] = data[2]; g_colorDataBuf[3] = data[3];
-    }
-    char buf[128]; snprintf(buf, sizeof(buf), "nativeRecordColors: %d floats\n", (int)len); OutputDebugStringA(buf);
+    // PathA removed - colors stored per-vertex in VertexPC
     env->ReleaseFloatArrayElements(colors, data, JNI_ABORT);
 }
 
@@ -3207,27 +2897,13 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jcl
             float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             memcpy(src, identity, sizeof(identity));
         }
-        // coordType==0 (WORLD) 投影矩阵修复：缺少投影特征时构建标准投影
+        // coordType==0 (WORLD) 投影矩阵诊断日志（不修改矩阵，信任Java）
         if (coordType == 0) {
             float m32 = src[11];  // column-major: m[3][2]
             float m33 = src[15];  // column-major: m[3][3]
             Log("[Matrix Check] m[3][2]=%.4f (expect -1), m[3][3]=%.4f (expect 0)", m32, m33);
-            // 如果 m[3][2] 接近 0，说明投影矩阵缺失（单位矩阵特征）
             if (fabsf(m32) < 0.1f) {
-                Log("[Matrix Fix] 检测到投影矩阵缺失 (m[3][2]=%.4f)，强制构建投影矩阵", m32);
-                float fov = 70.0f * 3.14159265f / 180.0f;
-                float aspect = (float)g_w / (float)g_h;
-                if (aspect <= 0 || !std::isfinite(aspect)) aspect = 16.0f / 9.0f;
-                float zNear = 0.1f, zFar = 1000.0f;
-                float tanHalfFov = tanf(fov / 2.0f);
-                float proj[16] = {
-                    1.0f / (tanHalfFov * aspect), 0, 0, 0,
-                    0, 1.0f / tanHalfFov, 0, 0,
-                    0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
-                    0, 0, -1.0f, 0
-                };
-                memcpy(src, proj, sizeof(proj));
-                Log("[Matrix Fix] 已强制替换为投影矩阵，m[3][2]=%.4f", src[11]);
+                Log("[Matrix Warn] WORLD matrix m[3][2]=%.4f near 0, projection may be missing - trusting Java", m32);
             }
         }
         // 根据 coordType 存储到不同的矩阵
@@ -3642,32 +3318,14 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
     }
 
     for (auto& dc : g_transparentDrawCalls) {
-        // 根据类型设置投影矩阵
+        // 根据类型设置投影矩阵 — 使用 Java 传入的矩阵
         if (dc.type == VERTEX_TYPE_WORLD) {
-            float fov = 70.0f * 3.14159265f / 180.0f;
-            float aspect = (float)g_w / (float)g_h;
-            float zNear = 0.1f, zFar = 1000.0f;
-            float tanHalfFov = tanf(fov / 2.0f);
-            float proj[16] = {
-                1.0f / (tanHalfFov * aspect), 0, 0, 0,
-                0, 1.0f / tanHalfFov, 0, 0,
-                0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
-                0, 0, -1.0f, 0
-            };
             if (g_cbData) {
-                memcpy(g_cbData, proj, sizeof(proj));
+                memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
             }
         } else if (dc.type == VERTEX_TYPE_SCREEN) {
-            float w = (float)g_w;
-            float h = (float)g_h;
-            float ortho[16] = {
-                2.0f / w, 0.0f, 0.0f, -1.0f,
-                0.0f, -2.0f / h, 0.0f, 1.0f,
-                0.0f, 0.0f, 1.0f, 0.0f,
-                0.0f, 0.0f, 0.0f, 1.0f
-            };
             if (g_cbData) {
-                memcpy(g_cbData, ortho, sizeof(ortho));
+                memcpy(g_cbData, g_mvpScreen, sizeof(g_mvpScreen));
             }
         } else { // VERTEX_TYPE_UNKNOWN / NDC — 单位矩阵
             if (g_cbData) {

@@ -7,20 +7,23 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * MC 26.1.2: BufferBuilder.build() returns MeshData (not the old BuiltBuffer).
- * Hook at RETURN to get the fully-built MeshData with sorted vertex buffer.
+ * MC 26.1.2: BufferBuilder.build() returns MeshData.
+ * Intercept return value and pass vertex data to D3D12 bridge.
  */
 @Mixin(targets = "com.mojang.blaze3d.vertex.BufferBuilder", remap = false)
 public class BufferBuilderMixin {
 
     @Inject(method = "build", at = @At("RETURN"), remap = false)
     private void onBuild(CallbackInfoReturnable<Object> cir) {
-        System.out.println("[GL4DX12] BufferBuilder.build() intercepted - SKIPPING (stability test)");
-        // 直接返回，不处理任何数据
-        return;
+        if (!D3D12Bridge.isD3D12Active()) return;
+
+        Object meshData = cir.getReturnValue();
+        if (meshData == null) return;
+
+        D3D12Bridge.processMeshData(meshData);
     }
 
     static {
-        System.out.println("[GL4DX12] BufferBuilderMixin v23 loaded -> build()@RETURN");
+        System.out.println("[GL4DX12] BufferBuilderMixin loaded -> build()@RETURN (active capture)");
     }
 }

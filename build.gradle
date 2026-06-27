@@ -14,14 +14,23 @@ repositories {
 group = 'com.dx12'
 version = '1.0.0'
 
+loom {
+    mods {
+        register("gl4dx12") {
+            sourceSet(sourceSets["main"])
+        }
+    }
+}
+
 dependencies {
     minecraft "com.mojang:minecraft:26.1.2"
 
     implementation "net.fabricmc:fabric-loader:0.19.2"
-    implementation "net.fabricmc.fabric-api:fabric-api:0.149.1+26.1.2"
+    implementation "net.fabricmc.fabric-api:fabric-api:0.150.0+26.1.2"
 }
 
 java {
+    withSourcesJar()
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }

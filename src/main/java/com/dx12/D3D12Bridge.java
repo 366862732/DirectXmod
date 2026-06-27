@@ -56,12 +56,6 @@ public class D3D12Bridge {
     }
 
     public static void setD3D12Active(boolean active) {
-        System.out.println("[GL4DX12] setD3D12Active called: " + active + " (was " + d3d12Active + ")");
-        try {
-            throw new RuntimeException("Stack trace for setD3D12Active");
-        } catch (RuntimeException e) {
-            e.printStackTrace();
-        }
         d3d12Active = active;
         LOGGER.info("D3D12 active: {}", active);
     }
@@ -101,12 +95,10 @@ public class D3D12Bridge {
             }
             return result;
         } catch (UnsatisfiedLinkError e) {
-            System.err.println("[GL4DX12] nativeInit UNSATISFIED_LINK_ERROR: " + e.getMessage());
-            e.printStackTrace();
+            LOGGER.error("[GL4DX12] nativeInit UNSATISFIED_LINK_ERROR: {}", e.getMessage());
             return false;
         } catch (Throwable t) {
-            System.err.println("[GL4DX12] nativeInit threw: " + t.getClass().getName() + ": " + t.getMessage());
-            t.printStackTrace();
+            LOGGER.error("[GL4DX12] nativeInit exception: {}: {}", t.getClass().getName(), t.getMessage());
             return false;
         }
     }
@@ -381,8 +373,7 @@ public class D3D12Bridge {
                     System.out.println("[GL4DX12] processMeshData: failed to get window handle");
                 }
             } catch (Exception e) {
-                System.err.println("[GL4DX12] processMeshData: forced init exception: " + e.getMessage());
-                e.printStackTrace();
+                LOGGER.error("[GL4DX12] processMeshData: forced init exception: {}", e.getMessage());
             }
         }
         System.out.println("[GL4DX12] processMeshData ENTERED, d3d12Active=" + d3d12Active + ", meshData=" + (meshData != null));
@@ -590,53 +581,43 @@ public class D3D12Bridge {
             }
 
         } catch (Exception e) {
-            System.err.println("[GL4DX12] processMeshData failed: " + e.getMessage() +
-                              " (" + e.getClass().getSimpleName() + ")");
-            e.printStackTrace();
+            LOGGER.error("[GL4DX12] processMeshData failed: {} ({})", e.getMessage(), e.getClass().getSimpleName());
         }
     }
 
     // ========== 完整帧渲染 ==========
     
     public static void renderFullFrame(LevelRenderState levelState, CameraRenderState cameraState, float partialTick, Matrix4fc modelViewMatrix) {
-        System.out.println("[GL4DX12] renderFullFrame called, modelView=" + (modelViewMatrix != null) + ", cameraState=" + (cameraState != null));
-        if (modelViewMatrix == null) {
-            System.out.println("[GL4DX12] renderFullFrame: modelView is NULL!");
-            return;
-        }
+        if (modelViewMatrix == null) return;
         if (!d3d12Ready || !d3d12Active) return;
 
-        // 1. 开始帧
-        DX12LibClient.nativeBeginFrame();
-
-        // 2. 同步矩阵（使用 MC 的 modelView + cameraState 的投影）
+        // 1. 同步矩阵（使用 MC 的 modelView + cameraState 的投影）
         syncMatrices(modelViewMatrix, cameraState);
 
-        // 3. 渲染天空盒
+        // 2. 渲染天空盒
         if (levelState.skyRenderState != null) {
             renderSky(levelState.skyRenderState);
         }
 
-        // 4. 渲染世界（方块）
+        // 3. 渲染世界（方块）— 顶点已通过 BufferBuilderMixin 上传
         if (levelState.chunkSectionsToRender != null) {
             renderTerrain(levelState.chunkSectionsToRender);
         }
 
-        // 5. 渲染实体
+        // 4. 渲染实体
         if (!cachedEntityStates.isEmpty()) {
             renderEntities(cachedEntityStates, partialTick);
             cachedEntityStates.clear();
         }
 
-        // 6. 渲染粒子
+        // 5. 渲染粒子
         if (cachedParticlesState != null) {
             renderParticles(cachedParticlesState);
             cachedParticlesState = null;
         }
 
-        // 7. 结束帧并展示
-        DX12LibClient.nativeEndFrame();
-        DX12LibClient.nativePresent();
+        // Note: Present is handled exclusively by the C++ RenderLoop thread.
+        // Java only uploads data and signals the render thread.
     }
 
     private static void renderSky(SkyRenderState skyState) {
@@ -648,8 +629,8 @@ public class D3D12Bridge {
     }
 
     private static void renderTerrain(Object chunkSections) {
-        // 使用现有的 processMeshData 已经上传了顶点数据
-        // 这里只需要确保 C++ 层绘制它们
+        // Terrain vertices are already uploaded via BufferBuilderMixin → processMeshData → nativeRecordVertices.
+        // The RenderLoop handles drawing them from g_drawChunks automatically.
     }
 
     private static void renderEntities(List<EntityRenderState> entities, float partialTick) {

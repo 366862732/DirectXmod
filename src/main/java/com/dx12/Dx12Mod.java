@@ -1,7 +1,5 @@
 package com.dx12;
 
-import java.io.File;
-
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
 
@@ -18,31 +16,8 @@ public class Dx12Mod implements ClientModInitializer {
         System.out.println("[GL4DX12] Mod Initializing (Client)...");
         System.out.println("========================================");
 
-
-        // === 从版本隔离目录下的 dx12mod 文件夹加载 DLL ===
-        // 版本隔离路径: D:\.minecraft\versions\26.1.2-Fabric_0.19.3\dx12mod\
-        String versionDir = "D:\\.minecraft\\versions\\26.1.2-Fabric_0.19.3";
-        File dllDir = new File(versionDir, "dx12mod");
-        if (!dllDir.exists()) {
-            if (!dllDir.mkdirs()) {
-                System.err.println("[GL4DX12] Failed to create dx12mod directory at " + dllDir.getAbsolutePath());
-                return;
-            }
-        }
-        File dllFile = new File(dllDir, "gl4dx12.dll");
-        if (!dllFile.exists()) {
-            System.err.println("[GL4DX12] DLL not found at " + dllFile.getAbsolutePath());
-            System.err.println("[GL4DX12] Please copy gl4dx12.dll to " + dllDir.getAbsolutePath());
-            return;
-        }
-        try {
-            System.load(dllFile.getAbsolutePath());
-            System.out.println("[GL4DX12] System.load SUCCESS from " + dllFile.getAbsolutePath());
-        } catch (Throwable t) {
-            System.err.println("[GL4DX12] System.load FAILED: " + t.getMessage());
-            t.printStackTrace();
-            return;
-        }
+        // DLL loading is handled by DX12LibClient static initializer via FabricLoader
+        System.out.println("[GL4DX12] DLL discovery delegated to DX12LibClient");
 
 
         // 2. Enumerate ALL RenderSystem static methods (one-time diagnostic)

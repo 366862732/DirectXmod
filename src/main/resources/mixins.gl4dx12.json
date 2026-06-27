@@ -8,7 +8,9 @@
     "BufferBuilderMixin",
     "LevelRendererMixin",
     "EntityRenderDispatcherMixin",
-    "ParticleEngineMixin"
+    "ParticleEngineMixin",
+    "GlDrawMixin",
+    "GlBufferMixin"
   ],
   "client": [],
   "injectors": {
