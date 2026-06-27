@@ -1,6 +1,6 @@
 ﻿// =============================================================================
 // TDR崩溃与AUTO-CORRECT残留问题最终修复
-// 技术方案：Deepseek | 执行日期：2026-06-21 | 版本：v0.3.1
+// 技术方案：Deepseek | 执行日期：2026-06-27 | 版本：v1.0.0
 // 修复内容：
 // 1. 彻底删除AUTO-CORRECT强制切换coordType逻辑，仅保留警告日志
 // 2. 将RenderLoop设备检测提前到循环绝对顶部
@@ -85,9 +85,13 @@ static void Log(const char* fmt, ...) {
 
 // ===== 前向声明（供 RenderLoop 调用，必须放在文件顶部） =====
 extern "C" {
+    //窗口 Resize
+    JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass,jint w,jint h);
     // 天空系统
     JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFFF
     (JNIEnv* env, jclass clazz, jfloat r, jfloat g, jfloat b, jfloat a, jfloat sunAngle, jfloat moonAngle);
+    JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters___3F
+    (JNIEnv* env, jclass clazz, jfloatArray params);
 
     JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderSky
     (JNIEnv* env, jclass clazz);
@@ -212,7 +216,7 @@ static void WaitForGpu() {
     g_cl->Close();
     ID3D12CommandList* cmdLists[] = {g_cl.Get()};
     g_queue->ExecuteCommandLists(1, cmdLists);
-    HRESULT presentHR = g_swap->Present(1, 0);
+    HRESULT presentHR = g_swap->Present(0, 0);  // SyncInterval=0
     if (FAILED(presentHR))
     {
         char buf[128];
@@ -614,14 +618,15 @@ static bool BuildSolidPSO(UINT stateBits, bool textured) {
     pd.RasterizerState.CullMode = (stateBits & GLB_CULL) ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
     // 先启用深度测试
-    pd.DepthStencilState.DepthEnable = (stateBits & GLB_DEPTH) ? TRUE : FALSE;
-    pd.DepthStencilState.DepthWriteMask = (stateBits & GLB_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pd.DepthStencilState.StencilEnable = FALSE;
     pd.InputLayout = {ie, ieCount};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.DSVFormat = (stateBits & GLB_DEPTH) ? g_dsvFormat : DXGI_FORMAT_UNKNOWN;
+    pd.DSVFormat = g_dsvFormat;  // 强制使用深度格式，确保深度测试生效
     pd.SampleDesc.Count = 1;
     pd.SampleDesc.Quality = 0;
     Log("[BuildSolidPSO] Creating PSO idx=%d: DSVFormat=%d, SampleCount=%d, DepthEnable=%d",
@@ -1219,14 +1224,29 @@ static DWORD WINAPI RenderLoop(LPVOID) {
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
     while (true) {
+        Log("[RenderLoop] Loop iteration start, g_run=%d, g_deviceLost=%d", g_run, g_deviceLost.load());
         // 设备丢失检测 - 必须是循环第一行
         if (g_deviceLost.load() || !g_dev || g_dev->GetDeviceRemovedReason() != S_OK) {
-            Log("[RenderLoop] EXIT: Device lost at loop top, g_deviceLost=%d, g_dev=%p, reason=0x%08X",
-                g_deviceLost.load(), g_dev.Get(), g_dev ? g_dev->GetDeviceRemovedReason() : 0);
+            Log("[RenderLoop] EXIT: Device lost at loop top, g_deviceLost=%d, g_run=%d, g_ok=%d, g_dev=%p, reason=0x%08X",
+                g_deviceLost.load(), g_run, g_ok, g_dev.Get(), g_dev ? g_dev->GetDeviceRemovedReason() : 0);
             g_run = false;
             break;
         }
         if (!g_globalDeviceReady) { Log("[INFO] Device not ready, exiting render thread."); g_run = false; break; }
+
+        // 窗口大小变化检测，Resize 交换链
+        if (g_hwndMC) {
+            RECT rc;
+            if (GetClientRect(g_hwndMC, &rc)) {
+                int newW = rc.right - rc.left;
+                int newH = rc.bottom - rc.top;
+                if (newW > 0 && newH > 0 && (newW != (int)g_w || newH != (int)g_h)) {
+                    Log("[RenderLoop] Window resize detected: %dx%d -> %dx%d", g_w, g_h, newW, newH);
+                    Java_com_dx12_DX12LibClient_nativeResize(nullptr, nullptr, newW, newH);
+                }
+            }
+        }
+
         Log("=== RenderLoop LOOP ITERATION ===");
         if (!g_dev || !g_queue || !g_rtvHeap || !g_srvHeap || !g_alloc || !g_cl) {
             Sleep(16);
@@ -1245,7 +1265,11 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 g_run = false;
                 break;
             }
-
+            //初始化阶段添加同步
+            if(g_fence->GetCompletedValue() < g_fenceVal -1){
+            g_fence->SetEventOnCompletion(g_fenceVal - 1,g_fenceEv);
+            WaitForSingleObject(g_fenceEv,INFINITE);
+            }
             // 重置命令分配器和列表（为当前帧准备）
             HRESULT hr = g_alloc->Reset();
             if (FAILED(hr)) {
@@ -1548,7 +1572,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         }
 
-        float bg[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // 黑色
+        float bg[4] = {0.1f, 0.2f, 0.4f, 1.0f};  // 深蓝色，调试用（原黑色）
         g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
         if (hasDSV) g_cl->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
@@ -1682,6 +1706,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 // 如果顶点数超过 1024，拆分为多次 Draw 以减轻 GPU 压力
                 const int kBatchSize = 1024;
                 if (ch.vertexCount > kBatchSize) {
+                    Log("  Batch splitting: %d vertices → %d batches of %d", ch.vertexCount,
+                        (ch.vertexCount + kBatchSize - 1) / kBatchSize, kBatchSize);
                     for (int offset = 0; offset < ch.vertexCount; offset += kBatchSize) {
                         int count = min(kBatchSize, int(ch.vertexCount - offset));
                         D3D12_VERTEX_BUFFER_VIEW batchVbv = chVbv;
@@ -1690,6 +1716,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                         g_cl->IASetVertexBuffers(0, 1, &batchVbv);
                         g_cl->DrawInstanced(count, 1, 0, 0);
                     }
+                    Log("  Batch drawing complete");
                 } else {
                     g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
                 }
@@ -1745,9 +1772,31 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         ID3D12CommandList* lists[] = {g_cl.Get()};
         g_queue->ExecuteCommandLists(1, lists);
 
-        OutputDebugStringA("[FATAL] TEST: About to call Present(1, 0)\n");
-        HRESULT presentHR = g_swap->Present(1, 0);
-        if (FAILED(presentHR)) {
+        // 在 Present 之前强制 GPU 同步
+        g_queue->Signal(g_fence.Get(), g_fenceVal);
+        g_fenceVal++;
+        if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
+            g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
+            WaitForSingleObject(g_fenceEv, INFINITE);
+        }
+
+        auto beforePresent = std::chrono::high_resolution_clock::now();
+        HRESULT presentHR = g_swap->Present(0, 0);  // SyncInterval=0, 不等待垂直同步
+        if (presentHR == DXGI_ERROR_DEVICE_REMOVED || presentHR == DXGI_ERROR_DEVICE_HUNG) {
+            Log("[RenderLoop] Present failed with DEVICE_HUNG/REMOVED, trying to recover...");
+            // 等待 1 秒再重试
+            Sleep(1000);
+            presentHR = g_swap->Present(0, 0);
+            if (FAILED(presentHR)) {
+                Log("[RenderLoop] EXIT: Present failed after retry, presentHR=0x%08X", presentHR);
+                HRESULT devErr = g_dev->GetDeviceRemovedReason();
+                Log("[RenderLoop] EXIT: Device removed reason after retry = 0x%08X", devErr);
+                g_deviceLost.store(true);
+                g_run = false;
+                break;
+            }
+            Log("[RenderLoop] Present succeeded after retry");
+        } else if (FAILED(presentHR)) {
             Log("[RenderLoop] EXIT: Present failed, presentHR=0x%08X", presentHR);
             HRESULT devErr = g_dev->GetDeviceRemovedReason();
             Log("[RenderLoop] EXIT: Device removed reason after Present fail = 0x%08X", devErr);
@@ -1772,6 +1821,13 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             OutputDebugStringA("[FATAL] TEST: Present succeeded\n");
         }
 
+        auto afterPresent = std::chrono::high_resolution_clock::now();
+        auto presentDuration = std::chrono::duration_cast<std::chrono::milliseconds>(afterPresent - beforePresent).count();
+        Log("[RenderLoop] Present took %lld ms, hr=0x%08X", presentDuration, presentHR);
+        if (presentDuration > 1000) {
+            Log("[RenderLoop] WARNING: Present took >1s, possible TDR trigger!");
+        }
+
         // Present完成兜底检测，捕获帧内中途触发的TDR
         HRESULT frameCheck = g_dev->GetDeviceRemovedReason();
         if (frameCheck != S_OK) {
@@ -1787,11 +1843,32 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         }
 
         // 强制 GPU 完全空闲后再 Reset
-        g_queue->Signal(g_fence.Get(), g_fenceVal);
+        Log("[RenderLoop] Signaling fence, g_fenceVal=%llu", g_fenceVal);
+        HRESULT hrSignal = g_queue->Signal(g_fence.Get(), g_fenceVal);
+        if (FAILED(hrSignal)) {
+            Log("[ERROR] Signal failed, hr=0x%08X", hrSignal);
+            g_run = false;
+            break;
+        }
         g_fenceVal++;
         if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
-            g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
-            WaitForSingleObject(g_fenceEv, INFINITE);
+            Log("[RenderLoop] Waiting for fence %llu", g_fenceVal - 1);
+            HRESULT hrEvent = g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
+            if (FAILED(hrEvent)) {
+                Log("[ERROR] SetEventOnCompletion failed, hr=0x%08X", hrEvent);
+                g_run = false;
+                break;
+            }
+            DWORD waitResult = WaitForSingleObject(g_fenceEv, INFINITE);
+            if (waitResult != WAIT_OBJECT_0) {
+                Log("[ERROR] WaitForSingleObject failed, result=%d", waitResult);
+                g_run = false;
+                break;
+            }
+            Log("[RenderLoop] Fence wait completed");
+        } else {
+            Log("[RenderLoop] GPU already done, no wait needed (completed=%llu, fenceVal-1=%llu)",
+                g_fence->GetCompletedValue(), g_fenceVal - 1);
         }
 
         // 确保GPU完成当前帧绘制后重置命令分配器和命令列表（防止CBV数据竞争）
@@ -1846,9 +1923,13 @@ static bool InitD3D12(HWND hwndMC) {
     Log("=== Init D3D12 overlay on MC window (HWND=0x%p) ===", hwndMC);
     g_hwndMC = hwndMC;
     if (!g_hwndMC) {
-           Log("ERROR: g_hwndMC is NULL");  // 添加
-           return false;
-        }
+        Log("ERROR: g_hwndMC is NULL");  // 添加
+        return false;
+    }
+    if (!IsWindow(g_hwndMC)) {
+        Log("ERROR: g_hwndMC is not a valid window!");
+        return false;
+    }
 
 RECT rc;
 if (!GetClientRect(g_hwndMC, &rc)) {
@@ -1881,11 +1962,15 @@ ComPtr<IDXGIFactory4> dxgi;
     }
 #endif
 
+    // 尝试创建 D3D12 设备
     OutputDebugStringA("[nativeInit] === STEP 3: Creating D3D12Device ===\n");
     ComPtr<IDXGIAdapter1> adp;
-    for (UINT i=0; dxgi->EnumAdapters1(i,&adp)!=DXGI_ERROR_NOT_FOUND; i++) {
+    HRESULT hrDev = S_OK;
+    for (UINT i = 0; dxgi->EnumAdapters1(i, &adp) != DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d; adp->GetDesc1(&d);
-        if (SUCCEEDED(D3D12CreateDevice(adp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf())))) {
+        hrDev = D3D12CreateDevice(adp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf()));
+        if (SUCCEEDED(hrDev)) {
+            Log("D3D12Device created successfully on adapter %d", i);
             D3D12_FEATURE_DATA_FEATURE_LEVELS fl = {};
             g_dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
             const char* flNames[] = {"Unknown","9.1","9.2","9.3","10.0","10.1","11.0","11.1","12.0","12.1","12.2"};
@@ -1897,60 +1982,121 @@ ComPtr<IDXGIFactory4> dxgi;
             snprintf(g_d3d12Info + strlen(g_d3d12Info), sizeof(g_d3d12Info) - strlen(g_d3d12Info), " (FL%s)", flNames[idx]);
             break;
         }
+        Log("D3D12CreateDevice failed on adapter %d, hr=0x%08X", i, hrDev);
         adp.Reset();
     }
-    if (!g_dev && FAILED(D3D12CreateDevice(0, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf())))) return false;
+    if (!g_dev) {
+        hrDev = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(g_dev.GetAddressOf()));
+        if (FAILED(hrDev)) {
+            Log("ERROR: D3D12CreateDevice failed on WARP/fallback, hr=0x%08X", hrDev);
+            return false;
+        }
+    }
 
     OutputDebugStringA("[nativeInit] === STEP 3: D3D12Device created OK ===\n");
-    OutputDebugStringA("[nativeInit] === STEP 4: Creating CommandQueue ===\n");
-    D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(g_queue.GetAddressOf())))) return false;
-    OutputDebugStringA("[nativeInit] === STEP 4: CommandQueue created OK ===\n");
+    Log("[nativeInit] === STEP 3: D3D12Device created OK ===");
 
-    OutputDebugStringA("[nativeInit] === STEP 5: Creating SwapChain ===\n");
+    // === STEP 4: 创建命令队列 ===
+    Log("[nativeInit] === STEP 4: Creating CommandQueue ===");
+    D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(g_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(g_queue.GetAddressOf())))) {
+        Log("[ERROR] CreateCommandQueue failed");
+        return false;
+    }
+    OutputDebugStringA("[nativeInit] === STEP 4: CommandQueue created OK ===\n");
+    Log("[nativeInit] === STEP 4: CommandQueue created OK ===");
+
+    // === STEP 5: 创建交换链 ===
+    Log("[nativeInit] === STEP 5: Creating SwapChain ===");
+    if (!IsWindow(g_hwndMC)) {
+        Log("[ERROR] g_hwndMC is not a valid window!");
+        return false;
+    }
     DXGI_SWAP_CHAIN_DESC1 sd = {};
-    sd.BufferCount=2; sd.Width=g_w; sd.Height=g_h;
-    sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD; sd.SampleDesc.Count=1;
+    sd.BufferCount = 2;
+    sd.Width = g_w;
+    sd.Height = g_h;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.SampleDesc.Count = 1;
+    sd.Flags = 0;
     ComPtr<IDXGISwapChain1> sc1;
-    if (FAILED(dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndMC, &sd, 0, 0, &sc1))) return false;
+    HRESULT hrSwap = dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndMC, &sd, 0, 0, &sc1);
+    if (FAILED(hrSwap)) {
+        Log("[ERROR] CreateSwapChainForHwnd failed, hr=0x%08X", hrSwap);
+        return false;
+    }
     sc1.As(&g_swap); g_fi = g_swap->GetCurrentBackBufferIndex();
     OutputDebugStringA("[nativeInit] === STEP 5: SwapChain created OK ===\n");
+    Log("[nativeInit] === STEP 5: SwapChain created OK ===");
 
-    OutputDebugStringA("[nativeInit] === STEP 6: Creating RTV Descriptor Heap ===\n");
+    // === STEP 6: 创建 RTV 描述符堆 ===
+    Log("[nativeInit] === STEP 6: Creating RTV Descriptor Heap ===");
     D3D12_DESCRIPTOR_HEAP_DESC rd = {};
     rd.NumDescriptors=2; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_rtvHeap.GetAddressOf())))) return false;
+    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_rtvHeap.GetAddressOf())))) {
+        Log("[ERROR] CreateDescriptorHeap (RTV) failed");
+        return false;
+    }
     g_rtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     OutputDebugStringA("[nativeInit] === STEP 6: RTV Heap created OK ===\n");
+    Log("[nativeInit] === STEP 6: RTV Heap created OK ===");
 
-    OutputDebugStringA("[nativeInit] === STEP 7: Creating CBV_SRV_UAV Descriptor Heap ===\n");
+    // === STEP 7: 创建 CBV_SRV_UAV 描述符堆 ===
+    Log("[nativeInit] === STEP 7: Creating CBV_SRV_UAV Descriptor Heap ===");
     rd = {}; rd.NumDescriptors=1; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     rd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_srvHeap.GetAddressOf())))) return false;
+    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_srvHeap.GetAddressOf())))) {
+        Log("[ERROR] CreateDescriptorHeap (CBV_SRV_UAV) failed");
+        return false;
+    }
     g_srvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     OutputDebugStringA("[nativeInit] === STEP 7: SRV Heap created OK ===\n");
+    Log("[nativeInit] === STEP 7: SRV Heap created OK ===");
 
+    // 创建 RTV for back buffers
+    Log("[nativeInit] Creating RTVs for back buffers...");
     D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     for (UINT n=0; n<2; n++) {
         g_swap->GetBuffer(n, IID_PPV_ARGS(g_rt[n].GetAddressOf()));
         g_dev->CreateRenderTargetView(g_rt[n].Get(), nullptr, rh);
         rh.ptr += g_rtvSize;
     }
+    Log("[nativeInit] RTVs created OK");
 
-    OutputDebugStringA("[nativeInit] === STEP 8: Creating CommandAllocator + CommandList ===\n");
-    if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf())))) return false;
-    if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), 0, IID_PPV_ARGS(g_cl.GetAddressOf())))) return false;
+    // === STEP 8: 创建命令分配器和命令列表 ===
+    Log("[nativeInit] === STEP 8: Creating CommandAllocator + CommandList ===");
+    if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf())))) {
+        Log("[ERROR] CreateCommandAllocator failed");
+        return false;
+    }
+    if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), 0, IID_PPV_ARGS(g_cl.GetAddressOf())))) {
+        Log("[ERROR] CreateCommandList failed");
+        return false;
+    }
     g_cl->Close();
     OutputDebugStringA("[nativeInit] === STEP 8: CommandAllocator + CommandList created OK ===\n");
-    OutputDebugStringA("[nativeInit] === STEP 9: Creating Fence ===\n");
-    if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(g_fence.GetAddressOf())))) return false;
-    g_fenceVal=1; g_fenceEv=CreateEventW(0,0,0,0);
-    OutputDebugStringA("[nativeInit] === STEP 9: Fence created OK ===\n");
+    Log("[nativeInit] === STEP 8: CommandAllocator + CommandList created OK ===");
 
-    OutputDebugStringA("[nativeInit] === STEP 10: Creating DepthStencil buffer ===\n");
+    // === STEP 9: 创建 Fence ===
+    Log("[nativeInit] === STEP 9: Creating Fence ===");
+    if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(g_fence.GetAddressOf())))) {
+        Log("[ERROR] CreateFence failed");
+        return false;
+    }
+    g_fenceVal=1; g_fenceEv=CreateEventW(0,0,0,0);
+    if (!g_fenceEv) {
+        Log("[ERROR] CreateEventW for fence failed");
+        return false;
+    }
+    OutputDebugStringA("[nativeInit] === STEP 9: Fence created OK ===\n");
+    Log("[nativeInit] === STEP 9: Fence created OK ===");
+
+    // === STEP 10: 创建深度缓冲 ===
+    Log("[nativeInit] === STEP 10: Creating DepthStencil buffer ===");
     g_dsvFormat = PickDepthFormat();
+    Log("[nativeInit] PickDepthFormat returned: %d", (int)g_dsvFormat);
     if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
         D3D12_DESCRIPTOR_HEAP_DESC dd = {};
         dd.NumDescriptors = 1; dd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -1968,54 +2114,79 @@ ComPtr<IDXGIFactory4> dxgi;
                 &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
             g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
                 g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+        } else {
+            Log("[nativeInit] DSV DescriptorHeap creation failed, continuing without depth");
         }
+    } else {
+        Log("[nativeInit] No suitable depth format found, continuing without depth");
     }
     OutputDebugStringA("[nativeInit] === STEP 10: DepthStencil buffer created OK ===\n");
+    Log("[nativeInit] === STEP 10: DepthStencil buffer created OK ===");
 
-    OutputDebugStringA("[nativeInit] === STEP 11: Creating Constant Buffer ===\n");
+    // === STEP 11: 创建常量缓冲 ===
+    Log("[nativeInit] === STEP 11: Creating Constant Buffer ===");
     D3D12_HEAP_PROPERTIES hpCB = {}; hpCB.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC rdCB = {};
     rdCB.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     rdCB.Width = g_cbSize; rdCB.Height = 1; rdCB.DepthOrArraySize = 1;
     rdCB.MipLevels = 1; rdCB.SampleDesc.Count = 1;
     rdCB.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (SUCCEEDED(g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
-        &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_cbUpload.GetAddressOf())))) {
-        HRESULT hr = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
-        if (FAILED(hr) || !g_cbData) { Log("[FATAL] Init CBV Map failed, hr=0x%08X\n", hr); return false; }
-        float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-        D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
-        if (sizeof(identity) > cbvDesc.Width) { Log("[FATAL] memory write out of buffer range"); g_cbUpload->Unmap(0, nullptr); return false; }
-        memcpy(g_cbData, identity, sizeof(identity));
+    HRESULT hrCB = g_dev->CreateCommittedResource(&hpCB, D3D12_HEAP_FLAG_NONE,
+        &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_cbUpload.GetAddressOf()));
+    if (FAILED(hrCB)) {
+        Log("[ERROR] CreateCommittedResource for CB failed, hr=0x%08X", hrCB);
+        return false;
     }
+    HRESULT hrMap = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
+    if (FAILED(hrMap) || !g_cbData) {
+        Log("[FATAL] Init CBV Map failed, hr=0x%08X", hrMap);
+        return false;
+    }
+    float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    D3D12_RESOURCE_DESC cbvDesc = g_cbUpload->GetDesc();
+    if (sizeof(identity) > cbvDesc.Width) {
+        Log("[FATAL] memory write out of buffer range");
+        g_cbUpload->Unmap(0, nullptr);
+        return false;
+    }
+    memcpy(g_cbData, identity, sizeof(identity));
     OutputDebugStringA("[nativeInit] === STEP 11: Constant Buffer created OK ===\n");
+    Log("[nativeInit] === STEP 11: Constant Buffer created OK ===");
 
-    OutputDebugStringA("[nativeInit] === STEP 12: Pipeline State Objects will be created in init stages ===\n");
+    // === STEP 12: PSOs (created in init stages) ===
+    Log("[nativeInit] === STEP 12: Pipeline State Objects will be created in init stages ===");
     // PSO（MkPSO/BuildSolidPSO/MkPSOTex/BuildAlphaBlendPSO）已移至 ProcessNextInitStage 分阶段创建
 
-    OutputDebugStringA("[nativeInit] === STEP 13: Creating Immediate Vertex Buffer ===\n");
+    // === STEP 13: 创建立即顶点缓冲 ===
+    Log("[nativeInit] === STEP 13: Creating Immediate Vertex Buffer ===");
     D3D12_HEAP_PROPERTIES hpIm = {}; hpIm.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC rdIm = {};
     rdIm.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     rdIm.Width = g_imVBCap; rdIm.Height = 1; rdIm.DepthOrArraySize = 1;
     rdIm.MipLevels = 1; rdIm.SampleDesc.Count = 1;
     rdIm.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    g_dev->CreateCommittedResource(&hpIm, D3D12_HEAP_FLAG_NONE,
+    HRESULT hrVB = g_dev->CreateCommittedResource(&hpIm, D3D12_HEAP_FLAG_NONE,
         &rdIm, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_imVB.GetAddressOf()));
-    if (g_imVB) {
-        g_imVbv.BufferLocation = g_imVB->GetGPUVirtualAddress();
-        g_imVbv.StrideInBytes = sizeof(VertexPC);
-        g_imVbv.SizeInBytes = g_imVBCap;
+    if (FAILED(hrVB)) {
+        Log("[ERROR] CreateCommittedResource for IM VB failed, hr=0x%08X", hrVB);
+        return false;
     }
-
+    g_imVbv.BufferLocation = g_imVB->GetGPUVirtualAddress();
+    g_imVbv.StrideInBytes = sizeof(VertexPC);
+    g_imVbv.SizeInBytes = g_imVBCap;
     OutputDebugStringA("[nativeInit] === STEP 13: IM Vertex Buffer created OK ===\n");
+    Log("[nativeInit] === STEP 13: IM Vertex Buffer created OK ===");
+
     InitializeCriticalSection(&g_texLock);
     InitializeCriticalSection(&g_stateLock);
+    Log("[nativeInit] CriticalSections initialized");
     g_ok = true; g_run = true;
+    Log("[nativeInit] g_ok=true, g_run=true");
 
     // 设置状态机从第一阶段开始，后续由 RenderLoop 驱动分阶段初始化
     g_initStage = STAGE_BASE_DEVICE;
     g_renderInitDone = false;
+    Log("[nativeInit] Init Stage machine set to STAGE_BASE_DEVICE");
 
     OutputDebugStringA("[nativeInit] === STEP 14: Creating sync events + RenderThread ===\n");
     // 创建帧同步事件（必须在 CreateThread 之前）
@@ -2392,6 +2563,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadPixels(JNIEnv* en
 // 自动判断顶点类型（C++ 端完整检测逻辑）
 // 在 vertexSize 字节的顶点数组中采样判断坐标空间
 // ==============================================
+// ==============================================
+// 顶点类型自动检测（纯日志，不参与PSO选择）
+// Java coordType 拥有最高优先级，此函数只做诊断分析
+// ==============================================
 static VertexType autoDetectVertexType(const float* vertices, UINT vertexCount, UINT vertexSize) {
     if (vertexCount == 0 || vertexSize < 12) {
         return VERTEX_TYPE_UNKNOWN;
@@ -2513,6 +2688,22 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRecordVertices(JNIEnv* 
         }
     }
     // ===== 顶点类型检测结束（渲染管线依赖Java传入值） =====
+
+    // coordType=1 (SCREEN) 时检查顶点范围是否异常大
+    if (coordType == 1 && safeCount > 0) {
+        float minX = buf[0], maxX = buf[0];
+        float minY = buf[1], maxY = buf[1];
+        for (UINT vi = 0; vi < safeCount; ++vi) {
+            float x = buf[vi * 3 + 0];
+            float y = buf[vi * 3 + 1];
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+        if (maxX > 2000 || maxY > 2000) {
+            Log("[WARNING] coordType=1 (SCREEN) but vertices are large: X[%.1f, %.1f], Y[%.1f, %.1f], count=%d",
+                minX, maxX, minY, maxY, safeCount);
+        }
+    }
 
     // 读取颜色数据
     jbyte* colorData = nullptr;
@@ -2794,6 +2985,20 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jcl
     Log("=== nativeSetMvp CALLED (coordType=%d) ===", coordType);
     jfloat* src = env->GetFloatArrayElements(matrix, nullptr);
     if (src) {
+        // 检查矩阵元素是否有效（NaN / Inf 会导致渲染异常）
+        bool valid = true;
+        for (int i = 0; i < 16; i++) {
+            if (!std::isfinite(src[i])) {
+                Log("[ERROR] nativeSetMvp: matrix[%d] is invalid: %f", i, src[i]);
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            Log("[ERROR] nativeSetMvp: invalid matrix received, using identity");
+            float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            memcpy(src, identity, sizeof(identity));
+        }
         // 根据 coordType 存储到不同的矩阵
         switch (coordType) {
             case 0: memcpy(g_mvpWorld, src, 64); break;
@@ -2809,6 +3014,14 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jcl
         Log("MVP matrix set: [%.3f %.3f %.3f %.3f]", src[4], src[5], src[6], src[7]);
         Log("MVP matrix set: [%.3f %.3f %.3f %.3f]", src[8], src[9], src[10], src[11]);
         Log("MVP matrix set: [%.3f %.3f %.3f %.3f]", src[12], src[13], src[14], src[15]);
+        // 投影矩阵特征检查：m[0][0]≈1/tan(fov/2), m[3][2]≈-1
+        if (coordType == 0) {  // WORLD 矩阵应包含投影
+            Log("  Proj check: m[0][0]=%.4f (expect ~1.0), m[3][2]=%.4f (expect ~-1.0)",
+                src[0], src[11]);
+            if (fabsf(src[11] - (-1.0f)) > 0.5f) {
+                Log("[WARNING] WORLD MVP matrix m[3][2]=%.4f, projection may be missing!", src[11]);
+            }
+        }
         Log("nativeSetMvp: matrix updated successfully");
         env->ReleaseFloatArrayElements(matrix, src, JNI_ABORT);
     }
@@ -3065,6 +3278,22 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFF
     Log("nativeSetSkyParameters: color[%.2f,%.2f,%.2f,%.2f] sun=%.2f moon=%.2f", r, g, b, a, sunAngle, moonAngle);
 }
 
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetSkyParameters___3F
+(JNIEnv* env, jclass clazz, jfloatArray params) {
+    jfloat* data = env->GetFloatArrayElements(params, nullptr);
+    if (!data) {
+        Log("ERROR: nativeSetSkyParameters(float[]) failed to get array elements");
+        return;
+    }
+    if (env->GetArrayLength(params) >= 6) {
+        Java_com_dx12_DX12LibClient_nativeSetSkyParameters__FFFFFF(
+            env, clazz, data[0], data[1], data[2], data[3], data[4], data[5]);
+    } else {
+        Log("ERROR: nativeSetSkyParameters: array length < 6 (got %d)", env->GetArrayLength(params));
+    }
+    env->ReleaseFloatArrayElements(params, data, JNI_ABORT);
+}
+
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
 (JNIEnv* env, jclass clazz, jfloatArray vertices, jint count, jint vertexSize) {
     if (!g_globalDeviceReady) return;
@@ -3088,13 +3317,13 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
     Log("=== nativeUploadParticles ===");
     Log("  count=%d, vertexSize=%d, totalBytes=%d", count, vertexSize, count * vertexSize);
 
-    VertexType vertexType = autoDetectVertexType(data, count, vertexSize);
-    Log("  vertexType=%s", vertexType == VERTEX_TYPE_WORLD ? "WORLD" : "SCREEN");
+    // 纯日志检测：分析顶点范围，但不用于 PSO 选择
+    autoDetectVertexType(data, count, vertexSize);
 
     ParticleDrawCall drawCall;
     drawCall.vertexCount = count;
     drawCall.vertexSize = vertexSize;
-    drawCall.type = vertexType;
+    drawCall.type = VERTEX_TYPE_WORLD;  // 粒子始终是3D世界物体，使用Java传入的coordType
 
     if (!UploadVertexData(data, count, vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
         env->ReleaseFloatArrayElements(vertices, data, JNI_ABORT);
@@ -3181,7 +3410,9 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
     drawCall.vertexCount = count;
     drawCall.vertexSize = vertexSize;
     drawCall.distance = distance;
-    drawCall.type = autoDetectVertexType(data, count, vertexSize);
+    // 纯日志检测，PSO 选择由 Java coordType 决定
+    autoDetectVertexType(data, count, vertexSize);
+    drawCall.type = VERTEX_TYPE_WORLD;  // 默认3D世界，Java coordType 优先
 
     if (UploadVertexData(data, count, vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
         std::lock_guard<std::mutex> lock(g_transparentMutex);

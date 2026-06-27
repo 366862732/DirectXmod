@@ -8,7 +8,8 @@
     "BufferBuilderMixin",
     "LevelRendererMixin",
     "EntityRenderDispatcherMixin",
-    "ParticleEngineMixin"
+    "ParticleEngineMixin",
+    // "DebugScreenMixin" //暂时注释
   ],
   "client": [],
   "injectors": {

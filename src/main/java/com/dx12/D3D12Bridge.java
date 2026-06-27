@@ -7,6 +7,7 @@ package com.dx12;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import org.joml.Matrix4f;
@@ -142,32 +143,50 @@ public class D3D12Bridge {
                 for (int i = 0; i < 4; i++) mv[i * 5] = 1f;
             }
 
-            // 计算投影矩阵（从 cameraState 或默认 FOV）
+            // 获取投影矩阵
             float[] proj = new float[16];
+            boolean projValid = false;
             if (cameraState != null) {
                 try {
-                    // 从 cameraState 获取投影矩阵
                     java.lang.reflect.Field projField = cameraState.getClass().getDeclaredField("projectionMatrix");
                     projField.setAccessible(true);
                     Matrix4fc projMat = (Matrix4fc) projField.get(cameraState);
                     if (projMat != null) {
                         projMat.get(proj);
+                        // 检查投影矩阵是否有效（检测 Infinity/NaN）
+                        projValid = true;
+                        for (int i = 0; i < 16; i++) {
+                            if (!Float.isFinite(proj[i])) {
+                                projValid = false;
+                                break;
+                            }
+                        }
+                        if (!projValid) {
+                            System.out.println("[GL4DX12] projectionMatrix contains Infinity/NaN, using fallback");
+                        }
                     }
                 } catch (Exception e) {
-                    // fallback: 使用 FOV 计算
-                    float fov = 70f;
-                    float aspect = (float)g_cachedW / (float)g_cachedH;
-                    try {
-                        java.lang.reflect.Field fovField = cameraState.getClass().getDeclaredField("fov");
-                        fovField.setAccessible(true);
-                        fov = fovField.getFloat(cameraState);
-                    } catch (Exception ignored) {}
-                    Matrix4f p = new Matrix4f().perspective(
-                        (float)Math.toRadians(fov), aspect, 0.05f, 1000f);
-                    p.get(proj);
+                    System.out.println("[GL4DX12] Failed to get projectionMatrix: " + e.getMessage());
                 }
-            } else {
-                new Matrix4f().identity().get(proj);
+            }
+
+            // 如果投影矩阵无效，使用 FOV 计算 fallback
+            if (!projValid) {
+                float fov = 70f;
+                float aspect = (float)g_cachedW / (float)g_cachedH;
+                // 防止 aspect 为 0 或无效
+                if (aspect <= 0 || !Float.isFinite(aspect)) {
+                    aspect = 16.0f / 9.0f;
+                }
+                try {
+                    java.lang.reflect.Field fovField = cameraState.getClass().getDeclaredField("fov");
+                    fovField.setAccessible(true);
+                    fov = fovField.getFloat(cameraState);
+                } catch (Exception ignored) {}
+                Matrix4f p = new Matrix4f().perspective(
+                    (float)Math.toRadians(fov), aspect, 0.05f, 1000f);
+                p.get(proj);
+                System.out.println("[GL4DX12] Using fallback projection: fov=" + fov + ", aspect=" + aspect);
             }
 
             // 合并 MVP = projection * modelView
@@ -176,7 +195,29 @@ public class D3D12Bridge {
             Matrix4f mvMat = new Matrix4f().set(mv);
             pMat.mul(mvMat).get(mvp);
 
+            System.out.println("[GL4DX12] modelViewMatrix: " + Arrays.toString(mv));
+            System.out.println("[GL4DX12] projectionMatrix: " + Arrays.toString(proj));
+            System.out.println("[GL4DX12] final MVP: " + Arrays.toString(mvp));
+
             System.out.println("[GL4DX12] syncMatrices: calling nativeSetMvp with WORLD matrix");
+
+            // 检查 MVP 矩阵是否有效
+            boolean valid = true;
+            for (int i = 0; i < 16; i++) {
+                if (!Float.isFinite(mvp[i])) {
+                    System.err.println("[GL4DX12] Invalid MVP matrix at index " + i + ": " + mvp[i] + ", using identity");
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) {
+                java.util.Arrays.fill(mvp, 0.0f);
+                mvp[0] = 1.0f;
+                mvp[5] = 1.0f;
+                mvp[10] = 1.0f;
+                mvp[15] = 1.0f;
+            }
+
             DX12LibClient.nativeSetMvp(mvp, 0); // 0 = COORD_WORLD
 
             // 诊断：验证矩阵有效性
@@ -234,7 +275,17 @@ public class D3D12Bridge {
         if (maxX <= 1.1f && minX >= -1.1f &&
             maxY <= 1.1f && minY >= -1.1f &&
             maxZ <= 1.1f && minZ >= -1.1f) {
-            System.out.printf("[GL4DX12] detectCoordSpace: NDC (X[%.1f,%.1f] Y[%.1f,%.1f])%n", minX, maxX, minY, maxY);
+            System.out.printf("[GL4DX12] detectCoordSpace: NDC (X[%.1f,%.1f] Y[%.1f,%.1f] Z[%.1f,%.1f])%n",
+                minX, maxX, minY, maxY, minZ, maxZ);
+            return COORD_NDC;
+        }
+
+        // 规则1b：近NDC检测 — XY在窄范围内但Z可能略超，说明顶点已过变换
+        if (maxX <= 2.0f && minX >= -2.0f &&
+            maxY <= 2.0f && minY >= -2.0f &&
+            (maxX - minX) < 3.0f && (maxY - minY) < 3.0f) {
+            System.out.printf("[GL4DX12] detectCoordSpace: near-NDC (X[%.2f,%.2f] Y[%.2f,%.2f] Z[%.2f,%.2f]) → NDC%n",
+                minX, maxX, minY, maxY, minZ, maxZ);
             return COORD_NDC;
         }
 

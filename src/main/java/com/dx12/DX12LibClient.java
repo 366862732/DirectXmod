@@ -1,9 +1,8 @@
 package com.dx12;
 
 import java.io.File;
-import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
+
+import net.fabricmc.loader.api.FabricLoader;
 
 public class DX12LibClient {
 
@@ -12,51 +11,45 @@ public class DX12LibClient {
     }
 
     private static void loadLibrary() {
-        // 方法0: 使用最新编译的 DLL 绝对路径（最高优先级）
-        try {
-            String dllPath = "D:\\dx12-lib-template-26.1.2\\src\\main\\native\\windows\\gl4dx12.dll";
-            System.load(dllPath);
-            System.out.println("[GL4DX12] DLL loaded from build output: " + dllPath);
-            return;
-        } catch (UnsatisfiedLinkError e) {
-            System.err.println("[GL4DX12] Build output DLL not found: " + e.getMessage());
-        }
+        // 从游戏目录下的 versions/<版本>/dx12mod/ 加载 DLL
+        File gameDir = FabricLoader.getInstance().getGameDir().toFile();
+        System.out.println("[GL4DX12] Game directory: " + gameDir.getAbsolutePath());
 
-        // 方法1: 从 JAR 中提取
-        try (InputStream in = DX12LibClient.class.getResourceAsStream("/native/windows/gl4dx12.dll")) {
-            if (in != null) {
-                File tempDir = new File(System.getProperty("java.io.tmpdir"), "gl4dx12");
-                tempDir.mkdirs();
-                File tempFile = new File(tempDir, "gl4dx12.dll");
-                tempFile.deleteOnExit();
-                Files.copy(in, tempFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                System.load(tempFile.getAbsolutePath());
-                System.out.println("[GL4DX12] Loaded from JAR: " + tempFile.getAbsolutePath());
-                return;
+        // 尝试1: 扫描 versions/ 下的 dx12mod 子目录
+        File versionsDir = new File(gameDir, "versions");
+        if (versionsDir.isDirectory()) {
+            File[] versionDirs = versionsDir.listFiles(File::isDirectory);
+            if (versionDirs != null) {
+                for (File verDir : versionDirs) {
+                    File dx12modDir = new File(verDir, "dx12mod");
+                    File dllFile = new File(dx12modDir, "d3d12bridge.dll");
+                    if (dllFile.exists()) {
+                        try {
+                            System.load(dllFile.getAbsolutePath());
+                            System.out.println("[GL4DX12] DLL loaded from: " + dllFile.getAbsolutePath());
+                            return;
+                        } catch (UnsatisfiedLinkError e) {
+                            System.err.println("[GL4DX12] Failed to load: " + dllFile.getAbsolutePath() + " - " + e.getMessage());
+                        }
+                    }
+                }
             }
-        } catch (Throwable e) {
-            System.err.println("[GL4DX12] Extract failed: " + e.getMessage());
         }
 
-        // 方法2: 直接从项目路径加载（备用）
-        try {
-            System.load("D:\\dx12-lib-template-26.1.2\\src\\main\\resources\\native\\windows\\gl4dx12.dll");
-            System.out.println("[GL4DX12] Loaded from project path");
-            return;
-        } catch (Throwable e) {
-            // ignore
+        // 尝试2: 直接从 gameDir/dx12mod/ 加载
+        File fallbackDir = new File(gameDir, "dx12mod");
+        File fallbackDll = new File(fallbackDir, "d3d12bridge.dll");
+        if (fallbackDll.exists()) {
+            try {
+                System.load(fallbackDll.getAbsolutePath());
+                System.out.println("[GL4DX12] DLL loaded from fallback: " + fallbackDll.getAbsolutePath());
+                return;
+            } catch (UnsatisfiedLinkError e) {
+                System.err.println("[GL4DX12] Fallback load failed: " + e.getMessage());
+            }
         }
 
-        // 方法3: 从 natives 目录加载
-        try {
-            System.load("D:\\.minecraft\\versions\\xiaozi craft 26.1.2\\xiaozi craft 26.1.2-natives\\gl4dx12.dll");
-            System.out.println("[GL4DX12] Loaded from natives path");
-            return;
-        } catch (Throwable e) {
-            // ignore
-        }
-
-        System.err.println("[GL4DX12] Failed to load DLL!");
+        System.err.println("[GL4DX12] FATAL: d3d12bridge.dll not found in any dx12mod directory under: " + gameDir.getAbsolutePath());
     }
 
     public static boolean isLibraryLoaded() {
