@@ -2,14 +2,13 @@
   "required": true,
   "minVersion": "0.8",
   "package": "com.dx12.mixin",
-  "compatibilityLevel": "JAVA_25",
+  "compatibilityLevel": "JAVA_21",
   "refmap": "mixins.gl4dx12.refmap.json",
   "mixins": [
     "BufferBuilderMixin",
     "LevelRendererMixin",
     "EntityRenderDispatcherMixin",
-    "ParticleEngineMixin",
-    // "DebugScreenMixin" //暂时注释
+    "ParticleEngineMixin"
   ],
   "client": [],
   "injectors": {

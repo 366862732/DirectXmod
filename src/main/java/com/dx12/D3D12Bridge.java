@@ -153,7 +153,7 @@ public class D3D12Bridge {
                     Matrix4fc projMat = (Matrix4fc) projField.get(cameraState);
                     if (projMat != null) {
                         projMat.get(proj);
-                        // 检查投影矩阵是否有效（检测 Infinity/NaN）
+                        // 检查投影矩阵是否有效（检测 Infinity/NaN + 投影特征）
                         projValid = true;
                         for (int i = 0; i < 16; i++) {
                             if (!Float.isFinite(proj[i])) {
@@ -161,8 +161,13 @@ public class D3D12Bridge {
                                 break;
                             }
                         }
+                        // 额外检查：m[3][2] 应 ≈ -1（投影矩阵特征）
+                        if (projValid && Math.abs(proj[11] + 1.0f) > 0.5f) {
+                            System.out.println("[GL4DX12] projectionMatrix lacks projection (m[3][2]=" + proj[11] + ")");
+                            projValid = false;
+                        }
                         if (!projValid) {
-                            System.out.println("[GL4DX12] projectionMatrix contains Infinity/NaN, using fallback");
+                            System.out.println("[GL4DX12] projectionMatrix invalid, using hardcoded");
                         }
                     }
                 } catch (Exception e) {
@@ -170,23 +175,26 @@ public class D3D12Bridge {
                 }
             }
 
-            // 如果投影矩阵无效，使用 FOV 计算 fallback
+            // 如果投影矩阵无效，使用硬编码的正确投影矩阵
             if (!projValid) {
-                float fov = 70f;
+                System.out.println("[GL4DX12] Using HARDCODED projection matrix");
+                float fov = 70.0f;
                 float aspect = (float)g_cachedW / (float)g_cachedH;
-                // 防止 aspect 为 0 或无效
-                if (aspect <= 0 || !Float.isFinite(aspect)) {
-                    aspect = 16.0f / 9.0f;
-                }
+                if (aspect <= 0 || !Float.isFinite(aspect)) aspect = 16.0f / 9.0f;
+                float zNear = 0.05f, zFar = 1000.0f;
                 try {
                     java.lang.reflect.Field fovField = cameraState.getClass().getDeclaredField("fov");
                     fovField.setAccessible(true);
                     fov = fovField.getFloat(cameraState);
                 } catch (Exception ignored) {}
-                Matrix4f p = new Matrix4f().perspective(
-                    (float)Math.toRadians(fov), aspect, 0.05f, 1000f);
-                p.get(proj);
-                System.out.println("[GL4DX12] Using fallback projection: fov=" + fov + ", aspect=" + aspect);
+                float tanHalfFov = (float)Math.tan(Math.toRadians(fov) / 2.0f);
+                float[] hardcodedProj = {
+                    1.0f / (tanHalfFov * aspect), 0, 0, 0,
+                    0, 1.0f / tanHalfFov, 0, 0,
+                    0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
+                    0, 0, -1.0f, 0
+                };
+                System.arraycopy(hardcodedProj, 0, proj, 0, 16);
             }
 
             // 合并 MVP = projection * modelView
@@ -280,9 +288,10 @@ public class D3D12Bridge {
             return COORD_NDC;
         }
 
-        // 规则1b：近NDC检测 — XY在窄范围内但Z可能略超，说明顶点已过变换
+        // 规则1b：近NDC检测 — XY在窄范围内，Z也在范围内，说明顶点已过变换
         if (maxX <= 2.0f && minX >= -2.0f &&
             maxY <= 2.0f && minY >= -2.0f &&
+            maxZ <= 2.0f && minZ >= -2.0f &&
             (maxX - minX) < 3.0f && (maxY - minY) < 3.0f) {
             System.out.printf("[GL4DX12] detectCoordSpace: near-NDC (X[%.2f,%.2f] Y[%.2f,%.2f] Z[%.2f,%.2f]) → NDC%n",
                 minX, maxX, minY, maxY, minZ, maxZ);

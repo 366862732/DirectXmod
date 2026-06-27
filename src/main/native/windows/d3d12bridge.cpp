@@ -22,8 +22,12 @@
 //Visual Studio再给我抽风拿命来！！！！！！！
 //Visual Studio再给我抽风拿命来！！！！！！！
 //Visual Studio再给我抽风拿命来！！！！！！！
-//Visual Studio再给我抽风拿命来！！！！！！！
-//Visual Studio再给我抽风拿命来！！！！！！！
+//空指针拿命来！！！
+//空指针拿命来！！！
+//空指针拿命来！！！
+//空指针拿命来！！！
+//空指针拿命来！！！
+//空指针拿命来！！！
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <jni.h>
@@ -237,6 +241,7 @@ static void WaitForGpu() {
     }
 }
 static HANDLE   g_frameDoneEvent = nullptr;   // 帧渲染完成事件（可选）
+
 
 // ========== 新简单顶点数据存储（与 g_drawChunks 并行） ==========
 static std::vector<float> g_vertexData;      // 顶点位置 (x,y,z 连续)
@@ -617,16 +622,16 @@ static bool BuildSolidPSO(UINT stateBits, bool textured) {
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = (stateBits & GLB_CULL) ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
-    // 先启用深度测试
-    pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    // 禁用深度测试（NDC 测试三角形不需要深度）
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     pd.DepthStencilState.StencilEnable = FALSE;
     pd.InputLayout = {ie, ieCount};
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.DSVFormat = g_dsvFormat;  // 强制使用深度格式，确保深度测试生效
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;  // 无深度，不需要 DSV
     pd.SampleDesc.Count = 1;
     pd.SampleDesc.Quality = 0;
     Log("[BuildSolidPSO] Creating PSO idx=%d: DSVFormat=%d, SampleCount=%d, DepthEnable=%d",
@@ -1213,18 +1218,67 @@ struct Vertex2D { float x,y,u,v; };
 struct VertexPC { float x,y,z; UINT color; };
 struct VertexPT { float x,y,z; UINT color; float u,v; };
 
+// 通用顶点数据上传函数（供粒子、实体、天空盒复用）
+static bool UploadVertexData(const float* data, int count, int vertexSize,
+                              ComPtr<ID3D12Resource>& outUploadBuffer,
+                              D3D12_GPU_VIRTUAL_ADDRESS& outGpuAddress) {
+    UINT totalSize = (UINT)count * (UINT)vertexSize;
+    D3D12_HEAP_PROPERTIES uploadProps = {};
+    uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    uploadProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    uploadProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    uploadProps.CreationNodeMask = 1;
+    uploadProps.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = totalSize;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufferDesc.SampleDesc.Count = 1;
+    bufferDesc.SampleDesc.Quality = 0;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    HRESULT hr = g_dev->CreateCommittedResource(
+        &uploadProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&outUploadBuffer));
+    if (FAILED(hr)) {
+        Log("ERROR: Failed to create vertex upload buffer, hr=0x%08X", hr);
+        return false;
+    }
+    void* mappedData;
+    D3D12_RANGE readRange = {};
+    readRange.Begin = 0;
+    readRange.End = 0;
+    hr = outUploadBuffer->Map(0, &readRange, &mappedData);
+    if (FAILED(hr) || mappedData == nullptr) {
+        Log("[FATAL] UploadVertexData Map failed, hr=0x%08X\n", hr);
+        return false;
+    }
+    D3D12_RESOURCE_DESC bufDesc = outUploadBuffer->GetDesc();
+    if ((UINT64)totalSize > bufDesc.Width) {
+        Log("[FATAL] memory write out of buffer range");
+        outUploadBuffer->Unmap(0, nullptr);
+        return false;
+    }
+    memcpy(mappedData, data, totalSize);
+    outUploadBuffer->Unmap(0, nullptr);
+    outGpuAddress = outUploadBuffer->GetGPUVirtualAddress();
+    return true;
+}
+
 static DWORD WINAPI RenderLoop(LPVOID) {
-    OutputDebugStringA("[FATAL] TEST: RenderLoop entered (before any code)\n");
-    MessageBoxA(NULL, "RenderLoop ENTERED", "DEBUG", MB_OK);
-    Log("=== RenderLoop ENTERED (FORCED) ===");
-    Log("=== RenderLoop DIAGNOSTIC VERSION 2 ===");
-    Log("Render thread started");
+    OutputDebugStringA("[RenderLoop] ENTERED - THREAD STARTED!\n");
+    Log("[RenderLoop] ENTERED - THREAD STARTED!");
     int loopCount = 0;
     Vertex2D fsQuad[] = {{-1,-1,0,1},{3,-1,2,1},{-1,3,0,-1}};
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
     while (true) {
-        Log("[RenderLoop] Loop iteration start, g_run=%d, g_deviceLost=%d", g_run, g_deviceLost.load());
+        Log("[RenderLoop] Loop iteration: g_run=%d, g_ok=%d, g_globalDeviceReady=%d, g_deviceLost=%d",
+            g_run, g_ok, g_globalDeviceReady, g_deviceLost.load());
         // 设备丢失检测 - 必须是循环第一行
         if (g_deviceLost.load() || !g_dev || g_dev->GetDeviceRemovedReason() != S_OK) {
             Log("[RenderLoop] EXIT: Device lost at loop top, g_deviceLost=%d, g_run=%d, g_ok=%d, g_dev=%p, reason=0x%08X",
@@ -1256,6 +1310,99 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             // g_run 被设为 false（可能是 CleanupD3D12 调用），退出
             Log("Render thread: g_run=false, exiting");
             break;
+        }
+
+        // ===== 强制处理 NDC 顶点（即使在初始化阶段） =====
+        if (g_hasNewVertexData && g_newVertexCount > 0 && g_currentCoordType == 2) {
+            {
+                std::lock_guard<std::mutex> lock(g_dataMutex);
+                g_hasNewVertexData = false;
+            }
+            // 使用硬编码红色测试三角形替换实际顶点数据
+            float testVerts[9] = {
+                -0.5f, -0.5f, 0.0f,
+                 0.5f, -0.5f, 0.0f,
+                 0.0f,  0.5f, 0.0f
+            };
+            const UINT testVertCount = 3;
+            // 转为 VertexPC 格式（红色）
+            VertexPC redTri[3] = {
+                {testVerts[0], testVerts[1], testVerts[2], 0xFF0000FF},
+                {testVerts[3], testVerts[4], testVerts[5], 0xFF0000FF},
+                {testVerts[6], testVerts[7], testVerts[8], 0xFF0000FF},
+            };
+            if (g_cl && g_alloc && g_psoSolidVariants[0]) {
+                Log("RenderLoop: FORCE NDC RED TRIANGLE TEST");
+                // 最小渲染路径：重置 → 上传 → 绘制 → 执行
+                HRESULT hr = g_alloc->Reset();
+                if (SUCCEEDED(hr)) {
+                    hr = g_cl->Reset(g_alloc.Get(), nullptr);
+                }
+                if (SUCCEEDED(hr) && g_swap) {
+                    g_fi = g_swap->GetCurrentBackBufferIndex();
+                    D3D12_RESOURCE_BARRIER rb = {};
+                    rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    rb.Transition.pResource = g_rt[g_fi].Get();
+                    rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+                    rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    g_cl->ResourceBarrier(1, &rb);
+
+                    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+                    rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
+                    // NDC 测试三角形使用无深度 PSO，不绑定 DSV
+                    g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+                    float bg[4] = {0.1f, 0.2f, 0.4f, 1.0f};
+                    g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
+
+                    D3D12_VIEWPORT vp = {0, 0, (float)g_w, (float)g_h, 0, 1};
+                    D3D12_RECT sc = {0, 0, (LONG)g_w, (LONG)g_h};
+                    g_cl->RSSetViewports(1, &vp);
+                    g_cl->RSSetScissorRects(1, &sc);
+
+                    // 上传顶点数据
+                    ComPtr<ID3D12Resource> vb;
+                    D3D12_GPU_VIRTUAL_ADDRESS vbAddr;
+                    if (UploadVertexData((const float*)redTri, testVertCount, sizeof(VertexPC), vb, vbAddr)) {
+                        float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                        memcpy(g_cbData, identity, sizeof(identity));
+                        void* cbMapped;
+                        D3D12_RANGE wr = {0, 256};
+                        if (SUCCEEDED(g_cbUpload->Map(0, &wr, &cbMapped))) {
+                            memcpy(cbMapped, g_cbData, 256);
+                            g_cbUpload->Unmap(0, nullptr);
+                        }
+
+                        g_cl->SetGraphicsRootSignature(g_rsSolidVariants[0].Get());
+                        g_cl->SetPipelineState(g_psoSolidVariants[0].Get());
+                        g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        D3D12_VERTEX_BUFFER_VIEW vbv = {};
+                        vbv.BufferLocation = vbAddr;
+                        vbv.SizeInBytes = testVertCount * sizeof(VertexPC);
+                        vbv.StrideInBytes = sizeof(VertexPC);
+                        g_cl->IASetVertexBuffers(0, 1, &vbv);
+                        g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
+                        g_cl->DrawInstanced(testVertCount, 1, 0, 0);
+                        Log("Force-draw NDC: RED TRIANGLE (%d verts)", testVertCount);
+                    }
+
+                    rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+                    g_cl->ResourceBarrier(1, &rb);
+                    g_cl->Close();
+                    ID3D12CommandList* lists[] = {g_cl.Get()};
+                    g_queue->ExecuteCommandLists(1, lists);
+                    g_queue->Signal(g_fence.Get(), g_fenceVal);
+                    g_fenceVal++;
+                    if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
+                        g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
+                        WaitForSingleObject(g_fenceEv, INFINITE);
+                    }
+                } else {
+                    Log("[ERROR] Force NDC: allocator/CL reset failed");
+                }
+            }
         }
 
         // ===== 12阶段异步初始化状态机：每阶段独占1帧，创建资源+强制GPU同步，根除TDR =====
@@ -1371,10 +1518,22 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
                 // ===== 根据顶点类型选择投影矩阵 =====
                 switch (g_currentCoordType) {
-                    case 0: // COORD_WORLD — 使用 Java 端传入的 MVP 矩阵
+                    case 0: // COORD_WORLD — 直接构建投影矩阵
                         Log("Using perspective projection for 3D vertices (WORLD coords)");
                         if (g_cbData) {
-                            memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+                            // 直接构建投影矩阵，不依赖 Java 端传递
+                            float fov = 70.0f * 3.14159265f / 180.0f;
+                            float aspect = (float)g_w / (float)g_h;
+                            float zNear = 0.1f, zFar = 1000.0f;
+                            float tanHalfFov = tanf(fov / 2.0f);
+                            float proj[16] = {
+                                1.0f / (tanHalfFov * aspect), 0, 0, 0,
+                                0, 1.0f / tanHalfFov, 0, 0,
+                                0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
+                                0, 0, -1.0f, 0
+                            };
+                            memcpy(g_cbData, proj, sizeof(proj));
+                            Log("[RenderLoop] 强制使用投影矩阵，m[3][2]=%.4f", ((float*)g_cbData)[11]);
                         }
                         // 检查 MVP 变换后的 NDC 范围
                         if (g_cbData && vertexCount > 0) {
@@ -1416,6 +1575,11 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
                     case 2: // COORD_NDC — 使用单位矩阵（不变换）
                         Log("Using identity matrix for NDC vertices (already in clip space)");
+                        // NDC 顶点范围诊断
+                        if (vertexCount > 0) {
+                            Log("  NDC vertex range: X[%.3f, %.3f] Y[%.3f, %.3f] Z[%.3f, %.3f] count=%d",
+                                minX, maxX, minY, maxY, minZ, maxZ, vertexCount);
+                        }
                         if (g_cbData) {
                             memcpy(g_cbData, g_mvpNDC, sizeof(g_mvpNDC));
                         }
@@ -1621,10 +1785,21 @@ static DWORD WINAPI RenderLoop(LPVOID) {
 
             for (auto& ch : chunks) {
                 // ===== 每个 DrawChunk 独立设置常量缓冲区矩阵 =====
-                if (ch.vertexType == 0) { // COORD_WORLD
+                if (ch.vertexType == 0) { // COORD_WORLD — 直接构建投影矩阵
+                    float fov = 70.0f * 3.14159265f / 180.0f;
+                    float aspect = (float)g_w / (float)g_h;
+                    float zNear = 0.1f, zFar = 1000.0f;
+                    float tanHalfFov = tanf(fov / 2.0f);
+                    float proj[16] = {
+                        1.0f / (tanHalfFov * aspect), 0, 0, 0,
+                        0, 1.0f / tanHalfFov, 0, 0,
+                        0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
+                        0, 0, -1.0f, 0
+                    };
                     if (g_cbData) {
-                        memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+                        memcpy(g_cbData, proj, sizeof(proj));
                     }
+                    Log("[DrawChunk WORLD] m[3][2]=%.4f", proj[11]);
                 } else if (ch.vertexType == 1) { // COORD_SCREEN
                     float w = (float)g_w;
                     float h = (float)g_h;
@@ -1636,6 +1811,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     };
                     if (g_cbData) {
                         memcpy(g_cbData, orthoMatrix, sizeof(orthoMatrix));
+                    }
+                } else if (ch.vertexType == 2) { // COORD_NDC — 单位矩阵
+                    if (g_cbData) {
+                        memcpy(g_cbData, g_mvpNDC, sizeof(g_mvpNDC));
                     }
                 }
                 // 立即刷新常量缓冲区到 GPU（upload heap 写入可见性）
@@ -1704,12 +1883,12 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 Log("=== DRAW CALL: vertexCount=%d, stride=%d, bytes=%d, buffer=0x%llX, topo=%d",
                     ch.vertexCount, ch.vertexStride, chVbv.SizeInBytes, chVbv.BufferLocation, ch.topo);
                 // 如果顶点数超过 1024，拆分为多次 Draw 以减轻 GPU 压力
-                const int kBatchSize = 1024;
+                const UINT kBatchSize = 1024;
                 if (ch.vertexCount > kBatchSize) {
                     Log("  Batch splitting: %d vertices → %d batches of %d", ch.vertexCount,
                         (ch.vertexCount + kBatchSize - 1) / kBatchSize, kBatchSize);
-                    for (int offset = 0; offset < ch.vertexCount; offset += kBatchSize) {
-                        int count = min(kBatchSize, int(ch.vertexCount - offset));
+                    for (UINT offset = 0; offset < ch.vertexCount; offset += kBatchSize) {
+                        UINT count = min(kBatchSize, ch.vertexCount - offset);
                         D3D12_VERTEX_BUFFER_VIEW batchVbv = chVbv;
                         batchVbv.BufferLocation += (UINT64)offset * ch.vertexStride;
                         batchVbv.SizeInBytes = count * ch.vertexStride;
@@ -2200,8 +2379,13 @@ ComPtr<IDXGIFactory4> dxgi;
     Log("Frame sync events created: ready=0x%p, done=0x%p", g_frameReadyEvent, g_frameDoneEvent);
 
     OutputDebugStringA("[nativeInit] === STEP 14: Events created OK, starting RenderThread ===\n");
-    g_thread = CreateThread(0, 0, RenderLoop, 0, 0, 0);
     g_globalDeviceReady = true;
+    g_thread = CreateThread(0, 0, RenderLoop, 0, 0, 0);
+    if (!g_thread) {
+        Log("ERROR: CreateThread failed, err=%d", GetLastError());
+        g_globalDeviceReady = false;
+        return false;
+    }
     OutputDebugStringA("[nativeInit] === STEP DONE: All initialized, RenderThread running ===\n");
     Log("=== D3D12 on MC window Ready ===");
     return true;
@@ -2435,7 +2619,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeCleanup(JNIEnv* env, jc
     CleanupD3D12();
 }
 
-extern "C" __declspec(dllexport) JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
+extern "C" JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeInit
     (JNIEnv*, jclass, jlong hwnd) {
     // 第一行：立即写入文件，证明函数被调用
     HANDLE hFile = CreateFileA("C:\\temp\\nativeInit_called.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2476,7 +2660,22 @@ extern "C" __declspec(dllexport) JNIEXPORT jboolean JNICALL Java_com_dx12_DX12Li
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRender(JNIEnv*, jclass) {}
-JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativePresent(JNIEnv*, jclass) {}
+JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativePresent(JNIEnv*, jclass) {
+    if (!g_ok || !g_globalDeviceReady || g_deviceLost.load()) {
+        Log("[nativePresent] skipped - device not ready or lost");
+        return;
+    }
+    if (g_swap) {
+        HRESULT hr = g_swap->Present(0, 0);
+        if (FAILED(hr)) {
+            Log("[nativePresent] Present failed, hr=0x%08X", hr);
+        } else {
+            Log("[nativePresent] Present succeeded");
+        }
+    } else {
+        Log("[nativePresent] g_swap is null");
+    }
+}
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeBeginFrame(JNIEnv*, jclass) {
     // 清空操作由 RenderLoop 后台线程负责，这里不做任何事
@@ -2999,6 +3198,29 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetMvp(JNIEnv* env, jcl
             float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             memcpy(src, identity, sizeof(identity));
         }
+        // coordType==0 (WORLD) 投影矩阵修复：缺少投影特征时构建标准投影
+        if (coordType == 0) {
+            float m32 = src[11];  // column-major: m[3][2]
+            float m33 = src[15];  // column-major: m[3][3]
+            Log("[Matrix Check] m[3][2]=%.4f (expect -1), m[3][3]=%.4f (expect 0)", m32, m33);
+            // 如果 m[3][2] 接近 0，说明投影矩阵缺失（单位矩阵特征）
+            if (fabsf(m32) < 0.1f) {
+                Log("[Matrix Fix] 检测到投影矩阵缺失 (m[3][2]=%.4f)，强制构建投影矩阵", m32);
+                float fov = 70.0f * 3.14159265f / 180.0f;
+                float aspect = (float)g_w / (float)g_h;
+                if (aspect <= 0 || !std::isfinite(aspect)) aspect = 16.0f / 9.0f;
+                float zNear = 0.1f, zFar = 1000.0f;
+                float tanHalfFov = tanf(fov / 2.0f);
+                float proj[16] = {
+                    1.0f / (tanHalfFov * aspect), 0, 0, 0,
+                    0, 1.0f / tanHalfFov, 0, 0,
+                    0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
+                    0, 0, -1.0f, 0
+                };
+                memcpy(src, proj, sizeof(proj));
+                Log("[Matrix Fix] 已强制替换为投影矩阵，m[3][2]=%.4f", src[11]);
+            }
+        }
         // 根据 coordType 存储到不同的矩阵
         switch (coordType) {
             case 0: memcpy(g_mvpWorld, src, 64); break;
@@ -3040,63 +3262,9 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsD3D12Active(JNIEn
 
 // === Phase 3: Sky, Terrain, Entity, Particle ===
 
-// 通用顶点数据上传函数（供粒子、实体、天空盒复用）
-static bool UploadVertexData(const float* data, UINT count, UINT vertexSize,
-                              ComPtr<ID3D12Resource>& outUploadBuffer,
-                              D3D12_GPU_VIRTUAL_ADDRESS& outGpuAddress) {
-    UINT totalSize = count * vertexSize;
-
-    D3D12_HEAP_PROPERTIES uploadProps = {};
-    uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    uploadProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    uploadProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    uploadProps.CreationNodeMask = 1;
-    uploadProps.VisibleNodeMask = 1;
-    D3D12_RESOURCE_DESC bufferDesc = {};
-    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bufferDesc.Width = totalSize;
-    bufferDesc.Height = 1;
-    bufferDesc.DepthOrArraySize = 1;
-    bufferDesc.MipLevels = 1;
-    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
-    bufferDesc.SampleDesc.Count = 1;
-    bufferDesc.SampleDesc.Quality = 0;
-    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-    HRESULT hr = g_dev->CreateCommittedResource(
-        &uploadProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&outUploadBuffer));
-
-    if (FAILED(hr)) {
-        Log("ERROR: Failed to create vertex upload buffer, hr=0x%08X", hr);
-        return false;
-    }
-
-    void* mappedData;
-    D3D12_RANGE readRange = {};
-    readRange.Begin = 0;
-    readRange.End = 0;
-    hr = outUploadBuffer->Map(0, &readRange, &mappedData);
-    if (FAILED(hr) || mappedData == nullptr) {
-        Log("[FATAL] UploadVertexData Map failed, hr=0x%08X\n", hr);
-        return false;
-    }
-    D3D12_RESOURCE_DESC bufDesc = outUploadBuffer->GetDesc();
-    if ((UINT64)totalSize > bufDesc.Width) {
-        Log("[FATAL] memory write out of buffer range");
-        outUploadBuffer->Unmap(0, nullptr);
-        return false;
-    }
-    memcpy(mappedData, data, totalSize);
-    outUploadBuffer->Unmap(0, nullptr);
-    outGpuAddress = outUploadBuffer->GetGPUVirtualAddress();
-
-    return true;
-}
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeDraw(JNIEnv* env, jclass, jint vertexCount) {
+    Log("[nativeDraw] called with vertexCount=%d", vertexCount);
     if (!g_globalDeviceReady) return;
     // 顶层快速拦截，主线程Mesh构建直接阻断空设备
     if (!g_dev || g_deviceLost.load())
@@ -3325,7 +3493,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadParticles
     drawCall.vertexSize = vertexSize;
     drawCall.type = VERTEX_TYPE_WORLD;  // 粒子始终是3D世界物体，使用Java传入的coordType
 
-    if (!UploadVertexData(data, count, vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
+    if (!UploadVertexData(data, (UINT)count, (UINT)vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
         env->ReleaseFloatArrayElements(vertices, data, JNI_ABORT);
         return;
     }
@@ -3414,7 +3582,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadTransparent
     autoDetectVertexType(data, count, vertexSize);
     drawCall.type = VERTEX_TYPE_WORLD;  // 默认3D世界，Java coordType 优先
 
-    if (UploadVertexData(data, count, vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
+    if (UploadVertexData(data, (UINT)count, (UINT)vertexSize, drawCall.uploadBuffer, drawCall.gpuAddress)) {
         std::lock_guard<std::mutex> lock(g_transparentMutex);
         g_transparentDrawCalls.push_back(std::move(drawCall));
         Log("nativeUploadTransparent: queued %d verts, distance=%.2f (total=%zu)",
@@ -3467,8 +3635,18 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
     for (auto& dc : g_transparentDrawCalls) {
         // 根据类型设置投影矩阵
         if (dc.type == VERTEX_TYPE_WORLD) {
+            float fov = 70.0f * 3.14159265f / 180.0f;
+            float aspect = (float)g_w / (float)g_h;
+            float zNear = 0.1f, zFar = 1000.0f;
+            float tanHalfFov = tanf(fov / 2.0f);
+            float proj[16] = {
+                1.0f / (tanHalfFov * aspect), 0, 0, 0,
+                0, 1.0f / tanHalfFov, 0, 0,
+                0, 0, (zFar + zNear) / (zNear - zFar), (2.0f * zFar * zNear) / (zNear - zFar),
+                0, 0, -1.0f, 0
+            };
             if (g_cbData) {
-                memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
+                memcpy(g_cbData, proj, sizeof(proj));
             }
         } else if (dc.type == VERTEX_TYPE_SCREEN) {
             float w = (float)g_w;
@@ -3481,6 +3659,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeRenderTransparent
             };
             if (g_cbData) {
                 memcpy(g_cbData, ortho, sizeof(ortho));
+            }
+        } else { // VERTEX_TYPE_UNKNOWN / NDC — 单位矩阵
+            if (g_cbData) {
+                memcpy(g_cbData, g_mvpNDC, sizeof(g_mvpNDC));
             }
         }
         // 刷新常量缓冲区
