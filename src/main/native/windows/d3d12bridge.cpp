@@ -1371,6 +1371,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 g_imVertCount = 0;
                 g_imVBSize = 0;
                 LeaveCriticalSection(&g_stateLock);
+                Log("[RenderLoop] Cleared all draw chunks before entering main loop.");
                 g_renderInitDone = true;
                 OutputDebugStringA("[INIT] 13-stage init complete, entering normal rendering\n");
             }
@@ -2551,8 +2552,8 @@ static void ProcessNextInitStage() {
         }
 
         case ST_NDC_TEST:
-            Log("[INIT STAGE] ST_NDC_TEST - drawing red triangle");
-            DrawRedTriangle();
+            Log("[INIT STAGE] ST_NDC_TEST - skipping draw for stability");
+            // DrawRedTriangle(); // 暂时禁用
             break;
 
         case ST_SKY_TEX: {

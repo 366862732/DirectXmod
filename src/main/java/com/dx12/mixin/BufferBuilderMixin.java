@@ -15,24 +15,9 @@ public class BufferBuilderMixin {
 
     @Inject(method = "build", at = @At("RETURN"), remap = false)
     private void onBuild(CallbackInfoReturnable<Object> cir) {
-        System.out.println("[GL4DX12] === BufferBuilder.build() RETURN triggered ===");
-
-        Object result = cir.getReturnValue();
-        if (result == null) {
-            System.out.println("[GL4DX12] meshData IS NULL, skipping processMeshData");
-            return;
-        }
-
-        System.out.println("[GL4DX12] meshData class: " + result.getClass().getName());
-        System.out.println("[GL4DX12] About to call D3D12Bridge.processMeshData");
-
-        try {
-            D3D12Bridge.processMeshData(result);
-            System.out.println("[GL4DX12] D3D12Bridge.processMeshData returned successfully");
-        } catch (Throwable t) {
-            System.err.println("[GL4DX12] processMeshData threw exception: " + t.getMessage());
-            t.printStackTrace();
-        }
+        System.out.println("[GL4DX12] BufferBuilder.build() intercepted - SKIPPING (stability test)");
+        // 直接返回，不处理任何数据
+        return;
     }
 
     static {
