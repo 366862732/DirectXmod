@@ -202,6 +202,7 @@ enum InitStage {
     ST_CMD_RES,               // 命令队列分配器
     ST_UI_PSO_CBUF,           // UI管线+UI常量缓冲
     ST_3D_PSO_CBUF,           // 3D透视管线+世界常量缓冲
+    ST_NDC_TEST,              // 新增：单独绘制红色三角形
     ST_SKY_TEX,               // 天空盒纹理上传
     ST_SKY_VB,                // 天空顶点缓冲
     ST_ENTITY_STATIC_VB,      // 实体静态顶点
@@ -1312,99 +1313,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             break;
         }
 
-        // ===== 强制处理 NDC 顶点（即使在初始化阶段） =====
-        if (g_hasNewVertexData && g_newVertexCount > 0 && g_currentCoordType == 2) {
-            {
-                std::lock_guard<std::mutex> lock(g_dataMutex);
-                g_hasNewVertexData = false;
-            }
-            // 使用硬编码红色测试三角形替换实际顶点数据
-            float testVerts[9] = {
-                -0.5f, -0.5f, 0.0f,
-                 0.5f, -0.5f, 0.0f,
-                 0.0f,  0.5f, 0.0f
-            };
-            const UINT testVertCount = 3;
-            // 转为 VertexPC 格式（红色）
-            VertexPC redTri[3] = {
-                {testVerts[0], testVerts[1], testVerts[2], 0xFF0000FF},
-                {testVerts[3], testVerts[4], testVerts[5], 0xFF0000FF},
-                {testVerts[6], testVerts[7], testVerts[8], 0xFF0000FF},
-            };
-            if (g_cl && g_alloc && g_psoSolidVariants[0]) {
-                Log("RenderLoop: FORCE NDC RED TRIANGLE TEST");
-                // 最小渲染路径：重置 → 上传 → 绘制 → 执行
-                HRESULT hr = g_alloc->Reset();
-                if (SUCCEEDED(hr)) {
-                    hr = g_cl->Reset(g_alloc.Get(), nullptr);
-                }
-                if (SUCCEEDED(hr) && g_swap) {
-                    g_fi = g_swap->GetCurrentBackBufferIndex();
-                    D3D12_RESOURCE_BARRIER rb = {};
-                    rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                    rb.Transition.pResource = g_rt[g_fi].Get();
-                    rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-                    rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                    g_cl->ResourceBarrier(1, &rb);
-
-                    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-                    rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
-                    // NDC 测试三角形使用无深度 PSO，不绑定 DSV
-                    g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-
-                    float bg[4] = {0.1f, 0.2f, 0.4f, 1.0f};
-                    g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
-
-                    D3D12_VIEWPORT vp = {0, 0, (float)g_w, (float)g_h, 0, 1};
-                    D3D12_RECT sc = {0, 0, (LONG)g_w, (LONG)g_h};
-                    g_cl->RSSetViewports(1, &vp);
-                    g_cl->RSSetScissorRects(1, &sc);
-
-                    // 上传顶点数据
-                    ComPtr<ID3D12Resource> vb;
-                    D3D12_GPU_VIRTUAL_ADDRESS vbAddr;
-                    if (UploadVertexData((const float*)redTri, testVertCount, sizeof(VertexPC), vb, vbAddr)) {
-                        float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-                        memcpy(g_cbData, identity, sizeof(identity));
-                        void* cbMapped;
-                        D3D12_RANGE wr = {0, 256};
-                        if (SUCCEEDED(g_cbUpload->Map(0, &wr, &cbMapped))) {
-                            memcpy(cbMapped, g_cbData, 256);
-                            g_cbUpload->Unmap(0, nullptr);
-                        }
-
-                        g_cl->SetGraphicsRootSignature(g_rsSolidVariants[0].Get());
-                        g_cl->SetPipelineState(g_psoSolidVariants[0].Get());
-                        g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                        D3D12_VERTEX_BUFFER_VIEW vbv = {};
-                        vbv.BufferLocation = vbAddr;
-                        vbv.SizeInBytes = testVertCount * sizeof(VertexPC);
-                        vbv.StrideInBytes = sizeof(VertexPC);
-                        g_cl->IASetVertexBuffers(0, 1, &vbv);
-                        g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
-                        g_cl->DrawInstanced(testVertCount, 1, 0, 0);
-                        Log("Force-draw NDC: RED TRIANGLE (%d verts)", testVertCount);
-                    }
-
-                    rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-                    g_cl->ResourceBarrier(1, &rb);
-                    g_cl->Close();
-                    ID3D12CommandList* lists[] = {g_cl.Get()};
-                    g_queue->ExecuteCommandLists(1, lists);
-                    g_queue->Signal(g_fence.Get(), g_fenceVal);
-                    g_fenceVal++;
-                    if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
-                        g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
-                        WaitForSingleObject(g_fenceEv, INFINITE);
-                    }
-                } else {
-                    Log("[ERROR] Force NDC: allocator/CL reset failed");
-                }
-            }
-        }
-
         // ===== 12阶段异步初始化状态机：每阶段独占1帧，创建资源+强制GPU同步，根除TDR =====
         if (g_initStage < ST_FULL_READY) {
             // 如果设备已丢失，提前退出
@@ -1457,8 +1365,14 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             // 阶段递增
             g_initStage = (InitStage)((int)g_initStage + 1);
             if (g_initStage >= ST_FULL_READY) {
+                // 清空可能残留的绘制命令（调试用）
+                EnterCriticalSection(&g_stateLock);
+                g_drawChunks.clear();
+                g_imVertCount = 0;
+                g_imVBSize = 0;
+                LeaveCriticalSection(&g_stateLock);
                 g_renderInitDone = true;
-                OutputDebugStringA("[INIT] 12-stage init complete, entering normal rendering\n");
+                OutputDebugStringA("[INIT] 13-stage init complete, entering normal rendering\n");
             }
             continue;
         }
@@ -2448,6 +2362,95 @@ static void CleanupD3D12() {
     SafeCleanD3D();
 }
 
+// 独立的红色三角形绘制函数（供 ST_NDC_TEST 初始化阶段调用）
+static void DrawRedTriangle() {
+    Log("[NDC TEST] Drawing red triangle");
+
+    if (!g_cl || !g_alloc || !g_psoSolidVariants[0] || !g_swap) {
+        Log("[ERROR] DrawRedTriangle: resources not ready");
+        return;
+    }
+
+    float testVerts[9] = {
+        -0.5f, -0.5f, 0.0f,
+         0.5f, -0.5f, 0.0f,
+         0.0f,  0.5f, 0.0f
+    };
+    const UINT testVertCount = 3;
+    VertexPC redTri[3] = {
+        {testVerts[0], testVerts[1], testVerts[2], 0xFF0000FF},
+        {testVerts[3], testVerts[4], testVerts[5], 0xFF0000FF},
+        {testVerts[6], testVerts[7], testVerts[8], 0xFF0000FF},
+    };
+
+    HRESULT hr = g_alloc->Reset();
+    if (SUCCEEDED(hr)) {
+        hr = g_cl->Reset(g_alloc.Get(), nullptr);
+    }
+    if (SUCCEEDED(hr)) {
+        g_fi = g_swap->GetCurrentBackBufferIndex();
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = g_rt[g_fi].Get();
+        rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_cl->ResourceBarrier(1, &rb);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
+        g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+        float bg[4] = {0.1f, 0.2f, 0.4f, 1.0f};
+        g_cl->ClearRenderTargetView(rtv, bg, 0, nullptr);
+
+        D3D12_VIEWPORT vp = {0, 0, (float)g_w, (float)g_h, 0, 1};
+        D3D12_RECT sc = {0, 0, (LONG)g_w, (LONG)g_h};
+        g_cl->RSSetViewports(1, &vp);
+        g_cl->RSSetScissorRects(1, &sc);
+
+        ComPtr<ID3D12Resource> vb;
+        D3D12_GPU_VIRTUAL_ADDRESS vbAddr;
+        if (UploadVertexData((const float*)redTri, testVertCount, sizeof(VertexPC), vb, vbAddr)) {
+            float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            memcpy(g_cbData, identity, sizeof(identity));
+            void* cbMapped;
+            D3D12_RANGE wr = {0, 256};
+            if (SUCCEEDED(g_cbUpload->Map(0, &wr, &cbMapped))) {
+                memcpy(cbMapped, g_cbData, 256);
+                g_cbUpload->Unmap(0, nullptr);
+            }
+
+            g_cl->SetGraphicsRootSignature(g_rsSolidVariants[0].Get());
+            g_cl->SetPipelineState(g_psoSolidVariants[0].Get());
+            g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            D3D12_VERTEX_BUFFER_VIEW vbv = {};
+            vbv.BufferLocation = vbAddr;
+            vbv.SizeInBytes = testVertCount * sizeof(VertexPC);
+            vbv.StrideInBytes = sizeof(VertexPC);
+            g_cl->IASetVertexBuffers(0, 1, &vbv);
+            g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
+            g_cl->DrawInstanced(testVertCount, 1, 0, 0);
+            Log("DrawRedTriangle: RED TRIANGLE (%d verts)", testVertCount);
+        }
+
+        rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        g_cl->ResourceBarrier(1, &rb);
+        g_cl->Close();
+        ID3D12CommandList* lists[] = {g_cl.Get()};
+        g_queue->ExecuteCommandLists(1, lists);
+        g_queue->Signal(g_fence.Get(), g_fenceVal);
+        g_fenceVal++;
+        if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
+            g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
+            WaitForSingleObject(g_fenceEv, INFINITE);
+        }
+    } else {
+        Log("[ERROR] DrawRedTriangle: allocator/CL reset failed");
+    }
+}
+
 // 分阶段资源创建：每阶段创建一类资源，分散GPU负载
 static void ProcessNextInitStage() {
     if (g_deviceLost.load() || !g_dev || !g_queue) {
@@ -2546,6 +2549,11 @@ static void ProcessNextInitStage() {
             Log("[INIT STAGE] ST_3D_PSO_CBUF - completed");
             break;
         }
+
+        case ST_NDC_TEST:
+            Log("[INIT STAGE] ST_NDC_TEST - drawing red triangle");
+            DrawRedTriangle();
+            break;
 
         case ST_SKY_TEX: {
             // 上传天空盒纹理（如果有预设纹理的话，暂时留空，以后可从文件加载）

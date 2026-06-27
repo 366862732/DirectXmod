@@ -17,6 +17,10 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.lang.reflect.Field;
+import java.util.EnumMap;
+import java.util.List;
+
 @Mixin(LevelRenderer.class)
 public class LevelRendererMixin {
 
@@ -78,9 +82,71 @@ public class LevelRendererMixin {
             System.out.println("[GL4DX12] AFTER nativeDraw(4)");
             DX12LibClient.nativePresent(); // 强制刷新
 
+            // 提取 ChunkSectionsToRender 中的 Draw 数据
+            if (chunkSectionsToRender != null) {
+                extractAndRenderChunks(chunkSectionsToRender);
+            }
+
             // 调用 D3D12 渲染
             float partialTick = deltaTracker.getGameTimeDeltaPartialTick(false);
             D3D12Bridge.renderFullFrame(levelRenderState, cameraState, partialTick, modelViewMatrix);
+        }
+    }
+
+    private void extractAndRenderChunks(ChunkSectionsToRender sections) {
+        if (sections == null) return;
+
+        try {
+            // 获取 drawGroupsPerLayer 字段
+            Field drawGroupsField = sections.getClass().getDeclaredField("drawGroupsPerLayer");
+            drawGroupsField.setAccessible(true);
+            EnumMap<?, ?> drawGroups = (EnumMap<?, ?>) drawGroupsField.get(sections);
+
+            // 遍历每个层 (SOLID, CUTOUT, TRANSLUCENT)
+            for (Object layer : drawGroups.keySet()) {
+                Object drawList = drawGroups.get(layer);
+                if (drawList == null) continue;
+
+                // 获取 Draw 列表
+                if (drawList instanceof List) {
+                    List<?> draws = (List<?>) drawList;
+                    System.out.println("[GL4DX12] Layer " + layer + " has " + draws.size() + " draws");
+
+                    for (Object draw : draws) {
+                        // 提取每个 Draw 的顶点数据
+                        processDraw(draw);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void processDraw(Object draw) {
+        try {
+            // 获取 vertexBuffer
+            Field vbField = draw.getClass().getDeclaredField("vertexBuffer");
+            vbField.setAccessible(true);
+            Object vertexBuffer = vbField.get(draw);
+
+            // 获取 indexCount 和 baseVertex
+            Field indexCountField = draw.getClass().getDeclaredField("indexCount");
+            indexCountField.setAccessible(true);
+            int indexCount = (int) indexCountField.get(draw);
+
+            Field baseVertexField = draw.getClass().getDeclaredField("baseVertex");
+            baseVertexField.setAccessible(true);
+            int baseVertex = (int) baseVertexField.get(draw);
+
+            System.out.println("[GL4DX12] Draw: indexCount=" + indexCount + ", baseVertex=" + baseVertex);
+
+            // TODO: 从 vertexBuffer 中提取实际顶点数据
+            // 这需要根据 Minecraft 的顶点格式解析
+            // 暂时跳过，先打印日志确认流程
+
+        } catch (Exception e) {
+            e.printStackTrace();
         }
     }
 }
