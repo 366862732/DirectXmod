@@ -83,4 +83,6 @@ public class DX12LibClient {
     public static native void nativeRenderParticles();
     public static native void nativeUploadTransparent(float[] vertices, int count, int vertexSize, float distance);
     public static native void nativeRenderTransparent();
+    // Texture pipeline
+    public static native void nativeUploadTextureEx(byte[] pixels, int w, int h, int texId);
 }

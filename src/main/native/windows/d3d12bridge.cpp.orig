@@ -161,9 +161,8 @@ HRESULT SafeCreateGraphicsPipelineState(
 std::recursive_mutex g_d3dGlobalMtx;
 static char g_d3d12Info[256] = "D3D12 not initialized";
 static ComPtr<ID3D12CommandQueue>    g_queue;
-// static ComPtr<IDXGISwapChain3> g_swap;  // REMOVED: off-screen render + GDI Blit
-// static ComPtr<ID3D12Resource> g_rt[2];  // REMOVED: off-screen render + GDI Blit
-static ComPtr<IDXGISwapChain3> g_swap;
+static ComPtr<IDXGISwapChain3>       g_swap;
+static ComPtr<ID3D12Resource>        g_rt[2];
 static ComPtr<ID3D12DescriptorHeap>  g_rtvHeap;
 static ComPtr<ID3D12DescriptorHeap>  g_srvHeap;
 static ComPtr<ID3D12CommandAllocator>     g_alloc;
@@ -225,9 +224,12 @@ static CRITICAL_SECTION g_texLock;
 
 // MC framebuffer capture via GDI BitBlt
 static ComPtr<ID3D12Resource> g_texMCFrame;
+static UINT g_mcCaptureW = 0, g_mcCaptureH = 0;
 
 // Fullscreen quad
 static ComPtr<ID3D12Resource> g_vbFSQuad;
+
+// PSO (textured quad)
 static ComPtr<ID3D12RootSignature> g_rs;
 static ComPtr<ID3D12PipelineState> g_pso;
 
@@ -340,7 +342,6 @@ static DXGI_FORMAT g_dsvFormat = DXGI_FORMAT_UNKNOWN;
 
 struct MvpCB { float mvp[16]; };
 static ComPtr<ID3D12Resource> g_cbUpload;
-// GDI capture (for legacy overlay, now deprecated)
 static BYTE* g_cbData = nullptr;
 static const UINT g_cbSize = 256;
 
@@ -394,8 +395,12 @@ static HWND g_hwndMC = nullptr;
 
 static LRESULT CALLBACK OverlayWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: ValidateRect(h, nullptr); return 0;
+    case WM_ERASEBKGND: 
+        return 1;  // 避免闪烁
+    case WM_PAINT:
+        // 让 D3D12 渲染，不需要 GDI 绘制
+        ValidateRect(h, nullptr);
+        return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -404,13 +409,13 @@ static HWND CreateOverlayWindow(HWND hParent) {
     static int classCounter = 0;
     wchar_t cn[64];
     swprintf(cn, 64, L"GL4DX12_Overlay_%d", classCounter++);
-
+    
     WNDCLASSW wc = {};
     wc.lpfnWndProc = OverlayWndProc;
     wc.hInstance = GetModuleHandleW(0);
     wc.lpszClassName = cn;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-
+    
     if (!RegisterClassW(&wc)) {
         DWORD err = GetLastError();
         Log("ERROR: RegisterClassW failed for %S, error=%d", cn, err);
@@ -418,6 +423,7 @@ static HWND CreateOverlayWindow(HWND hParent) {
     }
     Log("Window class registered: %S", cn);
 
+    // 短暂延迟
     Sleep(50);
 
     // 创建独立弹窗（与 MC 窗口完全隔离，避免 GPU 驱动冲突）
@@ -446,7 +452,6 @@ static HWND CreateOverlayWindow(HWND hParent) {
     ShowWindow(hw, SW_SHOW);
     return hw;
 }
-
 
 static void WaitGPU() {
     if (g_fence && g_queue) {
@@ -983,39 +988,174 @@ static void UploadTextureEx(const void* pixels, int w, int h, int texId) {
     Log("Upload texture #%d %dx%d slot=%u", texId, w, h, slot);
 }
 static bool CaptureMCFrame() {
-    // Deprecated: no longer used in popup window rendering mode
-    return false;
+    if (!g_hwndMC) return false;
+    HDC hdcWin = GetDC(g_hwndMC);
+    if (!hdcWin) return false;
+    HDC hdcMem = CreateCompatibleDC(hdcWin);
+    if (!hdcMem) { ReleaseDC(g_hwndMC, hdcWin); return false; }
+    HBITMAP hbm = CreateCompatibleBitmap(hdcWin, (int)g_w, (int)g_h);
+    if (!hbm) { DeleteDC(hdcMem); ReleaseDC(g_hwndMC, hdcWin); return false; }
+    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbm);
+    BitBlt(hdcMem, 0, 0, (int)g_w, (int)g_h, hdcWin, 0, 0, SRCCOPY);
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = (LONG)g_w;
+    bi.bmiHeader.biHeight = -(LONG)g_h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    UINT rowSize = g_w * 4;
+    UINT dataSize = rowSize * g_h;
+    BYTE* pixels = new BYTE[dataSize];
+    GetDIBits(hdcWin, hbm, 0, (UINT)g_h, pixels, &bi, DIB_RGB_COLORS);
+
+    for (UINT i = 0; i < dataSize; i += 4) {
+        BYTE tmp = pixels[i];
+        pixels[i] = pixels[i + 2];
+        pixels[i + 2] = tmp;
+    }
+
+    SelectObject(hdcMem, hbmOld);
+    DeleteObject(hbm);
+    DeleteDC(hdcMem);
+    ReleaseDC(g_hwndMC, hdcWin);
+
+    bool needRecreate = (g_mcCaptureW != g_w || g_mcCaptureH != g_h || !g_texMCFrame);
+    if (needRecreate) {
+        g_texMCFrame.Reset();
+        D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = g_w; td.Height = g_h;
+        td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        if (FAILED(g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
+            &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(g_texMCFrame.GetAddressOf())))) {
+            delete[] pixels;
+            return false;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        g_dev->CreateShaderResourceView(g_texMCFrame.Get(), &srvDesc,
+            g_srvHeap->GetCPUDescriptorHandleForHeapStart());
+        g_mcCaptureW = g_w; g_mcCaptureH = g_h;
+    }
+
+    UINT alignedRowSize = (rowSize + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    D3D12_HEAP_PROPERTIES hpUp = {}; hpUp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rdUp = {};
+    rdUp.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdUp.Width = alignedRowSize * (UINT64)g_h;
+    rdUp.Height = 1; rdUp.DepthOrArraySize = 1;
+    rdUp.MipLevels = 1; rdUp.SampleDesc.Count = 1;
+    rdUp.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> upBuf;
+    g_dev->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE,
+        &rdUp, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upBuf));
+
+    BYTE* dst = nullptr;
+    HRESULT hr = upBuf->Map(0, nullptr, (void**)&dst);
+    if (FAILED(hr) || dst == nullptr) {
+        Log("[FATAL] CaptureMCFrame Map failed, hr=0x%08X\n", hr);
+        delete[] pixels;
+        return false;
+    }
+    for (UINT y = 0; y < g_h; y++)
+        memcpy(dst + y * alignedRowSize, pixels + y * rowSize, rowSize);
+    upBuf->Unmap(0, nullptr);
+    delete[] pixels;
+
+    ComPtr<ID3D12CommandAllocator> capAlloc;
+    ComPtr<ID3D12GraphicsCommandList> capCL;
+    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&capAlloc));
+    g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, capAlloc.Get(), nullptr, IID_PPV_ARGS(&capCL));
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = g_texMCFrame.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upBuf.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srcLoc.PlacedFootprint.Footprint.Width = g_w;
+    srcLoc.PlacedFootprint.Footprint.Height = g_h;
+    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+    srcLoc.PlacedFootprint.Footprint.RowPitch = alignedRowSize;
+
+    capCL->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER rb = {};
+    rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    rb.Transition.pResource = g_texMCFrame.Get();
+    rb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    rb.Transition.Subresource = 0;
+    capCL->ResourceBarrier(1, &rb);
+    capCL->Close();
+    ID3D12CommandList* lists[] = {capCL.Get()};
+    g_queue->ExecuteCommandLists(1, lists);
+    WaitGPU();
+    return true;
 }
 
-static void RecreateOffscreenOnResize(UINT newW, UINT newH) {
-    if (newW == g_w && newH == g_h) return;
-    g_w = newW; g_h = newH;
-    WaitGPU();
-    g_depthBuf.Reset();
-    g_cl.Reset(); g_alloc.Reset();
-    g_fi = 0;
-    D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT n = 0; n < 2; n++) {
-        rh.ptr += g_rtvSize;
+static void RepositionOverlay() {
+    // 将 D3D12 overlay 子窗口覆盖到 MC 窗口的整个客户区
+    if (!g_hwndMC) return;
+    if (IsIconic(g_hwndMC)) return;
+    RECT rc; GetClientRect(g_hwndMC, &rc);
+    int newW = rc.right - rc.left, newH = rc.bottom - rc.top;
+    if (newW <= 0 || newH <= 0) return;
+    bool sizeChanged = ((int)g_w != newW || (int)g_h != newH);
+
+    // 同步 overlay 窗口位置和大小
+    if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) {
+        POINT pt = {0, 0};
+        ClientToScreen(g_hwndMC, &pt);
+        SetWindowPos(g_hwndOverlay, HWND_TOP, pt.x, pt.y, newW, newH, SWP_NOACTIVATE);
     }
-    if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
-        D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC depthDesc = {};
-        depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        depthDesc.Width = g_w; depthDesc.Height = g_h;
-        depthDesc.DepthOrArraySize = 1; depthDesc.MipLevels = 1;
-        depthDesc.Format = g_dsvFormat; depthDesc.SampleDesc.Count = 1;
-        depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
-        cv.DepthStencil.Depth = 1.0f;
-        g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
-            &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
-        g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
-            g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    if (sizeChanged) {
+        g_w = (UINT)newW; g_h = (UINT)newH;
+        g_texMCFrame.Reset(); g_mcCaptureW = 0; g_mcCaptureH = 0;
+        WaitGPU();
+        for (auto& r : g_rt) r.Reset();
+        g_depthBuf.Reset();
+        g_cl.Reset(); g_alloc.Reset();
+        g_swap->ResizeBuffers(2, g_w, g_h, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        g_fi = g_swap->GetCurrentBackBufferIndex();
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT n = 0; n < 2; n++) {
+            g_swap->GetBuffer(n, IID_PPV_ARGS(g_rt[n].GetAddressOf()));
+            g_dev->CreateRenderTargetView(g_rt[n].Get(), nullptr, rh);
+            rh.ptr += g_rtvSize;
+        }
+        if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
+            D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC depthDesc = {};
+            depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            depthDesc.Width = g_w; depthDesc.Height = g_h;
+            depthDesc.DepthOrArraySize = 1; depthDesc.MipLevels = 1;
+            depthDesc.Format = g_dsvFormat; depthDesc.SampleDesc.Count = 1;
+            depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
+            cv.DepthStencil.Depth = 1.0f;
+            g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
+                &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
+            g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
+                g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+        }
+        g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf()));
+        g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(g_cl.GetAddressOf()));
+        g_cl->Close();
     }
-    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(g_alloc.GetAddressOf()));
-    g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc.Get(), nullptr, IID_PPV_ARGS(g_cl.GetAddressOf()));
-    g_cl->Close();
 }
 
 static DXGI_FORMAT PickDepthFormat() {
@@ -1220,16 +1360,16 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             }
 
             // 清屏准备
-            // auto bb = g_rt[0] replaced with g_offscreenRT
+            auto bb = g_rt[g_swap->GetCurrentBackBufferIndex()];
             D3D12_RESOURCE_BARRIER rb = {};
-        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = g_swap->GetCurrentBackBuffer(g_fi);
-        rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_cl->ResourceBarrier(1, &rb);
-        D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rh.ptr += g_fi * g_rtvSize;
+            rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb.Transition.pResource = bb.Get();
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_cl->ResourceBarrier(1, &rb);
+            D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rh.ptr += g_swap->GetCurrentBackBufferIndex() * g_rtvSize;
             float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             g_cl->OMSetRenderTargets(1, &rh, FALSE, nullptr);
             g_cl->ClearRenderTargetView(rh, clearColor, 0, nullptr);
@@ -1281,7 +1421,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             continue;
         }
 
-        // RepositionOverlay() REMOVED: no overlay window
+        RepositionOverlay();
         CaptureMCFrame();
 
         HRESULT hr = g_alloc->Reset();
@@ -1294,18 +1434,18 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             Log("[ERROR] 命令列表 Reset 失败");
             continue;
         }
-        g_fi = 0;
+        g_fi = g_swap->GetCurrentBackBufferIndex();
 
         D3D12_RESOURCE_BARRIER rb = {};
         rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = g_swap->GetCurrentBackBuffer(g_fi);
+        rb.Transition.pResource = g_rt[g_fi].Get();
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         g_cl->ResourceBarrier(1, &rb);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += g_fi * g_rtvSize;
+        rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
         bool hasDSV = (g_dsvHeap && g_depthBuf);
         D3D12_CPU_DESCRIPTOR_HANDLE dsvH = {};
         if (hasDSV) {
@@ -1333,7 +1473,20 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             Log("                        [%.3f %.3f %.3f %.3f]", m[12], m[13], m[14], m[15]);
         }
 
-        // Layer 0: MC capture (deprecated - popup window mode doesn't need this)
+        // Layer 0: MC capture
+        if (g_texMCFrame && g_pso) {
+            g_cl->SetGraphicsRootSignature(g_rs.Get());
+            g_cl->SetPipelineState(g_pso.Get());
+            g_cl->SetDescriptorHeaps(1, g_srvHeap.GetAddressOf());
+            g_cl->SetGraphicsRootDescriptorTable(0, g_srvHeap->GetGPUDescriptorHandleForHeapStart());
+            D3D12_VERTEX_BUFFER_VIEW fsVbv = {};
+            fsVbv.BufferLocation = g_vbFSQuad->GetGPUVirtualAddress();
+            fsVbv.StrideInBytes = sizeof(Vertex2D);
+            fsVbv.SizeInBytes = sizeof(Vertex2D) * 3;
+            g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_cl->IASetVertexBuffers(0, 1, &fsVbv);
+            g_cl->DrawInstanced(3, 1, 0, 0);
+        }
 
         // Layer 1: GL geometry
         {
@@ -1565,6 +1718,54 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             WaitForSingleObject(g_fenceEv, INFINITE);
         }
 
+        auto beforePresent = std::chrono::high_resolution_clock::now();
+        HRESULT presentHR = g_swap->Present(0, 0);  // SyncInterval=0, 不等待垂直同步
+        if (presentHR == DXGI_ERROR_DEVICE_REMOVED || presentHR == DXGI_ERROR_DEVICE_HUNG) {
+            Log("[RenderLoop] Present failed with DEVICE_HUNG/REMOVED, trying to recover...");
+            // 等待 1 秒再重试
+            Sleep(1000);
+            presentHR = g_swap->Present(0, 0);
+            if (FAILED(presentHR)) {
+                Log("[RenderLoop] EXIT: Present failed after retry, presentHR=0x%08X", presentHR);
+                HRESULT devErr = g_dev->GetDeviceRemovedReason();
+                Log("[RenderLoop] EXIT: Device removed reason after retry = 0x%08X", devErr);
+                g_deviceLost.store(true);
+                g_run = false;
+                break;
+            }
+            Log("[RenderLoop] Present succeeded after retry");
+        } else if (FAILED(presentHR)) {
+            Log("[RenderLoop] EXIT: Present failed, presentHR=0x%08X", presentHR);
+            HRESULT devErr = g_dev->GetDeviceRemovedReason();
+            Log("[RenderLoop] EXIT: Device removed reason after Present fail = 0x%08X", devErr);
+            char errBuf[512];
+            sprintf_s(errBuf, "[FATAL D3D Present 失败，错误码0x%08X，标记设备丢失", devErr);
+            OutputDebugStringA(errBuf);
+            switch (devErr) {
+                case DXGI_ERROR_DEVICE_REMOVED:
+                case DXGI_ERROR_DEVICE_HUNG:
+                    OutputDebugStringA("[FATAL D3D Present 失败，标记设备丢失");
+                    g_deviceLost.store(true);
+                    g_run = false;
+                    SetEvent(g_frameReadyEvent);
+                    SetEvent(g_frameDoneEvent);
+                    break;
+                case DXGI_ERROR_DEVICE_RESET:    OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_DEVICE_RESET\n"); break;
+                case DXGI_ERROR_ACCESS_DENIED:   OutputDebugStringA("[FATAL] Reason: DXGI_ERROR_ACCESS_DENIED\n"); break;
+                default: OutputDebugStringA("[FATAL] Reason: unknown error code\n"); break;
+            }
+            if (!g_run) break;
+        } else {
+            OutputDebugStringA("[FATAL] TEST: Present succeeded\n");
+        }
+
+        auto afterPresent = std::chrono::high_resolution_clock::now();
+        auto presentDuration = std::chrono::duration_cast<std::chrono::milliseconds>(afterPresent - beforePresent).count();
+        Log("[RenderLoop] Present took %lld ms, hr=0x%08X", presentDuration, presentHR);
+        if (presentDuration > 1000) {
+            Log("[RenderLoop] WARNING: Present took >1s, possible TDR trigger!");
+        }
+
         // Present完成兜底检测，捕获帧内中途触发的TDR
         HRESULT frameCheck = g_dev->GetDeviceRemovedReason();
         if (frameCheck != S_OK) {
@@ -1579,7 +1780,7 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             break;
         }
 
-        // 强制 GPU 完全空闲后再 Present
+        // 强制 GPU 完全空闲后再 Reset
         Log("[RenderLoop] Signaling fence, g_fenceVal=%llu", g_fenceVal);
         HRESULT hrSignal = g_queue->Signal(g_fence.Get(), g_fenceVal);
         if (FAILED(hrSignal)) {
@@ -1606,14 +1807,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         } else {
             Log("[RenderLoop] GPU already done, no wait needed (completed=%llu, fenceVal-1=%llu)",
                 g_fence->GetCompletedValue(), g_fenceVal - 1);
-        }
-
-        // Present 到 overlay 窗口
-        HRESULT hrPresent = g_swap->Present(1, 0);
-        if (SUCCEEDED(hrPresent)) {
-            Log("[RenderLoop] Present succeeded, g_fenceVal=%llu", g_fenceVal);
-        } else {
-            Log("[RenderLoop] Present failed, reason=0x%08X", hrPresent);
         }
 
         // 确保GPU完成当前帧绘制后重置命令分配器和命令列表（防止CBV数据竞争）
@@ -1654,14 +1847,19 @@ static bool InitD3D12(HWND hwndMC) {
         }
         return TRUE;
     }, 0);
+    // 确保 g_hwndOverlay 全局变量也被清空
+    if (g_hwndOverlay) {
+        Log("Clearing global overlay handle");
+        g_hwndOverlay = nullptr;
+    }
     // --- 强制清理结束 ---
 
     OutputDebugStringA("=== InitD3D12 ENTERED ===\n");
     Log("=== InitD3D12 ENTERED ===");
-    Log("=== Init D3D12 on MC window (HWND=0x%p) ===", hwndMC);
+    Log("=== Init D3D12 overlay on MC window (HWND=0x%p) ===", hwndMC);
     g_hwndMC = hwndMC;
     if (!g_hwndMC) {
-        Log("ERROR: g_hwndMC is NULL");
+        Log("ERROR: g_hwndMC is NULL");  // 添加
         return false;
     }
     if (!IsWindow(g_hwndMC)) {
@@ -1669,26 +1867,26 @@ static bool InitD3D12(HWND hwndMC) {
         return false;
     }
 
-    RECT rc;
-    if (!GetClientRect(g_hwndMC, &rc)) {
-        Log("ERROR: GetClientRect failed, error=%d", GetLastError());
-        return false;
-    }
-    Log("GetClientRect succeeded: left=%d, top=%d, right=%d, bottom=%d", rc.left, rc.top, rc.right, rc.bottom);
-    g_w = (UINT)(rc.right - rc.left);
-    g_h = (UINT)(rc.bottom - rc.top);
-    Log("Client rect: %dx%d", g_w, g_h);
+RECT rc;
+if (!GetClientRect(g_hwndMC, &rc)) {
+    Log("ERROR: GetClientRect failed, error=%d", GetLastError());
+    return false;
+}
+Log("GetClientRect succeeded: left=%d, top=%d, right=%d, bottom=%d", rc.left, rc.top, rc.right, rc.bottom);
+g_w = (UINT)(rc.right - rc.left);
+g_h = (UINT)(rc.bottom - rc.top);
+Log("Client rect: %dx%d", g_w, g_h);
 
-    // 创建独立的 D3D12 覆盖子窗口，避免与 MC 的 OpenGL 上下文冲突
-    g_hwndOverlay = CreateOverlayWindow(g_hwndMC);
-    if (!g_hwndOverlay) {
-        Log("Overlay window creation FAILED, falling back to MC window directly");
-        g_hwndOverlay = g_hwndMC;
-    } else {
-        Log("D3D12 overlay child window created successfully on MC window");
-    }
+// 创建独立的 D3D12 覆盖子窗口，避免与 MC 的 OpenGL 上下文冲突
+g_hwndOverlay = CreateOverlayWindow(g_hwndMC);
+if (!g_hwndOverlay) {
+    Log("Overlay window creation FAILED, falling back to MC window directly");
+    g_hwndOverlay = g_hwndMC;
+} else {
+    Log("D3D12 overlay child window created successfully on MC window");
+}
 
-    ComPtr<IDXGIFactory4> dxgi;
+ComPtr<IDXGIFactory4> dxgi;
     OutputDebugStringA("[nativeInit] === STEP 2: Creating DXGI Factory ===\n");
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi)))) {
         Log("ERROR: CreateDXGIFactory1 failed");  // 添加
@@ -1750,31 +1948,41 @@ static bool InitD3D12(HWND hwndMC) {
     OutputDebugStringA("[nativeInit] === STEP 4: CommandQueue created OK ===\n");
     Log("[nativeInit] === STEP 4: CommandQueue created OK ===");
 
-    // === STEP 5: 创建 SwapChain（绑定到 overlay 窗口，不与 OpenGL 冲突）===
+    // === STEP 5: 创建交换链 ===
     Log("[nativeInit] === STEP 5: Creating SwapChain ===");
-    {
-        DXGI_SWAP_CHAIN_DESC1 sd = {};
-        sd.Width = g_w;
-        sd.Height = g_h;
-        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.SampleDesc.Count = 1;
-        sd.SampleDesc.Quality = 0;
-        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount = 2;
-        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-        sd.Flags = 0;
-
-        ComPtr<IDXGISwapChain1> sc1;
-        HRESULT hrSwap = dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndOverlay, &sd, nullptr, nullptr, &sc1);
-        if (FAILED(hrSwap)) {
-            Log("[ERROR] CreateSwapChainForHwnd failed, hr=0x%08X", hrSwap);
-            return false;
-        }
-        sc1.QueryInterface(IID_PPV_ARGS(&g_swap));
-        Log("[nativeInit] === STEP 5: SwapChain created OK ===");
+    if (!IsWindow(g_hwndOverlay)) {
+        Log("[ERROR] g_hwndOverlay is not a valid window!");
+        return false;
     }
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.BufferCount = 2;
+    sd.Width = g_w;
+    sd.Height = g_h;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.SampleDesc.Count = 1;
+    sd.Flags = 0;
+    ComPtr<IDXGISwapChain1> sc1;
+    HRESULT hrSwap = dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndOverlay, &sd, 0, 0, &sc1);
+    if (FAILED(hrSwap)) {
+        Log("[ERROR] CreateSwapChainForHwnd failed, hr=0x%08X", hrSwap);
+        return false;
+    }
+    sc1.As(&g_swap); g_fi = g_swap->GetCurrentBackBufferIndex();
+    OutputDebugStringA("[nativeInit] === STEP 5: SwapChain created OK ===\n");
+    Log("[nativeInit] === STEP 5: SwapChain created OK ===");
 
+    // === STEP 6: 创建 RTV 描述符堆 ===
+    Log("[nativeInit] === STEP 6: Creating RTV Descriptor Heap ===");
+    D3D12_DESCRIPTOR_HEAP_DESC rd = {};
+    rd.NumDescriptors=2; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_rtvHeap.GetAddressOf())))) {
+        Log("[ERROR] CreateDescriptorHeap (RTV) failed");
+        return false;
+    }
+    g_rtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    OutputDebugStringA("[nativeInit] === STEP 6: RTV Heap created OK ===\n");
     Log("[nativeInit] === STEP 6: RTV Heap created OK ===");
 
     // === STEP 7: 创建 CBV_SRV_UAV 描述符堆 ===
@@ -1789,13 +1997,12 @@ static bool InitD3D12(HWND hwndMC) {
     OutputDebugStringA("[nativeInit] === STEP 7: SRV Heap created OK ===\n");
     Log("[nativeInit] === STEP 7: SRV Heap created OK ===");
 
-    // 创建 RTV for swap chain back buffers
+    // 创建 RTV for back buffers
     Log("[nativeInit] Creating RTVs for back buffers...");
     D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT n = 0; n < 2; n++) {
-        ComPtr<ID3D12Resource> backBuffer;
-        g_swap->GetBuffer(n, IID_PPV_ARGS(&backBuffer));
-        g_dev->CreateRenderTargetView(backBuffer.Get(), nullptr, rh);
+    for (UINT n=0; n<2; n++) {
+        g_swap->GetBuffer(n, IID_PPV_ARGS(g_rt[n].GetAddressOf()));
+        g_dev->CreateRenderTargetView(g_rt[n].Get(), nullptr, rh);
         rh.ptr += g_rtvSize;
     }
     Log("[nativeInit] RTVs created OK");
@@ -1988,16 +2195,14 @@ static void SafeCleanD3D() {
         g_texMCFrame.Reset(); g_vbFSQuad.Reset(); g_imVB.Reset(); g_vbEntityMarker.Reset();
         // ComPtr 自动释放全部 D3D 资源
         // 优先释放D3D设备，IsDeviceValid立刻返回false
-        g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_rtvHeap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
+        g_cl.Reset(); g_alloc.Reset(); g_swap.Reset(); g_queue.Reset(); g_fence.Reset(); g_dev.Reset();
         g_ok = false;
     }
     // 4. 关闭同步事件、窗口附属资源
     if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
     if (g_frameDoneEvent)   { CloseHandle(g_frameDoneEvent);   g_frameDoneEvent = nullptr; }
-    if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) {
-        DestroyWindow(g_hwndOverlay);
-        g_hwndOverlay = nullptr;
-    }
+    if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) { DestroyWindow(g_hwndOverlay); }
+    g_hwndOverlay = nullptr;
     g_hwndMC = nullptr;
     OutputDebugStringA("[CLEANUP] D3D资源销毁完成\n");
 }
@@ -2032,18 +2237,17 @@ static void DrawRedTriangle() {
         hr = g_cl->Reset(g_alloc.Get(), nullptr);
     }
     if (SUCCEEDED(hr)) {
-        g_fi = 0;
+        g_fi = g_swap->GetCurrentBackBufferIndex();
         D3D12_RESOURCE_BARRIER rb = {};
         rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = g_swap->GetCurrentBackBuffer(g_fi);
+        rb.Transition.pResource = g_rt[g_fi].Get();
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         g_cl->ResourceBarrier(1, &rb);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += g_fi * g_rtvSize;
-        // Single RTV, no index needed
+        rtv.ptr += (SIZE_T)g_fi * g_rtvSize;
         g_cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
         float bg[4] = {0.1f, 0.2f, 0.4f, 1.0f};
@@ -2325,11 +2529,13 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeClearDrawList(JNIEnv*, 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass, jint w, jint h) {
-    if (!g_ok || !g_dev) return;
+    if (!g_ok||!g_swap) return;
     if (g_w == (UINT)w && g_h == (UINT)h) {
         // 即使尺寸没变，也要同步 overlay 位置
+        if (g_hwndOverlay && g_hwndOverlay != g_hwndMC && g_hwndMC) {
             RECT rc; GetClientRect(g_hwndMC, &rc);
             POINT pt = {0, 0}; ClientToScreen(g_hwndMC, &pt);
+            SetWindowPos(g_hwndOverlay, HWND_TOP, pt.x, pt.y, rc.right-rc.left, rc.bottom-rc.top, SWP_NOACTIVATE);
         }
         return;
     }
@@ -2337,10 +2543,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass,
     for (auto& r : g_rt) r.Reset();
     g_depthBuf.Reset();
     g_cl.Reset(); g_alloc.Reset();
-    // Resize handled by offscreen RT recreation
-    g_w=(UINT)w; g_h=(UINT)h; g_fi=0;
+    g_swap->ResizeBuffers(2,(UINT)w,(UINT)h,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+    g_w=(UINT)w; g_h=(UINT)h; g_fi=g_swap->GetCurrentBackBufferIndex();
     D3D12_CPU_DESCRIPTOR_HANDLE rh=g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    // Offscreen RT resized in RecreateOffscreenOnResize()
+    for (UINT n=0;n<2;n++) { g_swap->GetBuffer(n,IID_PPV_ARGS(g_rt[n].GetAddressOf())); g_dev->CreateRenderTargetView(g_rt[n].Get(),0,rh); rh.ptr+=g_rtvSize; }
     g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(g_alloc.GetAddressOf()));
     g_dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,g_alloc.Get(),0,IID_PPV_ARGS(g_cl.GetAddressOf()));
     g_cl->Close();
@@ -2362,8 +2568,10 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass,
     }
 
     // 同步 overlay 窗口位置
+    if (g_hwndOverlay && g_hwndOverlay != g_hwndMC && g_hwndMC) {
         RECT rc; GetClientRect(g_hwndMC, &rc);
         POINT pt = {0, 0}; ClientToScreen(g_hwndMC, &pt);
+        SetWindowPos(g_hwndOverlay, HWND_TOP, pt.x, pt.y, rc.right-rc.left, rc.bottom-rc.top, SWP_NOACTIVATE);
     }
 }
 
@@ -2382,6 +2590,7 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeSetGlColor(JNIEnv*, jcl
 JNIEXPORT jboolean JNICALL Java_com_dx12_DX12LibClient_nativeIsInitialized(JNIEnv*, jclass) { return g_ok?JNI_TRUE:JNI_FALSE; }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeShowDebugWindow(JNIEnv*, jclass, jboolean s) {
+    if (g_hwndOverlay) ShowWindow(g_hwndOverlay, s ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeUploadPixels(JNIEnv* env, jclass, jbyteArray pixels, jint w, jint h) {

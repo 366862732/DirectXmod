@@ -18,31 +18,43 @@ public class DebugScreenMixin {
     private List<String> lines;
 
     /**
-     * 在 DebugScreenOverlay 初始化后，直接修改 lines 列表
+     * 在 DebugScreenOverlay 初始化后，替换 OpenGL 行
      */
     @Inject(method = "<init>", at = @At("RETURN"))
     private void onInit(CallbackInfo ci) {
+        replaceOpenGLLine();
+    }
+
+    /**
+     * drawGameInformation 每帧被调用，刷新文本行
+     * 在调用后再次替换，确保持续覆盖
+     */
+    @Inject(method = "drawGameInformation", at = @At("RETURN"), require = 0)
+    private void onDrawGameInformation(CallbackInfo ci) {
+        replaceOpenGLLine();
+    }
+
+    private void replaceOpenGLLine() {
         try {
             if (lines == null) return;
-            
-            // 替换 OpenGL 行
+            if (!D3D12Bridge.isD3D12Active()) return;
+
             for (int i = 0; i < lines.size(); i++) {
                 String line = lines.get(i);
-                if (line != null && line.contains("OpenGL")) {
-                    String d3dInfo = D3D12Bridge.isD3D12Ready() ? 
+                if (line != null && (line.contains("OpenGL") || line.startsWith("Display:"))) {
+                    String d3dInfo = D3D12Bridge.isD3D12Ready() ?
                         D3D12Bridge.getD3D12Info() : "Not initialized";
-                    String status = D3D12Bridge.isD3D12Active() ? "ACTIVE" : "INACTIVE";
-                    lines.set(i, "D3D12: " + d3dInfo + " [" + status + "]");
-                    System.out.println("[GL4DX12] Replaced OpenGL line with D3D12 info");
+                    String tag = line.contains("OpenGL") ? "D3D12" : "Display";
+                    lines.set(i, tag + ": [D3D12] " + d3dInfo);
                     break;
                 }
             }
         } catch (Exception e) {
-            System.err.println("[GL4DX12] Failed to modify debug overlay: " + e.getMessage());
+            // 静默失败
         }
     }
 
     static {
-        System.out.println("[GL4DX12] DebugScreenMixin loaded (init hook)");
+        System.out.println("[GL4DX12] DebugScreenMixin loaded");
     }
 }

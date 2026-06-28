@@ -16,6 +16,7 @@ import org.lwjgl.glfw.GLFWNativeWin32;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.dx12.render.ParticleExtractor;
 import com.dx12.render.SkyboxExtractor;
 
 import net.minecraft.client.Minecraft;
@@ -616,6 +617,9 @@ public class D3D12Bridge {
             cachedParticlesState = null;
         }
 
+        // 6. 通知 C++ 渲染线程：本帧数据已全部上传完毕
+        DX12LibClient.nativeEndFrame();
+
         // Note: Present is handled exclusively by the C++ RenderLoop thread.
         // Java only uploads data and signals the render thread.
     }
@@ -634,12 +638,62 @@ public class D3D12Bridge {
     }
 
     private static void renderEntities(List<EntityRenderState> entities, float partialTick) {
-        // 提取实体数据，批量上传到 C++ 层
+        if (entities.isEmpty()) return;
+        // 提取实体位置 (x,y,z) + 旋转 (xRot,yRot)，格式: [x,y,z,xRot,yRot] 每实体 5 floats
+        int floatsPerEntity = 5;
+        float[] entityData = new float[entities.size() * floatsPerEntity];
+        int idx = 0;
+        for (EntityRenderState state : entities) {
+            entityData[idx++] = (float) state.x;
+            entityData[idx++] = (float) state.y;
+            entityData[idx++] = (float) state.z;
+            // 旋转仅在子类中 — 默认 0
+            float xRot = 0f, yRot = 0f;
+            try {
+                if (state instanceof net.minecraft.client.renderer.entity.state.LivingEntityRenderState living) {
+                    xRot = living.xRot;
+                    yRot = living.yRot;
+                } else if (state instanceof net.minecraft.client.renderer.entity.state.DisplayEntityRenderState display) {
+                    xRot = display.entityXRot;
+                    yRot = display.entityYRot;
+                } else if (state instanceof net.minecraft.client.renderer.entity.state.MinecartRenderState minecart) {
+                    xRot = minecart.xRot;
+                    yRot = minecart.yRot;
+                } else if (state instanceof net.minecraft.client.renderer.entity.state.BoatRenderState boat) {
+                    yRot = boat.yRot;
+                } else if (state instanceof net.minecraft.client.renderer.entity.state.LlamaSpitRenderState spit) {
+                    xRot = spit.xRot;
+                    yRot = spit.yRot;
+                } else if (state instanceof net.minecraft.client.renderer.entity.state.EvokerFangsRenderState fangs) {
+                    yRot = fangs.yRot;
+                }
+            } catch (NoClassDefFoundError ignored) {}
+            entityData[idx++] = xRot;
+            entityData[idx++] = yRot;
+        }
+        DX12LibClient.nativeUploadEntities(entityData, entities.size());
+        LOGGER.debug("[GL4DX12] Uploaded {} entities", entities.size());
     }
 
     private static void renderParticles(ParticlesRenderState particlesState) {
-        // 已有的粒子提取代码保持不变
+        if (particlesState == null) return;
+        List<float[]> particleList = ParticleExtractor.extractParticles(particlesState);
+        if (particleList.isEmpty()) return;
+
+        // 展平为 float[]: 每粒子 14 floats
+        float[] flatData = new float[particleList.size() * 14];
+        int idx = 0;
+        for (float[] p : particleList) {
+            System.arraycopy(p, 0, flatData, idx, 14);
+            idx += 14;
+        }
+        DX12LibClient.nativeUploadParticles(flatData, particleList.size(), 14 * 4); // vertexSize = 14 floats * 4 bytes
+        LOGGER.debug("[GL4DX12] Uploaded {} particles", particleList.size());
     }
+
+    // 纹理跟踪
+    private static int g_currentTextureId = -1;
+    private static final java.util.Set<Integer> g_uploadedTextures = new java.util.HashSet<>();
 
     // ========== Phase 3: 实体/粒子捕获 ==========
 
@@ -676,8 +730,29 @@ public class D3D12Bridge {
     public static void onGlBlendFunc(int sfactor, int dfactor) {}
     public static void onGlDepthMask(boolean flag) {}
     public static void onGlCullFace(int mode) {}
-    public static void onBindTexture(int texture) {}
-    public static void onTexImage2D(int target, int level, int internalformat, int width, int height, int border, int format, java.nio.Buffer pixels) {}
+    public static void onBindTexture(int texture) {
+        if (!d3d12Active) return;
+        g_currentTextureId = texture;
+    }
+
+    public static void onTexImage2D(int target, int level, int internalformat, int width, int height, int border, int format, java.nio.Buffer pixels) {
+        if (!d3d12Active) return;
+        if (pixels == null || !(pixels instanceof java.nio.ByteBuffer)) return;
+        if (level != 0) return; // 只上传 mip 0 层
+        int texId = (g_currentTextureId > 0) ? g_currentTextureId : format; // 用 format hash 做 fallback
+        if (g_uploadedTextures.contains(texId)) return; // 避免重复上传
+
+        java.nio.ByteBuffer buf = (java.nio.ByteBuffer) pixels;
+        byte[] pixelBytes = new byte[buf.remaining()];
+        buf.duplicate().get(pixelBytes);
+        try {
+            DX12LibClient.nativeUploadTextureEx(pixelBytes, width, height, texId);
+            g_uploadedTextures.add(texId);
+            LOGGER.debug("[GL4DX12] Texture uploaded: id={}, {}x{}", texId, width, height);
+        } catch (Exception e) {
+            LOGGER.warn("[GL4DX12] Texture upload failed: {}", e.getMessage());
+        }
+    }
 
     // ========== glDrawArrays / glDrawElements 钩子 ==========
 

@@ -5,15 +5,18 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
-      <change beforePath="$PROJECT_DIR$/exit" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/LevelRendererMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/LevelRendererMixin.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/build.bat" beforeDir="false" afterPath="$PROJECT_DIR$/build.bat" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/DX12LibClient.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/DebugScreenMixin.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/dx12/mixin/DebugScreenMixin.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge.cpp" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/d3d12bridge/x64/Release/d3d12bridge.iobj" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/d3d12bridge/x64/Release/d3d12bridge.iobj" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/d3d12bridge/x64/Release/d3d12bridge.ipdb" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/d3d12bridge/x64/Release/d3d12bridge.ipdb" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/d3d12bridge/x64/Release/vc145.pdb" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/d3d12bridge/x64/Release/vc145.pdb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/x64/Release/d3d12bridge.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/x64/Release/d3d12bridge.dll" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/x64/Release/d3d12bridge.dll" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/x64/Release/d3d12bridge.pdb" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/native/windows/d3d12bridge/x64/Release/d3d12bridge.pdb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/所需做的操作.md" beforeDir="false" afterPath="$PROJECT_DIR$/所需做的操作.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/resources/d3d12bridge.dll" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/d3d12bridge.dll" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
