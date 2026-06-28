@@ -10,12 +10,13 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
-#include <jni.h>
+#include <jni.h> 
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#include <dwmapi.h>
 #include <wrl.h>
 #include <cstdio>
 #include <cstdarg>
@@ -388,62 +389,37 @@ static std::unordered_map<int, UINT> g_texSlotMap;
 static UINT g_texSlotNext = 0;
 static int g_currentTexId = 0;
 
-// Window overlay
-static HWND g_hwndOverlay = nullptr;
+// MC window handle (SwapChain renders to hidden child, composited via DWM)
 static HWND g_hwndMC = nullptr;
+static HWND g_hwndHidden = nullptr;  // hidden child window for SwapChain
 
-static LRESULT CALLBACK OverlayWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    switch (m) {
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: ValidateRect(h, nullptr); return 0;
+static HWND CreateHiddenChildWindow(HWND hParent, UINT w, UINT h) {
+    static wchar_t clsName[] = L"GL4DX12_HiddenSink";
+    static int clsRegistered = 0;
+    if (!clsRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(0);
+        wc.lpszClassName = clsName;
+        wc.hCursor = nullptr;
+        wc.hbrBackground = nullptr;
+        if (RegisterClassW(&wc)) clsRegistered = 1;
     }
-    return DefWindowProcW(h, m, w, l);
-}
-
-static HWND CreateOverlayWindow(HWND hParent) {
-    static int classCounter = 0;
-    wchar_t cn[64];
-    swprintf(cn, 64, L"GL4DX12_Overlay_%d", classCounter++);
-
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = OverlayWndProc;
-    wc.hInstance = GetModuleHandleW(0);
-    wc.lpszClassName = cn;
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-
-    if (!RegisterClassW(&wc)) {
-        DWORD err = GetLastError();
-        Log("ERROR: RegisterClassW failed for %S, error=%d", cn, err);
-        return nullptr;
-    }
-    Log("Window class registered: %S", cn);
-
-    Sleep(50);
-
-    // 创建独立弹窗（与 MC 窗口完全隔离，避免 GPU 驱动冲突）
-    // 获取父窗口在屏幕上的位置
-    RECT parentRC;
-    GetClientRect(hParent, &parentRC);
-    POINT pt = {0, 0};
-    ClientToScreen(hParent, &pt);
 
     HWND hw = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,  // 无任务栏、鼠标穿透、不抢焦点
-        cn, L"GL4DX12 Overlay",
-        WS_POPUP | WS_VISIBLE,  // 独立弹窗
-        pt.x, pt.y, (int)g_w, (int)g_h,
-        nullptr,  // 无父窗口——彻底独立的顶层窗口
-        nullptr, GetModuleHandleW(0), nullptr);
+        WS_EX_NOPARENTNOTIFY,
+        clsName, L"Hidden",
+        WS_CHILD | WS_VISIBLE,
+        0, 0, (int)w, (int)h,
+        hParent, nullptr, GetModuleHandleW(0), nullptr);
 
     if (!hw) {
-        DWORD err = GetLastError();
-        Log("ERROR: CreateWindowExW failed, error=%d", err);
-        UnregisterClassW(cn, GetModuleHandleW(0));
+        Log("[ERROR] CreateHiddenChildWindow failed, error=%d", GetLastError());
         return nullptr;
     }
 
-    Log("Window created as popup, HWND=0x%p, class=%S, pos=(%d,%d) size=%dx%d", hw, cn, pt.x, pt.y, (int)g_w, (int)g_h);
-    ShowWindow(hw, SW_SHOW);
+    SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    Log("[HIDDEN] Created hidden child HWND=0x%p at (0,0) size=%dx%d", hw, w, h);
     return hw;
 }
 
@@ -983,8 +959,7 @@ static void UploadTextureEx(const void* pixels, int w, int h, int texId) {
     Log("Upload texture #%d %dx%d slot=%u", texId, w, h, slot);
 }
 static bool CaptureMCFrame() {
-    // Deprecated: no longer used in popup window rendering mode
-    return false;
+    return false; // not needed - D3D12 renders directly to MC window
 }
 
 static void RecreateOffscreenOnResize(UINT newW, UINT newH) {
@@ -1150,14 +1125,12 @@ static bool UploadVertexData(const float* data, int count, int vertexSize,
 
 static DWORD WINAPI RenderLoop(LPVOID) {
     OutputDebugStringA("[RenderLoop] ENTERED - THREAD STARTED!\n");
-    Log("[RenderLoop] ENTERED - THREAD STARTED! <<<BUILD_20260628_v2>>>");
+    Log("[RenderLoop] ENTERED - THREAD STARTED!");
     int loopCount = 0;
     Vertex2D fsQuad[] = {{-1,-1,0,1},{3,-1,2,1},{-1,3,0,-1}};
     MkUpload(g_vbFSQuad, fsQuad, sizeof(fsQuad));
 
     while (true) {
-        Log("[RenderLoop] Loop iteration: g_run=%d, g_ok=%d, g_globalDeviceReady=%d, g_deviceLost=%d",
-            g_run, g_ok, g_globalDeviceReady, g_deviceLost.load());
         // 设备丢失检测 - 必须是循环第一行
         if (g_deviceLost.load() || !g_dev || g_dev->GetDeviceRemovedReason() != S_OK) {
             Log("[RenderLoop] EXIT: Device lost at loop top, g_deviceLost=%d, g_run=%d, g_ok=%d, g_dev=%p, reason=0x%08X",
@@ -1180,7 +1153,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             }
         }
 
-        Log("=== RenderLoop LOOP ITERATION ===");
         if (!g_dev || !g_queue || !g_rtvHeap || !g_srvHeap || !g_alloc || !g_cl) {
             Sleep(16);
             continue;
@@ -1191,19 +1163,13 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             break;
         }
 
-        // ===== 12阶段异步初始化状态机：每阶段独占1帧，创建资源+强制GPU同步，根除TDR =====
+        // ===== 多阶段异步初始化：每阶段创建资源 + Present，避免黑屏 =====
         if (g_initStage < ST_FULL_READY) {
-            // 如果设备已丢失，提前退出
             if (g_deviceLost.load()) {
                 g_run = false;
                 break;
             }
-            //初始化阶段添加同步
-            if(g_fence->GetCompletedValue() < g_fenceVal -1){
-            g_fence->SetEventOnCompletion(g_fenceVal - 1,g_fenceEv);
-            WaitForSingleObject(g_fenceEv,INFINITE);
-            }
-            // 重置命令分配器和列表（为当前帧准备）
+
             HRESULT hr = g_alloc->Reset();
             if (FAILED(hr)) {
                 Log("[ERROR] InitStateMachine: allocator Reset failed at stage %d, hr=0x%08X", (int)g_initStage, hr);
@@ -1219,40 +1185,58 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 break;
             }
 
-            // 清屏准备
-            // auto bb = g_rt[0] replaced with g_offscreenRT
+            // 分阶段资源创建 (内部会 Close g_cl)
+            ProcessNextInitStage();
+
+            // ProcessNextInitStage 关闭了 g_cl，重新 Reset 以录制 Present
+            hr = g_alloc->Reset();
+            if (FAILED(hr)) {
+                Log("[ERROR] InitStateMachine: post-stage allocator Reset failed, hr=0x%08X", hr);
+                g_deviceLost.store(true); g_run = false; break;
+            }
+            hr = g_cl->Reset(g_alloc.Get(), nullptr);
+            if (FAILED(hr)) {
+                Log("[ERROR] InitStateMachine: post-stage cmdList Reset failed, hr=0x%08X", hr);
+                g_deviceLost.store(true); g_run = false; break;
+            }
+
+            // 每阶段结束后 Present 一帧，防止黑屏
+            ComPtr<ID3D12Resource> initBB;
+            g_swap->GetBuffer(g_fi, IID_PPV_ARGS(&initBB));
             D3D12_RESOURCE_BARRIER rb = {};
-        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = g_swap->GetCurrentBackBuffer(g_fi);
-        rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_cl->ResourceBarrier(1, &rb);
-        D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rh.ptr += g_fi * g_rtvSize;
-            float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            g_cl->OMSetRenderTargets(1, &rh, FALSE, nullptr);
-            g_cl->ClearRenderTargetView(rh, clearColor, 0, nullptr);
+            rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb.Transition.pResource = initBB.Get();
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_cl->ResourceBarrier(1, &rb);
+            D3D12_CPU_DESCRIPTOR_HANDLE initRtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            initRtv.ptr += g_fi * g_rtvSize;
+            float initBg[4] = {0.15f, 0.2f, 0.35f, 1.0f};  // 深蓝灰，非纯黑
+            g_cl->OMSetRenderTargets(1, &initRtv, FALSE, nullptr);
+            g_cl->ClearRenderTargetView(initRtv, initBg, 0, nullptr);
             rb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             g_cl->ResourceBarrier(1, &rb);
-
-            // 分阶段资源创建（ProcessNextInitStage 内部会调用 WaitForGpu 执行+同步）
-            ProcessNextInitStage();
+            g_cl->Close();
+            ID3D12CommandList* initLists[] = {g_cl.Get()};
+            g_queue->ExecuteCommandLists(1, initLists);
+            g_swap->Present(1, 0);
+            g_fi = (g_fi + 1) % 2;
 
             // 阶段递增
             g_initStage = (InitStage)((int)g_initStage + 1);
             if (g_initStage >= ST_FULL_READY) {
-                // 清空可能残留的绘制命令（调试用）
                 EnterCriticalSection(&g_stateLock);
                 g_drawChunks.clear();
                 g_imVertCount = 0;
                 g_imVBSize = 0;
                 LeaveCriticalSection(&g_stateLock);
-                Log("[RenderLoop] Cleared all draw chunks before entering main loop.");
                 g_renderInitDone = true;
-                OutputDebugStringA("[INIT] 13-stage init complete, entering normal rendering\n");
+                Log("[RenderLoop] Init complete, entering normal rendering");
             }
+            // 短暂 yield 避免 TDR
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
@@ -1281,8 +1265,8 @@ static DWORD WINAPI RenderLoop(LPVOID) {
             continue;
         }
 
-        // RepositionOverlay() REMOVED: no overlay window
-        CaptureMCFrame();
+        // RepositionOverlay() removed: no overlay window needed
+        // CaptureMCFrame() removed: D3D12 renders directly to MC window
 
         HRESULT hr = g_alloc->Reset();
         if (FAILED(hr)) {
@@ -1296,9 +1280,11 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         }
         g_fi = 0;
 
+        ComPtr<ID3D12Resource> backBuffer;
+        g_swap->GetBuffer(g_fi, IID_PPV_ARGS(&backBuffer));
         D3D12_RESOURCE_BARRIER rb = {};
         rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = g_swap->GetCurrentBackBuffer(g_fi);
+        rb.Transition.pResource = backBuffer.Get();
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -1324,24 +1310,10 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         g_cl->RSSetViewports(1, &vp);
         g_cl->RSSetScissorRects(1, &sc);
 
-        // 诊断：打印当前使用的MVP矩阵（由Java端 nativeSetMvp 设置）
-        if (g_cbData) {
-            float* m = (float*)g_cbData;
-            Log("RenderLoop using MVP: [%.3f %.3f %.3f %.3f]", m[0], m[1], m[2], m[3]);
-            Log("                        [%.3f %.3f %.3f %.3f]", m[4], m[5], m[6], m[7]);
-            Log("                        [%.3f %.3f %.3f %.3f]", m[8], m[9], m[10], m[11]);
-            Log("                        [%.3f %.3f %.3f %.3f]", m[12], m[13], m[14], m[15]);
-        }
+        // ===== 渲染天空 =====
+        Java_com_dx12_DX12LibClient_nativeRenderSky(nullptr, nullptr);
 
-        // Layer 0: MC capture (deprecated - popup window mode doesn't need this)
-
-        // Layer 1: GL geometry
-        {
-            // ===== Layer 0.5: 渲染天空 =====
-            Java_com_dx12_DX12LibClient_nativeRenderSky(nullptr, nullptr);
-            Log("  Sky rendered");
-
-            EnterCriticalSection(&g_stateLock);
+        EnterCriticalSection(&g_stateLock);
             auto chunks = g_drawChunks;
             UINT stateSnapshot = g_glStateBits;
             LeaveCriticalSection(&g_stateLock);
@@ -1355,7 +1327,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     if (g_cbData) {
                         memcpy(g_cbData, g_mvpWorld, sizeof(g_mvpWorld));
                     }
-                    Log("[DrawChunk WORLD] using Java MVP, m[3][2]=%.4f", g_mvpWorld[11]);
                 } else if (ch.vertexType == 1) { // COORD_SCREEN — 使用 Java 正交矩阵
                     if (g_cbData) {
                         memcpy(g_cbData, g_mvpScreen, sizeof(g_mvpScreen));
@@ -1385,10 +1356,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     }
                     g_cbUpload->Unmap(0, &writeRange);
                 }
-                Log("DrawChunk: vertexType=%d (%s), vertices=%d",
-                    ch.vertexType,
-                    ch.vertexType == 0 ? "WORLD" : (ch.vertexType == 1 ? "SCREEN" : "NDC"),
-                    ch.vertexCount);
 
                 UINT state = stateSnapshot;
                 int variantIdx = (int)((state << 1) | (ch.textured ? 1 : 0));
@@ -1428,13 +1395,9 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 chVbv.StrideInBytes = ch.vertexStride;
                 g_cl->IASetVertexBuffers(0, 1, &chVbv);
                 g_cl->IASetPrimitiveTopology(ch.topo);
-                Log("=== DRAW CALL: vertexCount=%d, stride=%d, bytes=%d, buffer=0x%llX, topo=%d",
-                    ch.vertexCount, ch.vertexStride, chVbv.SizeInBytes, chVbv.BufferLocation, ch.topo);
                 // 如果顶点数超过 1024，拆分为多次 Draw 以减轻 GPU 压力
                 const UINT kBatchSize = 1024;
                 if (ch.vertexCount > kBatchSize) {
-                    Log("  Batch splitting: %d vertices → %d batches of %d", ch.vertexCount,
-                        (ch.vertexCount + kBatchSize - 1) / kBatchSize, kBatchSize);
                     for (UINT offset = 0; offset < ch.vertexCount; offset += kBatchSize) {
                         UINT count = (ch.vertexCount - offset < (int)kBatchSize) ? (UINT)(ch.vertexCount - offset) : kBatchSize;
                         D3D12_VERTEX_BUFFER_VIEW batchVbv = chVbv;
@@ -1443,17 +1406,13 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                         g_cl->IASetVertexBuffers(0, 1, &batchVbv);
                         g_cl->DrawInstanced(count, 1, 0, 0);
                     }
-                    Log("  Batch drawing complete");
                 } else {
                     g_cl->DrawInstanced(ch.vertexCount, 1, 0, 0);
                 }
-                Log("  DrawInstanced executed");
             }
-        }
 
         // ===== 渲染半透明物体 =====
         Java_com_dx12_DX12LibClient_nativeRenderTransparent(nullptr, nullptr);
-        Log("  Transparent objects rendered");
 
         EnterCriticalSection(&g_stateLock);
         g_imVertCount = 0;
@@ -1465,7 +1424,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         {
             std::lock_guard<std::mutex> lock(g_entityMutex);
             if (!g_entityList.empty() && g_vbEntityMarker.Get() != nullptr) {
-                Log("  Rendering %zu entity markers", g_entityList.size());
                 ID3D12RootSignature* rs = g_rsSolidVariants[0].Get();
                 if (BuildSolidPSO(0, false) && rs) {
                     g_cl->SetGraphicsRootSignature(rs);
@@ -1515,7 +1473,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
                     g_cl->DrawInstanced(12, 1, 0, 0); // 12 菱形顶点
                 }
-                Log("  Entity markers rendered");
             }
         }
 
@@ -1529,7 +1486,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     g_cl->SetPipelineState(g_psoAlphaBlend.Get());
                     g_cl->SetGraphicsRootConstantBufferView(0, g_cbUpload->GetGPUVirtualAddress());
                 }
-                Log("  Rendering %zu particle draw calls", g_particleDrawCalls.size());
                 for (size_t i = 0; i < g_particleDrawCalls.size(); i++) {
                     auto& dc = g_particleDrawCalls[i];
                     D3D12_VERTEX_BUFFER_VIEW vbView = {};
@@ -1539,13 +1495,9 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                     g_cl->IASetVertexBuffers(0, 1, &vbView);
                     g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     g_cl->DrawInstanced(dc.vertexCount, 1, 0, 0);
-                    Log("  Particle DC[%zu]: %d vertices, type=%s",
-                        i, dc.vertexCount,
-                        dc.type == VERTEX_TYPE_WORLD ? "WORLD" : "SCREEN");
                 }
                 g_particleDrawCalls.clear();
                 g_particlesPending = false;
-                Log("  All particles rendered, draw calls cleared");
             }
         }
 
@@ -1580,7 +1532,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         }
 
         // 强制 GPU 完全空闲后再 Present
-        Log("[RenderLoop] Signaling fence, g_fenceVal=%llu", g_fenceVal);
         HRESULT hrSignal = g_queue->Signal(g_fence.Get(), g_fenceVal);
         if (FAILED(hrSignal)) {
             Log("[ERROR] Signal failed, hr=0x%08X", hrSignal);
@@ -1589,7 +1540,6 @@ static DWORD WINAPI RenderLoop(LPVOID) {
         }
         g_fenceVal++;
         if (g_fence->GetCompletedValue() < g_fenceVal - 1) {
-            Log("[RenderLoop] Waiting for fence %llu", g_fenceVal - 1);
             HRESULT hrEvent = g_fence->SetEventOnCompletion(g_fenceVal - 1, g_fenceEv);
             if (FAILED(hrEvent)) {
                 Log("[ERROR] SetEventOnCompletion failed, hr=0x%08X", hrEvent);
@@ -1602,17 +1552,11 @@ static DWORD WINAPI RenderLoop(LPVOID) {
                 g_run = false;
                 break;
             }
-            Log("[RenderLoop] Fence wait completed");
-        } else {
-            Log("[RenderLoop] GPU already done, no wait needed (completed=%llu, fenceVal-1=%llu)",
-                g_fence->GetCompletedValue(), g_fenceVal - 1);
         }
 
-        // Present 到 overlay 窗口
+        // Present
         HRESULT hrPresent = g_swap->Present(1, 0);
-        if (SUCCEEDED(hrPresent)) {
-            Log("[RenderLoop] Present succeeded, g_fenceVal=%llu", g_fenceVal);
-        } else {
+        if (FAILED(hrPresent)) {
             Log("[RenderLoop] Present failed, reason=0x%08X", hrPresent);
         }
 
@@ -1640,22 +1584,6 @@ static bool InitD3D12(HWND hwndMC) {
     Log("=== INITD3D12 - Direct rendering mode ===");
     Log("=== INITD3D12 V2 START ===");
 
-    // --- 新增：强制清理所有可能的旧覆盖层窗口 ---
-    Log("Forcefully cleaning up any existing overlay windows...");
-    // 枚举所有顶级窗口
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-        wchar_t className[256];
-        if (GetClassNameW(hwnd, className, 256)) {
-            // 如果窗口类名以 "GL4DX12_Overlay" 开头，就销毁它
-            if (wcsstr(className, L"GL4DX12_Overlay") == className) {
-                Log("Found and is destroying old overlay window (Class: %S, HWND: 0x%p)", className, hwnd);
-                DestroyWindow(hwnd);
-            }
-        }
-        return TRUE;
-    }, 0);
-    // --- 强制清理结束 ---
-
     OutputDebugStringA("=== InitD3D12 ENTERED ===\n");
     Log("=== InitD3D12 ENTERED ===");
     Log("=== Init D3D12 on MC window (HWND=0x%p) ===", hwndMC);
@@ -1679,13 +1607,11 @@ static bool InitD3D12(HWND hwndMC) {
     g_h = (UINT)(rc.bottom - rc.top);
     Log("Client rect: %dx%d", g_w, g_h);
 
-    // 创建独立的 D3D12 覆盖子窗口，避免与 MC 的 OpenGL 上下文冲突
-    g_hwndOverlay = CreateOverlayWindow(g_hwndMC);
-    if (!g_hwndOverlay) {
-        Log("Overlay window creation FAILED, falling back to MC window directly");
-        g_hwndOverlay = g_hwndMC;
-    } else {
-        Log("D3D12 overlay child window created successfully on MC window");
+    // Create a hidden child window for SwapChain to avoid OpenGL/D3D12 conflict on same HWND
+    g_hwndHidden = CreateHiddenChildWindow(g_hwndMC, g_w, g_h);
+    if (!g_hwndHidden) {
+        Log("[ERROR] Failed to create hidden child window, falling back to MC window");
+        g_hwndHidden = g_hwndMC;
     }
 
     ComPtr<IDXGIFactory4> dxgi;
@@ -1750,7 +1676,7 @@ static bool InitD3D12(HWND hwndMC) {
     OutputDebugStringA("[nativeInit] === STEP 4: CommandQueue created OK ===\n");
     Log("[nativeInit] === STEP 4: CommandQueue created OK ===");
 
-    // === STEP 5: 创建 SwapChain（绑定到 overlay 窗口，不与 OpenGL 冲突）===
+    // === STEP 5: 创建 SwapChain（直接绑定到 MC 窗口 HWND）===
     Log("[nativeInit] === STEP 5: Creating SwapChain ===");
     {
         DXGI_SWAP_CHAIN_DESC1 sd = {};
@@ -1766,26 +1692,39 @@ static bool InitD3D12(HWND hwndMC) {
         sd.Flags = 0;
 
         ComPtr<IDXGISwapChain1> sc1;
-        HRESULT hrSwap = dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndOverlay, &sd, nullptr, nullptr, &sc1);
+        HRESULT hrSwap = dxgi->CreateSwapChainForHwnd(g_queue.Get(), g_hwndHidden, &sd, nullptr, nullptr, &sc1);
         if (FAILED(hrSwap)) {
             Log("[ERROR] CreateSwapChainForHwnd failed, hr=0x%08X", hrSwap);
             return false;
         }
-        sc1.QueryInterface(IID_PPV_ARGS(&g_swap));
+        sc1.As(&g_swap);
         Log("[nativeInit] === STEP 5: SwapChain created OK ===");
     }
 
+    Log("[nativeInit] === STEP 6: Creating RTV Heap ===");
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC rd = {};
+        rd.NumDescriptors = 2; rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_rtvHeap.GetAddressOf())))) {
+            Log("[ERROR] CreateDescriptorHeap (RTV) failed");
+            return false;
+        }
+        g_rtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
     Log("[nativeInit] === STEP 6: RTV Heap created OK ===");
 
     // === STEP 7: 创建 CBV_SRV_UAV 描述符堆 ===
     Log("[nativeInit] === STEP 7: Creating CBV_SRV_UAV Descriptor Heap ===");
-    rd = {}; rd.NumDescriptors=1; rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    rd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(g_srvHeap.GetAddressOf())))) {
-        Log("[ERROR] CreateDescriptorHeap (CBV_SRV_UAV) failed");
-        return false;
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC srvDesc = {};
+        srvDesc.NumDescriptors = 1; srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dev->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(g_srvHeap.GetAddressOf())))) {
+            Log("[ERROR] CreateDescriptorHeap (CBV_SRV_UAV) failed");
+            return false;
+        }
+        g_srvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
-    g_srvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     OutputDebugStringA("[nativeInit] === STEP 7: SRV Heap created OK ===\n");
     Log("[nativeInit] === STEP 7: SRV Heap created OK ===");
 
@@ -1980,7 +1919,6 @@ static void SafeCleanD3D() {
         g_psoAlphaBlend.Reset();
         g_psoTex.Reset(); g_rsTex.Reset(); g_texSrvHeap.Reset();
         g_texMap.clear(); g_texSlotMap.clear(); g_texSlotNext = 0;
-        for (auto& r : g_rt) r.Reset();
         g_rtvHeap.Reset(); g_srvHeap.Reset();
         g_depthBuf.Reset(); g_dsvHeap.Reset();
         if (g_cbData) { g_cbUpload->Unmap(0, nullptr); g_cbData = nullptr; }
@@ -1994,10 +1932,7 @@ static void SafeCleanD3D() {
     // 4. 关闭同步事件、窗口附属资源
     if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
     if (g_frameDoneEvent)   { CloseHandle(g_frameDoneEvent);   g_frameDoneEvent = nullptr; }
-    if (g_hwndOverlay && g_hwndOverlay != g_hwndMC) {
-        DestroyWindow(g_hwndOverlay);
-        g_hwndOverlay = nullptr;
-    }
+    if (g_hwndHidden) { DestroyWindow(g_hwndHidden); g_hwndHidden = nullptr; }
     g_hwndMC = nullptr;
     OutputDebugStringA("[CLEANUP] D3D资源销毁完成\n");
 }
@@ -2033,9 +1968,11 @@ static void DrawRedTriangle() {
     }
     if (SUCCEEDED(hr)) {
         g_fi = 0;
+        ComPtr<ID3D12Resource> backBuffer;
+        g_swap->GetBuffer(g_fi, IID_PPV_ARGS(&backBuffer));
         D3D12_RESOURCE_BARRIER rb = {};
         rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = g_swap->GetCurrentBackBuffer(g_fi);
+        rb.Transition.pResource = backBuffer.Get();
         rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         rb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -2109,26 +2046,19 @@ static void ProcessNextInitStage() {
 
     switch (g_initStage) {
         case STAGE_BASE_DEVICE:
-            // 基础设备、交换链、RTV/SRV堆、命令分配器、命令列表、Fence 等已在 InitD3D12 中创建
-            // 此阶段仅做日志，不需要额外操作
-            Log("[INIT STAGE] STAGE_BASE_DEVICE - already done by InitD3D12");
+            Log("[INIT] STAGE_BASE_DEVICE - done");
             break;
 
         case ST_CMD_RES:
-            // 命令分配器、命令列表、Fence 已在 InitD3D12 中创建，此处不需要重复
-            Log("[INIT STAGE] ST_CMD_RES - already done");
+            // skip - already done by InitD3D12
             break;
 
         case ST_UI_PSO_CBUF: {
-            // 创建纹理 PSO（用于 MC 捕获显示）
-            Log("[INIT STAGE] ST_UI_PSO_CBUF - creating textured PSO");
+            Log("[INIT] ST_UI_PSO_CBUF - creating PSOs");
             if (!MkPSO()) {
                 Log("[ERROR] MkPSO() failed");
-                g_deviceLost.store(true);
-                g_run = false;
-                return;
+                g_deviceLost.store(true); g_run = false; return;
             }
-            // 创建常量缓冲（如果还没创建的话，实际上 InitD3D12 已创建，但保证只创建一次）
             if (!g_cbUpload) {
                 D3D12_HEAP_PROPERTIES hpCB = {}; hpCB.Type = D3D12_HEAP_TYPE_UPLOAD;
                 D3D12_RESOURCE_DESC rdCB = {};
@@ -2140,130 +2070,68 @@ static void ProcessNextInitStage() {
                     &rdCB, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_cbUpload.GetAddressOf()));
                 if (FAILED(hr)) {
                     Log("[ERROR] CreateCommittedResource for CB failed, hr=0x%08X", hr);
-                    g_deviceLost.store(true);
-                    g_run = false;
-                    return;
+                    g_deviceLost.store(true); g_run = false; return;
                 }
                 hr = g_cbUpload->Map(0, nullptr, (void**)&g_cbData);
                 if (FAILED(hr) || !g_cbData) {
                     Log("[FATAL] Map CB failed, hr=0x%08X", hr);
-                    g_deviceLost.store(true);
-                    g_run = false;
-                    return;
+                    g_deviceLost.store(true); g_run = false; return;
                 }
-                // 初始化为单位矩阵
                 float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
                 memcpy(g_cbData, identity, sizeof(identity));
             }
-            // 创建固体 PSO（默认）
             if (!BuildSolidPSO(0, false)) {
-                Log("[ERROR] BuildSolidPSO(0,false) failed");
-                g_deviceLost.store(true);
-                g_run = false;
-                return;
+                Log("[ERROR] BuildSolidPSO failed"); g_deviceLost.store(true); g_run = false; return;
             }
-            // 创建纹理 PSO（带纹理）
             if (!MkPSOTex()) {
-                Log("[ERROR] MkPSOTex() failed");
-                g_deviceLost.store(true);
-                g_run = false;
-                return;
+                Log("[ERROR] MkPSOTex() failed"); g_deviceLost.store(true); g_run = false; return;
             }
-            Log("[INIT STAGE] ST_UI_PSO_CBUF - completed");
             break;
         }
 
         case ST_3D_PSO_CBUF: {
-            // 创建 3D 管线需要的 PSO 变体（带深度、混合等）
-            Log("[INIT STAGE] ST_3D_PSO_CBUF - creating solid PSO variants");
-            // 预先创建几种常用的状态组合，避免运行时延迟
+            Log("[INIT] ST_3D_PSO_CBUF - creating PSO variants");
             for (UINT state = 0; state < 8; state++) {
-                if (!BuildSolidPSO(state, false)) {
-                    Log("[ERROR] BuildSolidPSO(%d,false) failed", state);
-                    g_deviceLost.store(true);
-                    g_run = false;
-                    return;
-                }
-                if (!BuildSolidPSO(state, true)) {
-                    Log("[ERROR] BuildSolidPSO(%d,true) failed", state);
-                    g_deviceLost.store(true);
-                    g_run = false;
-                    return;
+                if (!BuildSolidPSO(state, false) || !BuildSolidPSO(state, true)) {
+                    Log("[ERROR] BuildSolidPSO(%d) failed", state);
+                    g_deviceLost.store(true); g_run = false; return;
                 }
             }
-            Log("[INIT STAGE] ST_3D_PSO_CBUF - completed");
             break;
         }
 
         case ST_NDC_TEST:
-            Log("[INIT STAGE] ST_NDC_TEST - skipping draw for stability");
-            // DrawRedTriangle(); // 暂时禁用
+            // skip
             break;
 
-        case ST_SKY_TEX: {
-            // 上传天空盒纹理（如果有预设纹理的话，暂时留空，以后可从文件加载）
-            Log("[INIT STAGE] ST_SKY_TEX - no sky texture loaded yet (skip)");
+        case ST_SKY_TEX:
+        case ST_SKY_VB:
+        case ST_ENTITY_STATIC_VB:
+        case ST_INSTANCE_BUFFER:
+        case ST_PARTICLE_RES:
+        case ST_TEXTURE_POOL:
+            // skip - these stages are not yet needed
             break;
-        }
-
-        case ST_SKY_VB: {
-            // 创建天空盒顶点缓冲（目前天空盒使用 CPU 上传临时缓冲，不预先创建）
-            Log("[INIT STAGE] ST_SKY_VB - no static sky VB needed (skip)");
-            break;
-        }
-
-        case ST_ENTITY_STATIC_VB: {
-            // 创建实体标记顶点缓冲（小菱形）
-            Log("[INIT STAGE] ST_ENTITY_STATIC_VB - creating entity marker geometry");
-            if (!g_vbEntityMarker) {
-                CreateEntityMarkerGeometry();
-            }
-            Log("[INIT STAGE] ST_ENTITY_STATIC_VB - completed");
-            break;
-        }
-
-        case ST_INSTANCE_BUFFER: {
-            // 实例缓冲（预留）
-            Log("[INIT STAGE] ST_INSTANCE_BUFFER - skip (not implemented)");
-            break;
-        }
-
-        case ST_PARTICLE_RES: {
-            // 粒子资源（预留）
-            Log("[INIT STAGE] ST_PARTICLE_RES - skip (not implemented)");
-            break;
-        }
-
-        case ST_TEXTURE_POOL: {
-            // 通用贴图池（即 g_texMap 初始化，目前为空）
-            Log("[INIT STAGE] ST_TEXTURE_POOL - done (empty pool)");
-            break;
-        }
 
         case ST_ALPHA_PSO: {
-            // 创建半透明 PSO（用于粒子、天空）
-            Log("[INIT STAGE] ST_ALPHA_PSO - creating alpha blend PSO");
+            Log("[INIT] ST_ALPHA_PSO - creating alpha blend PSO");
             if (!BuildAlphaBlendPSO()) {
                 Log("[ERROR] BuildAlphaBlendPSO() failed");
-                g_deviceLost.store(true);
-                g_run = false;
-                return;
+                g_deviceLost.store(true); g_run = false; return;
             }
-            Log("[INIT STAGE] ST_ALPHA_PSO - completed");
             break;
         }
 
         case ST_FULL_READY:
-            Log("[INIT STAGE] ST_FULL_READY - all resources initialized");
             g_renderInitDone = true;
             break;
 
         default:
-            Log("[INIT STAGE] Unknown stage %d, skipping", (int)g_initStage);
             break;
     }
 
-    // 每个阶段结束后强制 GPU 同步，确保资源真正就绪，防止 TDR
+    // GPU同步确保资源就绪 — 注意：这会关闭 g_cl
+    // 调用者必须在此之后 Reset g_cl 才能继续录制命令
     if (g_queue && g_fence) {
         WaitForGpu();
     }
@@ -2325,45 +2193,17 @@ JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeClearDrawList(JNIEnv*, 
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_DX12LibClient_nativeResize(JNIEnv*, jclass, jint w, jint h) {
-    if (!g_ok || !g_dev) return;
-    if (g_w == (UINT)w && g_h == (UINT)h) {
-        // 即使尺寸没变，也要同步 overlay 位置
-            RECT rc; GetClientRect(g_hwndMC, &rc);
-            POINT pt = {0, 0}; ClientToScreen(g_hwndMC, &pt);
+    if (!g_ok||!g_swap) return;
+    if (g_w == (UINT)w && g_h == (UINT)h) return;
+
+    RecreateOffscreenOnResize((UINT)w, (UINT)h);
+
+    // Resize the hidden child window to match
+    if (g_hwndHidden && g_hwndMC) {
+        RECT rc;
+        if (GetClientRect(g_hwndMC, &rc)) {
+            SetWindowPos(g_hwndHidden, HWND_TOP, 0, 0, (int)(rc.right-rc.left), (int)(rc.bottom-rc.top), SWP_NOZORDER);
         }
-        return;
-    }
-    WaitGPU();
-    for (auto& r : g_rt) r.Reset();
-    g_depthBuf.Reset();
-    g_cl.Reset(); g_alloc.Reset();
-    // Resize handled by offscreen RT recreation
-    g_w=(UINT)w; g_h=(UINT)h; g_fi=0;
-    D3D12_CPU_DESCRIPTOR_HANDLE rh=g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    // Offscreen RT resized in RecreateOffscreenOnResize()
-    g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(g_alloc.GetAddressOf()));
-    g_dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,g_alloc.Get(),0,IID_PPV_ARGS(g_cl.GetAddressOf()));
-    g_cl->Close();
-
-    if (g_dsvFormat != DXGI_FORMAT_UNKNOWN) {
-        D3D12_HEAP_PROPERTIES hpDef = {}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC depthDesc = {};
-        depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        depthDesc.Width = g_w; depthDesc.Height = g_h; depthDesc.DepthOrArraySize = 1;
-        depthDesc.MipLevels = 1; depthDesc.Format = g_dsvFormat;
-        depthDesc.SampleDesc.Count = 1;
-        depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        D3D12_CLEAR_VALUE cv = {}; cv.Format = g_dsvFormat;
-        cv.DepthStencil.Depth = 1.0f;
-        g_dev->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE,
-            &depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(g_depthBuf.GetAddressOf()));
-        g_dev->CreateDepthStencilView(g_depthBuf.Get(), nullptr,
-            g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
-    }
-
-    // 同步 overlay 窗口位置
-        RECT rc; GetClientRect(g_hwndMC, &rc);
-        POINT pt = {0, 0}; ClientToScreen(g_hwndMC, &pt);
     }
 }
 

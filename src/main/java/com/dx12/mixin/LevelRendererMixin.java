@@ -23,8 +23,7 @@ public class LevelRendererMixin {
     private LevelRenderState levelRenderState;
 
     @Inject(method = "renderLevel",
-            at = @At("HEAD"),
-            cancellable = true)
+            at = @At("RETURN"))
     private void onRenderLevel(
             GraphicsResourceAllocator resourceAllocator,
             DeltaTracker deltaTracker,
@@ -39,8 +38,8 @@ public class LevelRendererMixin {
 
         if (!D3D12Bridge.isD3D12Active()) return;
 
-        // Cancel OpenGL rendering — D3D12 renders the frame
-        ci.cancel();
+        // Let MC's OpenGL pipeline run (generates vertex data via BufferBuilderMixin)
+        // D3D12 SwapChain on the same HWND will overwrite OpenGL output
 
         // Delegate full frame to D3D12 bridge
         float partialTick = deltaTracker.getGameTimeDeltaPartialTick(false);
