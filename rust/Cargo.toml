@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "wgpu-mc",
+    "wgpu-mc-jni",
+]
+resolver = "2"

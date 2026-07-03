@@ -1,0 +1,17 @@
+[package]
+name = "wgpu-mc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "23"
+bytemuck = { version = "1.14", features = ["derive"] }
+log = "0.4"
+env_logger = "0.10"
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
+[dev-dependencies]
+winit = "0.30"

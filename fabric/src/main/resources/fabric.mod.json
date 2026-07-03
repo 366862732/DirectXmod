@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "gl4dx12",
+  "version": "${version}",
+  "name": "GL4DX12",
+  "description": "OpenGL to DirectX 12 bridge using wgpu rendering engine",
+  "authors": [
+    "dx12-team"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "icon": "assets/gl4dx12/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "client": [
+      "com.dx12.Dx12Mod"
+    ]
+  },
+  "mixins": [
+    "mixins.gl4dx12.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~26.1.2",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "flamingo": "*"
+  }
+}
