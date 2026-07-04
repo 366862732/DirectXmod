@@ -8,10 +8,4 @@ wgpu = "23"
 bytemuck = { version = "1.14", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
-
-[[example]]
-name = "simple"
-path = "examples/simple.rs"
-
-[dev-dependencies]
-winit = "0.30"
+futures = "0.3"

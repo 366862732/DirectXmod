@@ -12,11 +12,11 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _cla
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHello(
-    env: JNIEnv,
-    _class: JClass,
-    input: JString,
-) -> JString {
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHello<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    input: JString<'a>,
+) -> JString<'a> {
     let input_str: String = env
         .get_string(&input)
         .expect("Couldn't get Java string")
@@ -25,17 +25,19 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHello(
     log::info!("Java said: {}", input_str);
 
     let response = format!("Hello from Rust wgpu! You said: {}", input_str);
-    env.new_string(&response).unwrap().into_inner()
+    env.new_string(&response).expect("Failed to create Java string")
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo(
-    env: JNIEnv,
-    _class: JClass,
-) -> JString {
-    let info = format!(
-        "wgpu-mc-jni loaded on {}. Graphics: DX12 available via wgpu.",
-        cfg!(target_os = "windows")
-    );
-    env.new_string(&info).unwrap().into_inner()
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+) -> JString<'a> {
+    let has_dx12 = wgpu_mc::WmRenderer::check_gpu_availability();
+    let info = if has_dx12 {
+        "wgpu-mc-jni loaded. DX12 adapter: AVAILABLE"
+    } else {
+        "wgpu-mc-jni loaded. DX12 adapter: NOT FOUND"
+    };
+    env.new_string(info).expect("Failed to create Java string")
 }

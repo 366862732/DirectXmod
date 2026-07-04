@@ -1,6 +1,5 @@
 plugins {
-    id 'fabric-loom' version '1.10.3'
-    id 'maven-publish'
+    id 'java'
 }
 
 version = project.mod_version
@@ -11,44 +10,18 @@ base {
 }
 
 repositories {
-    // Add repositories to retrieve artifacts from in here.
-    // You need only look here to add any special repositories for your dependencies
+    mavenCentral()
 }
 
-dependencies {
-    // To change the versions please see the gradle.gradle file
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
-    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
-
-    // Fabric API. This is really just a convenience helper mod,
-    // everything else in there can be done with installed network
-    // providers and their own chosen dependency managers
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-}
-
-apply from: 'gradle.properties'
-
-processResources {
-    inputs.property 'version', project.version
-    filesMatching('fabric.mod.json') {
-        expand 'version': project.version
-    }
-}
+// Just compile Java code - no Fabric API dependency for now
+// The JAR will be manually placed in .minecraft/mods/
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.release = 21
-}
-
-java {
-    withSourcesJar()
-
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    options.release = 21
 }
 
 jar {
-    from('LICENSE') {
-        rename { "${it}_${project.base.archivesName.get()}"}
+    from('src/main/resources') {
+        include '*.json'
     }
 }
