@@ -1,13 +1,13 @@
 package com.dx12;
 
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWNativeWin32;
+
 /**
  * JNI bridge for wgpu-mc Rust library.
  * Loads the native DLL and provides methods for Rust communication.
  */
 public class D3D12Bridge {
-    // The Rust JNI library name (without lib/extension prefix)
-    // On Windows: wgpu_mc_jni.dll
-    // On Linux: libwgpu_mc_jni.so
     static {
         String libName;
         String os = System.getProperty("os.name").toLowerCase();
@@ -58,9 +58,16 @@ public class D3D12Bridge {
     /** Get device info string from Rust side */
     public static native String nativeTestDeviceInfo();
 
+    /** Set the Minecraft window HWND for wgpu surface creation */
+    public static native void nativeSetWindow(long hwnd);
+
+    /** Render a single frame via Rust/wgpu backend */
+    public static native void nativeRenderFrame();
+
     // === Convenience methods ===
 
     private static boolean initialized = false;
+    private static long cachedHwnd = 0;
 
     public static void init() {
         if (initialized) return;
@@ -86,5 +93,41 @@ public class D3D12Bridge {
     public static String getDeviceInfo() {
         if (!initialized) init();
         return nativeTestDeviceInfo();
+    }
+
+    /**
+     * Get the current Minecraft window HWND via LWJGL GLFW.
+     * Returns 0 if not available.
+     */
+    public static long getWindowHandle() {
+        long glfwWindow = GLFW.glfwGetCurrentContext();
+        if (glfwWindow == 0) {
+            return 0;
+        }
+        return GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+    }
+
+    /**
+     * Set the window HWND for wgpu surface creation.
+     * Called once during initialization.
+     */
+    public static void setWindow(long hwnd) {
+        if (hwnd == 0) return;
+        if (cachedHwnd == hwnd) return; // Already set
+        cachedHwnd = hwnd;
+        nativeSetWindow(hwnd);
+        com.dx12.Dx12Mod.LOGGER.info("Set wgpu window HWND: 0x{:016x}", hwnd);
+    }
+
+    /**
+     * Render a single frame via the Rust/wgpu backend.
+     */
+    public static void renderFrame() {
+        if (!initialized) return;
+        try {
+            nativeRenderFrame();
+        } catch (UnsatisfiedLinkError e) {
+            com.dx12.Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
+        }
     }
 }

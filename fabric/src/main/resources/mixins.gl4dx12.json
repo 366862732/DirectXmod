@@ -3,7 +3,9 @@
   "package": "com.dx12.mixin",
   "compatibilityLevel": "JAVA_21",
   "minVersion": "0.8",
-  "client": [],
+  "client": [
+    "GameRendererMixin"
+  ],
   "mixins": [],
   "injectors": {
     "defaultRequire": 1
