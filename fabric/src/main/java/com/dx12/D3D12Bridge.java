@@ -12,24 +12,22 @@ public class D3D12Bridge {
         String libName;
         String os = System.getProperty("os.name").toLowerCase();
         if (os.contains("win")) {
-            libName = "wgpu_mc_jni";
+            libName = "wgpu_mc_jni.dll";
         } else if (os.contains("linux")) {
-            libName = "wgpu_mc_jni";
+            libName = "libwgpu_mc_jni.so";
         } else if (os.contains("mac")) {
-            libName = "wgpu_mc_jni";
+            libName = "libwgpu_mc_jni.dylib";
         } else {
             libName = "wgpu_mc_jni";
         }
-        try {
+        
+        // Try loading from the same directory as the JAR first
+        String dllPath = getDllPath();
+        if (dllPath != null) {
+            System.load(dllPath);
+        } else {
+            // Fallback: try from library path
             System.loadLibrary(libName);
-        } catch (UnsatisfiedLinkError e) {
-            // DLL might not be in library path; try explicit path
-            String dllPath = getDllPath();
-            if (dllPath != null) {
-                System.load(dllPath);
-            } else {
-                throw e;
-            }
         }
     }
 
@@ -43,7 +41,7 @@ public class D3D12Bridge {
         for (String path : candidates) {
             java.io.File f = new java.io.File(path);
             if (f.exists()) {
-                return path;
+                return f.getAbsolutePath();
             }
         }
         return null;
