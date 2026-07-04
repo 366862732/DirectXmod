@@ -1,4 +1,4 @@
-# wgpu-mc — Minecraft D3D12 渲染引擎 (Rust + wgpu)
+# GL4DX12 — Minecraft wgpu/DX12 渲染模组
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Fabric](https://img.shields.io/badge/Mod%20Loader-Fabric-blueviolet)](https://fabricmc.net/)
@@ -6,19 +6,21 @@
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org/)
 [![wgpu](https://img.shields.io/badge/wgpu-23-blue)](https://wgpu.rs/)
 
-> 为 Minecraft Java Edition 1.21.1 实现的 DirectX 12 渲染后端，通过 Rust + wgpu 渲染引擎 + JNI 桥接，将 OpenGL 渲染替换为 D3D12，以提升图形性能并降低 TDR 风险。
+> 为 Minecraft Java Edition 1.21.1 实现的 DirectX 12 渲染后端，通过 Rust + wgpu + JNI 桥接，将 OpenGL 渲染替换为 D3D12/WebGPU，以解决 TDR 崩溃问题并提升图形性能。
 
 ---
 
-## 目录
+## 📖 目录
 
 - [项目概述](#项目概述)
 - [架构设计](#架构设计)
-- [功能状态](#功能状态)
+- [项目状态](#项目状态)
+- [变更日志](#变更日志)
 - [技术栈](#技术栈)
 - [构建与运行](#构建与运行)
-- [开发路线图](#开发路线图)
-- [常见问题](#常见问题)
+- [配置方法](#配置方法)
+- [使用指引](#使用指引)
+- [路线图](#路线图)
 - [贡献指南](#贡献指南)
 - [许可证](#许可证)
 
@@ -26,127 +28,182 @@
 
 ## 项目概述
 
-**wgpu-mc** 是一个 Fabric 模组，通过 Rust + wgpu 渲染引擎实现 Minecraft 的 DirectX 12 后端。项目采用三层架构：
+**GL4DX12** 是一个 Fabric 模组，通过 Rust + wgpu 实现 DirectX 12 渲染后端，利用 JNI（Java Native Interface）桥接 Minecraft 的 Java 层与本地渲染引擎。
 
-```
-Java Fabric Mod ↔ JNI Bridge (Rust DLL) ↔ wgpu 渲染引擎
-```
+### 为什么重构为 Rust + wgpu？
 
-### 为什么要用 Rust + wgpu？
+| 旧方案 (C++/D3D12) | 新方案 (Rust/wgpu) |
+|---------------------|---------------------|
+| 手动管理 D3D12 资源 | wgpu 自动资源管理 |
+| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | 独立表面 (independent surface) 架构 |
+| 内存安全依赖开发者 | Rust 编译器保证内存安全 |
+| 复杂的 C++ 构建配置 | Cargo 依赖管理 |
+| TDR 崩溃频发 | 架构层面规避 TDR |
 
-- **跨平台**：wgpu 基于 WebGPU 标准，一次编写可在 Windows/Linux/macOS 运行
-- **安全性**：Rust 内存安全，避免 C++ 常见的 UAF/野指针问题
-- **现代图形 API**：wgpu 自动选择最佳后端（DX12/Vulkan/Metal）
-- **低 TDR 风险**：wgpu 内部优化资源加载和 GPU 同步
+### 核心优势
 
-### 迁移历史
-
-| 阶段 | 技术栈 | 状态 |
-|------|--------|------|
-| 第一阶段 (已废弃) | C++/D3D12 + JNI | 存在 OpenGL/D3D12 共享 HWND 冲突，导致 GPU 设备移除崩溃 |
-| 第二阶段 (当前) | Rust/wgpu + JNI | 独立渲染管线，避免 GPU 冲突 |
+- **内存安全**：Rust 编译器在编译期消除 use-after-free、数据竞争等常见 bug
+- **跨平台**：wgpu 抽象层支持 DX12/Vulkan/Metal，一次编写多平台运行
+- **高性能**：WebGPU 标准驱动的现代 GPU API，接近原生 C++ 性能
+- **易维护**：Cargo 生态系统 + 类型系统降低长期维护成本
 
 ---
 
 ## 架构设计
 
-### 项目结构
+### 三层架构
 
 ```
-DirectXmod-wgpu/
-├── fabric/                    # Fabric 模组 (Java)
-│   ├── src/main/java/com/dx12/
-│   │   ├── Dx12Mod.java      # 模组入口 (ClientModInitializer)
-│   │   └── D3D12Bridge.java  # JNI 桥接封装
-│   ├── src/main/resources/
-│   │   ├── fabric.mod.json   # Fabric 模组配置
-│   │   └── mixins.gl4dx12.json
-│   ├── build.gradle          # Fabric Loom 构建配置
-│   └── gradle.properties
-├── rust/                      # Rust 渲染引擎
-│   ├── Cargo.toml            # Workspace 配置
-│   ├── wgpu-mc/              # 核心渲染库
-│   │   ├── src/lib.rs        # WmRenderer 骨架
-│   │   └── Cargo.toml
-│   └── wgpu-mc-jni/          # JNI 桥接层
-│       ├── src/lib.rs        # native 函数导出
-│       └── Cargo.toml
-└── README.md
+┌─────────────────────────────────────────────────────────────┐
+│              Minecraft 1.21.1 (Fabric)                      │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  Dx12Mod.java (ClientModInitializer)                 │ │
+│  │  • 模组入口点                                         │ │
+│  │  • 初始化 JNI 桥接                                    │ │
+│  │  • 测试 Rust 通信                                     │ │
+│  └─────────────────────┬─────────────────────────────────┘ │
+│                        ▼                                   │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │  D3D12Bridge.java (JNI 封装层)                       │ │
+│  │  • 动态加载 wgpu_mc_jni.dll                           │ │
+│  │  • nativeInit() / nativeHello() / nativeTestDeviceInfo()│
+│  └─────────────────────┬─────────────────────────────────┘ │
+│                        ▼                                   │
+└────────────────────────┼──────────────────────────────────┘
+                         │ JNI (Java Native Interface)
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│         wgpu_mc_jni.dll (Rust JNI Bridge)                  │
+│  • Java_com_dx12_D3D12Bridge_nativeInit()                  │
+│  • Java_com_dx12_D3D12Bridge_nativeHello()                 │
+│  • Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo()        │
+│  • 日志: env_logger + log                                  │
+└────────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│         wgpu-mc (Rust 渲染引擎核心)                         │
+│  • WmRenderer::check_gpu_availability()                     │
+│  • DX12 适配器检测                                          │
+│  • 未来: Surface 绑定、渲染管线、RenderGraph                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 渲染流程
+### 渲染流程 (当前阶段)
 
 ```
-1. Minecraft 启动 → Fabric Loader 加载模组
+1. Minecraft 启动 → Dx12Mod.onInitializeClient()
    ↓
-2. Dx12Mod.onInitializeClient() 初始化
-   ├─ D3D12Bridge.init() → JNI 加载 wgpu_mc_jni.dll
-   ├─ D3D12Bridge.sayHello() → 测试 JNI 通信
-   └─ D3D12Bridge.getDeviceInfo() → 检测 DX12 适配器
+2. D3D12Bridge.init() → System.load("wgpu_mc_jni.dll")
    ↓
-3. wgpu 检测 GPU 可用性
-   ├─ Instance::new() 创建 wgpu 实例
-   ├─ request_adapter() 查找 DX12/Vulkan 适配器
-   └─ 返回适配器信息给 Java
+3. nativeInit() → Rust env_logger::init()
    ↓
-4. (未来) Mixin 拦截 LevelRenderer.renderLevel()
-   ├─ 取消 OpenGL 渲染
-   ├─ 传递顶点/纹理数据到 Rust
-   └─ wgpu 渲染到独立窗口
+4. nativeHello("Hello from Minecraft!") → 返回 "Hello from Rust wgpu! ..."
+   ↓
+5. nativeTestDeviceInfo() → 检测 DX12 适配器可用性
+   ↓
+6. 模组初始化完成，Minecraft 正常运行
 ```
 
 ---
 
-## 功能状态
+## 项目状态
 
-### ✅ 已完成
+### 当前阶段：第一阶段完成 ✅
+
+| 状态 | 说明 |
+|------|------|
+| **阶段 1** | **已完成** — JNI 通信链路打通，Java ↔ Rust 双向通信正常 |
+| **阶段 2** | 进行中 — wgpu 渲染引擎骨架开发 |
+| **阶段 3** | 待开始 — Minecraft Mixin 集成 |
+| **阶段 4** | 待开始 — 功能完善与优化 |
+
+### 已完成功能
 
 | 模块 | 说明 |
 |------|------|
-| **JNI 通信链路** | Java ↔ Rust 双向通信完全打通 |
-| **wgpu 核心骨架** | WmRenderer 初始化 + GPU 适配器检测 |
-| **Fabric 模组** | MC 1.21.1 + Fabric Loom 1.10.3 编译通过 |
-| **DLL 加载器** | 自动搜索 dx12mod/wgpu_mc_jni.dll 路径 |
-| **日志系统** | env_logger + log 跨语言日志 |
-| **构建自动化** | Gradle + Cargo 双构建系统 |
+| **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
+| **JNI 桥接层** | 3 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo` |
+| **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 1.21.1，Fabric API 0.116.6 |
+| **DLL 自动加载** | 多级路径搜索策略，支持 `dx12mod/` 目录部署 |
+| **GPU 适配器检测** | 通过 wgpu 检测系统 DX12/Vulkan 适配器可用性 |
+| **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
 
-### 🟡 开发中 (当前卡点)
+### 开发中
 
-| 卡点 | 严重性 | 说明 |
+| 任务 | 优先级 | 说明 |
 |------|--------|------|
-| **MC 窗口集成** | 🔴 最高 | 需要获取 MC 的 GLFW HWND 并创建 wgpu Surface |
-| **顶点数据传递** | 🟠 高 | BufferBuilder 拦截 + 顶点格式解析待实现 |
-| **渲染管线** | � 高 | terrain/sky/entities/particles 渲染 Pass 未实现 |
+| **wgpu Surface 绑定** | 🔴 P0 | 获取 MC 窗口 HWND 并创建 wgpu Surface |
+| **独立测试程序** | 🟠 P1 | `examples/simple.rs` 弹出窗口渲染三角形 |
+| **WGSL 着色器** | 🟠 P1 | 基础地形/天空/粒子着色器 |
 
-### ❌ 未开始
+### 待开始
 
-- Shader 系统 (WGSL 着色器)
+- 多 Pass 分层渲染 (GUI/3D 场景分离)
 - RenderGraph 配置驱动管线
-- 顶点数据压缩 (BlockstateKey/Palette)
-- 后处理效果 (抗锯齿、色彩校正)
+- 顶点数据压缩 (BlockstateKey)
+- Shader 后处理 (抗锯齿、色彩校正)
+
+---
+
+## 变更日志
+
+### [0.1.0] - 2026-07-04
+
+#### Added
+- Rust + wgpu 项目结构 (workspace + wgpu-mc + wgpu-mc-jni)
+- Fabric 模组项目 (MC 1.21.1 + Fabric Loom 1.10.3)
+- JNI 桥接层：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`
+- Java 端 `D3D12Bridge` 类：DLL 自动加载 + 路径搜索
+- GPU 适配器检测功能
+- WGSL 基础着色器模板
+- C++ 源码归档 (`cpp_sources_backup.zip`)
+
+#### Changed
+- 从 C++/D3D12 方案重构为 Rust/wgpu 方案
+- MC 版本从 26.1.2 降级到 1.21.1 (获得完整 Fabric API 支持)
+- Gradle 配置：使用 JDK 21 编译 (解决 JDK 25 兼容性问题)
+
+#### Fixed
+- OpenGL + D3D12 共享 HWND 导致的 GPU 设备移除崩溃
+- Gradle wrapper SSL 证书问题
+- JNI 库加载路径问题
+
+#### Removed
+- 废弃的 C++ 构建配置 (已归档)
 
 ---
 
 ## 技术栈
 
-### Java 端
+### Java 端 (Fabric 模组)
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
 | `com.mojang:minecraft` | 1.21.1 | Minecraft 游戏代码 |
 | `net.fabricmc:fabric-loader` | 0.16.9 | Fabric 模组加载器 |
-| `net.fabricmc:fabric-api` | 0.116.6+1.21.1 | Fabric API |
-| `org.slf4j:slf4j-api` | - | 日志接口 |
+| `net.fabricmc.fabric-api:fabric-api` | 0.116.6 | Fabric API 基础 |
+| `net.fabricmc:sponge-mixin` | 0.17.3 | Mixin 注入框架 |
+| `org.slf4j:slf4j-api` | - | Java 日志 |
 
 ### Rust 端
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
-| `wgpu` | 23 | 跨平台图形渲染 |
+| `wgpu` | 23 | WebGPU 图形库 |
 | `jni` | 0.21 | Java Native Interface |
-| `log` / `env_logger` | 0.4 / 0.10 | 跨语言日志 |
 | `bytemuck` | 1.14 | 安全字节处理 |
-| `futures` | 0.3 | 异步转同步 |
+| `log` / `env_logger` | 0.4 / 0.10 | 日志系统 |
+| `futures` | 0.3 | 异步支持 |
+
+### 构建工具
+
+| 工具 | 版本 | 用途 |
+|------|------|------|
+| Gradle | 8.13 | Java 构建 |
+| Fabric Loom | 1.10.3 | Minecraft 模组编译 |
+| Cargo | Rust 1.75+ | Rust 构建 |
+| JDK | 21 | Java 编译 (JDK 25 不兼容) |
 
 ---
 
@@ -155,148 +212,230 @@ DirectXmod-wgpu/
 ### 系统要求
 
 - **Windows 10/11** (x64)
-- **Java 21+** (推荐 JDK 21)
-- **Rust 1.70+** (stable)
-- **Gradle 8.13+** (或通过 wrapper)
-- **Minecraft 1.21.1** + Fabric Loader 0.19.3
+- **JDK 21** (推荐 BellSoft Liberica JDK 或 Adoptium)
+- **Rust 1.75+** (stable)
+- **Gradle 8.13** (或通过 wrapper)
 
-### 快速开始
+### 环境配置
 
-#### 1. 编译 Rust 端
-
-```bash
-cd rust
-cargo build --release
-```
-
-生成的 DLL 位于：
-```
-rust\target\release\wgpu_mc_jni.dll
-```
-
-#### 2. 编译 Java 端
-
-```bash
-cd fabric
-gradle clean build
-```
-
-生成的 JAR 位于：
-```
-fabric\build\libs\gl4dx12-0.1.0.jar
-```
-
-#### 3. 部署到 Minecraft
+#### 1. 安装 Rust
 
 ```powershell
-# 复制 JAR 到 mods 目录
-Copy-Item fabric\build\libs\gl4dx12-0.1.0.jar `
-  "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\mods\"
-
-# 复制 DLL 到 dx12mod 目录
-Copy-Item rust\target\release\wgpu_mc_jni.dll `
-  "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\"
+# 从 https://rustup.rs/ 下载安装，或：
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable
+rustup component add rust-analyzer rust-src
 ```
 
-#### 4. 启动游戏
+#### 2. 安装 JDK 21
 
-使用 PCLCE 或其他 Fabric 启动器加载 `1.21.1-Fabric_0.19.3` 版本。
+```powershell
+# 确认 Java 版本
+java -version
+# 应输出 Java 21.x.x
 
-启动日志应显示：
+# 如未安装，推荐使用 BellSoft Liberica JDK:
+# https://bell-sw.com/pages/downloads/?version=java-21&os=Windows+amd64
+```
+
+#### 3. 配置环境变量 (可选)
+
+```powershell
+# 设置 JAVA_HOME (如果尚未设置)
+$env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.10"
+```
+
+### 构建步骤
+
+#### 方式 A：分别构建 (推荐调试用)
+
+```powershell
+# 1. 构建 Rust DLL
+cd rust
+cargo build --release
+
+# 生成的 DLL 位于: target\release\wgpu_mc_jni.dll
+
+# 2. 构建 Fabric 模组
+cd ..\fabric
+gradlew build
+
+# 生成的 JAR 位于: build\libs\gl4dx12-0.1.0.jar
+```
+
+#### 方式 B：一键构建
+
+```powershell
+# 在项目根目录
+cd fabric
+gradlew clean build --no-daemon
+```
+
+### 部署到 Minecraft
+
+```powershell
+# 1. 复制 JAR 到 mods 目录
+copy fabric\build\libs\gl4dx12-0.1.0.jar ^
+     "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\mods\"
+
+# 2. 复制 DLL 到 dx12mod 目录
+copy rust\target\release\wgpu_mc_jni.dll ^
+     "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\"
+
+# 3. 启动 Minecraft 1.21.1-Fabric_0.19.3
+```
+
+### 验证安装
+
+启动游戏后，检查日志应看到：
+
 ```
 [INFO] GL4DX12 Mod initializing...
+[INFO] Using wgpu + Rust rendering engine (independent surface approach)
+[INFO] [D3D12Bridge] Rust JNI library loaded and initialized.
 [INFO] Rust responded: Hello from Rust wgpu! You said: Hello from Minecraft!
 [INFO] Device info: wgpu-mc-jni loaded. DX12 adapter: AVAILABLE
 [INFO] GL4DX12 Mod initialized successfully!
 ```
 
-### 开发模式
-
-#### 启用详细日志
-
-```bash
-# Rust 端日志
-set RUST_LOG=debug
-cargo build --release
-
-# Java 端日志
-# 在 Fabric 启动器中添加 JVM 参数:
-# -Dorg.slf4j.simpleLogger.defaultLogLevel=DEBUG
-```
-
-#### 重新编译单个组件
-
-```bash
-# 只编译 Rust
-cd rust && cargo build --release
-
-# 只编译 Java
-cd fabric && gradle build --rerun-tasks
-```
-
 ---
 
-## 开发路线图
+## 配置方法
 
-### 第一阶段：JNI 通信链路 ✅ (已完成)
+### Minecraft 版本配置
 
-- [x] Rust wgpu 项目初始化
-- [x] JNI 桥接层实现
-- [x] Fabric 模组编译
-- [x] Java ↔ Rust 双向通信验证
-- [x] GPU 适配器检测
+编辑 `fabric/gradle.properties`：
 
-### 第二阶段：wgpu 渲染引擎骨架 (进行中)
-
-- [ ] WmRenderer 完整实现
-- [ ] 独立窗口测试 (winit)
-- [ ] WGSL 着色器基础框架
-- [ ] 三角形/纯色渲染验证
-
-### 第三阶段：Minecraft 集成 (计划中)
-
-- [ ] Mixin 拦截 LevelRenderer.renderLevel()
-- [ ] GLFW HWND 获取与 Surface 绑定
-- [ ] 顶点数据传递 (BufferBuilder 拦截)
-- [ ] MVP 矩阵同步
-
-### 第四阶段：功能完善 (长期)
-
-- [ ] 区块渲染 (terrain pass)
-- [ ] 天空盒渲染 (sky pass)
-- [ ] 实体渲染 (entity pass)
-- [ ] 粒子系统 (particle pass)
-- [ ] 半透明物体深度排序
-- [ ] RenderGraph 配置驱动管线
-
----
-
-## 常见问题
-
-### Q: 启动时提示 `UnsatisfiedLinkError: wgpu_mc_jni.dll`
-
-**A:** 确保 DLL 文件位于：
-```
-.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\wgpu_mc_jni.dll
-```
-
-### Q: GPU 适配器检测失败
-
-**A:** 检查：
-1. 显卡驱动是否为最新版
-2. 是否支持 DX12 (Win10+ 默认支持)
-3. 查看 Rust 日志：`set RUST_LOG=debug`
-
-### Q: 编译失败 `Unsupported class file major version 69`
-
-**A:** 在 `fabric/gradle.properties` 中设置：
 ```properties
-org.gradle.java.home=C:\\Program Files\\Java\\jdk-21.0.10
+minecraft_version=1.21.1
+yarn_mappings=1.21.1+build.3
+loader_version=0.16.9
+fabric_version=0.116.6+1.21.1
 ```
 
-### Q: 为什么从 C++ 迁移到 Rust？
+### Rust 构建配置
 
-**A:** C++ 方案存在 OpenGL/D3D12 共享同一 HWND 导致的 GPU 设备移除崩溃问题。Rust + wgpu 通过独立的渲染管线避免了这一冲突，同时获得更好的安全性和跨平台能力。
+编辑 `rust/wgpu-mc-jni/Cargo.toml` 调整依赖：
+
+```toml
+[dependencies]
+jni = "0.21"
+log = "0.4"
+env_logger = "0.10"
+wgpu-mc = { path = "../wgpu-mc" }
+```
+
+### DLL 加载路径
+
+`D3D12Bridge.java` 按以下顺序搜索 DLL：
+
+1. `dx12mod/wgpu_mc_jni.dll` (相对于 MC 工作目录)
+2. `.minecraft/dx12mod/wgpu_mc_jni.dll`
+3. `<user.dir>/dx12mod/wgpu_mc_jni.dll`
+
+如需自定义路径，修改 `getDllPath()` 方法。
+
+### 日志级别控制
+
+```powershell
+# Rust 端日志 (通过环境变量)
+$env:RUST_LOG = "debug"  # 或 info, warn, error
+java -jar minecraft.jar
+
+# Java 端日志 (通过 logback.xml 或 fabric 配置)
+```
+
+---
+
+## 使用指引
+
+### 快速开始
+
+1. 按照 [构建与运行](#构建与运行) 章节完成构建
+2. 将 JAR 和 DLL 部署到 Minecraft 目录
+3. 启动 Minecraft 1.21.1-Fabric_0.19.3
+4. 观察控制台日志确认模组加载成功
+5. 进入游戏验证 (当前阶段为纯初始化，无渲染输出)
+
+### 调试技巧
+
+#### 检查 Rust DLL 是否加载
+
+```powershell
+# 确认 DLL 文件存在
+dir "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\wgpu_mc_jni.dll"
+
+# 检查 DLL 依赖 (需 Dependency Walker 或 dumpbin)
+dumpbin /dependents rust\target\release\wgpu_mc_jni.dll
+```
+
+#### 查看 Rust 日志
+
+```powershell
+# 设置日志级别
+$env:RUST_LOG = "debug"
+
+# 运行 Minecraft (日志输出到 latest.log)
+```
+
+#### 验证 JNI 通信
+
+模组启动时会自动执行以下测试：
+- `nativeInit()` — 初始化 Rust 环境
+- `nativeHello("Hello from Minecraft!")` — 双向字符串传递
+- `nativeTestDeviceInfo()` — GPU 适配器检测
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| `NoClassDefFoundError: net/minecraft/client/Minecraft` | JAR 版本过旧 | 重新编译并复制最新 JAR |
+| `UnsatisfiedLinkError: wgpu_mc_jni.dll` | DLL 路径不正确 | 确认 DLL 在 `dx12mod/` 目录下 |
+| `Unsupported class file major version 69` | JDK 版本不匹配 | 使用 JDK 21 编译 (非 JDK 25) |
+| `Incompatible mods found!` | fabric.mod.json 版本声明错误 | 确认 `"minecraft": "~1.21.1"` |
+
+---
+
+## 路线图
+
+### 阶段 1：JNI 通信链路 ✅ 已完成
+
+| 任务 | 状态 |
+|------|------|
+| Rust Workspace 搭建 | ✅ |
+| JNI 桥接层实现 | ✅ |
+| Java Fabric 模组 | ✅ |
+| DLL 自动加载 | ✅ |
+| GPU 适配器检测 | ✅ |
+
+### 阶段 2：wgpu 渲染引擎骨架 🚧 进行中
+
+| 任务 | 优先级 | 说明 |
+|------|--------|------|
+| Surface 绑定 | 🔴 P0 | 获取 MC 窗口 HWND 并创建 wgpu Surface |
+| 独立测试程序 | 🟠 P1 | `examples/simple.rs` 弹出窗口渲染 |
+| WGSL 着色器 | 🟠 P1 | 基础地形/天空/粒子着色器 |
+| 顶点缓冲区 | 🟡 P2 | 顶点数据传输与渲染 |
+
+### 阶段 3：Minecraft Mixin 集成 ⏳ 待开始
+
+| 任务 | 优先级 | 说明 |
+|------|--------|------|
+| LevelRenderer 拦截 | 🔴 P0 | 取消 OpenGL 渲染，调用 Rust |
+| 窗口句柄传递 | 🟠 P1 | GLFW → HWND → wgpu Surface |
+| 顶点数据传递 | 🟠 P1 | MC 顶点 → Rust 缓冲区 |
+| 纹理上传 | 🟡 P2 | MC 纹理 → DX12 SRV |
+
+### 阶段 4：功能完善 🗓 持续迭代
+
+| 任务 | 优先级 | 说明 |
+|------|--------|------|
+| RenderGraph | 🔴 P0 | 配置驱动渲染管线 |
+| 半透明排序 | 🟠 P1 | Alpha 混合 + 深度排序 |
+| 天空盒渲染 | 🟠 P1 | 昼夜循环 + 云层 |
+| 粒子系统 | 🟡 P2 | 帧动画 + 透明度渐变 |
+| 实体渲染 | 🟡 P2 | 骨骼蒙皮 + 动画 |
+| 后处理特效 | 🟢 P3 | 抗锯齿 + 色彩校正 |
 
 ---
 
@@ -310,12 +449,24 @@ org.gradle.java.home=C:\\Program Files\\Java\\jdk-21.0.10
 
 ### 当前可认领的任务
 
-| 任务 | 优先级 | 说明 |
-|------|--------|------|
-| MC 窗口集成 | 🔴 P0 | 获取 GLFW HWND 并创建 wgpu Surface |
-| 顶点数据拦截 | 🔴 P0 | BufferBuilder Mixin 实现 |
-| WGSL 着色器 | 🟠 P1 | terrain/sky 基础着色器 |
-| 独立窗口测试 | 🟠 P1 | winit 示例程序 |
+| 任务 | 难度 | 说明 |
+|------|------|------|
+| Surface 绑定 (HWND → wgpu) | 高 | 核心任务，需了解 raw-window-handle |
+| 独立测试程序 | 中 | winit + wgpu 基础示例 |
+| WGSL 着色器 | 中 | 地形/天空/粒子着色器实现 |
+| RenderGraph 设计 | 高 | YAML 配置解析 + 管线构建 |
+
+### 贡献者激励
+
+1. **源码永久标注**：贡献者信息记录在模块注释中
+2. **README 贡献名单**：统一收录
+3. **MC 百科官方词条**：正式发布后，贡献者写入 Mod 开发团队
+
+### 代码规范
+
+- **Rust**：`cargo fmt` + `cargo clippy`
+- **Java**：遵循 Oracle Java 编码规范
+- **提交信息**：使用语义化提交 (feat/fix/docs/refactor/test/chore)
 
 ---
 
