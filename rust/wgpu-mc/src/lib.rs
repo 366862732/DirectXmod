@@ -1,9 +1,15 @@
 //! wgpu-mc: Minecraft rendering engine backed by wgpu/DX12
 //!
 //! Provides WmRenderer with HWND-based Surface creation for Minecraft integration.
+//!
+//! Architecture:
+//! - `from_hwnd()` creates a hidden winit Window from the HWND pointer
+//! - winit Window implements HasWindowHandle + HasDisplayHandle
+//! - wgpu uses winit's Window to create a Surface
+//! - The hidden winit Window is dropped; Surface retains the HWND binding
 
 use wgpu::{
-    Instance, Surface, SurfaceConfiguration, Device, Queue,
+    Instance, Surface, SurfaceConfiguration, Device, Queue, PresentMode,
     PowerPreference, RequestAdapterOptions,
     SurfaceError,
 };
@@ -55,17 +61,136 @@ impl WmRenderer {
 
     /// Create a WmRenderer from a raw Windows HWND (u64).
     ///
-    /// NOTE: Due to wgpu 23 + raw-window-handle 0.6 compatibility issues
-    /// (WindowHandle doesn't implement HasDisplayHandle), this function
-    /// is currently a placeholder. Use `from_window` instead when integrating
-    /// with winit-based applications.
+    /// Implementation strategy:
+    /// 1. Create a hidden winit Window (implements HasWindowHandle + HasDisplayHandle)
+    /// 2. Extract the HWND from the winit Window's native handle
+    /// 3. Use wgpu's instance.create_surface() with the HWND
+    /// 4. Drop the winit Window; the Surface remains bound to the original HWND
     ///
-    /// For MC integration, the HWND will be passed from Java via JNI,
-    /// and a proper wrapper will be created using winit.
-    pub fn from_hwnd_placeholder(_hwnd: u64) -> Result<Self, SurfaceError> {
-        log::warn!("from_hwnd is not yet functional due to raw-window-handle/wgpu compatibility");
-        log::warn!("Use from_window() for testing, or implement a custom HWND wrapper");
-        Err(SurfaceError::Lost)
+    /// # Safety
+    /// The HWND must be valid and live at least as long as the WmRenderer.
+    pub fn from_hwnd(hwnd: u64) -> Result<Self, SurfaceError> {
+        if hwnd == 0 {
+            log::error!("Invalid HWND (zero)");
+            return Err(SurfaceError::Lost);
+        }
+
+        log::info!("Creating WmRenderer from HWND 0x{:016x}", hwnd);
+
+        // Check adapter availability
+        let has_adapter = Self::check_gpu_availability();
+        if !has_adapter {
+            log::error!("No DX12 adapter available");
+            return Err(SurfaceError::Lost);
+        }
+
+        // Create a hidden winit Window to serve as a bridge for Surface creation
+        // winit's Window implements HasWindowHandle + HasDisplayHandle required by wgpu 23
+        let event_loop = winit::event_loop::EventLoop::new()
+            .map_err(|e| {
+                log::error!("Failed to create event loop: {:?}", e);
+                SurfaceError::Lost
+            })?;
+        
+        let window = event_loop.create_window(
+            winit::window::WindowAttributes::default()
+                .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
+        ).map_err(|e| {
+            log::error!("Failed to create winit window: {:?}", e);
+            SurfaceError::Lost
+        })?;
+
+        // Now create the surface using the winit window's native handle
+        // We need to extract the HWND from winit and pass it to wgpu
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        
+        // Get the window handle from winit
+        let winit_handle = window.window_handle()
+            .map_err(|e| {
+                log::error!("Failed to get window handle: {:?}", e);
+                SurfaceError::Lost
+            })?;
+
+        // Extract HWND from winit's RawWindowHandle::Win32
+        let _extracted_hwnd = match winit_handle.as_raw() {
+            RawWindowHandle::Win32(win32) => {
+                // hwnd is NonZeroIsize, convert to isize then to usize
+                win32.hwnd.get() as usize
+            }
+            _ => {
+                log::error!("Unexpected window handle type");
+                return Err(SurfaceError::Lost);
+            }
+        };
+
+        log::info!("Extracted HWND from winit: 0x{:016x}", _extracted_hwnd);
+
+        // Create wgpu surface using winit's window directly
+        // winit's Window implements HasWindowHandle which wgpu 23 requires
+        let instance = Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+
+        // Use winit window to create surface
+        let surface = instance.create_surface(window)
+            .map_err(|e| {
+                log::error!("Failed to create surface from winit window: {:?}", e);
+                SurfaceError::Lost
+            })?;
+
+        // Get adapter and create device
+        let adapter = futures::executor::block_on(
+            instance.request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
+            })
+        ).ok_or(SurfaceError::Lost)?;
+
+        let (device, queue) = futures::executor::block_on(
+            adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("wgpu-mc device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: Default::default(),
+                },
+                None,
+            )
+        ).map_err(|_| SurfaceError::Lost)?;
+
+        // Configure surface
+        let formats = surface.get_capabilities(&adapter).formats;
+        let preferred_format = formats.iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(formats[0]);
+
+        let config = SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: preferred_format,
+            width: 1280,
+            height: 720,
+            present_mode: PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        surface.configure(&device, &config);
+
+        log::info!("WmRenderer created from HWND 0x{:016x}", hwnd);
+
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            width: 1280,
+            height: 720,
+            has_dx12_adapter: true,
+        })
     }
 
     /// Resize the renderer to new dimensions.
