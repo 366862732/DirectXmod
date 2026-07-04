@@ -4,10 +4,9 @@
 //! triangle rendering, and foundation for future MC integration.
 
 use wgpu::{
-    util::DeviceExt, CommandEncoder, CompositeAlphaMode, Device, Instance, Limits,
-    MemoryHints, PowerPreference, PresentMode, Queue, RenderPass, RenderPipeline,
-    RequestAdapterOptions, SampleCount, Surface, SurfaceConfiguration, SurfaceError,
-    TextureUsages,
+    util::DeviceExt, CompositeAlphaMode, Device, Instance, MemoryHints,
+    PowerPreference, PresentMode, Queue, RenderPipeline, RequestAdapterOptions,
+    Surface, SurfaceConfiguration, SurfaceError, TextureUsages,
 };
 use std::sync::Arc;
 use winit::{
@@ -80,10 +79,7 @@ impl WmRenderer {
     pub async fn new(event_loop: &ActiveEventLoop, width: u32, height: u32) -> Self {
         log::info!("Creating wgpu renderer: {}x{}", width, height);
 
-        let instance = Instance::new(InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
+        let instance = Instance::new(wgpu::InstanceDescriptor::default());
 
         let window = Arc::new(
             WindowBuilder::new()
@@ -109,10 +105,11 @@ impl WmRenderer {
 
         let (device, queue) = adapter
             .request_device(
-                &DeviceDescriptor {
+                &wgpu::DeviceDescriptor {
                     label: Some("Main Device"),
                     memory_hints: MemoryHints::MemoryUsage,
-                    limits: Limits::default(),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
                     ..Default::default()
                 },
                 None,
@@ -123,7 +120,7 @@ impl WmRenderer {
         let size = window.inner_size();
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
-            format: surface.get_supported_format(&adapter)[0],
+            format: surface.get_capabilities(&adapter).formats[0],
             width: size.width,
             height: size.height,
             present_mode: PresentMode::Fifo,
@@ -158,13 +155,13 @@ impl WmRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vertex_main"),
-                buffers: [Vertex::desc()],
+                buffers: &[Vertex::desc()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fragment_main"),
-                targets: [Some(wgpu::ColorTargetState {
+                targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
@@ -178,10 +175,7 @@ impl WmRenderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: SampleCount::One,
-                ..Default::default()
-            },
+            multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
         });
@@ -227,7 +221,7 @@ impl WmRenderer {
 
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..3);
+            render_pass.draw(0..3, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -254,7 +248,7 @@ impl ApplicationHandler for AppHandler {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 self.should_quit = true;
@@ -267,7 +261,7 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::RedrawRequested => {
                 if let Some(ref mut renderer) = self.renderer {
                     if let Err(_) = renderer.render() {
-                        // Surface lost, recreate
+                        // Surface lost, will recreate on next frame
                     }
                 }
             }
