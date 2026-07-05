@@ -84,61 +84,40 @@ impl WmRenderer {
             return Err(SurfaceError::Lost);
         }
 
-        // Create a hidden winit Window to serve as a bridge for Surface creation
-        // winit's Window implements HasWindowHandle + HasDisplayHandle required by wgpu 23
-        let event_loop = winit::event_loop::EventLoop::new()
-            .map_err(|e| {
-                log::error!("Failed to create event loop: {:?}", e);
-                SurfaceError::Lost
-            })?;
-        
-        #[allow(deprecated)]
-        let window = event_loop.create_window(
-            winit::window::WindowAttributes::default()
-                .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
-        ).map_err(|e| {
-            log::error!("Failed to create winit window: {:?}", e);
-            SurfaceError::Lost
-        })?;
-
-        // Now create the surface using the winit window's native handle
-        // We need to extract the HWND from winit and pass it to wgpu
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        
-        // Get the window handle from winit
-        let winit_handle = window.window_handle()
-            .map_err(|e| {
-                log::error!("Failed to get window handle: {:?}", e);
-                SurfaceError::Lost
-            })?;
-
-        // Extract HWND from winit's RawWindowHandle::Win32
-        let _extracted_hwnd = match winit_handle.as_raw() {
-            RawWindowHandle::Win32(win32) => {
-                // hwnd is NonZeroIsize, convert to isize then to usize
-                win32.hwnd.get() as usize
-            }
-            _ => {
-                log::error!("Unexpected window handle type");
-                return Err(SurfaceError::Lost);
-            }
-        };
-
-        log::info!("Extracted HWND from winit: 0x{:016x}", _extracted_hwnd);
-
         // Create wgpu surface using winit's window directly
         // winit's Window implements HasWindowHandle which wgpu 23 requires
+        // Use a block scope so the window can be dropped after surface creation
         let instance = Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..Default::default()
         });
 
-        // Use winit window to create surface
-        let surface = instance.create_surface(window)
-            .map_err(|e| {
-                log::error!("Failed to create surface from winit window: {:?}", e);
+        let surface = {
+            let event_loop = winit::event_loop::EventLoop::new()
+                .map_err(|e| {
+                    log::error!("Failed to create event loop: {:?}", e);
+                    SurfaceError::Lost
+                })?;
+
+            #[allow(deprecated)]
+            let window = event_loop.create_window(
+                winit::window::WindowAttributes::default()
+                    .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
+            ).map_err(|e| {
+                log::error!("Failed to create winit window: {:?}", e);
                 SurfaceError::Lost
             })?;
+
+            // Leak the window so it lives forever (surface needs 'static window)
+            // create_surface takes ownership of the Window
+            let surface = instance.create_surface(window)
+                .map_err(|e| {
+                    log::error!("Failed to create surface from winit window: {:?}", e);
+                    SurfaceError::Lost
+                })?;
+
+            surface
+        };
 
         // Get adapter and create device
         let adapter = futures::executor::block_on(
@@ -174,7 +153,7 @@ impl WmRenderer {
             width: 1280,
             height: 720,
             present_mode: PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
