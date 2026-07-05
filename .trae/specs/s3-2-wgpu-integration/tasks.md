@@ -25,16 +25,21 @@
 
 - [x] Task 6: 编译验证 Rust 端
   - 运行 `cargo build --package wgpu-mc-jni --release` ✅ 通过
-  - 确认无编译错误
-  - 运行 `cargo run --example simple` 验证独立渲染仍正常工作
+  - 运行 `cargo clippy -- -D warnings` ✅ 零警告
+  - 运行 `cargo run --example simple` ✅ 独立渲染正常工作
 
 - [x] Task 7: 编译验证 Fabric 模组
   - 运行 `gradle clean build` ✅ 通过
   - 确认 Mixin 注入配置正确
   - 确认 JAR 和 DLL 可正常部署
 
-- [ ] Task 8: 集成测试 - 启动 MC 验证
-  - 部署 JAR 和 DLL 到 MC 1.21.1 (需用户手动执行)
+- [x] Task 8: 代码合规性检查
+  - `cargo fmt -- --check` ✅ 通过
+  - `cargo clippy -- -D warnings` ✅ 零警告
+  - `gradle build` ✅ 通过
+
+- [ ] Task 9: 集成测试 - 启动 MC 验证 (需用户手动部署)
+  - 部署 JAR 和 DLL 到 MC 1.21.1
   - 启动游戏观察日志输出
   - 验证 wgpu Surface 成功绑定到 MC 窗口
 
@@ -45,3 +50,4 @@
 - [Task 6] depends on [Task 5]
 - [Task 7] depends on [Task 6]
 - [Task 8] depends on [Task 7]
+- [Task 9] depends on [Task 8]

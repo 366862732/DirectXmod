@@ -9,5 +9,7 @@
 - [x] cargo build --package wgpu-mc-jni --release 编译通过
 - [x] cargo run --example simple 独立测试程序仍可正常运行
 - [x] gradle clean build Fabric 模组编译通过
+- [x] cargo clippy -- -D warnings 零警告
+- [x] cargo fmt -- --check 格式检查通过
 - [ ] MC 1.21.1 启动后日志显示 "WmRenderer created from HWND"
 - [ ] MC 窗口中可见 wgpu 渲染输出（蓝色清屏或三角形）
