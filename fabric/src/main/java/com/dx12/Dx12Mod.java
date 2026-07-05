@@ -16,6 +16,14 @@ public class Dx12Mod implements ClientModInitializer {
         LOGGER.info("GL4DX12 Mod initializing...");
         LOGGER.info("Using wgpu + Rust rendering engine (independent surface approach)");
 
+        // Verify Mixin class exists
+        try {
+            Class.forName("com.dx12.mixin.GameRendererMixin");
+            LOGGER.info("Mixin class GameRendererMixin found in JAR");
+        } catch (ClassNotFoundException e) {
+            LOGGER.error("FATAL: GameRendererMixin class NOT found in JAR!", e);
+        }
+
         // Initialize Rust JNI bridge
         D3D12Bridge.init();
 
