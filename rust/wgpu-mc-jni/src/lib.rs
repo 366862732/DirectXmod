@@ -56,14 +56,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
 ) {
     log::info!("Setting window HWND: 0x{:016x}", hwnd);
 
-    // NOTE: from_hwnd_placeholder is not yet functional due to
-    // raw-window-handle 0.6 / wgpu 23 trait compatibility issues.
-    // The renderer will be created via winit wrapper in a future update.
-    // For now, we store the HWND and log it for debugging.
-    log::warn!("nativeSetWindow called with HWND 0x{:016x} — renderer not yet created", hwnd);
-
+    // Only create renderer once
     let mut renderer_lock = RENDERER.lock().unwrap();
-    *renderer_lock = None; // Placeholder until from_hwnd is fixed
+    if renderer_lock.is_some() {
+        log::info!("Renderer already initialized, skipping");
+        return;
+    }
+
+    // Create renderer from HWND using winit wrapper
+    // SAFETY: hwnd is a valid Windows window handle passed from Java
+    match wgpu_mc::WmRenderer::from_hwnd(hwnd as u64) {
+        Ok(renderer) => {
+            *renderer_lock = Some(renderer);
+            log::info!("WmRenderer created successfully from HWND 0x{:016x}", hwnd);
+        }
+        Err(e) => {
+            log::error!("Failed to create WmRenderer from HWND 0x{:016x}: {:?}", hwnd, e);
+        }
+    }
 }
 
 /// Render a single frame via the wgpu backend.
