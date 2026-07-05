@@ -9,5 +9,6 @@
   "mixins": [],
   "injectors": {
     "defaultRequire": 1
-  }
+  },
+  "refmap": "gl4dx12-refmap.json"
 }
