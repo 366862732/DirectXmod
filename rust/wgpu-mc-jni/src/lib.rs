@@ -9,12 +9,21 @@ use jni::JNIEnv;
 use std::sync::Mutex;
 static RENDERER: Mutex<Option<wgpu_mc::WmRenderer>> = Mutex::new(None);
 
+/// Initialize the Rust JNI library. Called once during mod startup.
+///
+/// # Safety
+/// This function is called from Java via JNI. The JNIEnv and JClass pointers
+/// are guaranteed valid for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _class: JClass) {
     env_logger::init();
     log::info!("Rust JNI library loaded successfully!");
 }
 
+/// Test JNI string communication. Returns "Hello from Rust wgpu! You said: <input>".
+///
+/// # Safety
+/// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHello<'a>(
     mut env: JNIEnv<'a>,
@@ -32,9 +41,13 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHello<'a>(
     env.new_string(&response).expect("Failed to create Java string")
 }
 
+/// Test GPU availability. Returns a string indicating DX12 adapter status.
+///
+/// # Safety
+/// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo<'a>(
-    mut env: JNIEnv<'a>,
+    env: JNIEnv<'a>,
     _class: JClass<'a>,
 ) -> JString<'a> {
     let has_dx12 = wgpu_mc::WmRenderer::check_gpu_availability();
@@ -48,6 +61,10 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo<'a>(
 
 /// Set the Minecraft window HWND and create the wgpu renderer.
 /// This is called once during game startup.
+///
+/// # Safety
+/// This function is called from Java via JNI. The hwnd parameter is a raw
+/// Windows window handle that must remain valid for the lifetime of the renderer.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
     _env: JNIEnv,
@@ -57,8 +74,8 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
     log::info!("Setting window HWND: 0x{:016x}", hwnd);
 
     // Only create renderer once
-    let mut renderer_lock = RENDERER.lock().unwrap();
-    if renderer_lock.is_some() {
+    let mut renderer_guard = RENDERER.lock().unwrap();
+    if renderer_guard.is_some() {
         log::info!("Renderer already initialized, skipping");
         return;
     }
@@ -67,7 +84,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
     // SAFETY: hwnd is a valid Windows window handle passed from Java
     match wgpu_mc::WmRenderer::from_hwnd(hwnd as u64) {
         Ok(renderer) => {
-            *renderer_lock = Some(renderer);
+            *renderer_guard = Some(renderer);
             log::info!("WmRenderer created successfully from HWND 0x{:016x}", hwnd);
         }
         Err(e) => {
@@ -77,10 +94,13 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
 }
 
 /// Render a single frame via the wgpu backend.
+///
+/// # Safety
+/// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame(_env: JNIEnv, _class: JClass) {
-    let mut renderer_lock = RENDERER.lock().unwrap();
-    if let Some(ref mut renderer) = renderer_lock.as_mut() {
+    let renderer_guard = RENDERER.lock().unwrap();
+    if let Some(renderer) = &*renderer_guard {
         match renderer.render_frame() {
             Ok(_) => {}
             Err(e) => {

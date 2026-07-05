@@ -92,6 +92,7 @@ impl WmRenderer {
                 SurfaceError::Lost
             })?;
         
+        #[allow(deprecated)]
         let window = event_loop.create_window(
             winit::window::WindowAttributes::default()
                 .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
@@ -204,7 +205,7 @@ impl WmRenderer {
     }
 
     /// Render a single frame: clear to blue color.
-    pub fn render_frame(&mut self) -> Result<(), SurfaceError> {
+    pub fn render_frame(&self) -> Result<(), SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
