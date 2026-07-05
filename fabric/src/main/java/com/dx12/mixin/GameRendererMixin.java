@@ -12,7 +12,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * Mixin that intercepts GameRenderer.render() to replace
  * OpenGL rendering with our Rust/wgpu backend.
  */
-@Mixin(value = net.minecraft.client.render.GameRenderer.class, remap = false)
+@Mixin(net.minecraft.client.render.GameRenderer.class)
 public class GameRendererMixin {
 
     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
