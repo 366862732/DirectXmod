@@ -1,20 +1,24 @@
 package com.dx12;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.minecraft.client.MinecraftClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Main entry point for the GL4DX12 Fabric mod.
- * Initializes the Rust JNI bridge on client startup.
+ * Uses wgpu/DX12 for rendering via a dedicated render thread.
  */
 public class Dx12Mod implements ClientModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12");
 
+    private static volatile boolean running = false;
+    private static Thread renderThread;
+
     @Override
     public void onInitializeClient() {
         LOGGER.info("GL4DX12 Mod initializing...");
-        LOGGER.info("Using wgpu + Rust rendering engine (independent surface approach)");
+        LOGGER.info("Using wgpu/DX12 rendering engine");
 
         // Initialize Rust JNI bridge
         D3D12Bridge.init();
@@ -27,14 +31,48 @@ public class Dx12Mod implements ClientModInitializer {
         String deviceInfo = D3D12Bridge.getDeviceInfo();
         LOGGER.info("Device info: {}", deviceInfo);
 
-        // Direct test: call nativeSetWindow with a dummy HWND to verify JNI bridge
-        try {
-            D3D12Bridge.setWindow(0x12345);
-            LOGGER.info("DIRECT TEST: nativeSetWindow(0x12345) called successfully");
-        } catch (Exception e) {
-            LOGGER.error("DIRECT TEST: nativeSetWindow failed: {}", e.getMessage());
-        }
+        // Start dedicated render thread
+        running = true;
+        renderThread = new Thread(Dx12Mod::renderLoop, "wgpu-render-thread");
+        renderThread.setDaemon(true);
+        renderThread.start();
+        LOGGER.info("Render thread started");
 
         LOGGER.info("GL4DX12 Mod initialized successfully!");
+    }
+
+    private static void renderLoop() {
+        while (running) {
+            try {
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null && client.getWindow() != null) {
+                    // Sync window size
+                    int width = client.getWindow().getWidth();
+                    int height = client.getWindow().getHeight();
+                    D3D12Bridge.syncWindowSize(width, height);
+
+                    // Render frame via wgpu
+                    D3D12Bridge.renderFrame();
+                }
+                // Sleep 1ms to avoid busy waiting
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                LOGGER.warn("Render loop error: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Called when the game is shutting down.
+     */
+    public static void shutdown() {
+        running = false;
+        if (renderThread != null) {
+            renderThread.interrupt();
+        }
+        LOGGER.info("Render thread stopped");
     }
 }

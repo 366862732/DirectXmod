@@ -16,9 +16,6 @@
       "com.dx12.Dx12Mod"
     ]
   },
-  "mixins": [
-    "mixins.gl4dx12.json"
-  ],
   "depends": {
     "fabricloader": ">=0.16.0",
     "minecraft": "~1.21.1",

@@ -5,7 +5,6 @@ import org.lwjgl.glfw.GLFWNativeWin32;
 
 /**
  * JNI bridge for wgpu-mc Rust library.
- * Loads the native DLL and provides methods for Rust communication.
  */
 public class D3D12Bridge {
     static {
@@ -21,18 +20,29 @@ public class D3D12Bridge {
             libName = "wgpu_mc_jni";
         }
         
-        // Try loading from the same directory as the JAR first
         String dllPath = getDllPath();
         if (dllPath != null) {
             System.load(dllPath);
         } else {
-            // Fallback: try from library path
             System.loadLibrary(libName);
         }
     }
 
     private static String getDllPath() {
-        // Look for DLL in common locations
+        // Try loading from the same directory as the JAR (mods folder)
+        try {
+            java.net.URL jarUrl = D3D12Bridge.class.getProtectionDomain().getCodeSource().getLocation();
+            java.io.File jarFile = new java.io.File(jarUrl.toURI());
+            java.io.File modsDir = jarFile.getParentFile();
+            java.io.File dllInMods = new java.io.File(modsDir, "wgpu_mc_jni.dll");
+            if (dllInMods.exists()) {
+                return dllInMods.getAbsolutePath();
+            }
+        } catch (Exception e) {
+            // Fall through to other paths
+        }
+        
+        // Fallback: try common relative paths
         String[] candidates = {
             "dx12mod/wgpu_mc_jni.dll",
             ".minecraft/dx12mod/wgpu_mc_jni.dll",
@@ -47,30 +57,19 @@ public class D3D12Bridge {
         return null;
     }
 
-    // === Native method declarations ===
-
-    /** Initialize the Rust library */
+    // === Native methods ===
     public static native void nativeInit();
-
-    /** Test JNI communication: returns "Hello from Rust! You said: <input>" */
     public static native String nativeHello(String input);
-
-    /** Get device info string from Rust side */
     public static native String nativeTestDeviceInfo();
-
-    /** Set the Minecraft window HWND for wgpu surface creation */
     public static native void nativeSetWindow(long hwnd);
-
-    /** Render a single frame via the Rust/wgpu backend */
     public static native void nativeRenderFrame();
-
-    /** Resize the wgpu renderer to match MC window dimensions */
     public static native void nativeResize(int width, int height);
 
     // === Convenience methods ===
-
     private static boolean initialized = false;
     private static long cachedHwnd = 0;
+    private static int lastWidth = -1;
+    private static int lastHeight = -1;
 
     public static void init() {
         if (initialized) return;
@@ -80,13 +79,10 @@ public class D3D12Bridge {
             System.out.println("[D3D12Bridge] Rust JNI library loaded and initialized.");
         } catch (UnsatisfiedLinkError e) {
             System.err.println("[D3D12Bridge] Failed to load Rust JNI library: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
-    public static boolean isInitialized() {
-        return initialized;
-    }
+    public static boolean isInitialized() { return initialized; }
 
     public static String sayHello(String msg) {
         if (!initialized) init();
@@ -98,62 +94,48 @@ public class D3D12Bridge {
         return nativeTestDeviceInfo();
     }
 
-    /**
-     * Get the current Minecraft window HWND via LWJGL GLFW.
-     * Returns 0 if not available.
-     */
     public static long getWindowHandle() {
         long glfwWindow = GLFW.glfwGetCurrentContext();
         if (glfwWindow == 0) {
-            com.dx12.Dx12Mod.LOGGER.warn("glfwGetCurrentContext returned 0");
+            Dx12Mod.LOGGER.warn("glfwGetCurrentContext returned 0");
             return 0;
         }
-        long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
-        com.dx12.Dx12Mod.LOGGER.debug("glfwGetWin32Window returned: 0x{:016x}", hwnd);
-        return hwnd;
+        return GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
     }
 
-    /**
-     * Set the window HWND for wgpu surface creation.
-     * Called once during initialization.
-     */
     public static void setWindow(long hwnd) {
         if (hwnd == 0) {
-            com.dx12.Dx12Mod.LOGGER.warn("setWindow called with hwnd=0, skipping");
+            Dx12Mod.LOGGER.warn("setWindow called with hwnd=0, skipping");
             return;
         }
-        if (cachedHwnd == hwnd) return; // Already set
+        if (cachedHwnd == hwnd) return;
         cachedHwnd = hwnd;
         try {
             nativeSetWindow(hwnd);
-            com.dx12.Dx12Mod.LOGGER.info("nativeSetWindow called with HWND: 0x{:016x}", hwnd);
+            Dx12Mod.LOGGER.info("nativeSetWindow called with HWND: 0x%016x", hwnd);
         } catch (UnsatisfiedLinkError e) {
-            com.dx12.Dx12Mod.LOGGER.error("nativeSetWindow not available: {}", e.getMessage());
+            Dx12Mod.LOGGER.error("nativeSetWindow not available: {}", e.getMessage());
         }
     }
 
-    /**
-     * Render a single frame via the Rust/wgpu backend.
-     */
     public static void renderFrame() {
         if (!initialized) return;
         try {
             nativeRenderFrame();
         } catch (UnsatisfiedLinkError e) {
-            com.dx12.Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
+            Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
         }
     }
 
-    /**
-     * Sync window size with the wgpu renderer.
-     * Called every frame to keep surface resolution in sync with MC window.
-     */
     public static void syncWindowSize(int width, int height) {
         if (!initialized) return;
+        if (lastWidth == width && lastHeight == height) return;
+        lastWidth = width;
+        lastHeight = height;
         try {
             nativeResize(width, height);
         } catch (UnsatisfiedLinkError e) {
-            com.dx12.Dx12Mod.LOGGER.warn("nativeResize not available: {}", e.getMessage());
+            Dx12Mod.LOGGER.warn("nativeResize not available: {}", e.getMessage());
         }
     }
 }

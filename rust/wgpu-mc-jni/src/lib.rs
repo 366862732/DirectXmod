@@ -101,6 +101,18 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
 /// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame(_env: JNIEnv, _class: JClass) {
+    // Append every render call with timestamp
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\tmp\\wgpu_mc_render_calls.txt")
+        .ok();
+    if let Some(f) = &mut file {
+        let _ = writeln!(f, "render_frame called at {}", std::time::Instant::now().elapsed().as_millis());
+    }
+    drop(file);
+    
     let renderer_guard = RENDERER.lock().unwrap();
     if let Some(renderer) = &*renderer_guard {
         if let Err(e) = renderer.render_frame() {
