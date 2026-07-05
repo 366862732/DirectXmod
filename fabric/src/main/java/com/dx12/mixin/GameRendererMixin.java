@@ -21,9 +21,14 @@ public class GameRendererMixin {
             boolean tick,
             CallbackInfo ci
     ) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.getWindow() == null) {
+            return; // Not ready yet, let OpenGL render
+        }
+
         // Sync window size with wgpu renderer
-        int width = MinecraftClient.getInstance().getWindow().getWidth();
-        int height = MinecraftClient.getInstance().getWindow().getHeight();
+        int width = mc.getWindow().getWidth();
+        int height = mc.getWindow().getHeight();
         D3D12Bridge.syncWindowSize(width, height);
 
         // Get window HWND for wgpu surface
