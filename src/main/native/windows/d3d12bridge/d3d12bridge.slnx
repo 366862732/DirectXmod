@@ -1,9 +1,0 @@
-<Solution>
-  <Configurations>
-    <Platform Name="x64" />
-    <Platform Name="x86" />
-  </Configurations>
-  <Project Path="d3d12bridge.vcxproj" Id="fc6e95a6-0cb7-435c-b880-424d8f52fff9">
-    <BuildType Solution="Debug|x64" Project="Release" />
-  </Project>
-</Solution>
