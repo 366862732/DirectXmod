@@ -103,6 +103,28 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame(_env: JNIEnv, _class: JClass) {
     let renderer_guard = RENDERER.lock().unwrap();
     if let Some(renderer) = &*renderer_guard {
-        let _ = renderer.render_frame();
+        if let Err(e) = renderer.render_frame() {
+            eprintln!("[wgpu-mc-jni] render_frame error: {:?}", e);
+        }
+    }
+}
+
+/// Resize the wgpu renderer to match MC window dimensions.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeResize(
+    _env: JNIEnv,
+    _class: JClass,
+    width: i32,
+    height: i32,
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let mut renderer_guard = RENDERER.lock().unwrap();
+    if let Some(ref mut renderer) = renderer_guard.as_mut() {
+        renderer.resize(width as u32, height as u32);
     }
 }

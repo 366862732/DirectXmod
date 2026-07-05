@@ -61,8 +61,11 @@ public class D3D12Bridge {
     /** Set the Minecraft window HWND for wgpu surface creation */
     public static native void nativeSetWindow(long hwnd);
 
-    /** Render a single frame via Rust/wgpu backend */
+    /** Render a single frame via the Rust/wgpu backend */
     public static native void nativeRenderFrame();
+
+    /** Resize the wgpu renderer to match MC window dimensions */
+    public static native void nativeResize(int width, int height);
 
     // === Convenience methods ===
 
@@ -138,6 +141,19 @@ public class D3D12Bridge {
             nativeRenderFrame();
         } catch (UnsatisfiedLinkError e) {
             com.dx12.Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Sync window size with the wgpu renderer.
+     * Called every frame to keep surface resolution in sync with MC window.
+     */
+    public static void syncWindowSize(int width, int height) {
+        if (!initialized) return;
+        try {
+            nativeResize(width, height);
+        } catch (UnsatisfiedLinkError e) {
+            com.dx12.Dx12Mod.LOGGER.warn("nativeResize not available: {}", e.getMessage());
         }
     }
 }

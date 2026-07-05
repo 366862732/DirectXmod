@@ -1,6 +1,7 @@
 package com.dx12.mixin;
 
 import com.dx12.D3D12Bridge;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.RenderTickCounter;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -10,9 +11,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * Mixin that intercepts GameRenderer.render() to replace
  * OpenGL rendering with our Rust/wgpu backend.
- *
- * In MC 1.21.1, the render entry point moved from LevelRenderer.renderLevel()
- * to GameRenderer.render(RenderTickCounter, boolean).
  */
 @Mixin(net.minecraft.client.render.GameRenderer.class)
 public class GameRendererMixin {
@@ -23,8 +21,10 @@ public class GameRendererMixin {
             boolean tick,
             CallbackInfo ci
     ) {
-        // Log entry point
-        com.dx12.Dx12Mod.LOGGER.info("GameRendererMixin: intercepting render");
+        // Sync window size with wgpu renderer
+        int width = MinecraftClient.getInstance().getWindow().getWidth();
+        int height = MinecraftClient.getInstance().getWindow().getHeight();
+        D3D12Bridge.syncWindowSize(width, height);
 
         // Get window HWND for wgpu surface
         long hwnd = D3D12Bridge.getWindowHandle();

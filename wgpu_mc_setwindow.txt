@@ -1,1 +1,0 @@
-nativeSetWindow: 0x0000000000300d18 -> OK
