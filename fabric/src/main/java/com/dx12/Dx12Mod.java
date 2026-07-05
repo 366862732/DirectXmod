@@ -27,6 +27,14 @@ public class Dx12Mod implements ClientModInitializer {
         String deviceInfo = D3D12Bridge.getDeviceInfo();
         LOGGER.info("Device info: {}", deviceInfo);
 
+        // Direct test: call nativeSetWindow with a dummy HWND to verify JNI bridge
+        try {
+            D3D12Bridge.setWindow(0x12345);
+            LOGGER.info("DIRECT TEST: nativeSetWindow(0x12345) called successfully");
+        } catch (Exception e) {
+            LOGGER.error("DIRECT TEST: nativeSetWindow failed: {}", e.getMessage());
+        }
+
         LOGGER.info("GL4DX12 Mod initialized successfully!");
     }
 }
