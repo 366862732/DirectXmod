@@ -63,9 +63,8 @@ impl WmRenderer {
     ///
     /// Implementation strategy:
     /// 1. Create a hidden winit Window (implements HasWindowHandle + HasDisplayHandle)
-    /// 2. Extract the HWND from the winit Window's native handle
-    /// 3. Use wgpu's instance.create_surface() with the HWND
-    /// 4. Drop the winit Window; the Surface remains bound to the original HWND
+    /// 2. Use wgpu's instance.create_surface() with the HWND
+    /// 3. The hidden winit Window is leaked (cannot be dropped while Surface exists)
     ///
     /// # Safety
     /// The HWND must be valid and live at least as long as the WmRenderer.
@@ -77,56 +76,49 @@ impl WmRenderer {
 
         log::info!("Creating WmRenderer from HWND 0x{:016x}", hwnd);
 
-        // Check adapter availability
-        let has_adapter = Self::check_gpu_availability();
-        if !has_adapter {
-            log::error!("No DX12 adapter available");
-            return Err(SurfaceError::Lost);
-        }
-
-        // Create wgpu surface using winit's window directly
-        // winit's Window implements HasWindowHandle which wgpu 23 requires
-        // Use a block scope so the window can be dropped after surface creation
+        // Create wgpu instance
         let instance = Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..Default::default()
         });
 
-        let surface = {
-            let event_loop = winit::event_loop::EventLoop::new()
-                .map_err(|e| {
-                    log::error!("Failed to create event loop: {:?}", e);
-                    SurfaceError::Lost
-                })?;
-
-            #[allow(deprecated)]
-            let window = event_loop.create_window(
-                winit::window::WindowAttributes::default()
-                    .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
-            ).map_err(|e| {
-                log::error!("Failed to create winit window: {:?}", e);
+        // Create a hidden winit Window to serve as a bridge for Surface creation
+        // winit's Window implements HasWindowHandle + HasDisplayHandle required by wgpu 23
+        let event_loop = winit::event_loop::EventLoop::new()
+            .map_err(|e| {
+                log::error!("Failed to create event loop: {:?}", e);
                 SurfaceError::Lost
             })?;
 
-            // Leak the window so it lives forever (surface needs 'static window)
-            // create_surface takes ownership of the Window
-            let surface = instance.create_surface(window)
-                .map_err(|e| {
-                    log::error!("Failed to create surface from winit window: {:?}", e);
-                    SurfaceError::Lost
-                })?;
+        #[allow(deprecated)]
+        let window = event_loop.create_window(
+            winit::window::WindowAttributes::default()
+                .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
+        ).map_err(|e| {
+            log::error!("Failed to create winit window: {:?}", e);
+            SurfaceError::Lost
+        })?;
 
-            surface
-        };
+        // Create surface from the winit window (takes ownership)
+        let surface = instance.create_surface(window)
+            .map_err(|e| {
+                log::error!("Failed to create surface from winit window: {:?}", e);
+                SurfaceError::Lost
+            })?;
 
-        // Get adapter and create device
+        // Request adapter with the surface
         let adapter = futures::executor::block_on(
             instance.request_adapter(&RequestAdapterOptions {
                 power_preference: PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
             })
-        ).ok_or(SurfaceError::Lost)?;
+        ).ok_or_else(|| {
+            log::error!("No suitable adapter found for surface");
+            SurfaceError::Lost
+        })?;
+
+        log::info!("DX12 adapter: {:?}", adapter.get_info().name);
 
         let (device, queue) = futures::executor::block_on(
             adapter.request_device(
@@ -138,10 +130,14 @@ impl WmRenderer {
                 },
                 None,
             )
-        ).map_err(|_| SurfaceError::Lost)?;
+        ).map_err(|e| {
+            log::error!("Device request failed: {:?}", e);
+            SurfaceError::Lost
+        })?;
 
         // Configure surface
-        let formats = surface.get_capabilities(&adapter).formats;
+        let caps = surface.get_capabilities(&adapter);
+        let formats = caps.formats;
         let preferred_format = formats.iter()
             .find(|f| f.is_srgb())
             .copied()
@@ -160,7 +156,7 @@ impl WmRenderer {
 
         surface.configure(&device, &config);
 
-        log::info!("WmRenderer created from HWND 0x{:016x}", hwnd);
+        log::info!("WmRenderer created successfully from HWND 0x{:016x}", hwnd);
 
         Ok(Self {
             surface,
