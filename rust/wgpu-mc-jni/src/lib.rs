@@ -12,15 +12,15 @@ static RENDERER: Mutex<Option<wgpu_mc::WmRenderer>> = Mutex::new(None);
 /// Initialize the Rust JNI library. Called once during mod startup.
 ///
 /// # Safety
-/// This function is called from Java via JNI. The JNIEnv and JClass pointers
-/// are guaranteed valid for the duration of the call.
+/// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _class: JClass) {
-    env_logger::init();
-    log::info!("Rust JNI library loaded successfully!");
+    let _ = env_logger::try_init();
+    // Write file to confirm DLL is loaded
+    let _ = std::fs::write("C:\\tmp\\wgpu_mc_init.txt", "nativeInit executed\n");
 }
 
-/// Test JNI string communication. Returns "Hello from Rust wgpu! You said: <input>".
+/// Test JNI string communication.
 ///
 /// # Safety
 /// This function is called from Java via JNI.
@@ -35,13 +35,11 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHello<'a>(
         .expect("Couldn't get Java string")
         .into();
 
-    log::info!("Java said: {}", input_str);
-
     let response = format!("Hello from Rust wgpu! You said: {}", input_str);
     env.new_string(&response).expect("Failed to create Java string")
 }
 
-/// Test GPU availability. Returns a string indicating DX12 adapter status.
+/// Test GPU availability.
 ///
 /// # Safety
 /// This function is called from Java via JNI.
@@ -60,39 +58,39 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo<'a>(
 }
 
 /// Set the Minecraft window HWND and create the wgpu renderer.
-/// This is called once during game startup.
 ///
 /// # Safety
-/// This function is called from Java via JNI. The hwnd parameter is a raw
-/// Windows window handle that must remain valid for the lifetime of the renderer.
+/// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
     _env: JNIEnv,
     _class: JClass,
     hwnd: i64,
 ) {
-    eprintln!("[wgpu-mc-jni] Setting window HWND: 0x{:016x}", hwnd);
-    log::info!("Setting window HWND: 0x{:016x}", hwnd);
+    // Write file to confirm this function is called
+    let hwnd_hex = format!("0x{:016x}", hwnd);
+    let _ = std::fs::write("C:\\tmp\\wgpu_mc_setwindow.txt", format!("nativeSetWindow: {}\n", hwnd_hex));
 
     // Only create renderer once
     let mut renderer_guard = RENDERER.lock().unwrap();
     if renderer_guard.is_some() {
-        eprintln!("[wgpu-mc-jni] Renderer already initialized, skipping");
-        log::info!("Renderer already initialized, skipping");
         return;
     }
 
-    // Create renderer from HWND using winit wrapper
-    // SAFETY: hwnd is a valid Windows window handle passed from Java
+    // Create renderer from HWND
     match wgpu_mc::WmRenderer::from_hwnd(hwnd as u64) {
         Ok(renderer) => {
             *renderer_guard = Some(renderer);
-            eprintln!("[wgpu-mc-jni] WmRenderer created successfully from HWND 0x{:016x}", hwnd);
-            log::info!("WmRenderer created successfully from HWND 0x{:016x}", hwnd);
+            let _ = std::fs::write(
+                "C:\\tmp\\wgpu_mc_setwindow.txt",
+                format!("nativeSetWindow: {} -> OK\n", hwnd_hex),
+            );
         }
         Err(e) => {
-            eprintln!("[wgpu-mc-jni] Failed to create WmRenderer from HWND 0x{:016x}: {:?}", hwnd, e);
-            log::error!("Failed to create WmRenderer from HWND 0x{:016x}: {:?}", hwnd, e);
+            let _ = std::fs::write(
+                "C:\\tmp\\wgpu_mc_setwindow.txt",
+                format!("nativeSetWindow: {} -> ERROR: {:?}\n", hwnd_hex, e),
+            );
         }
     }
 }
@@ -105,13 +103,6 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame(_env: JNIEnv, _class: JClass) {
     let renderer_guard = RENDERER.lock().unwrap();
     if let Some(renderer) = &*renderer_guard {
-        match renderer.render_frame() {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("render_frame error: {:?}", e);
-            }
-        }
-    } else {
-        log::warn!("nativeRenderFrame called but renderer not initialized — skipping frame");
+        let _ = renderer.render_frame();
     }
 }
