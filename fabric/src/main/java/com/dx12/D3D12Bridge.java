@@ -102,9 +102,12 @@ public class D3D12Bridge {
     public static long getWindowHandle() {
         long glfwWindow = GLFW.glfwGetCurrentContext();
         if (glfwWindow == 0) {
+            com.dx12.Dx12Mod.LOGGER.warn("glfwGetCurrentContext returned 0");
             return 0;
         }
-        return GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+        long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+        com.dx12.Dx12Mod.LOGGER.debug("glfwGetWin32Window returned: 0x{:016x}", hwnd);
+        return hwnd;
     }
 
     /**
@@ -112,11 +115,18 @@ public class D3D12Bridge {
      * Called once during initialization.
      */
     public static void setWindow(long hwnd) {
-        if (hwnd == 0) return;
+        if (hwnd == 0) {
+            com.dx12.Dx12Mod.LOGGER.warn("setWindow called with hwnd=0, skipping");
+            return;
+        }
         if (cachedHwnd == hwnd) return; // Already set
         cachedHwnd = hwnd;
-        nativeSetWindow(hwnd);
-        com.dx12.Dx12Mod.LOGGER.info("Set wgpu window HWND: 0x{:016x}", hwnd);
+        try {
+            nativeSetWindow(hwnd);
+            com.dx12.Dx12Mod.LOGGER.info("nativeSetWindow called with HWND: 0x{:016x}", hwnd);
+        } catch (UnsatisfiedLinkError e) {
+            com.dx12.Dx12Mod.LOGGER.error("nativeSetWindow not available: {}", e.getMessage());
+        }
     }
 
     /**

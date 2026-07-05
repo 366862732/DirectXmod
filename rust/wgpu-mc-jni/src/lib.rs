@@ -71,11 +71,13 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
     _class: JClass,
     hwnd: i64,
 ) {
+    eprintln!("[wgpu-mc-jni] Setting window HWND: 0x{:016x}", hwnd);
     log::info!("Setting window HWND: 0x{:016x}", hwnd);
 
     // Only create renderer once
     let mut renderer_guard = RENDERER.lock().unwrap();
     if renderer_guard.is_some() {
+        eprintln!("[wgpu-mc-jni] Renderer already initialized, skipping");
         log::info!("Renderer already initialized, skipping");
         return;
     }
@@ -85,9 +87,11 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
     match wgpu_mc::WmRenderer::from_hwnd(hwnd as u64) {
         Ok(renderer) => {
             *renderer_guard = Some(renderer);
+            eprintln!("[wgpu-mc-jni] WmRenderer created successfully from HWND 0x{:016x}", hwnd);
             log::info!("WmRenderer created successfully from HWND 0x{:016x}", hwnd);
         }
         Err(e) => {
+            eprintln!("[wgpu-mc-jni] Failed to create WmRenderer from HWND 0x{:016x}: {:?}", hwnd, e);
             log::error!("Failed to create WmRenderer from HWND 0x{:016x}: {:?}", hwnd, e);
         }
     }
