@@ -1,12 +1,6 @@
 //! wgpu-mc: Minecraft rendering engine backed by wgpu/DX12
 //!
 //! Provides WmRenderer with HWND-based Surface creation for Minecraft integration.
-//!
-//! Architecture:
-//! - `from_hwnd()` creates a hidden winit Window from the HWND pointer
-//! - winit Window implements HasWindowHandle + HasDisplayHandle
-//! - wgpu uses winit's Window to create a Surface
-//! - The hidden winit Window is dropped; Surface retains the HWND binding
 
 use wgpu::{
     Instance, Surface, SurfaceConfiguration, Device, Queue, PresentMode,
@@ -47,34 +41,20 @@ impl WmRenderer {
             })
         );
 
-        match adapter {
-            Some(a) => {
-                log::info!("DX12 adapter found: {:?}", a.get_info().name);
-                true
-            }
-            None => {
-                log::warn!("No suitable DX12 adapter found!");
-                false
-            }
+        if let Some(adapter) = adapter {
+            let info = adapter.get_info();
+            log::info!("GPU Adapter: {} ({:?})", info.name, info.backend);
+            info.backend == wgpu::Backend::Dx12
+        } else {
+            log::warn!("No suitable GPU adapter found");
+            false
         }
     }
 
-    /// Create a WmRenderer from a raw Windows HWND (u64).
-    ///
-    /// Implementation strategy:
-    /// 1. Create a hidden winit Window (implements HasWindowHandle + HasDisplayHandle)
-    /// 2. Use wgpu's instance.create_surface() with the HWND
-    /// 3. The hidden winit Window is leaked (cannot be dropped while Surface exists)
-    ///
-    /// # Safety
-    /// The HWND must be valid and live at least as long as the WmRenderer.
-    pub fn from_hwnd(hwnd: u64) -> Result<Self, SurfaceError> {
-        if hwnd == 0 {
-            log::error!("Invalid HWND (zero)");
-            return Err(SurfaceError::Lost);
-        }
-
-        log::info!("Creating WmRenderer from HWND 0x{:016x}", hwnd);
+    /// Create a WmRenderer from an HWND pointer.
+    /// Uses winit window as a bridge to create wgpu Surface.
+    pub fn from_hwnd(_hwnd: u64) -> Result<Self, SurfaceError> {
+        log::info!("Creating WmRenderer");
 
         // Create wgpu instance
         let instance = Instance::new(wgpu::InstanceDescriptor {
@@ -82,31 +62,31 @@ impl WmRenderer {
             ..Default::default()
         });
 
-        // Create a hidden winit Window to serve as a bridge for Surface creation
-        // winit's Window implements HasWindowHandle + HasDisplayHandle required by wgpu 23
+        // Create a hidden winit window to bridge to wgpu Surface
         let event_loop = winit::event_loop::EventLoop::new()
             .map_err(|e| {
                 log::error!("Failed to create event loop: {:?}", e);
-                SurfaceError::Lost
+                SurfaceError::InternalError
             })?;
 
-        #[allow(deprecated)]
         let window = event_loop.create_window(
             winit::window::WindowAttributes::default()
-                .with_inner_size(winit::dpi::LogicalSize::new(1.0, 1.0)),
+                .with_visible(false)  // Hide the window completely
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_inner_size(winit::dpi::PhysicalSize::new(1, 1)),
         ).map_err(|e| {
             log::error!("Failed to create winit window: {:?}", e);
-            SurfaceError::Lost
+            SurfaceError::InternalError
         })?;
 
-        // Create surface from the winit window (takes ownership)
         let surface = instance.create_surface(window)
             .map_err(|e| {
-                log::error!("Failed to create surface from winit window: {:?}", e);
-                SurfaceError::Lost
+                log::error!("Failed to create surface: {:?}", e);
+                SurfaceError::Unsupported
             })?;
 
-        // Request adapter with the surface
+        // Request adapter
         let adapter = futures::executor::block_on(
             instance.request_adapter(&RequestAdapterOptions {
                 power_preference: PowerPreference::HighPerformance,
@@ -156,7 +136,7 @@ impl WmRenderer {
 
         surface.configure(&device, &config);
 
-        log::info!("WmRenderer created successfully from HWND 0x{:016x}", hwnd);
+        log::info!("WmRenderer created successfully");
 
         Ok(Self {
             surface,
@@ -214,14 +194,5 @@ impl WmRenderer {
         output.present();
 
         Ok(())
-    }
-
-    /// Get device info string.
-    pub fn get_device_info(&self) -> Option<String> {
-        if self.has_dx12_adapter {
-            Some("DX12 adapter available".to_string())
-        } else {
-            Some("No compatible GPU adapter".to_string())
-        }
     }
 }
