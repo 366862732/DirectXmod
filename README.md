@@ -20,6 +20,7 @@
 - [构建与运行](#构建与运行)
 - [配置方法](#配置方法)
 - [使用指引](#使用指引)
+- [CI/CD](#cicd)
 - [路线图](#路线图)
 - [贡献指南](#贡献指南)
 - [许可证](#许可证)
@@ -77,15 +78,18 @@
 │  • Java_com_dx12_D3D12Bridge_nativeInit()                  │
 │  • Java_com_dx12_D3D12Bridge_nativeHello()                 │
 │  • Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo()        │
+│  • Java_com_dx12_D3D12Bridge_nativeRenderFrame()           │
+│  • Java_com_dx12_D3D12Bridge_nativeSetWindow()             │
+│  • Java_com_dx12_D3D12Bridge_nativeResize()                │
 │  • 日志: env_logger + log                                  │
 └────────────────────────┬──────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │         wgpu-mc (Rust 渲染引擎核心)                         │
-│  • WmRenderer::check_gpu_availability()                     │
-│  • DX12 适配器检测                                          │
-│  • 未来: Surface 绑定、渲染管线、RenderGraph                │
+│  • WmRenderer::create() — wgpu DX12 实例创建               │
+│  • WmRenderer::render_frame() — 离屏渲染帧输出              │
+│  • WmRenderer::resize() — 窗口尺寸调整                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -102,20 +106,24 @@
    ↓
 5. nativeTestDeviceInfo() → 检测 DX12 适配器可用性
    ↓
-6. 模组初始化完成，Minecraft 正常运行
+6. 客户端 Tick → 获取 HWND → nativeSetWindow(hwnd)
+   ↓
+7. 每帧 → nativeRenderFrame() → 获取 RGBA 像素 → 上传至 OpenGL 纹理 → 全屏 Quad 绘制
+   ↓
+8. 窗口大小变化 → syncWindowSize() → nativeResize(w, h)
 ```
 
 ---
 
 ## 项目状态
 
-### 当前阶段：第一阶段完成 ✅
+### 当前阶段：阶段 2 部分完成 ✅
 
 | 状态 | 说明 |
 |------|------|
 | **阶段 1** | **已完成** — JNI 通信链路打通，Java ↔ Rust 双向通信正常 |
-| **阶段 2** | 进行中 — wgpu 渲染引擎骨架开发 |
-| **阶段 3** | 待开始 — Minecraft Mixin 集成 |
+| **阶段 2** | **部分完成** — wgpu 渲染引擎骨架 + 离屏渲染 + 独立测试程序均可用 |
+| **阶段 3** | 待开始 — Minecraft Mixin 集成，替换实际游戏渲染 |
 | **阶段 4** | 待开始 — 功能完善与优化 |
 
 ### 已完成功能
@@ -123,19 +131,25 @@
 | 模块 | 说明 |
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
-| **JNI 桥接层** | 3 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo` |
+| **JNI 桥接层** | 6 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize` |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 1.21.1，Fabric API 0.116.6 |
-| **DLL 自动加载** | 多级路径搜索策略，支持 `dx12mod/` 目录部署 |
-| **GPU 适配器检测** | 通过 wgpu 检测系统 DX12/Vulkan 适配器可用性 |
+| **DLL 自动加载** | 多级路径搜索策略，支持 JAR 同级目录及 `dx12mod/` 目录部署 |
+| **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
+| **离屏渲染** | `WmRenderer::render_frame()` 输出 RGBA 像素缓冲区 |
+| **HWND 传递** | Java → Rust 窗口句柄传递，支持 `nativeSetWindow` / `nativeResize` |
+| **像素回传** | Rust → Java `byte[]` 像素数据传输 + OpenGL 纹理上传 + 全屏 Quad 绘制 |
+| **独立测试程序** | `examples/simple.rs` — winit + wgpu 弹出窗口渲染彩色三角形 |
+| **WGSL 着色器** | `triangle.wgsl` (2D 顶点着色器) + `simple.wgsl` (3D 顶点着色器) |
+| **预编译 DLL** | `wgpu_mc_jni.dll` 预打包在 `fabric/src/main/resources/` 中 |
 
-### 开发中
+### 已完成
 
-| 任务 | 优先级 | 说明 |
-|------|--------|------|
-| **wgpu Surface 绑定** | 🔴 P0 | 获取 MC 窗口 HWND 并创建 wgpu Surface |
-| **独立测试程序** | 🟠 P1 | `examples/simple.rs` 弹出窗口渲染三角形 |
-| **WGSL 着色器** | 🟠 P1 | 基础地形/天空/粒子着色器 |
+| 任务 | 说明 |
+|------|------|
+| **Surface 绑定 (基础)** | HWND 获取与传递已完成，wgpu Surface 绑定到 MC 窗口 |
+| **独立测试程序** | `examples/simple.rs` 可独立运行，弹出 1280×720 窗口渲染三角形 |
+| **WGSL 着色器** | 基础三角形着色器已实现 |
 
 ### 待开始
 
@@ -143,21 +157,45 @@
 - RenderGraph 配置驱动管线
 - 顶点数据压缩 (BlockstateKey)
 - Shader 后处理 (抗锯齿、色彩校正)
+- Mixin 替换实际游戏渲染 (LevelRenderer 拦截)
 
 ---
 
 ## 变更日志
+
+### [0.2.0] - 2026-07-07
+
+#### Added
+- 6 个 JNI native 方法完整实现 (`nativeRenderFrame`, `nativeSetWindow`, `nativeResize`)
+- 每帧渲染循环：Rust 离屏渲染 → byte[] 像素回传 → OpenGL 纹理上传 → 全屏 Quad 绘制
+- 窗口句柄 (HWND) 传递机制：Java 反射获取 GLFW 窗口 → `nativeSetWindow`
+- 窗口尺寸同步：`syncWindowSize()` 去重 + `nativeResize()` 更新
+- 独立测试程序 `examples/simple.rs`：winit + wgpu 弹出窗口渲染彩色三角形
+- WGSL 着色器：`triangle.wgsl` (2D) + `simple.wgsl` (3D)
+- `winit = "0.30"` + `raw-window-handle = "0.6"` + `windows-sys = "0.59"` 依赖
+- 预编译 DLL 打包至 `fabric/src/main/resources/`
+- GitHub Actions CI 工作流 (`.github/workflows/build.yml`)
+
+#### Changed
+- 渲染流程从纯初始化升级为每帧渲染循环
+- JNI 桥接从 3 个方法扩展至 6 个方法
+- 架构文档更新为实际的方法名和流程
+
+#### Fixed
+- 架构图中 `check_gpu_availability()` → 更正为 `WmRenderer::create()`
+- DLL 加载路径描述与实际代码一致 (优先 JAR 同级目录)
+
+---
 
 ### [0.1.0] - 2026-07-04
 
 #### Added
 - Rust + wgpu 项目结构 (workspace + wgpu-mc + wgpu-mc-jni)
 - Fabric 模组项目 (MC 1.21.1 + Fabric Loom 1.10.3)
-- JNI 桥接层：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`
+- JNI 桥接层初始 3 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`
 - Java 端 `D3D12Bridge` 类：DLL 自动加载 + 路径搜索
 - GPU 适配器检测功能
 - WGSL 基础着色器模板
-- C++ 源码归档 (`cpp_sources_backup.zip`)
 
 #### Changed
 - 从 C++/D3D12 方案重构为 Rust/wgpu 方案
@@ -195,6 +233,9 @@
 | `bytemuck` | 1.14 | 安全字节处理 |
 | `log` / `env_logger` | 0.4 / 0.10 | 日志系统 |
 | `futures` | 0.3 | 异步支持 |
+| `winit` | 0.30 | 窗口管理 (独立测试程序) |
+| `raw-window-handle` | 0.6 | RWH API 桥接 |
+| `windows-sys` | 0.59 | Windows API (Win32) |
 
 ### 构建工具
 
@@ -329,11 +370,14 @@ wgpu-mc = { path = "../wgpu-mc" }
 
 `D3D12Bridge.java` 按以下顺序搜索 DLL：
 
-1. `dx12mod/wgpu_mc_jni.dll` (相对于 MC 工作目录)
-2. `.minecraft/dx12mod/wgpu_mc_jni.dll`
-3. `<user.dir>/dx12mod/wgpu_mc_jni.dll`
+1. JAR 包同级目录 `wgpu_mc_jni.dll`
+2. `dx12mod/wgpu_mc_jni.dll` (相对于 MC 工作目录)
+3. `.minecraft/dx12mod/wgpu_mc_jni.dll`
+4. `<user.dir>/dx12mod/wgpu_mc_jni.dll`
 
 如需自定义路径，修改 `getDllPath()` 方法。
+
+> **注意**：预编译的 `wgpu_mc_jni.dll` 已打包在 `fabric/src/main/resources/` 中，可直接使用。
 
 ### 日志级别控制
 
@@ -355,7 +399,7 @@ java -jar minecraft.jar
 2. 将 JAR 和 DLL 部署到 Minecraft 目录
 3. 启动 Minecraft 1.21.1-Fabric_0.19.3
 4. 观察控制台日志确认模组加载成功
-5. 进入游戏验证 (当前阶段为纯初始化，无渲染输出)
+5. 进入游戏验证 — 当前会显示蓝色渲染覆盖层 (离屏渲染输出)
 
 ### 调试技巧
 
@@ -384,6 +428,21 @@ $env:RUST_LOG = "debug"
 - `nativeInit()` — 初始化 Rust 环境
 - `nativeHello("Hello from Minecraft!")` — 双向字符串传递
 - `nativeTestDeviceInfo()` — GPU 适配器检测
+- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄
+- `nativeRenderFrame()` — 每帧渲染并返回 RGBA 像素数据
+
+#### 运行独立测试程序
+
+```powershell
+# 在 rust/wgpu-mc 目录下运行
+cd rust\wgpu-mc
+cargo run --example simple
+# 弹出 1280×720 窗口，渲染红绿蓝三色三角形
+```
+
+#### 验证像素回传
+
+模组每帧调用 `nativeRenderFrame()` 返回蓝色像素缓冲区，通过 OpenGL `glTexSubImage2D` 上传至纹理并在全屏 Quad 上绘制。可在游戏中观察到蓝色覆盖层。
 
 ### 常见问题
 
@@ -393,6 +452,20 @@ $env:RUST_LOG = "debug"
 | `UnsatisfiedLinkError: wgpu_mc_jni.dll` | DLL 路径不正确 | 确认 DLL 在 `dx12mod/` 目录下 |
 | `Unsupported class file major version 69` | JDK 版本不匹配 | 使用 JDK 21 编译 (非 JDK 25) |
 | `Incompatible mods found!` | fabric.mod.json 版本声明错误 | 确认 `"minecraft": "~1.21.1"` |
+
+---
+
+## CI/CD
+
+### GitHub Actions
+
+项目配置了自动化 CI 流水线 (`.github/workflows/build.yml`)：
+
+- **触发条件**：push / pull_request 到主分支
+- **运行环境**：Ubuntu 24.04, JDK 25
+- **构建步骤**：
+  1. `./gradlew build` — 构建 Fabric 模组 JAR
+  2. 上传构建产物作为 Artifact
 
 ---
 
@@ -408,14 +481,16 @@ $env:RUST_LOG = "debug"
 | DLL 自动加载 | ✅ |
 | GPU 适配器检测 | ✅ |
 
-### 阶段 2：wgpu 渲染引擎骨架 🚧 进行中
+### 阶段 2：wgpu 渲染引擎骨架 🚧 部分完成
 
-| 任务 | 优先级 | 说明 |
-|------|--------|------|
-| Surface 绑定 | 🔴 P0 | 获取 MC 窗口 HWND 并创建 wgpu Surface |
-| 独立测试程序 | 🟠 P1 | `examples/simple.rs` 弹出窗口渲染 |
-| WGSL 着色器 | 🟠 P1 | 基础地形/天空/粒子着色器 |
-| 顶点缓冲区 | 🟡 P2 | 顶点数据传输与渲染 |
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| Surface 绑定 | ✅ 基础完成 | HWND 获取与传递已完成 |
+| 独立测试程序 | ✅ 完成 | `examples/simple.rs` 可独立运行渲染三角形 |
+| WGSL 着色器 | ✅ 基础完成 | `triangle.wgsl` + `simple.wgsl` |
+| 离屏渲染 | ✅ 完成 | `WmRenderer::render_frame()` 输出 RGBA 像素 |
+| 像素回传 | ✅ 完成 | Rust → Java byte[] → OpenGL 纹理 → 全屏 Quad |
+| 顶点缓冲区 | 🟡 P2 | 顶点数据传输与真实渲染管线 |
 
 ### 阶段 3：Minecraft Mixin 集成 ⏳ 待开始
 
@@ -443,32 +518,19 @@ $env:RUST_LOG = "debug"
 
 ### 参与方式
 
-1. **技术方案提案**：在 Issues 发布，标题标注 `[SOLUTION提案]`
-2. **代码实现**：Fork 仓库提交 PR，关联对应 Issue
-3. **BUG 反馈**：在 Issues 提交，包含日志和复现步骤
+##### 暂时不接受任何贡献
 
 ### 当前可认领的任务
 
-| 任务 | 难度 | 说明 |
-|------|------|------|
-| Surface 绑定 (HWND → wgpu) | 高 | 核心任务，需了解 raw-window-handle |
-| 独立测试程序 | 中 | winit + wgpu 基础示例 |
-| WGSL 着色器 | 中 | 地形/天空/粒子着色器实现 |
-| RenderGraph 设计 | 高 | YAML 配置解析 + 管线构建 |
+暂无
 
 ### 贡献者激励
 
-1. **源码永久标注**：贡献者信息记录在模块注释中
-2. **README 贡献名单**：统一收录
-3. **MC 百科官方词条**：正式发布后，贡献者写入 Mod 开发团队
+暂无
 
 ### 代码规范
 
-- **Rust**：`cargo fmt` + `cargo clippy`
-- **Java**：遵循 Oracle Java 编码规范
-- **提交信息**：使用语义化提交 (feat/fix/docs/refactor/test/chore)
-
----
+暂无
 
 ## 许可证
 

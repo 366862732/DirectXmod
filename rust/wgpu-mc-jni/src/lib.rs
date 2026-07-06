@@ -99,7 +99,11 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow<'a>(
     _class: JClass<'a>,
     _hwnd: i64,
 ) {
+    // Write file IMMEDIATELY - before anything else
+    let _ = std::fs::write("C:\\tmp\\wgpu_setwindow_entered.txt", "ENTERED\n");
+    
     log::info!("nativeSetWindow called with hwnd: {}", _hwnd);
+    eprintln!("[SETWINDOW] hwnd={}", _hwnd);
     
     let mut debug_log = format!("nativeSetWindow called, hwnd={}\n", _hwnd);
     
@@ -107,19 +111,26 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow<'a>(
     let width = 800u32;
     let height = 600u32;
     
-    match wgpu_mc::WmRenderer::create(width, height) {
-        Ok(renderer) => {
-            let mut guard = RENDERER.lock().unwrap();
-            *guard = Some(renderer);
-            log::info!("WmRenderer created successfully");
+    let result = (|| -> Result<(), String> {
+        log::info!("About to create WmRenderer {}x{}", width, height);
+        let renderer = wgpu_mc::WmRenderer::create(width, height)
+            .map_err(|e| format!("WmRenderer::create failed: {}", e))?;
+        
+        let mut guard = RENDERER.lock()
+            .map_err(|e| format!("lock failed: {:?}", e))?;
+        *guard = Some(renderer);
+        log::info!("WmRenderer created successfully");
+        Ok(())
+    })();
+    
+    match result {
+        Ok(_) => {
             debug_log.push_str("WmRenderer created OK\n");
-            
-            // Write file to confirm initialization
             let _ = std::fs::write("C:\\tmp\\wgpu_mc_initialized.txt", "renderer created\n");
         }
         Err(e) => {
-            log::error!("Failed to create WmRenderer: {}", e);
-            debug_log.push_str(&format!("WmRenderer FAILED: {}\n", e));
+            log::error!("Failed: {}", e);
+            debug_log.push_str(&format!("FAILED: {}\n", e));
             let _ = std::fs::write("C:\\tmp\\wgpu_mc_error.txt", format!("{}\n", e));
         }
     }
