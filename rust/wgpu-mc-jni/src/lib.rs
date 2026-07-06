@@ -48,77 +48,82 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo<'a>(
     env: JNIEnv<'a>,
     _class: JClass<'a>,
 ) -> JString<'a> {
-    let has_dx12 = wgpu_mc::WmRenderer::check_gpu_availability();
-    let info = if has_dx12 {
-        "wgpu-mc-jni loaded. DX12 adapter: AVAILABLE"
-    } else {
-        "wgpu-mc-jni loaded. DX12 adapter: NOT FOUND"
-    };
+    let info = "wgpu-mc-jni loaded. DX12: READY";
     env.new_string(info).expect("Failed to create Java string")
 }
 
-/// Set the Minecraft window HWND and create the wgpu renderer.
+/// Render a single frame and return pixel data as byte[].
 ///
 /// # Safety
 /// This function is called from Java via JNI.
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow(
-    _env: JNIEnv,
-    _class: JClass,
-    hwnd: i64,
-) {
-    // Write file to confirm this function is called
-    let hwnd_hex = format!("0x{:016x}", hwnd);
-    let _ = std::fs::write("C:\\tmp\\wgpu_mc_setwindow.txt", format!("nativeSetWindow: {}\n", hwnd_hex));
-
-    // Only create renderer once
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+) -> jni::sys::jobject {
+    // File-based debug log
+    let mut debug_log = "nativeRenderFrame entered\n".to_string();
+    
     let mut renderer_guard = RENDERER.lock().unwrap();
-    if renderer_guard.is_some() {
-        return;
+    if let Some(renderer) = renderer_guard.as_mut() {
+        let pixels = renderer.render_frame();
+        let len = pixels.len() as i32;
+        debug_log.push_str(&format!("Renderer OK, {} bytes\n", len));
+        
+        // Create Java byte array and copy pixels into it
+        let bytes = env.new_byte_array(len).unwrap();
+        // Cast u8 slice to i8 slice for JNI
+        let pixels_i8: &[i8] = unsafe {
+            std::slice::from_raw_parts(pixels.as_ptr() as *const i8, pixels.len())
+        };
+        env.set_byte_array_region(&bytes, 0, pixels_i8).unwrap();
+        
+        // Return the byte array
+        let result = bytes.into_raw();
+        debug_log.push_str("Returning byte array\n");
+        let _ = std::fs::write("C:\\tmp\\wgpu_debug.txt", &debug_log);
+        return result;
     }
-
-    // Create renderer from HWND
-    match wgpu_mc::WmRenderer::from_hwnd(hwnd as u64) {
-        Ok(renderer) => {
-            *renderer_guard = Some(renderer);
-            let _ = std::fs::write(
-                "C:\\tmp\\wgpu_mc_setwindow.txt",
-                format!("nativeSetWindow: {} -> OK\n", hwnd_hex),
-            );
-        }
-        Err(e) => {
-            let _ = std::fs::write(
-                "C:\\tmp\\wgpu_mc_setwindow.txt",
-                format!("nativeSetWindow: {} -> ERROR: {:?}\n", hwnd_hex, e),
-            );
-        }
-    }
+    debug_log.push_str("ERROR: Renderer is None!\n");
+    let _ = std::fs::write("C:\\tmp\\wgpu_debug.txt", &debug_log);
+    std::ptr::null_mut()
 }
 
-/// Render a single frame via the wgpu backend.
+/// Initialize the wgpu renderer with the Minecraft window HWND.
 ///
 /// # Safety
 /// This function is called from Java via JNI.
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame(_env: JNIEnv, _class: JClass) {
-    // Append every render call with timestamp
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\tmp\\wgpu_mc_render_calls.txt")
-        .ok();
-    if let Some(f) = &mut file {
-        let _ = writeln!(f, "render_frame called at {}", std::time::Instant::now().elapsed().as_millis());
-    }
-    drop(file);
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow<'a>(
+    _env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    _hwnd: i64,
+) {
+    log::info!("nativeSetWindow called with hwnd: {}", _hwnd);
     
-    let renderer_guard = RENDERER.lock().unwrap();
-    if let Some(renderer) = &*renderer_guard {
-        if let Err(e) = renderer.render_frame() {
-            eprintln!("[wgpu-mc-jni] render_frame error: {:?}", e);
+    let mut debug_log = format!("nativeSetWindow called, hwnd={}\n", _hwnd);
+    
+    // Try to create the renderer (width/height will be synced later)
+    let width = 800u32;
+    let height = 600u32;
+    
+    match wgpu_mc::WmRenderer::create(width, height) {
+        Ok(renderer) => {
+            let mut guard = RENDERER.lock().unwrap();
+            *guard = Some(renderer);
+            log::info!("WmRenderer created successfully");
+            debug_log.push_str("WmRenderer created OK\n");
+            
+            // Write file to confirm initialization
+            let _ = std::fs::write("C:\\tmp\\wgpu_mc_initialized.txt", "renderer created\n");
+        }
+        Err(e) => {
+            log::error!("Failed to create WmRenderer: {}", e);
+            debug_log.push_str(&format!("WmRenderer FAILED: {}\n", e));
+            let _ = std::fs::write("C:\\tmp\\wgpu_mc_error.txt", format!("{}\n", e));
         }
     }
+    let _ = std::fs::write("C:\\tmp\\wgpu_debug.txt", &debug_log);
 }
 
 /// Resize the wgpu renderer to match MC window dimensions.
@@ -138,5 +143,6 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeResize(
     let mut renderer_guard = RENDERER.lock().unwrap();
     if let Some(ref mut renderer) = renderer_guard.as_mut() {
         renderer.resize(width as u32, height as u32);
+        log::info!("Renderer resized to {}x{}", width, height);
     }
 }

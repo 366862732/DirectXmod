@@ -1,7 +1,11 @@
 package com.dx12;
 
+import net.minecraft.client.MinecraftClient;
+import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
+
+import java.nio.ByteBuffer;
 
 /**
  * JNI bridge for wgpu-mc Rust library.
@@ -62,7 +66,7 @@ public class D3D12Bridge {
     public static native String nativeHello(String input);
     public static native String nativeTestDeviceInfo();
     public static native void nativeSetWindow(long hwnd);
-    public static native void nativeRenderFrame();
+    public static native byte[] nativeRenderFrame();
     public static native void nativeResize(int width, int height);
 
     // === Convenience methods ===
@@ -94,13 +98,45 @@ public class D3D12Bridge {
         return nativeTestDeviceInfo();
     }
 
+    /**
+     * Get the Minecraft window HWND.
+     * Uses reflection to access the Window's handle field.
+     */
+    private static long lastCheckTime = 0;
+    private static final long CACHE_TTL_MS = 5000;
+
     public static long getWindowHandle() {
-        long glfwWindow = GLFW.glfwGetCurrentContext();
-        if (glfwWindow == 0) {
-            Dx12Mod.LOGGER.warn("glfwGetCurrentContext returned 0");
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.getWindow() == null) {
             return 0;
         }
-        return GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+
+        // Use cached value if still valid
+        long now = System.currentTimeMillis();
+        if (cachedHwnd != 0 && (now - lastCheckTime) < CACHE_TTL_MS) {
+            return cachedHwnd;
+        }
+
+        try {
+            // Access the GLFW window handle field (Yarn mapped name: field_5187)
+            java.lang.reflect.Field field = client.getWindow().getClass().getDeclaredField("field_5187");
+            field.setAccessible(true);
+            long glfwWindow = field.getLong(client.getWindow());
+            if (glfwWindow == 0) {
+                Dx12Mod.LOGGER.warn("Window field_5187 is 0");
+                return 0;
+            }
+            long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+            cachedHwnd = hwnd;
+            lastCheckTime = now;
+            return hwnd;
+        } catch (NoSuchFieldException e) {
+            Dx12Mod.LOGGER.error("Window.field_5187 not found: {}", e.getMessage());
+            return 0;
+        } catch (IllegalAccessException e) {
+            Dx12Mod.LOGGER.error("Cannot access Window.field_5187: {}", e.getMessage());
+            return 0;
+        }
     }
 
     public static void setWindow(long hwnd) {
@@ -118,12 +154,22 @@ public class D3D12Bridge {
         }
     }
 
-    public static void renderFrame() {
-        if (!initialized) return;
+    public static ByteBuffer renderFrame() {
+        if (!initialized) return null;
         try {
-            nativeRenderFrame();
+            byte[] pixels = nativeRenderFrame();
+            if (pixels == null || pixels.length == 0) {
+                Dx12Mod.LOGGER.info("nativeRenderFrame returned null or empty");
+                return null;
+            }
+            ByteBuffer buf = BufferUtils.createByteBuffer(pixels.length);
+            buf.put(pixels);
+            buf.flip();
+            Dx12Mod.LOGGER.info("renderFrame returned {} bytes", pixels.length);
+            return buf;
         } catch (UnsatisfiedLinkError e) {
             Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
+            return null;
         }
     }
 
