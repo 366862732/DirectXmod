@@ -144,14 +144,19 @@ public class D3D12Bridge {
             Dx12Mod.LOGGER.warn("setWindow called with hwnd=0, skipping");
             return;
         }
-        if (cachedHwnd == hwnd) return;
-        cachedHwnd = hwnd;
+        System.out.println("[WGPU DEBUG] setWindow: about to call nativeSetWindow(hwnd=" + hwnd + ")");
         try {
             nativeSetWindow(hwnd);
+            System.out.println("[WGPU DEBUG] setWindow: nativeSetWindow succeeded");
             Dx12Mod.LOGGER.info("nativeSetWindow called with HWND: 0x%016x", hwnd);
         } catch (UnsatisfiedLinkError e) {
+            System.out.println("[WGPU DEBUG] setWindow: UnsatisfiedLinkError: " + e.getMessage());
             Dx12Mod.LOGGER.error("nativeSetWindow not available: {}", e.getMessage());
+        } catch (Throwable e) {
+            System.out.println("[WGPU DEBUG] setWindow: THROUBLE: " + e.getClass().getName() + " - " + e.getMessage());
+            e.printStackTrace();
         }
+        cachedHwnd = hwnd;
     }
 
     public static ByteBuffer renderFrame() {
