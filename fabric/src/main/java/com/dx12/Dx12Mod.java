@@ -2,6 +2,7 @@ package com.dx12;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
@@ -35,7 +36,13 @@ public class Dx12Mod implements ClientModInitializer {
     private static int texId = 0;
     private static int vaoId = 0;
     private static int vboId = 0;
+    private static int iboId = 0;
     private static boolean vaoInitialized = false;
+
+    // Frame data shared between tick callback and HUD callback
+    private static ByteBuffer pendingPixels = null;
+    private static int pendingWidth = 0;
+    private static int pendingHeight = 0;
 
     @Override
     public void onInitializeClient() {
@@ -48,17 +55,13 @@ public class Dx12Mod implements ClientModInitializer {
         String deviceInfo = D3D12Bridge.getDeviceInfo();
         LOGGER.info("Device info: {}", deviceInfo);
 
-        // Register render tick loop - executes on Render thread
+        // Phase 1: Tick callback - get window info, create texture/VAO, call Rust renderer
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            // Get GLFW window from current OpenGL context
-            // This returns 0 before the first render frame, so we skip early ticks
             long glfwWindow = GLFW.glfwGetCurrentContext();
             if (glfwWindow == 0) return;
 
-            // Get framebuffer size using native GLFW API
-            // glfwGetWindowSize returns width and height via IntBuffer pointers
-            java.nio.IntBuffer wBuf = java.nio.IntBuffer.allocate(1);
-            java.nio.IntBuffer hBuf = java.nio.IntBuffer.allocate(1);
+            java.nio.IntBuffer wBuf = BufferUtils.createIntBuffer(1);
+            java.nio.IntBuffer hBuf = BufferUtils.createIntBuffer(1);
             GLFW.glfwGetWindowSize(glfwWindow, wBuf, hBuf);
             int width = wBuf.get(0);
             int height = hBuf.get(0);
@@ -92,13 +95,31 @@ public class Dx12Mod implements ClientModInitializer {
 
             LOGGER.info("Rendering frame: {} bytes, VAO={}", pixels.remaining(), vaoId);
 
+            // Store frame data for HUD callback to draw
+            pendingPixels = pixels;
+            pendingWidth = width;
+            pendingHeight = height;
+        });
+
+        // Phase 2: HUD callback - upload pixels and draw fullscreen quad
+        // This runs during the HUD render phase when OpenGL context is guaranteed safe
+        HudRenderCallback.register((client, tickDelta) -> {
+            if (pendingPixels == null || !pendingPixels.hasRemaining() || !vaoInitialized) {
+                return;
+            }
+
+            int width = pendingWidth;
+            int height = pendingHeight;
+            ByteBuffer pixels = pendingPixels;
+            pendingPixels = null; // Consume the pending frame
+
             // Upload pixels to texture
             glBindTexture(GL_TEXTURE_2D, texId);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
             glBindTexture(GL_TEXTURE_2D, 0);
 
-            // Draw fullscreen quad using VAO
-            drawFullScreenQuad(width, height);
+            // Draw fullscreen quad
+            drawFullScreenQuad();
 
             // Check for GL errors
             int err = glGetError();
@@ -113,11 +134,12 @@ public class Dx12Mod implements ClientModInitializer {
     private static void initVAO() {
         if (vaoInitialized) return;
 
-        // Interleaved vertex data: x, y, z, u, v (5 floats = 20 bytes per vertex)
+        // Fullscreen quad vertices in clip space (-1 to +1), with tex coords
         float[] data = {
-             0f,  0f,  0f,  0f, 0f,  // bottom-left
-             1f,  0f,  0f,  1f, 0f,  // bottom-right
-             0f,  1f,  0f,  0f, 1f,  // top-left
+            // x,     y,     z,   u,   v
+            -1f, -1f,  0f,  0f, 0f,  // bottom-left
+             1f, -1f,  0f,  1f, 0f,  // bottom-right
+            -1f,  1f,  0f,  0f, 1f,  // top-left
              1f,  1f,  0f,  1f, 1f,  // top-right
         };
         byte[] idx = { 0, 1, 2, 2, 1, 3 };
@@ -140,8 +162,8 @@ public class Dx12Mod implements ClientModInitializer {
         glEnableVertexAttribArray(1);
 
         // Index buffer
-        int ibo = glGenBuffers();
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        iboId = glGenBuffers();
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboId);
         ByteBuffer ibBuf = BufferUtils.createByteBuffer(idx.length);
         ibBuf.put(idx).flip();
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, ibBuf, GL_STATIC_DRAW);
@@ -151,27 +173,17 @@ public class Dx12Mod implements ClientModInitializer {
         glBindVertexArray(0);
 
         vaoInitialized = true;
-        LOGGER.info("VAO initialized: vao={}, vbo={}, ibo={}", vaoId, vboId, ibo);
+        LOGGER.info("VAO initialized: vao={}, vbo={}, ibo={}", vaoId, vboId, iboId);
     }
 
-    private static void drawFullScreenQuad(int width, int height) {
+    private static void drawFullScreenQuad() {
         if (!vaoInitialized) return;
 
-        glPushAttrib(GL_ALL_ATTRIB_BITS);
-
-        // Setup orthographic projection matching vertex coordinates
-        glMatrixMode(GL_PROJECTION);
-        glPushMatrix();
-        glLoadIdentity();
-        glOrtho(0, width, 0, height, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        glPushMatrix();
-        glLoadIdentity();
-
+        // Pure modern OpenGL - no matrix transforms, no attrib pushes
         glDisable(GL_DEPTH_TEST);
-        glEnable(GL_TEXTURE_2D);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquation(GL_FUNC_ADD);
 
         glBindTexture(GL_TEXTURE_2D, texId);
         glColor4f(1, 1, 1, 1);
@@ -181,14 +193,7 @@ public class Dx12Mod implements ClientModInitializer {
         glBindVertexArray(0);
 
         glBindTexture(GL_TEXTURE_2D, 0);
-        glDisable(GL_TEXTURE_2D);
         glDisable(GL_BLEND);
         glEnable(GL_DEPTH_TEST);
-
-        glMatrixMode(GL_PROJECTION);
-        glPopMatrix();
-        glMatrixMode(GL_MODELVIEW);
-        glPopMatrix();
-        glPopAttrib();
     }
 }
