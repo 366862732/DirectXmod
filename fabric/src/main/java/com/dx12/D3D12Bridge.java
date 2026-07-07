@@ -1,64 +1,60 @@
 package com.dx12;
 
-import net.minecraft.client.MinecraftClient;
 import org.lwjgl.BufferUtils;
-import org.lwjgl.glfw.GLFW;
-import org.lwjgl.glfw.GLFWNativeWin32;
 
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 
 /**
  * JNI bridge for wgpu-mc Rust library.
+ * Loads native DLL from dx12mod/ directory under the game working directory.
  */
 public class D3D12Bridge {
     static {
-        String libName;
-        String os = System.getProperty("os.name").toLowerCase();
-        if (os.contains("win")) {
-            libName = "wgpu_mc_jni.dll";
-        } else if (os.contains("linux")) {
-            libName = "libwgpu_mc_jni.so";
-        } else if (os.contains("mac")) {
-            libName = "libwgpu_mc_jni.dylib";
-        } else {
-            libName = "wgpu_mc_jni";
-        }
-        
-        String dllPath = getDllPath();
-        if (dllPath != null) {
-            System.load(dllPath);
-        } else {
-            System.loadLibrary(libName);
+        loadNativeLibrary();
+    }
+
+    private static void loadNativeLibrary() {
+        try {
+            String libName = "wgpu_mc_jni.dll";
+            Path dllDir = getDllDir();
+            Path dllPath = dllDir.resolve(libName);
+
+            // Extract DLL from JAR if not present
+            if (!Files.exists(dllPath)) {
+                try (InputStream in = D3D12Bridge.class.getResourceAsStream("/" + libName)) {
+                    if (in != null) {
+                        Files.copy(in, dllPath, StandardCopyOption.REPLACE_EXISTING);
+                        System.out.println("[D3D12Bridge] Extracted DLL to: " + dllPath);
+                    } else {
+                        System.err.println("[D3D12Bridge] DLL not found in JAR resources");
+                        return;
+                    }
+                }
+            }
+
+            System.load(dllPath.toAbsolutePath().toString());
+            System.out.println("[D3D12Bridge] Native library loaded from: " + dllPath);
+        } catch (Exception e) {
+            System.err.println("[D3D12Bridge] Failed to load native library: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
-    private static String getDllPath() {
-        // Try loading from the same directory as the JAR (mods folder)
+    private static Path getDllDir() {
+        // Use user.dir (launcher working directory)
+        // For version-isolated launchers: D:\.minecraft\versions\<version>\dx12mod
+        String userDir = System.getProperty("user.dir");
+        Path dllDir = Path.of(userDir, "dx12mod");
         try {
-            java.net.URL jarUrl = D3D12Bridge.class.getProtectionDomain().getCodeSource().getLocation();
-            java.io.File jarFile = new java.io.File(jarUrl.toURI());
-            java.io.File modsDir = jarFile.getParentFile();
-            java.io.File dllInMods = new java.io.File(modsDir, "wgpu_mc_jni.dll");
-            if (dllInMods.exists()) {
-                return dllInMods.getAbsolutePath();
-            }
+            Files.createDirectories(dllDir);
         } catch (Exception e) {
-            // Fall through to other paths
+            // Directory creation failed, continue anyway
         }
-        
-        // Fallback: try common relative paths
-        String[] candidates = {
-            "dx12mod/wgpu_mc_jni.dll",
-            ".minecraft/dx12mod/wgpu_mc_jni.dll",
-            System.getProperty("user.dir") + "/dx12mod/wgpu_mc_jni.dll"
-        };
-        for (String path : candidates) {
-            java.io.File f = new java.io.File(path);
-            if (f.exists()) {
-                return f.getAbsolutePath();
-            }
-        }
-        return null;
+        return dllDir;
     }
 
     // === Native methods ===
@@ -80,9 +76,9 @@ public class D3D12Bridge {
         try {
             nativeInit();
             initialized = true;
-            System.out.println("[D3D12Bridge] Rust JNI library loaded and initialized.");
+            System.out.println("[D3D12Bridge] Rust JNI library initialized.");
         } catch (UnsatisfiedLinkError e) {
-            System.err.println("[D3D12Bridge] Failed to load Rust JNI library: " + e.getMessage());
+            System.err.println("[D3D12Bridge] Failed to init Rust JNI library: " + e.getMessage());
         }
     }
 
@@ -99,42 +95,33 @@ public class D3D12Bridge {
     }
 
     /**
-     * Get the Minecraft window HWND.
-     * Uses reflection to access the Window's handle field.
+     * Get the Minecraft window HWND via LWJGL GLFW (no Yarn mapping issues).
      */
     private static long lastCheckTime = 0;
     private static final long CACHE_TTL_MS = 5000;
 
     public static long getWindowHandle() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.getWindow() == null) {
-            return 0;
-        }
-
-        // Use cached value if still valid
         long now = System.currentTimeMillis();
         if (cachedHwnd != 0 && (now - lastCheckTime) < CACHE_TTL_MS) {
             return cachedHwnd;
         }
 
         try {
-            // Access the GLFW window handle field (Yarn mapped name: field_5187)
-            java.lang.reflect.Field field = client.getWindow().getClass().getDeclaredField("field_5187");
-            field.setAccessible(true);
-            long glfwWindow = field.getLong(client.getWindow());
-            if (glfwWindow == 0) {
-                Dx12Mod.LOGGER.warn("Window field_5187 is 0");
+            // Get GLFW window pointer from current OpenGL context
+            long glfwWindowPtr = org.lwjgl.glfw.GLFW.glfwGetCurrentContext();
+            if (glfwWindowPtr == 0) {
+                Dx12Mod.LOGGER.warn("glfwGetCurrentContext returned 0");
                 return 0;
             }
-            long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+
+            // Convert GLFW window to Windows HWND
+            long hwnd = org.lwjgl.glfw.GLFWNativeWin32.glfwGetWin32Window(glfwWindowPtr);
             cachedHwnd = hwnd;
             lastCheckTime = now;
+            Dx12Mod.LOGGER.info("Got HWND via glfwGetCurrentContext: 0x{:016x}", hwnd);
             return hwnd;
-        } catch (NoSuchFieldException e) {
-            Dx12Mod.LOGGER.error("Window.field_5187 not found: {}", e.getMessage());
-            return 0;
-        } catch (IllegalAccessException e) {
-            Dx12Mod.LOGGER.error("Cannot access Window.field_5187: {}", e.getMessage());
+        } catch (Exception e) {
+            Dx12Mod.LOGGER.error("Failed to get window handle: {}", e.getMessage());
             return 0;
         }
     }

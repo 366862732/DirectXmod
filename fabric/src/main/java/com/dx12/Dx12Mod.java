@@ -1,7 +1,9 @@
 package com.dx12;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import org.lwjgl.BufferUtils;
+import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
 import org.lwjgl.opengl.GL15;
@@ -9,7 +11,6 @@ import org.lwjgl.opengl.GL30;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 
@@ -22,8 +23,8 @@ import static org.lwjgl.opengl.GL30.*;
  *
  * Design principles:
  * - No Mixin, no @Inject, no @Shadow
- * - Minimal Fabric API dependency (only ClientModInitializer entry point)
- * - All MC interaction via reflection for version compatibility
+ * - Uses ClientModInitializer (Fabric Loader core) + ClientTickEvents (Fabric API)
+ * - All window/HWND/size access via LWJGL GLFW (no Yarn mapping issues)
  * - Rust wgpu engine is completely independent of Minecraft
  * - Java side only: pass HWND to Rust, upload pixels via OpenGL
  */
@@ -36,12 +37,6 @@ public class Dx12Mod implements ClientModInitializer {
     private static int vboId = 0;
     private static boolean vaoInitialized = false;
 
-    // Cached reflection members
-    private static Method mcGetInstance = null;
-    private static Method getWindowMethod = null;
-    private static Method windowGetWidthMethod = null;
-    private static Method windowGetHeightMethod = null;
-
     @Override
     public void onInitializeClient() {
         LOGGER.info("GL4DX12 Mod initializing...");
@@ -53,69 +48,20 @@ public class Dx12Mod implements ClientModInitializer {
         String deviceInfo = D3D12Bridge.getDeviceInfo();
         LOGGER.info("Device info: {}", deviceInfo);
 
-        // Register render loop via ClientTickEvents using reflection
-        registerTickLoop();
+        // Register render tick loop - executes on Render thread
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            // Get GLFW window from current OpenGL context
+            // This returns 0 before the first render frame, so we skip early ticks
+            long glfwWindow = GLFW.glfwGetCurrentContext();
+            if (glfwWindow == 0) return;
 
-        LOGGER.info("GL4DX12 Mod initialized!");
-    }
-
-    /**
-     * Register the render tick loop using reflection to avoid Yarn mapping issues.
-     * Tries multiple possible class/method names for ClientTickEvents.
-     * NOTE: Does NOT reference MinecraftClient here — that class may not be loaded yet.
-     */
-    @SuppressWarnings("unchecked")
-    private void registerTickLoop() {
-        // Try to find ClientTickEvents.END_CLIENT_TICK
-        String[] tickEventClasses = {
-            "net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents",
-            "net.fabricmc.fabric.api.client.event.lifecycle.v1.FabricClientTickEvents"
-        };
-
-        boolean registered = false;
-        for (String className : tickEventClasses) {
-            try {
-                Class<?> tickClass = Class.forName(className);
-                java.lang.reflect.Field tickField = tickClass.getField("END_CLIENT_TICK");
-                Object tickEvent = tickField.get(null);
-
-                // Register the lambda — mcGetInstance will be lazily initialized on first tick
-                Method registerMethod = tickEvent.getClass().getMethod("register", java.util.function.Consumer.class);
-                registerMethod.invoke(tickEvent, (java.util.function.Consumer<Object>) client -> {
-                    tryRenderFrame();
-                });
-                LOGGER.info("Registered tick loop via {}", className);
-                registered = true;
-                break;
-            } catch (ClassNotFoundException | NoSuchFieldException | NoSuchMethodException e) {
-                continue;
-            } catch (Exception e) {
-                LOGGER.error("Failed to register tick loop via {}: {}", className, e.getMessage());
-            }
-        }
-
-        if (!registered) {
-            LOGGER.warn("Could not register tick loop via ClientTickEvents");
-        }
-    }
-
-    /**
-     * Called every tick to render a frame.
-     */
-    private void tryRenderFrame() {
-        if (mcGetInstance == null) return;
-
-        try {
-            Object mc = mcGetInstance.invoke(null);
-            if (mc == null) return;
-
-            // Lazy-init window reflection
-            if (getWindowMethod == null) {
-                initWindowReflection(mc);
-            }
-
-            Integer width = getWindowWidth(mc);
-            Integer height = getWindowHeight(mc);
+            // Get framebuffer size using native GLFW API
+            // glfwGetWindowSize returns width and height via IntBuffer pointers
+            java.nio.IntBuffer wBuf = java.nio.IntBuffer.allocate(1);
+            java.nio.IntBuffer hBuf = java.nio.IntBuffer.allocate(1);
+            GLFW.glfwGetWindowSize(glfwWindow, wBuf, hBuf);
+            int width = wBuf.get(0);
+            int height = hBuf.get(0);
             if (width <= 0 || height <= 0) return;
 
             if (!textureCreated) {
@@ -144,6 +90,8 @@ public class Dx12Mod implements ClientModInitializer {
             ByteBuffer pixels = D3D12Bridge.renderFrame();
             if (pixels == null || !pixels.hasRemaining()) return;
 
+            LOGGER.info("Rendering frame: {} bytes, VAO={}", pixels.remaining(), vaoId);
+
             // Upload pixels to texture
             glBindTexture(GL_TEXTURE_2D, texId);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
@@ -157,66 +105,9 @@ public class Dx12Mod implements ClientModInitializer {
             if (err != GL_NO_ERROR) {
                 LOGGER.error("GL error after draw: 0x{:08x}", err);
             }
-        } catch (Exception e) {
-            LOGGER.debug("Render frame error: {}", e.getMessage());
-        }
-    }
+        });
 
-    private void initWindowReflection(Object mc) {
-        try {
-            Class<?> mcClass = mc.getClass();
-
-            // Find getWindow() method
-            for (String methodName : new String[]{"getWindow", "getGui"}) {
-                try {
-                    getWindowMethod = mcClass.getMethod(methodName);
-                    Object window = getWindowMethod.invoke(mc);
-                    if (window != null) {
-                        LOGGER.info("Found getWindow method: {}", methodName);
-
-                        // Find width/height methods
-                        Class<?> windowClass = window.getClass();
-                        for (String wMethod : new String[]{"getWidth", "method_17686"}) {
-                            try {
-                                windowGetWidthMethod = windowClass.getMethod(wMethod);
-                                break;
-                            } catch (NoSuchMethodException ignored) {}
-                        }
-                        for (String hMethod : new String[]{"getHeight", "method_17687"}) {
-                            try {
-                                windowGetHeightMethod = windowClass.getMethod(hMethod);
-                                break;
-                            } catch (NoSuchMethodException ignored) {}
-                        }
-                        break;
-                    }
-                } catch (NoSuchMethodException ignored) {}
-            }
-        } catch (Exception e) {
-            LOGGER.debug("initWindowReflection failed: {}", e.getMessage());
-        }
-    }
-
-    private Integer getWindowWidth(Object mc) {
-        if (windowGetWidthMethod == null || getWindowMethod == null) return 800;
-        try {
-            Object window = getWindowMethod.invoke(mc);
-            if (window == null) return 800;
-            return (Integer) windowGetWidthMethod.invoke(window);
-        } catch (Exception e) {
-            return 800;
-        }
-    }
-
-    private Integer getWindowHeight(Object mc) {
-        if (windowGetHeightMethod == null || getWindowMethod == null) return 600;
-        try {
-            Object window = getWindowMethod.invoke(mc);
-            if (window == null) return 600;
-            return (Integer) windowGetHeightMethod.invoke(window);
-        } catch (Exception e) {
-            return 600;
-        }
+        LOGGER.info("GL4DX12 Mod initialized!");
     }
 
     private static void initVAO() {
