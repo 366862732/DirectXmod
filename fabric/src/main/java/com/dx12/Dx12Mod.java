@@ -2,19 +2,16 @@ package com.dx12;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL30;
-import org.lwjgl.opengl.GLUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
-import java.nio.charset.StandardCharsets;
 
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL15.*;
@@ -33,7 +30,6 @@ import static org.lwjgl.opengl.GL30.*;
 public class Dx12Mod implements ClientModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12");
 
-    private static boolean textureCreated = false;
     private static int texId = 0;
     private static int vaoId = 0;
     private static int vboId = 0;
@@ -41,14 +37,19 @@ public class Dx12Mod implements ClientModInitializer {
     private static boolean vaoInitialized = false;
     private static int shaderProgram = 0;
     private static int texUniformLocation = -1;
-
-    // Frame data shared between tick callback and HUD callback
-    private static ByteBuffer pendingPixels = null;
-    private static int pendingWidth = 0;
-    private static int pendingHeight = 0;
+    private static long frameCount = 0;
 
     // Track whether GL resources are valid (Minecraft may destroy them when menu opens)
     private static boolean glResourcesValid = false;
+
+    // Startup delay: skip GL operations during Minecraft's resource loading phase
+    // (Shader Loader, texture loading, etc. run on render thread and conflict with our GL calls)
+    private static boolean renderReady = false;
+    private static long initTime = 0;
+    private static long lastTickTime = 0;
+
+    private static final long LOADING_GAP_MS = 2000; // Tick gap > 2s indicates a resource reload
+    private static final long RENDER_DELAY_MS = 10000; // Wait 10s after reload before rendering
 
     @Override
     public void onInitializeClient() {
@@ -61,7 +62,12 @@ public class Dx12Mod implements ClientModInitializer {
         String deviceInfo = D3D12Bridge.getDeviceInfo();
         LOGGER.info("Device info: {}", deviceInfo);
 
-        // Phase 1: Tick callback - get window info, create texture/VAO, call Rust renderer
+        initTime = System.currentTimeMillis();
+
+        // Single unified tick callback:
+        // 1. Get window info  2. Create/recreate GL resources
+        // 3. Call Rust render  4. Upload pixels via glTexImage2D (safe)
+        // 5. Draw fullscreen quad  6. Restore ALL Minecraft GL state
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             long glfwWindow = GLFW.glfwGetCurrentContext();
             if (glfwWindow == 0) return;
@@ -73,108 +79,119 @@ public class Dx12Mod implements ClientModInitializer {
             int height = hBuf.get(0);
             if (width <= 0 || height <= 0) return;
 
-            // Check if GL resources were destroyed by Minecraft (menu open, etc.)
-            boolean resourcesLost = !glResourcesValid
-                || !glIsTexture(texId)
-                || !glIsVertexArray(vaoId)
-                || shaderProgram == 0;
+            // Detect resource reloads: if tick gap > 2 seconds, Minecraft did a reload
+            // Reset the render delay timer to avoid conflicts
+            long now = System.currentTimeMillis();
+            if (lastTickTime > 0 && (now - lastTickTime) > LOADING_GAP_MS) {
+                if (renderReady) {
+                    LOGGER.info("Resource reload detected ({} s gap), delaying rendering",
+                        (now - lastTickTime) / 1000);
+                    renderReady = false;
+                    initTime = now;
+                    glResourcesValid = false;
+                }
+            }
+            lastTickTime = now;
 
-            if (resourcesLost) {
-                textureCreated = false;
-                vaoInitialized = false;
-                shaderProgram = 0;
-                texId = 0;
-                vaoId = 0;
-                vboId = 0;
-                iboId = 0;
-                glResourcesValid = false;
-                LOGGER.info("GL resources lost, will recreate on next valid frame");
+            // Startup/reload delay: wait before attempting GL rendering
+            // This avoids conflicts with Minecraft's resource loading phase
+            if (!renderReady) {
+                long elapsed = now - initTime;
+                if (elapsed < RENDER_DELAY_MS) {
+                    return;
+                }
+                renderReady = true;
+                LOGGER.info("Render delay complete ({} s), enabling rendering", elapsed / 1000);
             }
 
-            if (!textureCreated) {
-                long hwnd = D3D12Bridge.getWindowHandle();
-                if (hwnd != 0) {
-                    D3D12Bridge.setWindow(hwnd);
-                    LOGGER.info("WGPU window HWND set: 0x%016x", hwnd);
+            // ----- Save ALL Minecraft GL state -----
+            int oldVao = glGetInteger(GL_VERTEX_ARRAY_BINDING);
+            int oldTex = glGetInteger(GL_TEXTURE_BINDING_2D);
+            int oldProg = glGetInteger(GL_CURRENT_PROGRAM);
+            int oldArrayBuf = glGetInteger(GL_ARRAY_BUFFER_BINDING);
+            int oldElemBuf = glGetInteger(GL_ELEMENT_ARRAY_BUFFER_BINDING);
+            boolean oldBlend = glIsEnabled(GL_BLEND);
+            boolean oldDepth = glIsEnabled(GL_DEPTH_TEST);
+
+            try {
+                // Check if VAO/shader destroyed by Minecraft (menu open, loading, etc.)
+                if (glResourcesValid && (!glIsVertexArray(vaoId) || shaderProgram == 0)) {
+                    LOGGER.info("GL resources lost, recreating");
+                    vaoInitialized = false;
+                    shaderProgram = 0;
+                    vaoId = 0;
+                    vboId = 0;
+                    iboId = 0;
+                    glResourcesValid = false;
                 }
 
+                // Create VAO + shader on first run or after loss
+                if (!vaoInitialized || shaderProgram == 0) {
+                    long hwnd = D3D12Bridge.getWindowHandle();
+                    if (hwnd != 0) {
+                        D3D12Bridge.setWindow(hwnd);
+                        LOGGER.info("WGPU window HWND set: 0x%016x", hwnd);
+                    }
+
+                    initVAO();
+                    initShaderProgram();
+                    LOGGER.info("OpenGL resources initialized: vao={}, shader={}", vaoId, shaderProgram);
+                    glResourcesValid = true;
+                }
+
+                if (shaderProgram == 0) return;
+
+                D3D12Bridge.syncWindowSize(width, height);
+
+                ByteBuffer pixels = D3D12Bridge.renderFrame();
+                if (pixels == null || !pixels.hasRemaining()) return;
+
+                if (frameCount++ % 60 == 0) {
+                    LOGGER.info("Rendering frame: {} bytes, VAO={} (frames={})", pixels.remaining(), vaoId, frameCount);
+                }
+
+                // Delete old texture to avoid name conflicts with Minecraft's shader loading
+                // (Minecraft may reuse our texture name for other GL objects during loading)
+                if (texId != 0) {
+                    glDeleteTextures(texId);
+                }
+
+                // Create fresh texture every frame - avoids stale/corrupted texture state
                 texId = glGenTextures();
                 glBindTexture(GL_TEXTURE_2D, texId);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glBindTexture(GL_TEXTURE_2D, 0);
-                textureCreated = true;
-                LOGGER.info("OpenGL texture created: {}", texId);
-
-                initVAO();
-                initShaderProgram();
-            }
-
-            // Skip pixel upload if shader wasn't created
-            if (shaderProgram == 0) return;
-
-            D3D12Bridge.syncWindowSize(width, height);
-
-            ByteBuffer pixels = D3D12Bridge.renderFrame();
-            if (pixels == null || !pixels.hasRemaining()) return;
-
-            LOGGER.info("Rendering frame: {} bytes, VAO={}", pixels.remaining(), vaoId);
-
-            // Store frame data for HUD callback to draw
-            pendingPixels = pixels;
-            pendingWidth = width;
-            pendingHeight = height;
-        });
-
-        // Phase 2: HUD callback - upload pixels and draw fullscreen quad
-        HudRenderCallback.EVENT.register((matrixStack, tickDelta) -> {
-            // Guard: skip if no pending frame or resources invalid
-            if (pendingPixels == null || !pendingPixels.hasRemaining() || !glResourcesValid) {
-                return;
-            }
-
-            int width = pendingWidth;
-            int height = pendingHeight;
-            ByteBuffer pixels = pendingPixels;
-            pendingPixels = null; // Consume the pending frame
-
-            // Final check right before drawing
-            if (!glIsTexture(texId) || !glIsVertexArray(vaoId) || shaderProgram == 0) {
-                glResourcesValid = false;
-                textureCreated = false;
-                vaoInitialized = false;
-                shaderProgram = 0;
-                return;
-            }
-
-            try {
-                // Upload pixels to texture
-                glBindTexture(GL_TEXTURE_2D, texId);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-                glBindTexture(GL_TEXTURE_2D, 0);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
                 // Draw fullscreen quad
-                drawFullScreenQuad();
-                glResourcesValid = true;
+                glUseProgram(shaderProgram);
+                glUniform1i(texUniformLocation, 0);
+                glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBindVertexArray(vaoId);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboId);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
             } catch (Throwable t) {
-                LOGGER.warn("OpenGL draw failed, resetting state: {}", t.getMessage());
+                LOGGER.warn("GL draw failed: {}", t.getMessage());
                 glResourcesValid = false;
-                textureCreated = false;
                 vaoInitialized = false;
                 shaderProgram = 0;
                 texId = 0;
                 vaoId = 0;
                 vboId = 0;
                 iboId = 0;
-            }
-
-            // Check for GL errors
-            int err = glGetError();
-            if (err != GL_NO_ERROR) {
-                LOGGER.error("GL error after draw: 0x{:08x}", err);
+            } finally {
+                // ----- Restore ALL Minecraft GL state -----
+                glBindVertexArray(oldVao);
+                glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, oldElemBuf);
+                glBindTexture(GL_TEXTURE_2D, oldTex);
+                glUseProgram(oldProg);
+                if (oldBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+                if (oldDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
             }
         });
 
@@ -225,49 +242,6 @@ public class Dx12Mod implements ClientModInitializer {
 
         vaoInitialized = true;
         LOGGER.info("VAO initialized: vao={}, vbo={}, ibo={}", vaoId, vboId, iboId);
-    }
-
-    private static void drawFullScreenQuad() {
-        if (!vaoInitialized || shaderProgram == 0) return;
-
-        // Check for stale GL resources (Minecraft may have destroyed them)
-        if (!glIsVertexArray(vaoId)) {
-            LOGGER.warn("VAO {} was deleted by Minecraft, recreating", vaoId);
-            vaoInitialized = false;
-            initVAO();
-            initShaderProgram();
-            if (!vaoInitialized || shaderProgram == 0) return;
-        }
-        if (!glIsTexture(texId)) {
-            LOGGER.warn("Texture {} was deleted, recreating", texId);
-            textureCreated = false;
-        }
-
-        glUseProgram(shaderProgram);
-        glUniform1i(texUniformLocation, 0);
-
-        glDisable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        glBindTexture(GL_TEXTURE_2D, texId);
-
-        // Rebind VAO + buffers (Minecraft may have cleared them)
-        glBindVertexArray(vaoId);
-
-        // Bind IB explicitly (Core Profile requires it)
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboId);
-
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
-
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        glBindVertexArray(0);
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glUseProgram(0);
-
-        glDisable(GL_BLEND);
-        glEnable(GL_DEPTH_TEST);
     }
 
     private static void initShaderProgram() {

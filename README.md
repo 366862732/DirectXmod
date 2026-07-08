@@ -142,6 +142,9 @@
 | **独立测试程序** | `examples/simple.rs` — winit + wgpu 弹出窗口渲染彩色三角形 |
 | **WGSL 着色器** | `triangle.wgsl` (2D 顶点着色器) + `simple.wgsl` (3D 顶点着色器) |
 | **预编译 DLL** | `wgpu_mc_jni.dll` 预打包在 `fabric/src/main/resources/` 中 |
+| **GL 状态管理** | 完整的 Minecraft GL 状态保存/恢复机制，避免与 MC 渲染冲突 |
+| **资源重载检测** | 自动检测 MC 资源重载并延迟渲染，避免 GL 资源失效 |
+| **VAO 重建机制** | 检测到 GL 资源丢失时自动重建 VAO/Shader |
 
 ### 已完成
 
@@ -162,6 +165,26 @@
 ---
 
 ## 变更日志
+
+### [0.3.0] - 2026-07-08
+
+#### Added
+- 完整的 GL 状态管理机制：保存/恢复 Minecraft VAO、Texture、Program、Blend、Depth 状态
+- 资源重载检测：通过 tick 时间间隔判断 MC 资源重新加载，自动重置渲染状态
+- VAO/Shader 自动重建：检测到 GL 资源失效时自动重建，无需重启游戏
+- 每帧创建新 Texture：避免与 MC 的 shader 加载产生纹理名称冲突
+- 启动延迟渲染：10 秒延迟确保 MC 资源加载完成后才启用渲染
+
+#### Changed
+- 渲染流程从简单贴图升级为完整的 GL 状态隔离方案
+- `Dx12Mod.java` 采用 try-finally 结构确保 GL 状态始终恢复
+
+#### Fixed
+- Minecraft 菜单打开时 GL 资源被销毁导致崩溃的问题
+- 资源重载期间渲染冲突问题
+- 纹理名称重复使用导致的渲染异常
+
+---
 
 ### [0.2.0] - 2026-07-07
 
