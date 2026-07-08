@@ -5,15 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/gradle/wrapper/gradle-wrapper.properties" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/gradle/wrapper/gradle-wrapper.properties" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/Dx12Mod.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/Dx12Mod.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/fabric/src/main/resources/fabric.mod.json" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/resources/fabric.mod.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/resources/wgpu_mc_jni.dll" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/resources/wgpu_mc_jni.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/rust/wgpu-mc-jni/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/rust/wgpu-mc-jni/src/lib.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/rust/wgpu-mc/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/rust/wgpu-mc/src/lib.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/步骤.md" beforeDir="false" afterPath="$PROJECT_DIR$/步骤.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -87,7 +81,7 @@
     &quot;kotlin-language-version-configured&quot;: &quot;true&quot;,
     &quot;last_opened_file_path&quot;: &quot;D:/dx12-lib-template-26.1.2&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;advanced.settings&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;,
     &quot;应用程序.Minecraft Client.executor&quot;: &quot;Debug&quot;
   }
@@ -97,7 +91,7 @@
       <recent name="com.dx12" />
     </key>
   </component>
-  <component name="RunManager" selected="应用程序.Minecraft Client" />
+  <component name="RunManager" selected="应用程序.Minecraft Server" />
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -117,7 +111,8 @@
       <workItem from="1783423556140" duration="106000" />
       <workItem from="1783493751846" duration="4027000" />
       <workItem from="1783509022332" duration="37000" />
-      <workItem from="1783509076714" duration="2605000" />
+      <workItem from="1783509076714" duration="4686000" />
+      <workItem from="1783527987031" duration="3000" />
     </task>
     <task id="LOCAL-00001" summary="移动位置准备重构">
       <option name="closed" value="true" />

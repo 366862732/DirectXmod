@@ -3,7 +3,7 @@
   "id": "gl4dx12",
   "version": "${version}",
   "name": "DirectX Mod",
-  "description": "OpenGL to DirectX 12 bridge using wgpu rendering engine",
+  "description": "这是一个JNI+dx12的渲染模组",
   "authors": [
     "dx12-team"
   ],

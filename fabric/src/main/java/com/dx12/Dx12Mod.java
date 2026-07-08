@@ -51,6 +51,8 @@ public class Dx12Mod implements ClientModInitializer {
     private static boolean shaderValid = false;
     private static int texId = 0;
     private static boolean texAllocated = false;
+    private static int texWidth = 0;
+    private static int texHeight = 0;
 
     // Startup delay: skip GL operations during Minecraft's resource loading phase
     // (Shader Loader, texture loading, etc. run on render thread and conflict with our GL calls)
@@ -98,6 +100,8 @@ public class Dx12Mod implements ClientModInitializer {
                     vaoId = 0;
                     shaderValid = false;
                     texAllocated = false;
+                    texWidth = 0;
+                    texHeight = 0;
                     pendingPixels = null;
                 }
             }
@@ -200,8 +204,8 @@ public class Dx12Mod implements ClientModInitializer {
                     LOGGER.info("Rendering frame: {} bytes (frame={})", bufferBytes, frameCount);
                 }
 
-                // Texture: allocate once, update every frame
-                if (!texAllocated) {
+                // Texture: allocate once, reallocate on resize
+                if (!texAllocated || texWidth != width || texHeight != height) {
                     if (texId != 0) glDeleteTextures(texId);
                     texId = glGenTextures();
                     glBindTexture(GL_TEXTURE_2D, texId);
@@ -211,6 +215,8 @@ public class Dx12Mod implements ClientModInitializer {
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
                     texAllocated = true;
+                    texWidth = width;
+                    texHeight = height;
                 }
                 glBindTexture(GL_TEXTURE_2D, texId);
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
