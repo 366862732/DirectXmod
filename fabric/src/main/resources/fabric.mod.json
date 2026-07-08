@@ -9,7 +9,7 @@
   ],
   "contact": {},
   "license": "MIT",
-  "icon": "assets/gl4dx12/icon.png",
+  "icon": "assets/dx12mod/icon.png",
   "environment": "*",
   "entrypoints": {
     "client": [

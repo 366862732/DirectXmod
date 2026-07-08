@@ -118,7 +118,6 @@ public class D3D12Bridge {
             long hwnd = org.lwjgl.glfw.GLFWNativeWin32.glfwGetWin32Window(glfwWindowPtr);
             cachedHwnd = hwnd;
             lastCheckTime = now;
-            Dx12Mod.LOGGER.info("Got HWND via glfwGetCurrentContext: 0x{:016x}", hwnd);
             return hwnd;
         } catch (Exception e) {
             Dx12Mod.LOGGER.error("Failed to get window handle: {}", e.getMessage());
@@ -126,24 +125,17 @@ public class D3D12Bridge {
         }
     }
 
+    private static long lastSetHwnd = 0;
+
     public static void setWindow(long hwnd) {
-        if (hwnd == 0) {
-            Dx12Mod.LOGGER.warn("setWindow called with hwnd=0, skipping");
-            return;
-        }
-        System.out.println("[WGPU DEBUG] setWindow: about to call nativeSetWindow(hwnd=" + hwnd + ")");
+        if (hwnd == 0) return;
+        if (hwnd == lastSetHwnd) return;
         try {
             nativeSetWindow(hwnd);
-            System.out.println("[WGPU DEBUG] setWindow: nativeSetWindow succeeded");
-            Dx12Mod.LOGGER.info("nativeSetWindow called with HWND: 0x%016x", hwnd);
+            lastSetHwnd = hwnd;
         } catch (UnsatisfiedLinkError e) {
-            System.out.println("[WGPU DEBUG] setWindow: UnsatisfiedLinkError: " + e.getMessage());
             Dx12Mod.LOGGER.error("nativeSetWindow not available: {}", e.getMessage());
-        } catch (Throwable e) {
-            System.out.println("[WGPU DEBUG] setWindow: THROUBLE: " + e.getClass().getName() + " - " + e.getMessage());
-            e.printStackTrace();
         }
-        cachedHwnd = hwnd;
     }
 
     public static ByteBuffer renderFrame() {
@@ -151,13 +143,11 @@ public class D3D12Bridge {
         try {
             byte[] pixels = nativeRenderFrame();
             if (pixels == null || pixels.length == 0) {
-                Dx12Mod.LOGGER.info("nativeRenderFrame returned null or empty");
                 return null;
             }
             ByteBuffer buf = BufferUtils.createByteBuffer(pixels.length);
             buf.put(pixels);
             buf.flip();
-            Dx12Mod.LOGGER.info("renderFrame returned {} bytes", pixels.length);
             return buf;
         } catch (UnsatisfiedLinkError e) {
             Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
