@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
+import java.nio.charset.StandardCharsets;
 
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL15.*;
@@ -37,6 +38,8 @@ public class Dx12Mod implements ClientModInitializer {
     private static int vboId = 0;
     private static int iboId = 0;
     private static boolean vaoInitialized = false;
+    private static int shaderProgram = 0;
+    private static int texUniformLocation = -1;
 
     // Frame data shared between tick callback and HUD callback
     private static ByteBuffer pendingPixels = null;
@@ -85,6 +88,7 @@ public class Dx12Mod implements ClientModInitializer {
                 LOGGER.info("OpenGL texture created: {}", texId);
 
                 initVAO();
+                initShaderProgram();
             }
 
             D3D12Bridge.syncWindowSize(width, height);
@@ -103,7 +107,14 @@ public class Dx12Mod implements ClientModInitializer {
         // Phase 2: HUD callback - upload pixels and draw fullscreen quad
         // This runs during the HUD render phase when OpenGL context is guaranteed safe
         HudRenderCallback.EVENT.register((matrixStack, tickDelta) -> {
+            // Guard: skip if no pending frame, VAO not ready, or OpenGL context lost
             if (pendingPixels == null || !pendingPixels.hasRemaining() || !vaoInitialized) {
+                return;
+            }
+
+            // Quick check: if texture/VAO were destroyed by Minecraft, skip drawing
+            // (e.g. when menu is open, context is lost)
+            if (!glIsTexture(texId) || !glIsVertexArray(vaoId)) {
                 return;
             }
 
@@ -112,13 +123,26 @@ public class Dx12Mod implements ClientModInitializer {
             ByteBuffer pixels = pendingPixels;
             pendingPixels = null; // Consume the pending frame
 
-            // Upload pixels to texture
-            glBindTexture(GL_TEXTURE_2D, texId);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-            glBindTexture(GL_TEXTURE_2D, 0);
+            try {
+                // Upload pixels to texture
+                glBindTexture(GL_TEXTURE_2D, texId);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                glBindTexture(GL_TEXTURE_2D, 0);
 
-            // Draw fullscreen quad
-            drawFullScreenQuad();
+                // Draw fullscreen quad
+                drawFullScreenQuad();
+            } catch (Throwable t) {
+                // OpenGL context may have been lost (menu open, window minimized, etc.)
+                // Reset state so we retry next frame
+                LOGGER.warn("OpenGL draw failed, resetting state: {}", t.getMessage());
+                textureCreated = false;
+                vaoInitialized = false;
+                shaderProgram = 0;
+                texId = 0;
+                vaoId = 0;
+                vboId = 0;
+                iboId = 0;
+            }
 
             // Check for GL errors
             int err = glGetError();
@@ -133,12 +157,13 @@ public class Dx12Mod implements ClientModInitializer {
     private static void initVAO() {
         if (vaoInitialized) return;
 
-        // Fullscreen quad vertices in clip space (-1 to +1), with tex coords
+        // Fullscreen quad vertices: position (x,y,z) + texCoord (u,v)
+        // Using screen-space coordinates (0 to 1) for simplicity
         float[] data = {
             // x,     y,     z,   u,   v
-            -1f, -1f,  0f,  0f, 0f,  // bottom-left
-             1f, -1f,  0f,  1f, 0f,  // bottom-right
-            -1f,  1f,  0f,  0f, 1f,  // top-left
+             0f,  0f,  0f,  0f, 0f,  // bottom-left
+             1f,  0f,  0f,  1f, 0f,  // bottom-right
+             0f,  1f,  0f,  0f, 1f,  // top-left
              1f,  1f,  0f,  1f, 1f,  // top-right
         };
         byte[] idx = { 0, 1, 2, 2, 1, 3 };
@@ -176,23 +201,108 @@ public class Dx12Mod implements ClientModInitializer {
     }
 
     private static void drawFullScreenQuad() {
-        if (!vaoInitialized) return;
+        if (!vaoInitialized || shaderProgram == 0) return;
 
-        // Pure modern OpenGL - no matrix transforms, no attrib pushes
+        // Check for stale GL resources (Minecraft may have destroyed them)
+        if (!glIsVertexArray(vaoId)) {
+            LOGGER.warn("VAO {} was deleted by Minecraft, recreating", vaoId);
+            vaoInitialized = false;
+            initVAO();
+            initShaderProgram();
+            if (!vaoInitialized || shaderProgram == 0) return;
+        }
+        if (!glIsTexture(texId)) {
+            LOGGER.warn("Texture {} was deleted, recreating", texId);
+            textureCreated = false;
+        }
+
+        glUseProgram(shaderProgram);
+        glUniform1i(texUniformLocation, 0);
+
         glDisable(GL_DEPTH_TEST);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glBlendEquation(GL_FUNC_ADD);
 
         glBindTexture(GL_TEXTURE_2D, texId);
-        glColor4f(1, 1, 1, 1);
 
+        // Rebind VAO + buffers (Minecraft may have cleared them)
         glBindVertexArray(vaoId);
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0);
+
+        // Bind IB explicitly (Core Profile requires it)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboId);
+
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
 
         glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+
         glDisable(GL_BLEND);
         glEnable(GL_DEPTH_TEST);
+    }
+
+    private static void initShaderProgram() {
+        if (shaderProgram != 0) return;
+
+        // Simple vertex shader: pass through position and texCoord
+        String vertSrc =
+            "#version 330 core\n" +
+            "layout(location = 0) in vec3 aPos;\n" +
+            "layout(location = 1) in vec2 aTexCoord;\n" +
+            "out vec2 vTexCoord;\n" +
+            "void main(){\n" +
+            "  gl_Position = vec4(aPos, 1.0);\n" +
+            "  vTexCoord = aTexCoord;\n" +
+            "}\n";
+
+        // Simple fragment shader: sample texture
+        String fragSrc =
+            "#version 330 core\n" +
+            "in vec2 vTexCoord;\n" +
+            "uniform sampler2D uTexture;\n" +
+            "out vec4 FragColor;\n" +
+            "void main(){\n" +
+            "  FragColor = texture(uTexture, vTexCoord);\n" +
+            "}\n";
+
+        int vertShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vertShader, vertSrc);
+        glCompileShader(vertShader);
+
+        if (glGetShaderi(vertShader, GL_COMPILE_STATUS) == GL_FALSE) {
+            LOGGER.error("Vertex shader compile failed: {}", glGetShaderInfoLog(vertShader));
+            return;
+        }
+
+        int fragShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fragShader, fragSrc);
+        glCompileShader(fragShader);
+
+        if (glGetShaderi(fragShader, GL_COMPILE_STATUS) == GL_FALSE) {
+            LOGGER.error("Fragment shader compile failed: {}", glGetShaderInfoLog(fragShader));
+            glDeleteShader(vertShader);
+            return;
+        }
+
+        shaderProgram = glCreateProgram();
+        glAttachShader(shaderProgram, vertShader);
+        glAttachShader(shaderProgram, fragShader);
+        glLinkProgram(shaderProgram);
+
+        if (glGetProgrami(shaderProgram, GL_LINK_STATUS) == GL_FALSE) {
+            LOGGER.error("Shader program link failed: {}", glGetProgramInfoLog(shaderProgram));
+            glDeleteProgram(shaderProgram);
+            shaderProgram = 0;
+            return;
+        }
+
+        texUniformLocation = glGetUniformLocation(shaderProgram, "uTexture");
+
+        glDeleteShader(vertShader);
+        glDeleteShader(fragShader);
+
+        LOGGER.info("Shader program created: prog={}, texLoc={}", shaderProgram, texUniformLocation);
     }
 }
