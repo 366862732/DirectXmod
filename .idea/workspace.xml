@@ -4,9 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/Dx12Mod.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/Dx12Mod.java" afterDir="false" />
-    </list>
+    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -107,7 +105,7 @@
       <updated>1781016552612</updated>
       <workItem from="1783151361810" duration="184000" />
       <workItem from="1783423556140" duration="106000" />
-      <workItem from="1783493751846" duration="34000" />
+      <workItem from="1783493751846" duration="923000" />
     </task>
     <task id="LOCAL-00001" summary="移动位置准备重构">
       <option name="closed" value="true" />

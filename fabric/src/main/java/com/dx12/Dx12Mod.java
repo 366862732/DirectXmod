@@ -8,6 +8,7 @@ import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL30;
+import org.lwjgl.opengl.GLUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +47,9 @@ public class Dx12Mod implements ClientModInitializer {
     private static int pendingWidth = 0;
     private static int pendingHeight = 0;
 
+    // Track whether GL resources are valid (Minecraft may destroy them when menu opens)
+    private static boolean glResourcesValid = false;
+
     @Override
     public void onInitializeClient() {
         LOGGER.info("GL4DX12 Mod initializing...");
@@ -69,6 +73,24 @@ public class Dx12Mod implements ClientModInitializer {
             int height = hBuf.get(0);
             if (width <= 0 || height <= 0) return;
 
+            // Check if GL resources were destroyed by Minecraft (menu open, etc.)
+            boolean resourcesLost = !glResourcesValid
+                || !glIsTexture(texId)
+                || !glIsVertexArray(vaoId)
+                || shaderProgram == 0;
+
+            if (resourcesLost) {
+                textureCreated = false;
+                vaoInitialized = false;
+                shaderProgram = 0;
+                texId = 0;
+                vaoId = 0;
+                vboId = 0;
+                iboId = 0;
+                glResourcesValid = false;
+                LOGGER.info("GL resources lost, will recreate on next valid frame");
+            }
+
             if (!textureCreated) {
                 long hwnd = D3D12Bridge.getWindowHandle();
                 if (hwnd != 0) {
@@ -91,6 +113,9 @@ public class Dx12Mod implements ClientModInitializer {
                 initShaderProgram();
             }
 
+            // Skip pixel upload if shader wasn't created
+            if (shaderProgram == 0) return;
+
             D3D12Bridge.syncWindowSize(width, height);
 
             ByteBuffer pixels = D3D12Bridge.renderFrame();
@@ -105,16 +130,9 @@ public class Dx12Mod implements ClientModInitializer {
         });
 
         // Phase 2: HUD callback - upload pixels and draw fullscreen quad
-        // This runs during the HUD render phase when OpenGL context is guaranteed safe
         HudRenderCallback.EVENT.register((matrixStack, tickDelta) -> {
-            // Guard: skip if no pending frame, VAO not ready, or OpenGL context lost
-            if (pendingPixels == null || !pendingPixels.hasRemaining() || !vaoInitialized) {
-                return;
-            }
-
-            // Quick check: if texture/VAO were destroyed by Minecraft, skip drawing
-            // (e.g. when menu is open, context is lost)
-            if (!glIsTexture(texId) || !glIsVertexArray(vaoId)) {
+            // Guard: skip if no pending frame or resources invalid
+            if (pendingPixels == null || !pendingPixels.hasRemaining() || !glResourcesValid) {
                 return;
             }
 
@@ -122,6 +140,15 @@ public class Dx12Mod implements ClientModInitializer {
             int height = pendingHeight;
             ByteBuffer pixels = pendingPixels;
             pendingPixels = null; // Consume the pending frame
+
+            // Final check right before drawing
+            if (!glIsTexture(texId) || !glIsVertexArray(vaoId) || shaderProgram == 0) {
+                glResourcesValid = false;
+                textureCreated = false;
+                vaoInitialized = false;
+                shaderProgram = 0;
+                return;
+            }
 
             try {
                 // Upload pixels to texture
@@ -131,10 +158,10 @@ public class Dx12Mod implements ClientModInitializer {
 
                 // Draw fullscreen quad
                 drawFullScreenQuad();
+                glResourcesValid = true;
             } catch (Throwable t) {
-                // OpenGL context may have been lost (menu open, window minimized, etc.)
-                // Reset state so we retry next frame
                 LOGGER.warn("OpenGL draw failed, resetting state: {}", t.getMessage());
+                glResourcesValid = false;
                 textureCreated = false;
                 vaoInitialized = false;
                 shaderProgram = 0;
