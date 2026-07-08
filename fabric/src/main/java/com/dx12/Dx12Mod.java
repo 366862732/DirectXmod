@@ -6,7 +6,6 @@ import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
-import org.lwjgl.opengl.GL12;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL30;
 import org.slf4j.Logger;
@@ -76,11 +75,11 @@ public class Dx12Mod implements ClientModInitializer {
 
                 texId = glGenTextures();
                 glBindTexture(GL_TEXTURE_2D, texId);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL12.GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 10497);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 10497);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glBindTexture(GL_TEXTURE_2D, 0);
                 textureCreated = true;
                 LOGGER.info("OpenGL texture created: {}", texId);
@@ -103,7 +102,7 @@ public class Dx12Mod implements ClientModInitializer {
 
         // Phase 2: HUD callback - upload pixels and draw fullscreen quad
         // This runs during the HUD render phase when OpenGL context is guaranteed safe
-        HudRenderCallback.register((client, tickDelta) -> {
+        HudRenderCallback.EVENT.register((matrixStack, tickDelta) -> {
             if (pendingPixels == null || !pendingPixels.hasRemaining() || !vaoInitialized) {
                 return;
             }
