@@ -166,7 +166,9 @@
 
 ## 变更日志
 
-### [0.3.0] - 2026-07-08
+### [1.0.0] - 2026-07-08
+
+> **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
 
 #### Added
 - 完整的 GL 状态管理机制：保存/恢复 Minecraft VAO、Texture、Program、Blend、Depth 状态
