@@ -2,7 +2,7 @@
 //!
 //! Exports native functions callable from Java Fabric mod.
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JFloatArray, JString};
 use jni::JNIEnv;
 
 // Global static renderer (initialized once from HWND)
@@ -16,8 +16,6 @@ static RENDERER: Mutex<Option<wgpu_mc::WmRenderer>> = Mutex::new(None);
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _class: JClass) {
     let _ = env_logger::try_init();
-    // Write file to confirm DLL is loaded
-    let _ = std::fs::write("C:\\tmp\\wgpu_mc_init.txt", "nativeInit executed\n");
 }
 
 /// Test JNI string communication.
@@ -58,34 +56,22 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeTestDeviceInfo<'a>(
 /// This function is called from Java via JNI.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame<'a>(
-    mut env: JNIEnv<'a>,
+    env: JNIEnv<'a>,
     _class: JClass<'a>,
 ) -> jni::sys::jobject {
-    // File-based debug log
-    let mut debug_log = "nativeRenderFrame entered\n".to_string();
-    
     let mut renderer_guard = RENDERER.lock().unwrap();
     if let Some(renderer) = renderer_guard.as_mut() {
         let pixels = renderer.render_frame();
         let len = pixels.len() as i32;
-        debug_log.push_str(&format!("Renderer OK, {} bytes\n", len));
-        
-        // Create Java byte array and copy pixels into it
+
         let bytes = env.new_byte_array(len).unwrap();
-        // Cast u8 slice to i8 slice for JNI
         let pixels_i8: &[i8] = unsafe {
             std::slice::from_raw_parts(pixels.as_ptr() as *const i8, pixels.len())
         };
         env.set_byte_array_region(&bytes, 0, pixels_i8).unwrap();
-        
-        // Return the byte array
-        let result = bytes.into_raw();
-        debug_log.push_str("Returning byte array\n");
-        let _ = std::fs::write("C:\\tmp\\wgpu_debug.txt", &debug_log);
-        return result;
+
+        return bytes.into_raw();
     }
-    debug_log.push_str("ERROR: Renderer is None!\n");
-    let _ = std::fs::write("C:\\tmp\\wgpu_debug.txt", &debug_log);
     std::ptr::null_mut()
 }
 
@@ -99,42 +85,51 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow<'a>(
     _class: JClass<'a>,
     _hwnd: i64,
 ) {
-    // Write file IMMEDIATELY - before anything else
-    let _ = std::fs::write("C:\\tmp\\wgpu_setwindow_entered.txt", "ENTERED\n");
-    
     log::info!("nativeSetWindow called with hwnd: {}", _hwnd);
-    eprintln!("[SETWINDOW] hwnd={}", _hwnd);
-    
-    let mut debug_log = format!("nativeSetWindow called, hwnd={}\n", _hwnd);
-    
-    // Try to create the renderer (width/height will be synced later)
+
     let width = 800u32;
     let height = 600u32;
-    
-    let result = (|| -> Result<(), String> {
-        log::info!("About to create WmRenderer {}x{}", width, height);
-        let renderer = wgpu_mc::WmRenderer::create(width, height)
-            .map_err(|e| format!("WmRenderer::create failed: {}", e))?;
-        
-        let mut guard = RENDERER.lock()
-            .map_err(|e| format!("lock failed: {:?}", e))?;
-        *guard = Some(renderer);
-        log::info!("WmRenderer created successfully");
-        Ok(())
-    })();
-    
-    match result {
-        Ok(_) => {
-            debug_log.push_str("WmRenderer created OK\n");
-            let _ = std::fs::write("C:\\tmp\\wgpu_mc_initialized.txt", "renderer created\n");
+
+    match wgpu_mc::WmRenderer::create(width, height) {
+        Ok(renderer) => {
+            let mut guard = RENDERER.lock().unwrap();
+            *guard = Some(renderer);
+            log::info!("WmRenderer created successfully");
         }
         Err(e) => {
             log::error!("Failed: {}", e);
-            debug_log.push_str(&format!("FAILED: {}\n", e));
-            let _ = std::fs::write("C:\\tmp\\wgpu_mc_error.txt", format!("{}\n", e));
         }
     }
-    let _ = std::fs::write("C:\\tmp\\wgpu_debug.txt", &debug_log);
+}
+
+/// Update the camera MVP matrix for the wgpu renderer.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCamera<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    matrix: JFloatArray<'a>,
+) {
+    let len = env.get_array_length(&matrix).unwrap();
+    if len != 16 {
+        return;
+    }
+    let mut floats = [0f32; 16];
+    env.get_float_array_region(&matrix, 0, &mut floats).unwrap();
+
+    let mvp: [[f32; 4]; 4] = [
+        [floats[0], floats[1], floats[2], floats[3]],
+        [floats[4], floats[5], floats[6], floats[7]],
+        [floats[8], floats[9], floats[10], floats[11]],
+        [floats[12], floats[13], floats[14], floats[15]],
+    ];
+
+    let mut guard = RENDERER.lock().unwrap();
+    if let Some(ref mut renderer) = guard.as_mut() {
+        renderer.set_camera(mvp);
+    }
 }
 
 /// Resize the wgpu renderer to match MC window dimensions.

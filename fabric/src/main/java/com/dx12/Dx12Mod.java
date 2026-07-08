@@ -11,6 +11,11 @@ import org.lwjgl.opengl.GL30;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.Camera;
+import net.minecraft.client.render.GameRenderer;
+import org.joml.Matrix4f;
+
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 
@@ -114,6 +119,38 @@ public class Dx12Mod implements ClientModInitializer {
             if (lastRenderTime > 0 && (now - lastRenderTime) < 100) return;
             lastRenderTime = now;
 
+            // Extract camera view-projection matrix from Minecraft
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc != null && mc.gameRenderer != null) {
+                Camera camera = mc.gameRenderer.getCamera();
+                if (camera != null) {
+                    // Get camera position and rotation
+                    var pos = camera.getPos();
+                    float pitch = camera.getPitch();
+                    float yaw = camera.getYaw();
+
+                    // Build view matrix (look-at)
+                    Matrix4f view = new Matrix4f();
+                    view.rotateX((float) Math.toRadians(pitch));
+                    view.rotateY((float) Math.toRadians(yaw + 180.0));
+                    view.translate((float) -pos.x, (float) -pos.y, (float) -pos.z);
+
+                    // Build projection matrix
+                    float aspect = (float) width / (float) height;
+                    Matrix4f proj = new Matrix4f();
+                    proj.perspective((float) Math.toRadians(70.0), aspect, 0.05f, 1000.0f);
+
+                    // MVP = projection * view
+                    Matrix4f mvp = new Matrix4f(proj);
+                    mvp.mul(view);
+
+                    // Convert Matrix4f to float[16] column-major for JNI
+                    float[] mvpArray = new float[16];
+                    mvp.get(mvpArray);
+                    D3D12Bridge.updateCamera(mvpArray);
+                }
+            }
+
             // Call Rust renderer — only update HWND when it changes
             long hwnd = D3D12Bridge.getWindowHandle();
             if (hwnd != 0 && hwnd != lastHwnd) {
@@ -135,16 +172,32 @@ public class Dx12Mod implements ClientModInitializer {
         // Minecraft uses RenderSystem which resets GL state before each draw call,
         // so we DON'T need to save/restore state — just set ours, draw, unbind.
         HudRenderCallback.EVENT.register((drawContext, tickDelta) -> {
+            // Skip GL drawing when any GUI screen is open (pause menu, inventory, etc.)
+            // Prevents nvoglv64 crash from GL state conflict with screen rendering
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc == null || mc.currentScreen != null) return;
+
             if (pendingPixels == null || !pendingPixels.hasRemaining()) return;
 
             int width = pendingWidth;
             int height = pendingHeight;
             ByteBuffer pixels = pendingPixels;
-            pendingPixels = null;
+            pendingPixels = null; 
+
+            // Safety: clamp upload size to actual buffer capacity
+            // Prevents nvoglv64 ACCESS_VIOLATION when buffer doesn't match expected size
+            int expectedBytes = width * height * 4;
+            int bufferBytes = pixels.remaining();
+            if (bufferBytes < expectedBytes) {
+                if (width * 4 > 0) {
+                    height = bufferBytes / (width * 4);
+                }
+                if (height <= 0) return;
+            }
 
             try {
                 if (frameCount++ % 60 == 0) {
-                    LOGGER.info("Rendering frame: {} bytes (frame={})", pixels.remaining(), frameCount);
+                    LOGGER.info("Rendering frame: {} bytes (frame={})", bufferBytes, frameCount);
                 }
 
                 // Texture: allocate once, update every frame

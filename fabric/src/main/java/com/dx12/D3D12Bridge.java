@@ -1,6 +1,7 @@
 package com.dx12;
 
 import org.lwjgl.BufferUtils;
+import org.lwjgl.system.MemoryUtil;
 
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -64,6 +65,7 @@ public class D3D12Bridge {
     public static native void nativeSetWindow(long hwnd);
     public static native byte[] nativeRenderFrame();
     public static native void nativeResize(int width, int height);
+    public static native void nativeUpdateCamera(float[] matrix);
 
     // === Convenience methods ===
     private static boolean initialized = false;
@@ -145,9 +147,16 @@ public class D3D12Bridge {
             if (pixels == null || pixels.length == 0) {
                 return null;
             }
-            ByteBuffer buf = BufferUtils.createByteBuffer(pixels.length);
+            // Allocate with 1-page extra padding to prevent NVIDIA driver
+            // ACCESS_VIOLATION when reading across page boundaries.
+            // The driver may prefetch or read in page-sized chunks even though
+            // glTexSubImage2D only needs width*height*4 bytes.
+            int paddedSize = pixels.length + 4096;
+            ByteBuffer buf = MemoryUtil.memAlloc(paddedSize);
             buf.put(pixels);
             buf.flip();
+            // Limit to actual pixel data so glTexSubImage2D knows the bounds
+            buf.limit(pixels.length);
             return buf;
         } catch (UnsatisfiedLinkError e) {
             Dx12Mod.LOGGER.warn("nativeRenderFrame not available: {}", e.getMessage());
@@ -164,6 +173,15 @@ public class D3D12Bridge {
             nativeResize(width, height);
         } catch (UnsatisfiedLinkError e) {
             Dx12Mod.LOGGER.warn("nativeResize not available: {}", e.getMessage());
+        }
+    }
+
+    public static void updateCamera(float[] matrix) {
+        if (!initialized) return;
+        try {
+            nativeUpdateCamera(matrix);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore if native lib not available
         }
     }
 }

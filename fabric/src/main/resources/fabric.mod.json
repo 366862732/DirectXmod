@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gl4dx12",
   "version": "${version}",
-  "name": "GL4DX12",
+  "name": "DirectX Mod",
   "description": "OpenGL to DirectX 12 bridge using wgpu rendering engine",
   "authors": [
     "dx12-team"
