@@ -233,7 +233,7 @@ impl WmRenderer {
         let (device, queue) = futures::executor::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wgpu-mc"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::PUSH_CONSTANTS,
                 required_limits: wgpu::Limits {
                     max_push_constant_size: 64,
                     ..Default::default()

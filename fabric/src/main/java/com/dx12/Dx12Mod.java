@@ -124,6 +124,11 @@ public class Dx12Mod implements ClientModInitializer {
             // Gives Minecraft's post-load GL state time to stabilize
             if (now - renderStartTime < 2000) return;
 
+            // Diagnostic: log when we actually start rendering
+            if (frameCount == 0) {
+                LOGGER.info("First render tick: width={}, height={}", width, height);
+            }
+
             // Throttle to ~20fps: GPU readback pipeline naturally limits to ~20fps,
             // but capping here prevents tick callback from hogging the render thread
             // when GPU responds at variable speeds.
@@ -131,6 +136,7 @@ public class Dx12Mod implements ClientModInitializer {
             lastRenderTime = now;
 
             // Extract camera view-projection matrix from Minecraft
+            try {
             MinecraftClient mc = MinecraftClient.getInstance();
             if (mc != null && mc.gameRenderer != null) {
                 Camera camera = mc.gameRenderer.getCamera();
@@ -161,22 +167,37 @@ public class Dx12Mod implements ClientModInitializer {
                     D3D12Bridge.updateCamera(mvpArray);
                 }
             }
+            } catch (Throwable t) {
+                LOGGER.error("Camera extraction failed: {}", t.getMessage());
+                return;
+            }
 
             // Call Rust renderer — only update HWND when it changes
+            try {
             long hwnd = D3D12Bridge.getWindowHandle();
             if (hwnd != 0 && hwnd != lastHwnd) {
+                LOGGER.info("Creating renderer for HWND=0x{} size={}x{}",
+                    Long.toHexString(hwnd), width, height);
                 D3D12Bridge.setWindow(hwnd);
                 lastHwnd = hwnd;
+                LOGGER.info("Renderer created successfully");
             }
             D3D12Bridge.syncWindowSize(width, height);
 
             ByteBuffer pixels = D3D12Bridge.renderFrame();
-            if (pixels == null || !pixels.hasRemaining()) return;
+            if (pixels == null || !pixels.hasRemaining()) {
+                if (frameCount == 0) LOGGER.warn("renderFrame returned null/empty");
+                return;
+            }
 
             // Store frame data for HUD callback
             pendingPixels = pixels;
             pendingWidth = width;
             pendingHeight = height;
+            } catch (Throwable t) {
+                LOGGER.error("Render tick failed: {}", t.getMessage(), t);
+                return;
+            }
         });
 
         // HUD callback: GL drawing (OpenGL context IS current during HUD rendering)
