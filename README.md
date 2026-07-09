@@ -24,7 +24,6 @@
 - [路线图](#路线图)
 - [贡献指南](#贡献指南)
 - [许可证](#许可证)
-
 ---
 
 ## 项目概述
@@ -79,12 +78,13 @@
 │  │  nativeSetWindow(HWND) → 初始化 DX12 Adapter           │  │
 │  │  nativeRenderFrame() → 返回 byte[] (RGBA 像素数据)      │  │
 │  │  nativeResize(width, height) → 更新窗口尺寸            │  │
+│  │  nativeUpdateCamera(float[16]) → 同步相机 MVP 矩阵     │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕                                  │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              wgpu-mc (Rust)                            │  │
 │  │  wgpu::Instance(DX12) → Adapter → Device + Queue       │  │
-│  │  render_frame() → 生成纯色/三角形像素数据               │  │
+│  │  render_frame() → 3D 场景渲染（地面 + 立方体 + 深度）  │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -107,7 +107,7 @@ dx12-lib-template-26.1.2/
 │   │   ├── src/lib.rs              # WmRenderer 结构
 │   │   └── Cargo.toml              # wgpu 23, futures, raw-window-handle
 │   └── wgpu-mc-jni/                # JNI 桥接层
-│       ├── src/lib.rs              # nativeSetWindow/renderFrame/resize
+│       ├── src/lib.rs              # nativeSetWindow/renderFrame/resize/updateCamera
 │       └── Cargo.toml              # jni 0.21, log, env_logger
 ```
 
@@ -115,37 +115,40 @@ dx12-lib-template-26.1.2/
 
 ## 项目状态
 
-### 当前阶段：阶段 1-3 已完成，阶段 4 未开始
+### 当前阶段：阶段 1-3 已完成，阶段 4 进行中
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | **第一阶段：JNI 通信链路** | ✅ 已完成 | Java ↔ Rust 双向通信正常 |
-| **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter 初始化 + 离屏渲染 + 像素回传 |
+| **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter 初始化 + 离屏渲染 + 像素回传 + 3D 几何管线 |
 | **第三阶段：Fabric 事件系统集成** | ✅ 已完成 | ClientTickEvents + HudRenderCallback，OpenGL 全屏 quad 绘制正常 |
-| **第四阶段：实际 Minecraft 场景渲染** | ❌ 未开始 | 当前为纯色覆盖层（蓝色），待接入真实游戏场景 |
+| **第四阶段：实际 Minecraft 场景渲染** | 🚧 进行中 | 已实现 3D 场景渲染（地面 + 立方体）+ 相机 MVP 同步，待接入真实游戏场景 |
 
 ### 已完成功能
 
 | 模块 | 说明 |
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
-| **JNI 桥接层** | 6 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize` |
+| **JNI 桥接层** | 7 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera` |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 1.21.1，Fabric API 0.116.13 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
-| **离屏渲染** | `WmRenderer::render_frame()` 输出 RGBA 像素缓冲区 |
+| **离屏渲染** | `WmRenderer::render_frame()` 输出 RGBA 像素缓冲区，含深度缓冲 + 3D 几何管线 |
 | **HWND 传递** | Java → Rust 窗口句柄传递，支持 `nativeSetWindow` / `nativeResize` |
+| **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步 |
 | **像素回传** | Rust → Java `byte[]` 像素数据传输 + OpenGL 纹理上传 + 全屏 Quad 绘制 |
 | **独立测试程序** | `examples/simple.rs` — winit + wgpu 弹出窗口渲染彩色三角形 |
 | **GL 状态管理** | 完整的 Minecraft GL 状态保存/恢复机制，避免与 MC 渲染冲突 |
+| **PBO 纹理上传** | Pixel Buffer Object 绕过 NVIDIA 驱动 DMA 页边界 crash |
 | **资源重载检测** | 自动检测 MC 资源重载并延迟渲染，避免 GL 资源失效 |
 | **VAO 重建机制** | 检测到 GL 资源丢失时自动重建 VAO/Shader |
 
 ### 验收结果
 
 - 模组加载成功，无 crash
-- 蓝色覆盖层正常显示（1920x1080 @ RGBA）
+- 3D 场景渲染正常：绿色地面 + 5 个橙色立方体（带深度测试）
+- 相机视角随 MC 移动实时更新（MVP 矩阵传递）
 - 日志输出：`Rendering frame: 1639680 bytes (frame=1/61/121...)`
 - 按 Esc 不会 crash
 - 进游戏、按 Esc、调设置均无 JVM 崩溃
@@ -153,6 +156,32 @@ dx12-lib-template-26.1.2/
 ---
 
 ## 变更日志
+
+### [1.1.0] - 2026-07-08
+
+> **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
+
+#### Added
+- 3D 几何管线：WGSL 着色器 + push constants（model matrix）+ 深度测试 + 背面剔除
+- 地面平面网格：200x200 绿色地面（y=0）
+- 5 个彩色立方体：不同位置摆放，每个面有明暗区分
+- 相机 MVP 矩阵传递：Java 提取 MC 相机视角 → `nativeUpdateCamera(float[16])` → Rust 实时同步
+- 深度缓冲区：`Depth32Float` 格式，支持正确遮挡关系
+- PBO（Pixel Buffer Object）纹理上传：绕过 NVIDIA 驱动 DMA 页边界 crash
+- 资源重载检测：自动检测 MC 资源重新加载并重置渲染状态
+- VAO/Shader 自动重建：检测到 GL 资源失效时自动重建，无需重启游戏
+
+#### Changed
+- `render_frame()` 从纯色背景升级为完整 3D 场景渲染
+- JNI 桥接从 6 个方法扩展至 7 个方法（新增 `nativeUpdateCamera`）
+- 节流策略调整为 50ms（~20fps）
+
+#### Fixed
+- Minecraft 菜单打开时 GL 资源被销毁导致崩溃的问题
+- 资源重载期间渲染冲突问题
+- 纹理名称重复使用导致的渲染异常
+
+---
 
 ### [1.0.0] - 2026-07-08
 
@@ -387,7 +416,7 @@ java -jar minecraft.jar
 2. 将 JAR 和 DLL 部署到 Minecraft 目录
 3. 启动 Minecraft 1.21.1-Fabric_0.19.3
 4. 观察控制台日志确认模组加载成功
-5. 进入游戏验证 — 当前会显示蓝色渲染覆盖层 (离屏渲染输出)
+5. 进入游戏验证 — 当前会显示 3D 场景覆盖层（绿色地面 + 5 个橙色立方体，相机随 MC 移动）
 
 ### 调试技巧
 
@@ -418,6 +447,7 @@ $env:RUST_LOG = "debug"
 - `nativeTestDeviceInfo()` — GPU 适配器检测
 - `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄
 - `nativeRenderFrame()` — 每帧渲染并返回 RGBA 像素数据
+- `nativeUpdateCamera(float[])` — 传递 MC 相机 MVP 矩阵
 
 #### 运行独立测试程序
 
@@ -444,11 +474,11 @@ cargo run --example simple
 | 问题 | 原因 | 解决方案 | 状态 |
 |------|------|----------|------|
 | `glTexImage2D(pixels)` 一步完成 crash | NVIDIA 驱动 bug | 改用 `glTexImage2D(null)` + `glTexSubImage2D(pixels)` 两步 | ✅ 已修复 |
-| `glTexSubImage2D` 在页边界 ACCESS_VIOLATION | NVIDIA 驱动按页粒度预读，缓冲区非页对齐 | `MemoryUtil.memAlloc` + 4KB 填充，`buf.limit(pixels.length)` | ✅ 已修复 |
+| `glTexSubImage2D` 在页边界 ACCESS_VIOLATION | NVIDIA 驱动按页粒度预读，缓冲区非页对齐 | PBO（Pixel Buffer Object）上传，GPU 侧 memcpy | ✅ 已修复 |
 | 按 Esc/设置菜单 crash | HUD callback 与 Screen 渲染 GL 状态冲突 | 当前 Screen 不为 null 时跳过 GL 绘制 | ✅ 已修复 |
 | 缓冲区大小不匹配导致 nvoglv64 越界 | 帧大小与窗口尺寸不一致 | 用 `bufferBytes` 反推安全 `height` 再调用 glTexSubImage2D | ✅ 已修复 |
 | 资源重载后渲染 crash | GL 状态未清理 | 重载检测时重置 `vaoId`/`shaderValid`/`texAllocated`/`pendingPixels` | ✅ 已修复 |
-| 每帧调用 Rust 渲染 freeze | GPU 命令队列竞争 | 节流到每 100ms 一次 | ✅ 已修复 |
+| 每帧调用 Rust 渲染 freeze | GPU 命令队列竞争 | 节流到每 50ms 一次 (~20fps) | ✅ 已修复 |
 | 调试日志导致卡顿 | 每 tick 写磁盘 | 移除所有非必要日志 | ✅ 已修复 |
 | `setWindow` 重复调用 | JNI 开销 + 日志轰炸 | `lastSetHwnd` 缓存，相同 HWND 直接跳过 | ✅ 已修复 |
 
@@ -472,9 +502,14 @@ cargo run --example simple
 |------|------|------|
 | WmRenderer 创建 | ✅ | wgpu DX12 Instance → Adapter → Device |
 | 离屏渲染 | ✅ | `render_frame()` 输出 RGBA 像素 |
+| 3D 几何管线 | ✅ | WGSL 着色器 + push constants + 深度测试 + 背面剔除 |
+| 地面网格 | ✅ | 200x200 绿色平面 |
+| 立方体网格 | ✅ | 24 顶点/6 面，每面明暗区分 |
+| 深度缓冲 | ✅ | `Depth32Float` 格式 |
 | 像素回传 | ✅ | Rust → Java byte[] → OpenGL 纹理 → 全屏 Quad |
 | 独立测试程序 | ✅ | `examples/simple.rs` 可独立运行渲染三角形 |
 | 窗口尺寸同步 | ✅ | `nativeResize()` 更新渲染器尺寸 |
+| 相机 MVP 同步 | ✅ | Java → Rust 实时传递 MC 相机视角 |
 
 ### 阶段 3：Fabric 事件系统集成 ✅ 已完成
 
@@ -485,9 +520,9 @@ cargo run --example simple
 | GL 状态管理 | ✅ | 完整的保存/恢复机制 |
 | VAO/Shader 持久化 | ✅ | 首次创建，丢失后自动重建 |
 
-### 阶段 4：实际 Minecraft 场景渲染 ❌ 未开始
+### 阶段 4：实际 Minecraft 场景渲染 🚧 进行中
 
-当前 `render_frame()` 只生成纯色帧（蓝色）。要实现实际 Minecraft 场景渲染，需要：
+当前已实现 3D 场景渲染（绿色地面 + 5 个橙色立方体），相机视角随 MC 移动实时更新。要实现真实 Minecraft 场景渲染，需要：
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
