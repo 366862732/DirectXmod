@@ -1,7 +1,6 @@
 package com.dx12;
 
 import org.lwjgl.BufferUtils;
-import org.lwjgl.system.MemoryUtil;
 
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -24,16 +23,14 @@ public class D3D12Bridge {
             Path dllDir = getDllDir();
             Path dllPath = dllDir.resolve(libName);
 
-            // Extract DLL from JAR if not present
-            if (!Files.exists(dllPath)) {
-                try (InputStream in = D3D12Bridge.class.getResourceAsStream("/" + libName)) {
-                    if (in != null) {
-                        Files.copy(in, dllPath, StandardCopyOption.REPLACE_EXISTING);
-                        System.out.println("[D3D12Bridge] Extracted DLL to: " + dllPath);
-                    } else {
-                        System.err.println("[D3D12Bridge] DLL not found in JAR resources");
-                        return;
-                    }
+            // Always extract DLL from JAR to ensure version match
+            try (InputStream in = D3D12Bridge.class.getResourceAsStream("/" + libName)) {
+                if (in != null) {
+                    Files.copy(in, dllPath, StandardCopyOption.REPLACE_EXISTING);
+                    System.out.println("[D3D12Bridge] Extracted DLL to: " + dllPath);
+                } else {
+                    System.err.println("[D3D12Bridge] DLL not found in JAR resources");
+                    return;
                 }
             }
 
@@ -147,15 +144,15 @@ public class D3D12Bridge {
             if (pixels == null || pixels.length == 0) {
                 return null;
             }
-            // Allocate with 1-page extra padding to prevent NVIDIA driver
-            // ACCESS_VIOLATION when reading across page boundaries.
-            // The driver may prefetch or read in page-sized chunks even though
-            // glTexSubImage2D only needs width*height*4 bytes.
+            // Use BufferUtils (standard DirectByteBuffer) with 4KB padding.
+            // NVIDIA driver (nvoglv64) reads texture data in page-sized DMA
+            // transfers. When a texture row crosses a 4KB page boundary, the
+            // driver continues reading the full page past our buffer, causing
+            // ACCESS_VIOLATION. One extra page ensures the DMA never overruns.
             int paddedSize = pixels.length + 4096;
-            ByteBuffer buf = MemoryUtil.memAlloc(paddedSize);
+            ByteBuffer buf = BufferUtils.createByteBuffer(paddedSize);
             buf.put(pixels);
             buf.flip();
-            // Limit to actual pixel data so glTexSubImage2D knows the bounds
             buf.limit(pixels.length);
             return buf;
         } catch (UnsatisfiedLinkError e) {

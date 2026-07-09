@@ -6,8 +6,10 @@
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.trae/specs/s4-camera-wgpu-pipeline/checklist.md" beforeDir="false" afterPath="$PROJECT_DIR$/.trae/specs/s4-camera-wgpu-pipeline/checklist.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/D3D12Bridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/D3D12Bridge.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/Dx12Mod.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/Dx12Mod.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/resources/fabric.mod.json" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/resources/fabric.mod.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/步骤.md" beforeDir="false" afterPath="$PROJECT_DIR$/步骤.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -113,6 +115,7 @@
       <workItem from="1783509022332" duration="37000" />
       <workItem from="1783509076714" duration="4686000" />
       <workItem from="1783527987031" duration="3000" />
+      <workItem from="1783570393480" duration="2289000" />
     </task>
     <task id="LOCAL-00001" summary="移动位置准备重构">
       <option name="closed" value="true" />

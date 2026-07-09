@@ -21,6 +21,7 @@ import java.nio.FloatBuffer;
 
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL15.*;
+import static org.lwjgl.opengl.GL21.*;
 import static org.lwjgl.opengl.GL30.*;
 
 /**
@@ -53,6 +54,9 @@ public class Dx12Mod implements ClientModInitializer {
     private static boolean texAllocated = false;
     private static int texWidth = 0;
     private static int texHeight = 0;
+
+    // PBO for safe texture upload — bypasses NVIDIA driver's client-memory DMA
+    private static int pboId = 0;
 
     // Startup delay: skip GL operations during Minecraft's resource loading phase
     // (Shader Loader, texture loading, etc. run on render thread and conflict with our GL calls)
@@ -102,6 +106,7 @@ public class Dx12Mod implements ClientModInitializer {
                     texAllocated = false;
                     texWidth = 0;
                     texHeight = 0;
+                    pboId = 0;
                     pendingPixels = null;
                 }
             }
@@ -119,8 +124,10 @@ public class Dx12Mod implements ClientModInitializer {
             // Gives Minecraft's post-load GL state time to stabilize
             if (now - renderStartTime < 2000) return;
 
-            // Throttle: only call wgpu renderFrame once per 100ms to avoid GPU contention
-            if (lastRenderTime > 0 && (now - lastRenderTime) < 100) return;
+            // Throttle to ~20fps: GPU readback pipeline naturally limits to ~20fps,
+            // but capping here prevents tick callback from hogging the render thread
+            // when GPU responds at variable speeds.
+            if (lastRenderTime > 0 && (now - lastRenderTime) < 50) return;
             lastRenderTime = now;
 
             // Extract camera view-projection matrix from Minecraft
@@ -218,8 +225,28 @@ public class Dx12Mod implements ClientModInitializer {
                     texWidth = width;
                     texHeight = height;
                 }
+
+                // Upload pixels via PBO to avoid NVIDIA driver DMA page-boundary crash.
+                // 1) Copy pixels to GPU-side buffer via CPU memcpy (safe).
+                // 2) Let driver upload from GPU memory to texture (always safe).
+                int pboBytes = width * height * 4;
+                if (pboId == 0) {
+                    pboId = glGenBuffers();
+                }
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pboId);
+                // Orphan old buffer: allocate fresh GPU memory so pending reads
+                // from previous frame don't stall our map+write.
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, (long) pboBytes, GL_STREAM_DRAW);
+                pixels.rewind();
+                ByteBuffer mapped = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY, (long) pboBytes, null);
+                if (mapped != null) {
+                    mapped.put(pixels);
+                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                }
+                // Upload from PBO (GPU memory) to texture
                 glBindTexture(GL_TEXTURE_2D, texId);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
                 // Shader: persistent
                 if (!shaderValid || shaderProg == 0) {
@@ -254,6 +281,7 @@ public class Dx12Mod implements ClientModInitializer {
                 vaoId = 0;
                 shaderValid = false;
                 texAllocated = false;
+                pboId = 0;
             }
         });
 

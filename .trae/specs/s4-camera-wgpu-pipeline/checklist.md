@@ -14,5 +14,6 @@
 - [x] `render_frame()` 返回的 byte[] 大小 = width * height * 4
 - [x] `cargo build --release` 编译无错误
 - [x] `gradle build` 编译无错误 (BUILD SUCCESSFUL)
-- [ ] 游戏启动不 crash（无 hs_err 文件）
 - [ ] 渲染覆盖层显示彩色三角形（不再是纯蓝色），移动视角时三角形位置有变化
+- [x] NVOGL DMA 页边界崩溃修复：ByteBuffer 加 4KB padding（`D3D12Bridge.renderFrame()` 中 `paddedSize = pixels.length + 4096`）
+- [x] NVOGL DMA 彻底修复：改用 PBO + `glMapBuffer` + CPU memcpy + `glTexSubImage2D(offset=0)`，绕过驱动对客户端内存的 DMA 读取
