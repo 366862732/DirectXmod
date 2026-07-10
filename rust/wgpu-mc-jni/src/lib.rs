@@ -8,15 +8,27 @@
 //! yet, so there is no GL/D3D12 conflict. The original crash was due to
 //! creating D3D12 during a render tick (nativeSetWindow), when the OpenGL
 //! context was actively bound.
+//!
+//! Mutex handling: We use lock_or_poisoned() instead of lock().unwrap() to
+//! survive panics in render_frame() — if the renderer panics, the Mutex
+//! becomes poisoned but the data is still valid. Recovering from poison
+//! prevents cascading JVM crashes.
 
 use jni::objects::{JClass, JFloatArray, JString};
 use jni::JNIEnv;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Renderer state: None=not started, Some(Ok)=ready, Some(Err)=failed.
 type RendererResult = Option<Result<wgpu_mc::WmRenderer, String>>;
 static RENDERER: Mutex<RendererResult> = Mutex::new(None);
+
+/// Lock the renderer mutex, recovering from poison state.
+/// If a previous frame panicked, the mutex is poisoned but the
+/// renderer data is still valid — we just continue normally.
+fn lock_or_poisoned() -> MutexGuard<'static, RendererResult> {
+    RENDERER.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Initialize the Rust JNI library and create the D3D12 renderer.
 /// Called during mod init (ClientModInitializer), BEFORE the game loop starts.
@@ -30,7 +42,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _cla
 
     // Only init once
     {
-        let guard = RENDERER.lock().unwrap();
+        let guard = lock_or_poisoned();
         if guard.is_some() {
             return;
         }
@@ -43,12 +55,12 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _cla
     match result {
         Ok(Ok(renderer)) => {
             log::info!("WmRenderer created successfully during mod init");
-            let mut guard = RENDERER.lock().unwrap();
+            let mut guard = lock_or_poisoned();
             *guard = Some(Ok(renderer));
         }
         Ok(Err(e)) => {
             log::error!("WmRenderer creation FAILED during mod init: {}", e);
-            let mut guard = RENDERER.lock().unwrap();
+            let mut guard = lock_or_poisoned();
             *guard = Some(Err(e.to_string()));
         }
         Err(panic_info) => {
@@ -60,7 +72,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _cla
                 "unknown panic".to_string()
             };
             log::error!("WmRenderer creation PANICKED during mod init: {}", msg);
-            let mut guard = RENDERER.lock().unwrap();
+            let mut guard = lock_or_poisoned();
             *guard = Some(Err(format!("panic: {}", msg)));
         }
     }
@@ -76,7 +88,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeIsReady(
     _env: JNIEnv,
     _class: JClass,
 ) -> i32 {
-    let guard = RENDERER.lock().unwrap();
+    let guard = lock_or_poisoned();
     match guard.as_ref() {
         Some(Ok(_)) => 1,
         Some(Err(_)) => -1,
@@ -93,7 +105,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeGetStatus<'a>(
     env: JNIEnv<'a>,
     _class: JClass<'a>,
 ) -> JString<'a> {
-    let guard = RENDERER.lock().unwrap();
+    let guard = lock_or_poisoned();
     let msg = match guard.as_ref() {
         Some(Ok(_)) => "ready".to_string(),
         Some(Err(e)) => format!("error: {}", e),
@@ -145,7 +157,11 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame<'a>(
     _class: JClass<'a>,
 ) -> jni::sys::jobject {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Vec<u8> {
-        let mut guard = RENDERER.lock().unwrap();
+        // IMPORTANT: lock the mutex inside catch_unwind.
+        // If render_frame() panics, the MutexGuard drop poisons the mutex,
+        // but catch_unwind catches the panic. Subsequent calls use
+        // lock_or_poisoned() to recover.
+        let mut guard = lock_or_poisoned();
         match guard.as_mut() {
             Some(Ok(renderer)) => renderer.render_frame(),
             Some(Err(_)) => Vec::new(),
@@ -190,7 +206,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow<'a>(
     hwnd: i64,
 ) {
     log::info!("nativeSetWindow: initializing D3D12 surface on HWND 0x{:x}", hwnd);
-    let mut guard = RENDERER.lock().unwrap();
+    let mut guard = lock_or_poisoned();
     if let Some(Ok(ref mut renderer)) = guard.as_mut() {
         renderer.init_surface(hwnd as usize);
     }
@@ -207,7 +223,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHasSurface(
     _env: JNIEnv,
     _class: JClass,
 ) -> jni::sys::jboolean {
-    let guard = RENDERER.lock().unwrap();
+    let guard = lock_or_poisoned();
     match guard.as_ref() {
         Some(Ok(renderer)) => {
             if renderer.has_surface() { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
@@ -240,7 +256,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCamera<'a>(
         [floats[12], floats[13], floats[14], floats[15]],
     ];
 
-    let mut guard = RENDERER.lock().unwrap();
+    let mut guard = lock_or_poisoned();
     if let Some(Ok(ref mut renderer)) = guard.as_mut() {
         renderer.set_camera(mvp);
     }
@@ -260,7 +276,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeResize(
     if width <= 0 || height <= 0 {
         return;
     }
-    let mut renderer_guard = RENDERER.lock().unwrap();
+    let mut renderer_guard = lock_or_poisoned();
     if let Some(Ok(ref mut renderer)) = renderer_guard.as_mut() {
         renderer.resize(width as u32, height as u32);
         log::info!("Renderer resized to {}x{}", width, height);

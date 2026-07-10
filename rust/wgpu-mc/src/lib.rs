@@ -3,6 +3,9 @@
 //! Architecture: Triple-buffered ring on JNI thread with optional surface mode.
 //! - Surface mode:  render directly to window swapchain, present → no readback
 //! - Offscreen mode: render to textures, async readback via triple-buffer ring
+//!
+//! Note: Push constants removed — not supported on all GPUs.
+//! Model transforms are baked into vertex buffers at creation time.
 
 use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
@@ -28,13 +31,12 @@ impl Vertex {
     }
 }
 
+// No push constants — compatible with all GPUs
 const SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
-
-var<push_constant> model: mat4x4<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -44,7 +46,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
     var out: VertexOutput;
-    out.position = camera.view_proj * model * vec4<f32>(pos, 1.0);
+    out.position = camera.view_proj * vec4<f32>(pos, 1.0);
     out.color = color;
     return out;
 }
@@ -150,44 +152,41 @@ fn create_plane_mesh(device: &wgpu::Device, size: f32, color: [f32; 3])
     (vbuf, ibuf, indices.len() as u32)
 }
 
-fn create_cube_mesh(device: &wgpu::Device, color: [f32; 3])
-    -> (wgpu::Buffer, wgpu::Buffer, u32)
-{
+/// Create a cube mesh with vertices pre-offsetted by (ox, oy, oz).
+/// Shares a single index buffer for all cubes.
+fn create_cube_mesh_at(
+    device: &wgpu::Device,
+    color: [f32; 3],
+    offset: (f32, f32, f32),
+) -> wgpu::Buffer {
     let c = color;
     let d = [c[0] * 0.6, c[1] * 0.6, c[2] * 0.6];
+    let (ox, oy, oz) = offset;
     let vertices: [Vertex; 24] = [
-        Vertex { position: [-0.5,  0.5, -0.5], color: c },
-        Vertex { position: [ 0.5,  0.5, -0.5], color: c },
-        Vertex { position: [-0.5,  0.5,  0.5], color: c },
-        Vertex { position: [ 0.5,  0.5,  0.5], color: c },
-        Vertex { position: [-0.5, -0.5, -0.5], color: d },
-        Vertex { position: [ 0.5, -0.5, -0.5], color: d },
-        Vertex { position: [-0.5, -0.5,  0.5], color: d },
-        Vertex { position: [ 0.5, -0.5,  0.5], color: d },
-        Vertex { position: [-0.5, -0.5,  0.5], color: c },
-        Vertex { position: [ 0.5, -0.5,  0.5], color: c },
-        Vertex { position: [-0.5,  0.5,  0.5], color: c },
-        Vertex { position: [ 0.5,  0.5,  0.5], color: c },
-        Vertex { position: [-0.5, -0.5, -0.5], color: d },
-        Vertex { position: [ 0.5, -0.5, -0.5], color: d },
-        Vertex { position: [-0.5,  0.5, -0.5], color: d },
-        Vertex { position: [ 0.5,  0.5, -0.5], color: d },
-        Vertex { position: [ 0.5, -0.5, -0.5], color: c },
-        Vertex { position: [ 0.5,  0.5, -0.5], color: c },
-        Vertex { position: [ 0.5, -0.5,  0.5], color: c },
-        Vertex { position: [ 0.5,  0.5,  0.5], color: c },
-        Vertex { position: [-0.5, -0.5, -0.5], color: d },
-        Vertex { position: [-0.5,  0.5, -0.5], color: d },
-        Vertex { position: [-0.5, -0.5,  0.5], color: d },
-        Vertex { position: [-0.5,  0.5,  0.5], color: d },
-    ];
-    let indices: [u16; 36] = [
-         0,  1,  2,  2,  1,  3,
-         4,  6,  5,  5,  6,  7,
-         8,  9, 10, 10,  9, 11,
-        12, 14, 13, 13, 14, 15,
-        16, 17, 18, 18, 17, 19,
-        20, 22, 21, 21, 22, 23,
+        Vertex { position: [-0.5+ox,  0.5+oy, -0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox,  0.5+oy, -0.5+oz], color: c },
+        Vertex { position: [-0.5+ox,  0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox,  0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [-0.5+ox, -0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [ 0.5+ox, -0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [-0.5+ox, -0.5+oy,  0.5+oz], color: d },
+        Vertex { position: [ 0.5+ox, -0.5+oy,  0.5+oz], color: d },
+        Vertex { position: [-0.5+ox, -0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox, -0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [-0.5+ox,  0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox,  0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [-0.5+ox, -0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [ 0.5+ox, -0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [-0.5+ox,  0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [ 0.5+ox,  0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [ 0.5+ox, -0.5+oy, -0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox,  0.5+oy, -0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox, -0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [ 0.5+ox,  0.5+oy,  0.5+oz], color: c },
+        Vertex { position: [-0.5+ox, -0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [-0.5+ox,  0.5+oy, -0.5+oz], color: d },
+        Vertex { position: [-0.5+ox, -0.5+oy,  0.5+oz], color: d },
+        Vertex { position: [-0.5+ox,  0.5+oy,  0.5+oz], color: d },
     ];
 
     let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -198,17 +197,7 @@ fn create_cube_mesh(device: &wgpu::Device, color: [f32; 3])
     });
     vbuf.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&vertices));
     vbuf.unmap();
-
-    let ibuf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Cube IB"),
-        size: std::mem::size_of_val(&indices) as wgpu::BufferAddress,
-        usage: wgpu::BufferUsages::INDEX,
-        mapped_at_creation: true,
-    });
-    ibuf.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&indices));
-    ibuf.unmap();
-
-    (vbuf, ibuf, indices.len() as u32)
+    vbuf
 }
 
 // ── Create wgpu Surface from Windows HWND ─────────────────────────
@@ -272,6 +261,7 @@ impl Slot {
 pub struct WmRenderer {
     #[allow(dead_code)]
     instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
 
@@ -289,14 +279,15 @@ pub struct WmRenderer {
     plane_vb: wgpu::Buffer,
     plane_ib: wgpu::Buffer,
     plane_count: u32,
-    cube_vb: wgpu::Buffer,
-    cube_ib: wgpu::Buffer,
+    cube_vbs: Vec<wgpu::Buffer>,    // One VB per cube position
+    cube_ib: wgpu::Buffer,          // Shared index buffer
     cube_count: u32,
 
     // Surface mode (native swapchain, no readback)
     surface: Option<wgpu::Surface<'static>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
+    surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
 
     // Offscreen mode (triple-buffer readback)
     slots: [Slot; RING_SIZE],
@@ -333,10 +324,7 @@ impl WmRenderer {
             &wgpu::DeviceDescriptor {
                 label: Some("wgpu-mc"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_push_constant_size: 64,
-                    ..Default::default()
-                },
+                required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
             },
             None,
@@ -379,13 +367,11 @@ impl WmRenderer {
             }],
         });
 
+        // No push constant ranges — compatible with all GPUs
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::VERTEX,
-                range: 0..64,
-            }],
+            push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -426,8 +412,38 @@ impl WmRenderer {
 
         let (plane_vb, plane_ib, plane_count) =
             create_plane_mesh(&device, 200.0, [0.2, 0.65, 0.2]);
-        let (cube_vb, cube_ib, cube_count) =
-            create_cube_mesh(&device, [0.8, 0.4, 0.1]);
+
+        // Create one cube VB per position (model offsets baked into vertices)
+        let cube_color = [0.8, 0.4, 0.1];
+        let cube_positions: [(f32, f32, f32); 5] = [
+            (0.0, 1.0, 0.0), (4.0, 1.0, 2.0), (-4.0, 1.0, -1.0),
+            (2.0, 1.0, -4.0), (-3.0, 1.0, 3.0),
+        ];
+
+        // Shared index buffer — all cubes use identical index data
+        let cube_indices: [u16; 36] = [
+             0,  1,  2,  2,  1,  3,
+             4,  6,  5,  5,  6,  7,
+             8,  9, 10, 10,  9, 11,
+            12, 14, 13, 13, 14, 15,
+            16, 17, 18, 18, 17, 19,
+            20, 22, 21, 21, 22, 23,
+        ];
+        let cube_count = cube_indices.len() as u32;
+        let cube_ib = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cube IB (shared)"),
+            size: std::mem::size_of_val(&cube_indices) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::INDEX,
+            mapped_at_creation: true,
+        });
+        cube_ib.slice(..).get_mapped_range_mut()[..]
+            .copy_from_slice(bytemuck::cast_slice(&cube_indices));
+        cube_ib.unmap();
+
+        let mut cube_vbs = Vec::with_capacity(cube_positions.len());
+        for &pos in &cube_positions {
+            cube_vbs.push(create_cube_mesh_at(&device, cube_color, pos));
+        }
 
         let slots = [
             Slot::new(&device, width, height),
@@ -439,6 +455,7 @@ impl WmRenderer {
 
         Ok(Self {
             instance,
+            adapter,
             device,
             queue,
             width,
@@ -452,12 +469,13 @@ impl WmRenderer {
             plane_vb,
             plane_ib,
             plane_count,
-            cube_vb,
+            cube_vbs,
             cube_ib,
             cube_count,
             surface: None,
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            surface_depth: None,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -467,59 +485,64 @@ impl WmRenderer {
 
     /// Initialize a D3D12 swapchain surface on the given Windows HWND.
     /// Called from JNI when the Minecraft window handle becomes available.
+    ///
+    /// Strategy to avoid GPU TDR (Timeout Detection &amp; Recovery):
+    /// - GameRendererMixin HEAD cancels MC's OpenGL rendering (ci.cancel())
+    /// - GL still does a swap (with stale/cancelled buffer — harmless)
+    /// - D3D12 Present() at MinecraftMixin TAIL overwrites the window pixels
+    /// - No concurrent GL+D3D12 rendering → no TDR timeout
     pub fn init_surface(&mut self, hwnd: usize) {
         if self.surface.is_some() {
-            return; // Already initialized
+            return;
         }
 
-        let Some(surface) = create_surface_from_hwnd(&self.instance, hwnd) else {
-            eprintln!("[dx12-wm] Failed to create surface from HWND 0x{:x}", hwnd);
-            return;
-        };
+        log::info!("[dx12-wm] init_surface: creating D3D12 swapchain on HWND 0x{:x}", hwnd);
 
-        // Choose adapter compatible with this surface
-        let adapter = match futures::executor::block_on(self.instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            },
-        )) {
-            Some(a) => a,
+        let surface = match create_surface_from_hwnd(&self.instance, hwnd) {
+            Some(s) => s,
             None => {
-                eprintln!("[dx12-wm] No adapter compatible with surface");
+                log::error!("[dx12-wm] Failed to create surface from HWND 0x{:x}", hwnd);
                 return;
             }
         };
 
-        let caps = surface.get_capabilities(&adapter);
-        let fmt = caps
-            .formats
-            .iter()
-            .copied()
+        let caps = surface.get_capabilities(&self.adapter);
+        let format = caps.formats.iter()
             .find(|f| f.is_srgb())
+            .copied()
             .unwrap_or(caps.formats[0]);
 
-        self.surface_format = fmt;
+        log::info!("[dx12-wm] Surface caps: format={:?}, present_modes={:?}", format, caps.present_modes);
+
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate  // No vsync — D3D12 Present overwrites GL swap
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+            wgpu::PresentMode::Fifo
+        } else {
+            caps.present_modes[0]
+        };
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: fmt,
+            format,
             width: self.width,
             height: self.height,
-            present_mode: wgpu::PresentMode::Immediate,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            present_mode,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
-        surface.configure(&self.device, &config);
-        self.surface_config = Some(config);
 
-        eprintln!(
-            "[dx12-wm] Surface OK! HWND=0x{:x} fmt={:?} {}x{}",
-            hwnd, fmt, self.width, self.height
-        );
+        surface.configure(&self.device, &config);
+
+        // Create and cache depth texture (reused every frame)
+        self.surface_depth = Some(make_depth_texture(&self.device, self.width, self.height));
+
+        self.surface_format = format;
+        self.surface_config = Some(config);
         self.surface = Some(surface);
+
+        log::info!("[dx12-wm] Surface mode ENABLED: {:?} {}x{}", format, self.width, self.height);
     }
 
     /// Returns true if the renderer has an active surface (swapchain mode).
@@ -538,12 +561,13 @@ impl WmRenderer {
         self.width = width;
         self.height = height;
 
-        // Reconfigure surface if active
+        // Reconfigure surface if active (+ recreate cached depth texture)
         if let (Some(surface), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
             config.width = width;
             config.height = height;
             surface.configure(&self.device, config);
-            eprintln!("[dx12-wm] Surface resized to {}x{}", width, height);
+            self.surface_depth = Some(make_depth_texture(&self.device, width, height));
+            log::info!("[dx12-wm] Surface resized to {}x{}", width, height);
             return;
         }
 
@@ -562,6 +586,25 @@ impl WmRenderer {
             return Vec::new();
         }
         self.render_offscreen()
+    }
+
+    // ── Draw calls shared by surface and offscreen modes ──────────
+
+    fn draw_scene<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        rp.set_pipeline(&self.pipeline);
+        rp.set_bind_group(0, &self.bind_group, &[]);
+
+        // Plane (identity model baked into vertices)
+        rp.set_vertex_buffer(0, self.plane_vb.slice(..));
+        rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
+        rp.draw_indexed(0..self.plane_count, 0, 0..1);
+
+        // Cubes (each VB has pre-offsetted vertices)
+        for cube_vb in &self.cube_vbs {
+            rp.set_vertex_buffer(0, cube_vb.slice(..));
+            rp.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
+            rp.draw_indexed(0..self.cube_count, 0, 0..1);
+        }
     }
 
     // ── Surface mode: render directly to swapchain ────────────────
@@ -598,9 +641,11 @@ impl WmRenderer {
         );
 
         {
-            // Depth texture for surface mode
-            let depth = make_depth_texture(&self.device, self.width, self.height);
-            let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+            // Use cached depth texture (reused every frame, recreated on resize)
+            let depth_view = self.surface_depth
+                .as_ref()
+                .expect("surface_depth must be created in init_surface")
+                .create_view(&wgpu::TextureViewDescriptor::default());
 
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Surface Pass"),
@@ -626,34 +671,7 @@ impl WmRenderer {
                 occlusion_query_set: None,
             });
 
-            rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.bind_group, &[]);
-
-            // Plane
-            rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
-                bytemuck::cast_slice(&IDENTITY));
-            rp.set_vertex_buffer(0, self.plane_vb.slice(..));
-            rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
-            rp.draw_indexed(0..self.plane_count, 0, 0..1);
-
-            // Cubes
-            let cube_positions: [(f32, f32, f32); 5] = [
-                (0.0, 1.0, 0.0), (4.0, 1.0, 2.0), (-4.0, 1.0, -1.0),
-                (2.0, 1.0, -4.0), (-3.0, 1.0, 3.0),
-            ];
-            for &(cx, cy, cz) in &cube_positions {
-                let model: [[f32; 4]; 4] = [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [cx, cy, cz, 1.0],
-                ];
-                rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
-                    bytemuck::cast_slice(&model));
-                rp.set_vertex_buffer(0, self.cube_vb.slice(..));
-                rp.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..self.cube_count, 0, 0..1);
-            }
+            self.draw_scene(&mut rp);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -708,32 +726,7 @@ impl WmRenderer {
                 occlusion_query_set: None,
             });
 
-            rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.bind_group, &[]);
-
-            rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
-                bytemuck::cast_slice(&IDENTITY));
-            rp.set_vertex_buffer(0, self.plane_vb.slice(..));
-            rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
-            rp.draw_indexed(0..self.plane_count, 0, 0..1);
-
-            let cube_positions: [(f32, f32, f32); 5] = [
-                (0.0, 1.0, 0.0), (4.0, 1.0, 2.0), (-4.0, 1.0, -1.0),
-                (2.0, 1.0, -4.0), (-3.0, 1.0, 3.0),
-            ];
-            for &(cx, cy, cz) in &cube_positions {
-                let model: [[f32; 4]; 4] = [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [cx, cy, cz, 1.0],
-                ];
-                rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
-                    bytemuck::cast_slice(&model));
-                rp.set_vertex_buffer(0, self.cube_vb.slice(..));
-                rp.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..self.cube_count, 0, 0..1);
-            }
+            self.draw_scene(&mut rp);
         }
 
         encoder.copy_texture_to_buffer(

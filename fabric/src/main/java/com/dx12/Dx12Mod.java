@@ -184,8 +184,10 @@ public class Dx12Mod implements ClientModInitializer {
                 lastRendererStatus = status;
             }
 
-            // Surface mode: render happens in onPreRender() via GameRendererMixin HEAD.
-            // Skip renderFrame here — D3D12 presents directly in onPreRender.
+            // Surface mode: MC's GL render is cancelled at GameRendererMixin HEAD.
+            // Camera was updated above. renderFrame() is called later from
+            // MinecraftMixin.runTick TAIL — D3D12 presents directly to window.
+            // Skip renderFrame here to avoid duplicate rendering.
             if (D3D12Bridge.hasSurface()) {
                 return;
             }
@@ -209,24 +211,7 @@ public class Dx12Mod implements ClientModInitializer {
         LOGGER.info("GL4DX12 Mod initialized!");
     }
 
-    /**
-     * Called by GameRendererMixin at HEAD of render() when surface mode is active.
-     * D3D12 renders and presents directly to the window swapchain, then the
-     * Minecraft OpenGL render is cancelled (ci.cancel()).
-     */
-    public static void onPreRender() {
-        if (!D3D12Bridge.hasSurface()) return;
-
-        // Surface mode: D3D12 presents directly. Camera was already updated
-        // in ClientTickEvents.END_CLIENT_TICK above.
-        try {
-            D3D12Bridge.renderFrame();
-        } catch (Throwable t) {
-            LOGGER.warn("Surface render failed: {}", t.getMessage());
-        }
-    }
-
-    // GL drawing: called by GameRendererMixin at TAIL of render().
+    // GL drawing: called by GameRendererMixin at TAIL of render() (offscreen mode only).
     // At this point ALL Minecraft rendering (world, entities, HUD) is complete,
     // our full-screen quad will be the last thing drawn this frame.
     // glPushAttrib/glPopAttrib removed — they are deprecated and crash on core profile.

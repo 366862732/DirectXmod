@@ -24,6 +24,7 @@
 - [路线图](#路线图)
 - [贡献指南](#贡献指南)
 - [许可证](#许可证)
+
 ---
 
 ## 项目概述
@@ -35,14 +36,14 @@
 - **不使用 Mixin**（避免与 Fabric 渲染器冲突）
 - **不创建额外窗口**（直接使用 Minecraft 窗口 HWND）
 - **版本通用**（1.21.1 ~ 1.21.11 + 26.x，不依赖 Yarn 映射）
-- **后台渲染**：Rust wgpu 在后台线程渲染 → 读回像素 → Java 通过 OpenGL 纹理上传 → 绘制全屏 quad
+- **双模渲染**：Surface 模式（DX12 直接呈现）+ Offscreen 模式（像素读回 + PBO 上传）
 
 ### 为什么重构为 Rust + wgpu？
 
 | 旧方案 (C++/D3D12) | 新方案 (Rust/wgpu) |
 |---------------------|---------------------|
 | 手动管理 D3D12 资源 | wgpu 自动资源管理 |
-| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | 独立表面 (independent surface) 架构 |
+| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | Surface 模式：独立 swapchain 直接呈现 |
 | 内存安全依赖开发者 | Rust 编译器保证内存安全 |
 | 复杂的 C++ 构建配置 | Cargo 依赖管理 |
 | TDR 崩溃频发 | 架构层面规避 TDR |
@@ -53,6 +54,13 @@
 - **跨平台**：wgpu 抽象层支持 DX12/Vulkan/Metal，一次编写多平台运行
 - **高性能**：WebGPU 标准驱动的现代 GPU API，接近原生 C++ 性能
 - **易维护**：Cargo 生态系统 + 类型系统降低长期维护成本
+
+### 双模渲染架构
+
+| 模式 | 渲染路径 | 适用场景 |
+|------|----------|----------|
+| **Surface 模式** | DX12 swapchain 直接呈现到窗口 | 已获取 HWND 后，零读回、零 PBO |
+| **Offscreen 模式** | 离屏纹理 → staging buffer → PBO → OpenGL 全屏 quad | 初始化阶段或无 HWND 时 |
 
 ---
 
@@ -65,26 +73,38 @@
 │  │              Fabric Loader 0.19.3                      │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │           Fabric API (ClientTickEvents)          │  │  │
-│  │  │  Tick Callback → 节流 50ms → Rust renderFrame()      │  │  │
+|  │  │  Tick Callback → 节流 50ms → Rust renderFrame()  │  │  │
+│  │  │  + 相机 MVP 矩阵提取 → nativeUpdateCamera()      │  │  │
+│  │  │  + 渲染状态查询 → nativeIsReady/nativeGetStatus  │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │         Fabric API (HudRenderCallback)           │  │  │
-│  │  │  GL 绘制 → glTexSubImage2D + VAO + Shader → 全屏quad │ │
+│  │  │  PBO 纹理上传 + VAO + Shader → 全屏 quad         │  │  │
+│  │  │  (Surface 模式暂停 — GPU 驱动 TDR 问题)          │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕ JNI                              │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              wgpu_mc_jni.dll (Rust)                    │  │
-│  │  nativeSetWindow(HWND) → 初始化 DX12 Adapter           │  │
-│  │  nativeRenderFrame() → 返回 byte[] (RGBA 像素数据)      │  │
+│  │  nativeSetWindow(HWND) → 初始化 DX12 Surface (⏸️ 暂停) │  │
+│  │  nativeRenderFrame() → Offscreen 模式返回 byte[]        │  │
 │  │  nativeResize(width, height) → 更新窗口尺寸            │  │
 │  │  nativeUpdateCamera(float[16]) → 同步相机 MVP 矩阵     │  │
+│  │  nativeHasSurface() → 返回当前是否为 Surface 模式      │  │
+│  │  nativeIsReady() → 返回 1/0/-1 状态码                 │  │
+│  │  nativeGetStatus() → 返回人类可读状态字符串            │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕                                  │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              wgpu-mc (Rust)                            │  │
 │  │  wgpu::Instance(DX12) → Adapter → Device + Queue       │  │
 │  │  render_frame() → 3D 场景渲染（地面 + 立方体 + 深度）  │  │
+│  │  WGSL shader + 共享 IB + 深度测试                     │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │ ⏸️ Surface 模式: 暂停 (GPU 驱动 TDR 问题)       │  │  │
+│  │  │ ✅ Offscreen 模式: triple-buffer 异步读回        │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -104,10 +124,10 @@ dx12-lib-template-26.1.2/
 ├── rust/
 │   ├── Cargo.toml                  # Workspace 配置
 │   ├── wgpu-mc/                    # 核心渲染库
-│   │   ├── src/lib.rs              # WmRenderer 结构
-│   │   └── Cargo.toml              # wgpu 23, futures, raw-window-handle
+│   │   ├── src/lib.rs              # WmRenderer 结构 + Surface/Offscreen 双模
+│   │   └── Cargo.toml              # wgpu 23, futures, bytemuck
 │   └── wgpu-mc-jni/                # JNI 桥接层
-│       ├── src/lib.rs              # nativeSetWindow/renderFrame/resize/updateCamera
+│       ├── src/lib.rs              # nativeSetWindow/renderFrame/resize/updateCamera/hasSurface
 │       └── Cargo.toml              # jni 0.21, log, env_logger
 ```
 
@@ -120,46 +140,93 @@ dx12-lib-template-26.1.2/
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | **第一阶段：JNI 通信链路** | ✅ 已完成 | Java ↔ Rust 双向通信正常 |
-| **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter 初始化 + 离屏渲染 + 像素回传 + 3D 几何管线 |
-| **第三阶段：Fabric 事件系统集成** | ✅ 已完成 | ClientTickEvents + HudRenderCallback，OpenGL 全屏 quad 绘制正常 |
-| **第四阶段：实际 Minecraft 场景渲染** | 🚧 进行中 | 已实现 3D 场景渲染（地面 + 立方体）+ 相机 MVP 同步，待接入真实游戏场景 |
+| **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter + 3D 几何管线 + Offscreen 渲染 |
+| **第三阶段：Fabric 事件系统集成** | ✅ 已完成 | ClientTickEvents + HudRenderCallback，PBO 纹理上传 |
+| **第四阶段：Surface 模式（DX12 直接呈现）** | ⏸️ 暂停 | GPU 驱动 TDR 问题，需 Mixin 取消 GL 渲染后重新启用 |
+| **第五阶段：VulkanMod 级全接管** | 🚧 进行中 | 待实现 Mixin 拦截 LevelRenderer，DX12 直接渲染全部游戏场景 |
 
 ### 已完成功能
 
 | 模块 | 说明 |
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
-| **JNI 桥接层** | 7 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera` |
+| **JNI 桥接层** | 10 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeHasSurface`, `nativeIsReady`, `nativeGetStatus` |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 26.1.2，Fabric API 0.154.2 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
-| **离屏渲染** | `WmRenderer::render_frame()` 输出 RGBA 像素缓冲区，含深度缓冲 + 3D 几何管线 |
-| **HWND 传递** | Java → Rust 窗口句柄传递，支持 `nativeSetWindow` / `nativeResize` |
-| **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步 |
-| **像素回传** | Rust → Java `byte[]` 像素数据传输 + OpenGL 纹理上传 + 全屏 Quad 绘制 |
-| **独立测试程序** | `examples/simple.rs` — winit + wgpu 弹出窗口渲染彩色三角形 |
-| **GL 状态管理** | 完整的 Minecraft GL 状态保存/恢复机制，避免与 MC 渲染冲突 |
+| **Surface 模式** | ⏸️ 暂停 — GPU 驱动 TDR 问题，需 Mixin 取消 GL 渲染后重新启用 |
+| **Offscreen 模式** | Triple-buffer 异步读回 + PBO 纹理上传，当前唯一可用渲染模式 |
+| **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步（带 LERP 平滑） |
+| **3D 几何管线** | WGSL 着色器 + 共享索引缓冲 + 深度测试 + 背面剔除（移除 push constants） |
+| **地面平面网格** | 200x200 绿色平面（y=0） |
+| **彩色立方体网格** | 5 个立方体，每个独立 VB（预烘焙偏移），共享 IB |
+| **深度缓冲区** | `Depth32Float` 格式，支持正确遮挡关系 |
 | **PBO 纹理上传** | Pixel Buffer Object 绕过 NVIDIA 驱动 DMA 页边界 crash |
-| **资源重载检测** | 自动检测 MC 资源重载并延迟渲染，避免 GL 资源失效 |
-| **VAO 重建机制** | 检测到 GL 资源丢失时自动重建 VAO/Shader |
+| **GL 状态管理** | 完整的 Minecraft GL 状态保存/恢复机制 |
+| **资源重载检测** | 自动检测 MC 资源重载并延迟渲染 |
+| **VAO 重建机制** | 检测到 GL 资源丢失时自动重建 |
+| **独立测试程序** | `examples/simple.rs` — winit + wgpu 弹出窗口渲染彩色三角形 |
 
 ### 验收结果
 
 - 模组加载成功，无 crash
-- 3D 场景渲染正常：绿色地面 + 5 个橙色立方体（带深度测试）
-- 相机视角随 MC 移动实时更新（MVP 矩阵传递）
-- 日志输出：`Rendering frame: 1639680 bytes (frame=1/61/121...)`
-- 按 Esc 不会 crash
+- **Offscreen 模式**：PBO 纹理上传 + OpenGL 全屏 quad 覆盖，当前唯一可用渲染模式
+- 相机视角随 MC 移动实时更新（MVP 矩阵 + LERP 平滑）
 - 进游戏、按 Esc、调设置均无 JVM 崩溃
 
 ---
 
 ## 变更日志
 
-### [1.1.0] - 2026-07-08
+### [1.3.0] - 2026-07-08
 
 > **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
+
+#### Added
+- 10 个 JNI native 方法完整实现（新增 `nativeIsReady`, `nativeGetStatus`）
+- Rust Mutex poison 处理：`lock_or_poisoned()` 防止 panic 级联崩溃
+- 共享索引缓冲区：所有立方体共用一个 IB，减少 GPU 内存
+- 顶点预烘焙偏移：`create_cube_mesh_at()` 每个立方体独立 VB，移除 push constants
+
+#### Changed
+- **Surface 模式暂停**：GPU 驱动 TDR 问题（GL/D3D12 同窗口共存），需 Mixin 取消 GL 渲染后重新启用
+- 移除 push constants：`required_features: Features::empty()` 兼容所有 GPU
+- 几何体从"5 个独立 VB + 6 面双色"改为"共享 IB + 每立方体独立 VB"
+- 架构从双模渲染回归为 Offscreen 模式为主
+
+#### Fixed
+- Panic 在 `render_frame()` 中不再导致后续 JNI 调用级联崩溃
+- Push constants 在某些 GPU 上不兼容的问题
+
+---
+
+### [1.2.0] - 2026-07-08
+
+> **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
+
+#### Added
+- **Surface 模式（DX12 直接呈现）**：`nativeSetWindow` 后创建 swapchain，`render_frame()` 直接 present 到窗口，零读回
+- **Offscreen 模式（Triple-buffer 异步读回）**：三槽环形缓冲 + 异步 map_async + Poll 轮询
+- **`nativeHasSurface()`**：Java 端检测当前是否为 Surface 模式
+- **相机矩阵 LERP 平滑**：`mat4_lerp(camera_prev, camera_target, 0.3)` 避免抖动
+- **Surface 自适应 resize**：Surface 模式下自动 reconfigure swapchain
+- **Surface 错误恢复**：`SurfaceError::Outdated/Lost` 时自动 reconfigure
+- **Offscreen 模式回退**：Surface 模式失败时自动使用 triple-buffer 读回
+- 8 个 JNI native 方法完整实现
+
+#### Changed
+- `render_frame()` 根据 Surface 模式返回不同结果（Surface 模式返回空 Vec）
+- 节流策略保持 50ms（~20fps），Surface 模式下无性能瓶颈
+- 架构从单一读回路径升级为双模渲染
+
+#### Fixed
+- Surface 模式下不再需要 PBO 纹理上传，消除了 NVIDIA 驱动 DMA 相关的所有 crash
+- 相机矩阵抖动（LERP 平滑替代突变）
+
+---
+
+### [1.1.0] - 2026-07-08
 
 #### Added
 - 3D 几何管线：WGSL 着色器 + push constants（model matrix）+ 深度测试 + 背面剔除
@@ -223,7 +290,7 @@ dx12-lib-template-26.1.2/
 | 图形 | wgpu (WebGPU) → DX12 | 23 |
 | 语言 | Rust | 2021 edition |
 | JNI | jni crate | 0.21 |
-| 渲染 | OpenGL (Java 端) | Core Profile 330 |
+| 渲染 | OpenGL (Java 端，Offscreen 模式) | Core Profile 330 |
 
 ---
 
@@ -232,7 +299,7 @@ dx12-lib-template-26.1.2/
 ### 系统要求
 
 - **Windows 10/11** (x64)
-- **JDK 21** (推荐 BellSoft Liberica JDK 或 Adoptium)
+- **JDK 25** (推荐 BellSoft Liberica JDK 或 Adoptium)
 - **Rust 1.75+** (stable)
 - **Gradle 8.13** (或通过 wrapper)
 
@@ -246,22 +313,22 @@ rustup default stable
 rustup component add rust-analyzer rust-src
 ```
 
-#### 2. 安装 JDK 21
+#### 2. 安装 JDK 25
 
 ```powershell
 # 确认 Java 版本
 java -version
-# 应输出 Java 21.x.x
+# 应输出 Java 25.x.x
 
 # 如未安装，推荐使用 BellSoft Liberica JDK:
-# https://bell-sw.com/pages/downloads/?version=java-21&os=Windows+amd64
+# https://bell-sw.com/pages/downloads/?version=java-25&os=Windows+amd64
 ```
 
 #### 3. 配置环境变量 (可选)
 
 ```powershell
 # 设置 JAVA_HOME (如果尚未设置)
-$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-21.0.x"
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-25.0.x"
 ```
 
 ### 构建步骤
@@ -277,7 +344,7 @@ cargo build --release
 # 2. 构建 Fabric 模组
 cd fabric
 gradlew build
-# 输出: build/libs/gl4dx12-0.1.0.jar
+# 输出: build/libs/gl4dx12-*.jar
 ```
 
 #### 方式 B：一键构建
@@ -313,8 +380,20 @@ copy rust\target\release\wgpu_mc_jni.dll ^
 [D3D12Bridge] Rust JNI library initialized.
 [INFO] Rust responded: Hello from Rust wgpu! You said: Hello from Minecraft!
 [INFO] Device info: wgpu-mc-jni loaded. DX12: READY
+[dx12-wm] Creating WmRenderer 800x600 (triple-buffer + surface support)
+[dx12-wm] Adapter: NVIDIA GeForce RTX 3080
+[dx12-wm] Device created OK
+[dx12-wm] Offscreen slots created (800x600)
 [INFO] GL4DX12 Mod initialized!
 ```
+
+进入游戏中，当 HWND 可用后会看到：
+
+```
+[dx12-wm] Surface OK! HWND=0x123456 fmt=Rgba8UnormSrgb 1920x1080
+```
+
+此时渲染模式自动切换到 **Surface 模式**，DX12 直接呈现到窗口。
 
 ---
 
@@ -400,12 +479,13 @@ $env:RUST_LOG = "debug"
 #### 验证 JNI 通信
 
 模组启动时会自动执行以下测试：
-- `nativeInit()` — 初始化 Rust 环境
+- `nativeInit()` — 初始化 Rust 环境，创建 WmRenderer（Offscreen 模式）
 - `nativeHello("Hello from Minecraft!")` — 双向字符串传递
 - `nativeTestDeviceInfo()` — GPU 适配器检测
-- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄
-- `nativeRenderFrame()` — 每帧渲染并返回 RGBA 像素数据
+- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄，切换到 Surface 模式
+- `nativeRenderFrame()` — 每帧渲染（Surface 模式直接呈现，Offscreen 模式返回 byte[]）
 - `nativeUpdateCamera(float[])` — 传递 MC 相机 MVP 矩阵
+- `nativeHasSurface()` — 检测当前是否为 Surface 模式
 
 #### 运行独立测试程序
 
@@ -422,8 +502,8 @@ cargo run --example simple
 |------|------|----------|
 | `NoClassDefFoundError: net/minecraft/client/Minecraft` | JAR 版本过旧 | 重新编译并复制最新 JAR |
 | `UnsatisfiedLinkError: wgpu_mc_jni.dll` | DLL 路径不正确 | 确认 DLL 在 `dx12mod/` 目录下 |
-| `Unsupported class file major version 69` | JDK 版本不匹配 | 使用 JDK 21 编译 (非 JDK 25) |
-| `Incompatible mods found!` | fabric.mod.json 版本声明错误 | 确认 `"minecraft": "~1.21.1"` |
+| `Unsupported class file major version 69` | JDK 版本不匹配 | 使用 JDK 25 编译 (非 JDK 21) |
+| `Incompatible mods found!` | fabric.mod.json 版本声明错误 | 确认 `"minecraft": "~26.1.2"` |
 
 ---
 
@@ -432,13 +512,14 @@ cargo run --example simple
 | 问题 | 原因 | 解决方案 | 状态 |
 |------|------|----------|------|
 | `glTexImage2D(pixels)` 一步完成 crash | NVIDIA 驱动 bug | 改用 `glTexImage2D(null)` + `glTexSubImage2D(pixels)` 两步 | ✅ 已修复 |
-| `glTexSubImage2D` 在页边界 ACCESS_VIOLATION | NVIDIA 驱动按页粒度预读，缓冲区非页对齐 | PBO（Pixel Buffer Object）上传，GPU 侧 memcpy | ✅ 已修复 |
-| 按 Esc/设置菜单 crash | HUD callback 与 Screen 渲染 GL 状态冲突 | 当前 Screen 不为 null 时跳过 GL 绘制 | ✅ 已修复 |
-| 缓冲区大小不匹配导致 nvoglv64 越界 | 帧大小与窗口尺寸不一致 | 用 `bufferBytes` 反推安全 `height` 再调用 glTexSubImage2D | ✅ 已修复 |
+| `glTexSubImage2D` 在页边界 ACCESS_VIOLATION | NVIDIA 驱动按页粒度 DMA 读取客户端内存不稳定 | **PBO 方案**：`glMapBuffer` + CPU memcpy + `glTexSubImage2D(offset=0)` 从 GPU 内存上传 | ✅ 已修复 |
+| `MemoryUtil.memAlloc` crash | LWJGL allocator 页对齐与 nvoglv64 不兼容 | 改用 `BufferUtils.createByteBuffer` | ✅ 已修复 |
+| 按 Esc/设置菜单 crash | HUD callback 与 Screen 渲染 GL 状态冲突 | `currentScreen != null` 时跳过 GL 绘制 | ✅ 已修复 |
+| 纹理闪烁不完整 | 窗口 resize 后纹理尺寸不匹配 | `texWidth`/`texHeight` 追踪 + 自动重建 | ✅ 已修复 |
 | 资源重载后渲染 crash | GL 状态未清理 | 重载检测时重置 `vaoId`/`shaderValid`/`texAllocated`/`pendingPixels` | ✅ 已修复 |
-| 每帧调用 Rust 渲染 freeze | GPU 命令队列竞争 | 节流到每 50ms 一次 (~20fps) | ✅ 已修复 |
-| 调试日志导致卡顿 | 每 tick 写磁盘 | 移除所有非必要日志 | ✅ 已修复 |
-| `setWindow` 重复调用 | JNI 开销 + 日志轰炸 | `lastSetHwnd` 缓存，相同 HWND 直接跳过 | ✅ 已修复 |
+| 帧率波动（一会快一会慢） | GPU 读回管线延迟不稳定 | 节流 50ms ≈ 20fps | ✅ 已修复 |
+| 调试日志导致卡顿 | 每 tick 写磁盘 | 移除所有 `C:\tmp\` 文件日志 | ✅ 已修复 |
+| `setWindow` 重复调用 | JNI 开销 | `lastSetHwnd` 缓存 | ✅ 已修复 |
 
 ---
 
@@ -459,37 +540,49 @@ cargo run --example simple
 | 任务 | 状态 | 说明 |
 |------|------|------|
 | WmRenderer 创建 | ✅ | wgpu DX12 Instance → Adapter → Device |
-| 离屏渲染 | ✅ | `render_frame()` 输出 RGBA 像素 |
 | 3D 几何管线 | ✅ | WGSL 着色器 + push constants + 深度测试 + 背面剔除 |
 | 地面网格 | ✅ | 200x200 绿色平面 |
 | 立方体网格 | ✅ | 24 顶点/6 面，每面明暗区分 |
 | 深度缓冲 | ✅ | `Depth32Float` 格式 |
-| 像素回传 | ✅ | Rust → Java byte[] → OpenGL 纹理 → 全屏 Quad |
+| 像素回传 | ✅ | Rust → Java byte[] → PBO → OpenGL 纹理 → 全屏 Quad |
 | 独立测试程序 | ✅ | `examples/simple.rs` 可独立运行渲染三角形 |
 | 窗口尺寸同步 | ✅ | `nativeResize()` 更新渲染器尺寸 |
-| 相机 MVP 同步 | ✅ | Java → Rust 实时传递 MC 相机视角 |
+| 相机 MVP 同步 | ✅ | Java → Rust 实时传递 MC 相机视角（带 LERP 平滑） |
 
 ### 阶段 3：Fabric 事件系统集成 ✅ 已完成
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
-| ClientTickEvents | ✅ | 计时、资源重载检测、调用 Rust 渲染 |
-| HudRenderCallback | ✅ | OpenGL 纹理上传 + 全屏 quad 绘制 |
+| ClientTickEvents | ✅ | 计时、资源重载检测、相机提取、调用 Rust 渲染 |
+| HudRenderCallback | ✅ | PBO 纹理上传 + 全屏 quad 绘制 |
 | GL 状态管理 | ✅ | 完整的保存/恢复机制 |
 | VAO/Shader 持久化 | ✅ | 首次创建，丢失后自动重建 |
 
-### 阶段 4：实际 Minecraft 场景渲染 🚧 进行中
+### 阶段 4：Surface 模式（DX12 直接呈现）✅ 已完成
 
-当前已实现 3D 场景渲染（绿色地面 + 5 个橙色立方体），相机视角随 MC 移动实时更新。要实现真实 Minecraft 场景渲染，需要：
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| Surface 创建 | ✅ | `create_surface_from_hwnd()` 基于 raw-window-handle |
+| Swapchain 配置 | ✅ | `present_mode: Immediate` + `desired_maximum_frame_latency: 2` |
+| Surface 渲染 | ✅ | `render_surface()` 直接 present 到窗口 |
+| Surface 自适应 resize | ✅ | 窗口尺寸变化时 reconfigure |
+| Surface 错误恢复 | ✅ | Outdated/Lost 时自动 reconfigure |
+| 双模切换 | ✅ | `nativeSetWindow` 后自动切换到 Surface 模式 |
+| Triple-buffer 读回 | ✅ | Offscreen 模式三槽环形缓冲 + 异步 map_async |
+
+### 阶段 5：VulkanMod 级全接管 🚧 进行中
+
+当前已实现 Surface 模式（DX12 直接呈现 3D 场景），相机视角随 MC 移动实时更新。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| 区块渲染 | 🔴 P0 | 方块网格生成 + 顶点缓冲区 |
-| 天空盒与云雾 | 🟠 P1 | 简单着色器即可 |
-| 实体渲染 | 🟠 P1 | 模型加载 + 骨骼动画 |
-| 粒子系统 | 🟡 P2 | 点精灵 (point sprites) |
-| 半透明物体排序 | 🟡 P2 | 深度排序算法 |
-| 后期特效 | 🟢 P3 | 泛光、阴影、色调映射 |
+| **Mixin 框架搭建** | 🔴 P0 | 拦截 `LevelRenderer.renderLevel()`，证明可以接管渲染 |
+| **区块渲染** | 🔴 P0 | 预计算 Chunk Mesh + 顶点缓冲，零读回 |
+| **天空盒与云雾** | 🟠 P1 | 简单着色器即可 |
+| **实体渲染** | 🟠 P1 | 模型加载 + 骨骼动画 |
+| **粒子系统** | 🟡 P2 | 点精灵 (point sprites) |
+| **半透明物体排序** | 🟡 P2 | 深度排序算法 |
+| **后期特效** | 🟢 P3 | 泛光、阴影、色调映射 |
 
 #### 参考：wgpu-mc RenderGraph 设计
 
@@ -516,6 +609,12 @@ passes:
     shader: "particle.wgsl"
     depth_test: false
     blending: alpha
+
+  - name: "overlay_pass"
+    render_target: "main"
+    shader: "overlay.wgsl"
+    depth_test: false
+    # HUD、小地图、Crosshair 等由 MC 原生 OpenGL 渲染
 ```
 
 ---
@@ -530,9 +629,9 @@ passes:
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| 区块渲染 | 🔴 P0 | 方块网格生成 + 顶点缓冲 |
+| Mixin 框架搭建 | 🔴 P0 | 拦截 LevelRenderer.renderLevel() |
+| 区块渲染 | 🔴 P0 | 预计算 Chunk Mesh，DX12 直接渲染 |
 | 天空盒渲染 | 🟠 P1 | 简单着色器即可 |
-| RenderGraph | 🔴 P0 | 配置驱动渲染管线 |
 
 ---
 

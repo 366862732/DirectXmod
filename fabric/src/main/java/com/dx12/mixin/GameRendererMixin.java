@@ -11,21 +11,24 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(GameRenderer.class)
 public class GameRendererMixin {
     /**
-     * HEAD injection: when D3D12 surface mode is active, skip Minecraft's
-     * entire OpenGL rendering pipeline. D3D12 handles all rendering and
-     * presents directly to the window swapchain.
+     * HEAD injection: surface mode — cancel MC's OpenGL rendering entirely.
+     * This prevents concurrent GL+D3D12 GPU work on the same window,
+     * which causes GPU driver TDR timeouts (~2s per frame).
+     *
+     * GL still does a GLFW swap (with cancelled/stale buffer — harmless).
+     * D3D12 Present() in MinecraftMixin TAIL overwrites the window pixels.
      */
     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
     private void onRenderHead(CallbackInfo ci) {
         if (D3D12Bridge.hasSurface()) {
-            Dx12Mod.onPreRender();
             ci.cancel();
         }
     }
 
     /**
-     * TAIL injection: offscreen mode fallback — upload D3D12-rendered
+     * TAIL injection: offscreen mode — upload D3D12-rendered
      * pixels as an OpenGL full-screen quad overlay.
+     * In surface mode, this is skipped (render happens in MinecraftMixin).
      */
     @Inject(method = "render", at = @At("TAIL"))
     private void onRenderTail(CallbackInfo ci) {
