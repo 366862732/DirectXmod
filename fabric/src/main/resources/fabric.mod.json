@@ -3,9 +3,9 @@
   "id": "gl4dx12",
   "version": "${version}",
   "name": "DirectX Mod",
-  "description": "这是一个JNI+dx12的渲染模组",
+  "description": "这是一个JNI+wgpu+dx12的渲染模组",
   "authors": [
-    "dx12-team"
+    "xiaozi Graphics Development Team"
   ],
   "contact": {},
   "license": "MIT",
@@ -18,10 +18,13 @@
   },
   "depends": {
     "fabricloader": ">=0.16.0",
-    "minecraft": "~1.21.1",
+    "minecraft": "~26.1.2",
     "java": ">=21",
     "fabric-api": "*"
   },
+  "mixins": [
+    "gl4dx12.mixins.json"
+  ],
   "suggests": {
     "flamingo": "*"
   }

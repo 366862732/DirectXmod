@@ -2,7 +2,6 @@ package com.dx12;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
@@ -11,9 +10,7 @@ import org.lwjgl.opengl.GL30;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.render.Camera;
-import net.minecraft.client.render.GameRenderer;
+import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
 
 import java.nio.ByteBuffer;
@@ -141,38 +138,33 @@ public class Dx12Mod implements ClientModInitializer {
             if (lastRenderTime > 0 && (now - lastRenderTime) < 50) return;
             lastRenderTime = now;
 
-            // Extract camera view-projection matrix from Minecraft
+            // Extract camera view-projection matrix from Minecraft.
+            // In Mojang mappings, Camera class has minimal public API.
+            // Use player entity directly — eye position matches camera view.
             try {
-            MinecraftClient mc = MinecraftClient.getInstance();
-            if (mc != null && mc.gameRenderer != null) {
-                Camera camera = mc.gameRenderer.getCamera();
-                if (camera != null) {
-                    // Get camera position and rotation
-                    var pos = camera.getPos();
-                    float pitch = camera.getPitch();
-                    float yaw = camera.getYaw();
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.player != null) {
+                    var player = mc.player;
+                    var pos = player.getEyePosition();
+                    float pitch = player.getXRot();
+                    float yaw = player.getYRot();
 
-                    // Build view matrix (look-at)
                     Matrix4f view = new Matrix4f();
                     view.rotateX((float) Math.toRadians(pitch));
                     view.rotateY((float) Math.toRadians(yaw + 180.0));
                     view.translate((float) -pos.x, (float) -pos.y, (float) -pos.z);
 
-                    // Build projection matrix
                     float aspect = (float) width / (float) height;
                     Matrix4f proj = new Matrix4f();
                     proj.perspective((float) Math.toRadians(70.0), aspect, 0.05f, 1000.0f);
 
-                    // MVP = projection * view
                     Matrix4f mvp = new Matrix4f(proj);
                     mvp.mul(view);
 
-                    // Convert Matrix4f to float[16] column-major for JNI
                     float[] mvpArray = new float[16];
                     mvp.get(mvpArray);
                     D3D12Bridge.updateCamera(mvpArray);
                 }
-            }
             } catch (Throwable t) {
                 LOGGER.error("Camera extraction failed: {}", t.getMessage());
                 return;
@@ -211,115 +203,122 @@ public class Dx12Mod implements ClientModInitializer {
                 return;
             }
         });
-
-        // HUD callback: GL drawing (OpenGL context IS current during HUD rendering)
-        // Minecraft uses RenderSystem which resets GL state before each draw call,
-        // so we DON'T need to save/restore state — just set ours, draw, unbind.
-        HudRenderCallback.EVENT.register((drawContext, tickDelta) -> {
-            // Skip GL drawing when any GUI screen is open (pause menu, inventory, etc.)
-            // Prevents nvoglv64 crash from GL state conflict with screen rendering
-            MinecraftClient mc = MinecraftClient.getInstance();
-            if (mc == null || mc.currentScreen != null) return;
-
-            if (pendingPixels == null || !pendingPixels.hasRemaining()) return;
-
-            int width = pendingWidth;
-            int height = pendingHeight;
-            ByteBuffer pixels = pendingPixels;
-            pendingPixels = null; 
-
-            // Safety: clamp upload size to actual buffer capacity
-            // Prevents nvoglv64 ACCESS_VIOLATION when buffer doesn't match expected size
-            int expectedBytes = width * height * 4;
-            int bufferBytes = pixels.remaining();
-            if (bufferBytes < expectedBytes) {
-                LOGGER.warn("Pixel buffer size mismatch: got={} expected={} ({}x{})",
-                    bufferBytes, expectedBytes, width, height);
-                if (width * 4 > 0) {
-                    height = bufferBytes / (width * 4);
-                }
-                if (height <= 0) return;
-            }
-
-            try {
-                if (frameCount++ % 60 == 0) {
-                    LOGGER.info("Rendering frame: {} bytes (frame={})", bufferBytes, frameCount);
-                }
-
-                // Texture: allocate once, reallocate on resize
-                if (!texAllocated || texWidth != width || texHeight != height) {
-                    if (texId != 0) glDeleteTextures(texId);
-                    texId = glGenTextures();
-                    glBindTexture(GL_TEXTURE_2D, texId);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
-                    texAllocated = true;
-                    texWidth = width;
-                    texHeight = height;
-                }
-
-                // Upload pixels via PBO to avoid NVIDIA driver DMA page-boundary crash.
-                // 1) Copy pixels to GPU-side buffer via CPU memcpy (safe).
-                // 2) Let driver upload from GPU memory to texture (always safe).
-                int pboBytes = width * height * 4;
-                if (pboId == 0) {
-                    pboId = glGenBuffers();
-                }
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pboId);
-                // Orphan old buffer: allocate fresh GPU memory so pending reads
-                // from previous frame don't stall our map+write.
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, (long) pboBytes, GL_STREAM_DRAW);
-                pixels.rewind();
-                ByteBuffer mapped = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY, (long) pboBytes, null);
-                if (mapped != null) {
-                    mapped.put(pixels);
-                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                }
-                // Upload from PBO (GPU memory) to texture
-                glBindTexture(GL_TEXTURE_2D, texId);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-                // Shader: persistent
-                if (!shaderValid || shaderProg == 0) {
-                    if (shaderProg != 0) glDeleteProgram(shaderProg);
-                    shaderProg = createShaderProgram();
-                    texUniformLoc = glGetUniformLocation(shaderProg, "uTexture");
-                    shaderValid = (shaderProg != 0);
-                }
-
-                // VAO: persistent
-                if (vaoId == 0 || !glIsVertexArray(vaoId)) {
-                    if (vaoId != 0) glDeleteVertexArrays(vaoId);
-                    vaoId = createVAO();
-                }
-
-                // Draw
-                glUseProgram(shaderProg);
-                glUniform1i(texUniformLoc, 0);
-                glBindVertexArray(vaoId);
-                glDisable(GL_DEPTH_TEST);
-                glDisable(GL_BLEND);
-                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
-
-                // Unbind (Minecraft's RenderSystem will set its own state next)
-                glBindVertexArray(0);
-                glBindTexture(GL_TEXTURE_2D, 0);
-                glUseProgram(0);
-
-            } catch (Throwable t) {
-                LOGGER.warn("GL draw failed: {}", t.getMessage());
-                vaoId = 0;
-                shaderValid = false;
-                texAllocated = false;
-                pboId = 0;
-            }
-        });
-
         LOGGER.info("GL4DX12 Mod initialized!");
+    }
+
+    // GL drawing: called by GameRendererMixin at TAIL of render().
+    // At this point ALL Minecraft rendering (world, entities, HUD) is complete,
+    // our full-screen quad will be the last thing drawn this frame.
+    // glPushAttrib/glPopAttrib removed — they are deprecated and crash on core profile.
+    public static void onPostRender() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.screen != null) return;  // skip menus
+
+        if (pendingPixels == null || !pendingPixels.hasRemaining()) return;
+
+        int width = pendingWidth;
+        int height = pendingHeight;
+        ByteBuffer pixels = pendingPixels;
+        pendingPixels = null;
+
+        // Safety: clamp upload size to actual buffer capacity
+        int expectedBytes = width * height * 4;
+        int bufferBytes = pixels.remaining();
+        if (bufferBytes < expectedBytes) {
+            LOGGER.warn("Pixel buffer size mismatch: got={} expected={} ({}x{})",
+                bufferBytes, expectedBytes, width, height);
+            if (width * 4 > 0) {
+                height = bufferBytes / (width * 4);
+            }
+            if (height <= 0) return;
+        }
+
+        try {
+            if (frameCount++ % 60 == 0) {
+                LOGGER.info("Rendering frame: {} bytes (frame={})", bufferBytes, frameCount);
+            }
+
+            // Texture: allocate once, reallocate on resize
+            if (!texAllocated || texWidth != width || texHeight != height) {
+                if (texId != 0) glDeleteTextures(texId);
+                texId = glGenTextures();
+                glBindTexture(GL_TEXTURE_2D, texId);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
+                texAllocated = true;
+                texWidth = width;
+                texHeight = height;
+            }
+
+            // Upload pixels via PBO
+            int pboBytes = width * height * 4;
+            if (pboId == 0) {
+                pboId = glGenBuffers();
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pboId);
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, (long) pboBytes, GL_STREAM_DRAW);
+            pixels.rewind();
+            ByteBuffer mapped = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY, (long) pboBytes, null);
+            if (mapped != null) {
+                mapped.put(pixels);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            }
+            glBindTexture(GL_TEXTURE_2D, texId);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+            // Shader: persistent
+            if (!shaderValid || shaderProg == 0) {
+                if (shaderProg != 0) glDeleteProgram(shaderProg);
+                shaderProg = createShaderProgram();
+                texUniformLoc = glGetUniformLocation(shaderProg, "uTexture");
+                shaderValid = (shaderProg != 0);
+            }
+
+            // VAO: persistent
+            if (vaoId == 0 || !glIsVertexArray(vaoId)) {
+                if (vaoId != 0) glDeleteVertexArrays(vaoId);
+                vaoId = createVAO();
+            }
+
+            // Manually save/restore GL state (glPushAttrib deprecated in core profile)
+            boolean scissorWasOn = glIsEnabled(GL_SCISSOR_TEST);
+            boolean depthWasOn = glIsEnabled(GL_DEPTH_TEST);
+            boolean blendWasOn = glIsEnabled(GL_BLEND);
+            int[] oldViewport = new int[4];
+            GL11.glGetIntegerv(GL11.GL_VIEWPORT, oldViewport);
+
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_BLEND);
+            glViewport(0, 0, width, height);
+
+            glUseProgram(shaderProg);
+            glUniform1i(texUniformLoc, 0);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, texId);
+            glBindVertexArray(vaoId);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
+
+            glBindVertexArray(0);
+            glUseProgram(0);
+
+            // Restore GL state
+            if (scissorWasOn) glEnable(GL_SCISSOR_TEST);
+            if (depthWasOn) glEnable(GL_DEPTH_TEST);
+            if (blendWasOn) glEnable(GL_BLEND);
+            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+
+        } catch (Throwable t) {
+            LOGGER.warn("GL draw failed: {}", t.getMessage());
+            vaoId = 0;
+            shaderValid = false;
+            texAllocated = false;
+            pboId = 0;
+        }
     }
 
     // Create a fullscreen quad VAO (vertex + index buffers included)
