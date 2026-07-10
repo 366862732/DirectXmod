@@ -1,6 +1,13 @@
 //! wgpu-mc: wgpu renderer with depth buffer, geometry pipeline, and readback.
+//!
+//! Architecture: Triple-buffered ring on JNI thread.
+//! - Each render_frame() submit is non-blocking
+//! - Ring(3) texture+staging buffers rotate: render / async map / readback in parallel
+//! - Camera smoothing with per-frame lerp
+//! - Push constants for model matrix → 1 uniform write/frame
 
 use bytemuck::{Pod, Zeroable};
+use std::sync::mpsc;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -25,9 +32,11 @@ impl Vertex {
 
 const SHADER_SRC: &str = r#"
 struct CameraUniform {
-    mvp: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+var<push_constant> model: mat4x4<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -37,7 +46,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
     var out: VertexOutput;
-    out.position = camera.mvp * vec4<f32>(pos, 1.0);
+    out.position = camera.view_proj * model * vec4<f32>(pos, 1.0);
     out.color = color;
     return out;
 }
@@ -48,15 +57,21 @@ fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Multiply two 4x4 matrices (both row-major: m[row][col]).
-fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+const IDENTITY: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+const RING_SIZE: usize = 3;
+const LERP_FACTOR: f32 = 0.3;
+
+fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
     let mut result = [[0.0f32; 4]; 4];
     for r in 0..4 {
         for c in 0..4 {
-            result[r][c] = a[r][0] * b[0][c]
-                + a[r][1] * b[1][c]
-                + a[r][2] * b[2][c]
-                + a[r][3] * b[3][c];
+            result[r][c] = a[r][c] + (b[r][c] - a[r][c]) * t;
         }
     }
     result
@@ -65,11 +80,7 @@ fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Depth Texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -79,8 +90,35 @@ fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::T
     })
 }
 
-/// Generate a horizontal plane mesh at y=0.
-/// Returns (vertex_buffer, index_buffer, index_count).
+fn make_color_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Color Texture"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+fn make_staging_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Buffer {
+    let row_aligned = ((width * 4 + 255) / 256) * 256;
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Staging"),
+        size: (row_aligned as u64) * (height as u64),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    })
+}
+
+fn aligned_row(width: u32) -> u32 {
+    ((width * 4 + 255) / 256) * 256
+}
+
 fn create_plane_mesh(device: &wgpu::Device, size: f32, color: [f32; 3])
     -> (wgpu::Buffer, wgpu::Buffer, u32)
 {
@@ -114,55 +152,44 @@ fn create_plane_mesh(device: &wgpu::Device, size: f32, color: [f32; 3])
     (vbuf, ibuf, indices.len() as u32)
 }
 
-/// Generate a unit cube mesh. Each face has a distinct color for 3D depth verification.
-/// Returns (vertex_buffer, index_buffer, index_count).
 fn create_cube_mesh(device: &wgpu::Device, color: [f32; 3])
     -> (wgpu::Buffer, wgpu::Buffer, u32)
 {
-    // 6 faces, 4 vertices each = 24 vertices. Each face gets a shade of the base color.
     let c = color;
-    let d = [c[0] * 0.6, c[1] * 0.6, c[2] * 0.6]; // darker shade
-
+    let d = [c[0] * 0.6, c[1] * 0.6, c[2] * 0.6];
     let vertices: [Vertex; 24] = [
-        // +Y (top) — brighter
         Vertex { position: [-0.5,  0.5, -0.5], color: c },
         Vertex { position: [ 0.5,  0.5, -0.5], color: c },
         Vertex { position: [-0.5,  0.5,  0.5], color: c },
         Vertex { position: [ 0.5,  0.5,  0.5], color: c },
-        // -Y (bottom) — darker
         Vertex { position: [-0.5, -0.5, -0.5], color: d },
         Vertex { position: [ 0.5, -0.5, -0.5], color: d },
         Vertex { position: [-0.5, -0.5,  0.5], color: d },
         Vertex { position: [ 0.5, -0.5,  0.5], color: d },
-        // +Z (front) — brighter
         Vertex { position: [-0.5, -0.5,  0.5], color: c },
         Vertex { position: [ 0.5, -0.5,  0.5], color: c },
         Vertex { position: [-0.5,  0.5,  0.5], color: c },
         Vertex { position: [ 0.5,  0.5,  0.5], color: c },
-        // -Z (back) — darker
         Vertex { position: [-0.5, -0.5, -0.5], color: d },
         Vertex { position: [ 0.5, -0.5, -0.5], color: d },
         Vertex { position: [-0.5,  0.5, -0.5], color: d },
         Vertex { position: [ 0.5,  0.5, -0.5], color: d },
-        // +X (right) — brighter
         Vertex { position: [ 0.5, -0.5, -0.5], color: c },
         Vertex { position: [ 0.5,  0.5, -0.5], color: c },
         Vertex { position: [ 0.5, -0.5,  0.5], color: c },
         Vertex { position: [ 0.5,  0.5,  0.5], color: c },
-        // -X (left) — darker
         Vertex { position: [-0.5, -0.5, -0.5], color: d },
         Vertex { position: [-0.5,  0.5, -0.5], color: d },
         Vertex { position: [-0.5, -0.5,  0.5], color: d },
         Vertex { position: [-0.5,  0.5,  0.5], color: d },
     ];
-
     let indices: [u16; 36] = [
-         0,  1,  2,  2,  1,  3,  // +Y
-         4,  6,  5,  5,  6,  7,  // -Y
-         8,  9, 10, 10,  9, 11,  // +Z
-        12, 14, 13, 13, 14, 15,  // -Z
-        16, 17, 18, 18, 17, 19,  // +X
-        20, 22, 21, 21, 22, 23,  // -X
+         0,  1,  2,  2,  1,  3,
+         4,  6,  5,  5,  6,  7,
+         8,  9, 10, 10,  9, 11,
+        12, 14, 13, 13, 14, 15,
+        16, 17, 18, 18, 17, 19,
+        20, 22, 21, 21, 22, 23,
     ];
 
     let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -186,45 +213,69 @@ fn create_cube_mesh(device: &wgpu::Device, color: [f32; 3])
     (vbuf, ibuf, indices.len() as u32)
 }
 
-pub struct WmRenderer {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub width: u32,
-    pub height: u32,
-    pub camera_mvp: [[f32; 4]; 4],
+// ── Ring slot ─────────────────────────────────────────────────────
 
+struct Slot {
+    #[allow(dead_code)]
+    color: wgpu::Texture,
+    #[allow(dead_code)]
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    staging: wgpu::Buffer,
+}
+
+impl Slot {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let color = make_color_texture(device, width, height);
+        let depth = make_depth_texture(device, width, height);
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let staging = make_staging_buffer(device, width, height);
+        Self { color, depth, depth_view, staging }
+    }
+}
+
+// ── Renderer ──────────────────────────────────────────────────────
+
+pub struct WmRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+
+    width: u32,
+    height: u32,
+
+    // Camera state
+    pub camera_mvp: [[f32; 4]; 4],
+    camera_prev: [[f32; 4]; 4],
+    camera_target: [[f32; 4]; 4],
+
+    // Immutable resources
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
-    #[allow(dead_code)]
-    bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
-    texture: wgpu::Texture,
-    depth_texture: wgpu::Texture,
-    depth_view: wgpu::TextureView,
-    staging_buffer: wgpu::Buffer,
-
-    // Geometry
     plane_vb: wgpu::Buffer,
     plane_ib: wgpu::Buffer,
     plane_count: u32,
     cube_vb: wgpu::Buffer,
     cube_ib: wgpu::Buffer,
     cube_count: u32,
+
+    // Ring state
+    slots: [Slot; RING_SIZE],
+    idx: usize,
+    pending_rx: [Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; RING_SIZE],
+    prev_pixels: Vec<u8>,
 }
 
 impl WmRenderer {
     pub fn create(width: u32, height: u32) -> Result<Self, &'static str> {
-        log::info!("Creating WmRenderer (offscreen) {}x{}", width, height);
-        eprintln!("[dx12-wm] Creating WmRenderer (offscreen) {}x{}", width, height);
+        eprintln!("[dx12-wm] Creating WmRenderer (triple-buffer) {}x{}", width, height);
+        log::info!("Creating WmRenderer (triple-buffer) {}x{}", width, height);
 
-        eprintln!("[dx12-wm] Creating wgpu Instance (DX12 backend)...");
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..Default::default()
         });
-        eprintln!("[dx12-wm] wgpu Instance created OK");
 
-        eprintln!("[dx12-wm] Requesting adapter...");
         let adapter = futures::executor::block_on(instance.request_adapter(
             &wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -234,9 +285,7 @@ impl WmRenderer {
         ))
         .ok_or("No adapter")?;
         eprintln!("[dx12-wm] Adapter: {:?}", adapter.get_info().name);
-        log::info!("DX12 adapter: {:?}", adapter.get_info().name);
 
-        eprintln!("[dx12-wm] Requesting device...");
         let (device, queue) = futures::executor::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wgpu-mc"),
@@ -252,13 +301,11 @@ impl WmRenderer {
         .map_err(|_| "Device failed")?;
         eprintln!("[dx12-wm] Device created OK");
 
-        // Shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Main Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SHADER_SRC)),
         });
 
-        // Uniform buffer (64 bytes for mat4x4 MVP)
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniform"),
             size: 64,
@@ -266,7 +313,6 @@ impl WmRenderer {
             mapped_at_creation: false,
         });
 
-        // Bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Camera Bind Group Layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -281,7 +327,6 @@ impl WmRenderer {
             }],
         });
 
-        // Bind group
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Camera Bind Group"),
             layout: &bind_group_layout,
@@ -291,14 +336,15 @@ impl WmRenderer {
             }],
         });
 
-        // Pipeline layout (no push constants — model folded into MVP on CPU)
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::VERTEX,
+                range: 0..64,
+            }],
         });
 
-        // Render pipeline with depth testing
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Main Pipeline"),
             layout: Some(&pipeline_layout),
@@ -335,133 +381,87 @@ impl WmRenderer {
             cache: None,
         });
 
-        // Offscreen color texture
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Offscreen Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
-        // Depth texture
-        let depth_texture = make_depth_texture(&device, width, height);
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Staging buffer for readback
-        let size = (width as u64) * (height as u64) * 4;
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        // Generate geometry
         let (plane_vb, plane_ib, plane_count) =
             create_plane_mesh(&device, 200.0, [0.2, 0.65, 0.2]);
         let (cube_vb, cube_ib, cube_count) =
             create_cube_mesh(&device, [0.8, 0.4, 0.1]);
+
+        let slots = [
+            Slot::new(&device, width, height),
+            Slot::new(&device, width, height),
+            Slot::new(&device, width, height),
+        ];
+
+        eprintln!("[dx12-wm] Slots created OK ({}x{})", width, height);
 
         Ok(Self {
             device,
             queue,
             width,
             height,
-            camera_mvp: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
+            camera_mvp: IDENTITY,
+            camera_prev: IDENTITY,
+            camera_target: IDENTITY,
             pipeline,
             bind_group,
-            bind_group_layout,
             uniform_buffer,
-            texture,
-            depth_texture,
-            depth_view,
-            staging_buffer,
             plane_vb,
             plane_ib,
             plane_count,
             cube_vb,
             cube_ib,
             cube_count,
+            slots,
+            idx: 0,
+            pending_rx: [None, None, None],
+            prev_pixels: Vec::new(),
         })
     }
 
     pub fn set_camera(&mut self, mvp: [[f32; 4]; 4]) {
-        self.camera_mvp = mvp;
+        self.camera_target = mvp;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        log::info!("Resizing renderer: {}x{} -> {}x{}", self.width, self.height, width, height);
+        eprintln!("[dx12-wm] Resize: {}x{}", width, height);
         self.width = width;
         self.height = height;
-
-        // Recreate color texture
-        self.texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Offscreen Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
-        // Recreate depth texture
-        self.depth_texture = make_depth_texture(&self.device, width, height);
-        self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Recreate staging buffer
-        let size = (width as u64) * (height as u64) * 4;
-        self.staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        for slot in self.slots.iter_mut() {
+            *slot = Slot::new(&self.device, width, height);
+        }
+        self.idx = 0;
+        self.pending_rx = [None, None, None];
+        // Keep prev_pixels — will be served until first new frame arrives
     }
 
-    /// Render a frame and return pixel data (RGBA).
+    /// Render one frame with triple-buffered async readback.
+    /// Returns pixels from ~2 frames ago (or cached if not ready).
+    /// GPU is never blocked: submit is non-blocking, readback is async.
     pub fn render_frame(&mut self) -> Vec<u8> {
-        let w = self.width as usize;
-        let h = self.height as usize;
+        let w = self.width;
+        let h = self.height;
+        if w == 0 || h == 0 {
+            return Vec::new();
+        }
 
-        // 1. Update uniform buffer with camera MVP
-        let mvp_bytes: &[u8] = bytemuck::cast_slice(&self.camera_mvp);
-        self.queue.write_buffer(&self.uniform_buffer, 0, mvp_bytes);
+        // ── 1. Lerp camera ────────────────────────────────────────
+        self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+        self.camera_prev = self.camera_mvp;
 
-        // 2. Create command encoder
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render"),
-            });
+        // ── 2. Write camera VP uniform (once) ─────────────────────
+        self.queue.write_buffer(&self.uniform_buffer, 0,
+            bytemuck::cast_slice(&self.camera_mvp));
 
-        // 3. Render pass
+        let slot = &self.slots[self.idx];
+        let row_aligned = aligned_row(w);
+
+        // ── 3. Render pass ────────────────────────────────────────
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("Render") },
+        );
+
         {
-            let color_view = self
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            let color_view = slot.color.create_view(&wgpu::TextureViewDescriptor::default());
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -469,16 +469,13 @@ impl WmRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.53,
-                            g: 0.81,
-                            b: 0.92,
-                            a: 1.0,
+                            r: 0.53, g: 0.81, b: 0.92, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
+                    view: &slot.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -492,23 +489,14 @@ impl WmRenderer {
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
 
-            // Model→MVP baked on CPU: upload combined matrix before each draw.
-
-            // Draw ground plane at y=0 (identity model)
-            let plane_model: [[f32; 4]; 4] = [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ];
-            let plane_mvp = mat4_mul(&self.camera_mvp, &plane_model);
-            self.queue.write_buffer(&self.uniform_buffer, 0,
-                bytemuck::cast_slice(&plane_mvp));
+            // Plane
+            rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
+                bytemuck::cast_slice(&IDENTITY));
             rp.set_vertex_buffer(0, self.plane_vb.slice(..));
             rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
             rp.draw_indexed(0..self.plane_count, 0, 0..1);
 
-            // Draw 5 colored cubes at different positions
+            // Cubes
             let cube_positions: [(f32, f32, f32); 5] = [
                 (0.0, 1.0, 0.0),
                 (4.0, 1.0, 2.0),
@@ -516,76 +504,93 @@ impl WmRenderer {
                 (2.0, 1.0, -4.0),
                 (-3.0, 1.0, 3.0),
             ];
-
             for &(cx, cy, cz) in &cube_positions {
-                let cube_model: [[f32; 4]; 4] = [
+                let model: [[f32; 4]; 4] = [
                     [1.0, 0.0, 0.0, 0.0],
                     [0.0, 1.0, 0.0, 0.0],
                     [0.0, 0.0, 1.0, 0.0],
                     [cx, cy, cz, 1.0],
                 ];
-                let cube_mvp = mat4_mul(&self.camera_mvp, &cube_model);
-                self.queue.write_buffer(&self.uniform_buffer, 0,
-                    bytemuck::cast_slice(&cube_mvp));
+                rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
+                    bytemuck::cast_slice(&model));
                 rp.set_vertex_buffer(0, self.cube_vb.slice(..));
                 rp.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..self.cube_count, 0, 0..1);
             }
         }
 
-        // 4. Copy texture to staging buffer
-        let aligned_row = ((self.width * 4 + 255) / 256) * 256;
-        let padded_size = (aligned_row as u64) * (self.height as u64);
-        if self.staging_buffer.size() < padded_size {
-            self.staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Staging"),
-                size: padded_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-        }
+        // ── 4. Copy color → staging, submit, start async map ─────
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
-                texture: &self.texture,
+                texture: &slot.color,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::ImageCopyBuffer {
-                buffer: &self.staging_buffer,
+                buffer: &slot.staging,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(aligned_row),
-                    rows_per_image: Some(self.height),
+                    bytes_per_row: Some(row_aligned),
+                    rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
 
-        // 5. Submit and wait
+        // Submit render + copy (non-blocking)
         self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::Poll);
 
-        // 6. Read back pixels (skip row padding from alignment)
-        let sb_slice = self.staging_buffer.slice(..);
-        sb_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
-
-        let data = sb_slice.get_mapped_range();
-        let actual_row = (self.width * 4) as usize;
-        let aligned_row = aligned_row as usize;
-        let mut pixels = Vec::with_capacity(actual_row * self.height as usize);
-        for row in 0..self.height as usize {
-            let start = row * aligned_row;
-            let end = start + actual_row;
-            pixels.extend_from_slice(&data[start..end]);
+        // Start async map on current slot's staging
+        {
+            let slice = slot.staging.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            self.device.poll(wgpu::Maintain::Poll);
+            self.pending_rx[self.idx] = Some(rx);
         }
-        drop(data);
-        self.staging_buffer.unmap();
+
+        // ── 5. Read from previous slot if ready ───────────────────
+        let read_idx = (self.idx + RING_SIZE - 1) % RING_SIZE;
+        let mut pixels = Vec::new();
+
+        if let Some(rx) = self.pending_rx[read_idx].take() {
+            match rx.recv_timeout(std::time::Duration::from_millis(0)) {
+                Ok(Ok(())) => {
+                    let data = self.slots[read_idx].staging.slice(..).get_mapped_range();
+                    let row_aligned_usize = row_aligned as usize;
+                    let actual_row = (w * 4) as usize;
+                    let mut new_pixels = Vec::with_capacity(actual_row * h as usize);
+                    for row in 0..h as usize {
+                        let start = row * row_aligned_usize;
+                        let end = start + actual_row;
+                        new_pixels.extend_from_slice(&data[start..end]);
+                    }
+                    drop(data);
+                    self.slots[read_idx].staging.unmap();
+                    pixels = new_pixels;
+                }
+                _ => {
+                    // Not ready — retry next frame
+                    self.pending_rx[read_idx] = Some(rx);
+                }
+            }
+        }
+
+        // Fall back to cached pixels
+        if pixels.is_empty() && !self.prev_pixels.is_empty() {
+            pixels = self.prev_pixels.clone();
+        }
+
+        if !pixels.is_empty() {
+            self.prev_pixels = pixels.clone();
+        }
+
+        // ── 6. Advance ring pointer ───────────────────────────────
+        self.idx = (self.idx + 1) % RING_SIZE;
 
         pixels
     }

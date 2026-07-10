@@ -132,10 +132,8 @@ public class Dx12Mod implements ClientModInitializer {
                 firstTickLogged = true;
             }
 
-            // Throttle to ~20fps: GPU readback pipeline naturally limits to ~20fps,
-            // but capping here prevents tick callback from hogging the render thread
-            // when GPU responds at variable speeds.
-            if (lastRenderTime > 0 && (now - lastRenderTime) < 50) return;
+            // No throttle: render_frame() is fully async (non-blocking submit + triple-buffer readback).
+            // GPU pipeline is kept busy without blocking the render thread.
             lastRenderTime = now;
 
             // Extract camera view-projection matrix from Minecraft.
@@ -221,16 +219,17 @@ public class Dx12Mod implements ClientModInitializer {
         ByteBuffer pixels = pendingPixels;
         pendingPixels = null;
 
-        // Safety: clamp upload size to actual buffer capacity
+        // Safety: skip frames where pixel buffer doesn't match expected dimensions.
+        // This happens during window resize — old-resolution frames are served
+        // from the render thread's cache until the first new-resolution frame arrives.
         int expectedBytes = width * height * 4;
         int bufferBytes = pixels.remaining();
-        if (bufferBytes < expectedBytes) {
-            LOGGER.warn("Pixel buffer size mismatch: got={} expected={} ({}x{})",
-                bufferBytes, expectedBytes, width, height);
-            if (width * 4 > 0) {
-                height = bufferBytes / (width * 4);
+        if (bufferBytes != expectedBytes) {
+            if (frameCount < 10 || frameCount % 60 == 0) {
+                LOGGER.info("Pixel buffer size mismatch: got={} expected={} ({}x{}) — skipping",
+                    bufferBytes, expectedBytes, width, height);
             }
-            if (height <= 0) return;
+            return;
         }
 
         try {

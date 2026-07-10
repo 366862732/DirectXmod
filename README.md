@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Fabric](https://img.shields.io/badge/Mod%20Loader-Fabric-blueviolet)](https://fabricmc.net/)
-[![Minecraft](https://img.shields.io/badge/Minecraft-1.21.1-green)](https://www.minecraft.net/)
+[![Minecraft](https://img.shields.io/badge/Minecraft-26.1.2-green)](https://www.minecraft.net/)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org/)
 [![wgpu](https://img.shields.io/badge/wgpu-23-blue)](https://wgpu.rs/)
 
-> 为 Minecraft Java Edition 1.21.1 实现的 DirectX 12 渲染后端，通过 Rust + wgpu + JNI 桥接，将 OpenGL 渲染替换为 D3D12/WebGPU，以解决 TDR 崩溃问题并提升图形性能。
+> 为 Minecraft Java Edition 26.1.2 实现的 DirectX 12 渲染后端，通过 Rust + wgpu + JNI 桥接，将 OpenGL 渲染替换为 D3D12/WebGPU，以解决 TDR 崩溃问题并提升图形性能。
 
 ---
 
@@ -60,12 +60,12 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   Minecraft 1.21.1                          │
+│                   Minecraft 26.1.2                          │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              Fabric Loader 0.19.3                      │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │           Fabric API (ClientTickEvents)          │  │  │
-│  │  │  Tick Callback → 节流 100ms → Rust renderFrame() │  │  │
+│  │  │  Tick Callback → 节流 50ms → Rust renderFrame()      │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │         Fabric API (HudRenderCallback)           │  │  │
@@ -130,7 +130,7 @@ dx12-lib-template-26.1.2/
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
 | **JNI 桥接层** | 7 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera` |
-| **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 1.21.1，Fabric API 0.116.13 |
+| **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 26.1.2，Fabric API 0.154.2 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
@@ -191,66 +191,24 @@ dx12-lib-template-26.1.2/
 - 完整的 GL 状态管理机制：保存/恢复 Minecraft VAO、Texture、Program、Blend、Depth 状态
 - 资源重载检测：通过 tick 时间间隔判断 MC 资源重新加载，自动重置渲染状态
 - VAO/Shader 自动重建：检测到 GL 资源失效时自动重建，无需重启游戏
-- 每帧创建新 Texture：避免与 MC 的 shader 加载产生纹理名称冲突
-- 启动延迟渲染：10 秒延迟确保 MC 资源加载完成后才启用渲染
+- PBO（Pixel Buffer Object）纹理上传：绕过 NVIDIA 驱动 DMA 页边界 crash
+- 节流策略：每 50ms 调用一次 Rust 渲染（~20fps）
+- 独立测试程序 `examples/simple.rs`：winit + wgpu 弹出窗口渲染彩色三角形
+- GitHub Actions CI 工作流 (`.github/workflows/build.yml`)
 
 #### Changed
 - 渲染流程从简单贴图升级为完整的 GL 状态隔离方案
 - `Dx12Mod.java` 采用 try-finally 结构确保 GL 状态始终恢复
+- JNI 桥接从 3 个方法扩展至 6 个方法
+- 架构文档更新为实际的方法名和流程
 
 #### Fixed
 - Minecraft 菜单打开时 GL 资源被销毁导致崩溃的问题
 - 资源重载期间渲染冲突问题
 - 纹理名称重复使用导致的渲染异常
-
----
-
-### [0.2.0] - 2026-07-07
-
-#### Added
-- 6 个 JNI native 方法完整实现 (`nativeRenderFrame`, `nativeSetWindow`, `nativeResize`)
-- 每帧渲染循环：Rust 离屏渲染 → byte[] 像素回传 → OpenGL 纹理上传 → 全屏 Quad 绘制
-- 窗口句柄 (HWND) 传递机制：Java 反射获取 GLFW 窗口 → `nativeSetWindow`
-- 窗口尺寸同步：`syncWindowSize()` 去重 + `nativeResize()` 更新
-- 独立测试程序 `examples/simple.rs`：winit + wgpu 弹出窗口渲染彩色三角形
-- WGSL 着色器：`triangle.wgsl` (2D) + `simple.wgsl` (3D)
-- `winit = "0.30"` + `raw-window-handle = "0.6"` + `windows-sys = "0.59"` 依赖
-- 预编译 DLL 打包至 `fabric/src/main/resources/`
-- GitHub Actions CI 工作流 (`.github/workflows/build.yml`)
-
-#### Changed
-- 渲染流程从纯初始化升级为每帧渲染循环
-- JNI 桥接从 3 个方法扩展至 6 个方法
-- 架构文档更新为实际的方法名和流程
-
-#### Fixed
-- 架构图中 `check_gpu_availability()` → 更正为 `WmRenderer::create()`
-- DLL 加载路径描述与实际代码一致 (优先 JAR 同级目录)
-
----
-
-### [0.1.0] - 2026-07-04
-
-#### Added
-- Rust + wgpu 项目结构 (workspace + wgpu-mc + wgpu-mc-jni)
-- Fabric 模组项目 (MC 1.21.1 + Fabric Loom 1.10.3)
-- JNI 桥接层初始 3 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`
-- Java 端 `D3D12Bridge` 类：DLL 自动加载 + 路径搜索
-- GPU 适配器检测功能
-- WGSL 基础着色器模板
-
-#### Changed
-- 从 C++/D3D12 方案重构为 Rust/wgpu 方案
-- MC 版本从 26.1.2 降级到 1.21.1 (获得完整 Fabric API 支持)
-- Gradle 配置：使用 JDK 21 编译 (解决 JDK 25 兼容性问题)
-
-#### Fixed
 - OpenGL + D3D12 共享 HWND 导致的 GPU 设备移除崩溃
 - Gradle wrapper SSL 证书问题
 - JNI 库加载路径问题
-
-#### Removed
-- 废弃的 C++ 构建配置 (已归档)
 
 ---
 
@@ -258,10 +216,10 @@ dx12-lib-template-26.1.2/
 
 | 层级 | 技术 | 版本 |
 |------|------|------|
-| 游戏 | Minecraft | 1.21.1 |
+| 游戏 | Minecraft | 26.1.2 |
 | 加载器 | Fabric Loader | 0.19.3 |
-| API | Fabric API | 0.116.13+1.21.1 |
-| 语言 | Java | 21 |
+| API | Fabric API | 0.154.2+26.1.2 |
+| 语言 | Java | 25 |
 | 图形 | wgpu (WebGPU) → DX12 | 23 |
 | 语言 | Rust | 2021 edition |
 | JNI | jni crate | 0.21 |
@@ -334,13 +292,13 @@ gradlew clean build --no-daemon
 ```powershell
 # 1. 复制 JAR 到 mods 目录
 copy fabric\build\libs\gl4dx12-*.jar ^
-     "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\mods\"
+     "$env:APPDATA\.minecraft\versions\26.1.2-Fabric_0.19.3\mods\"
 
 # 2. 复制 DLL 到 dx12mod 目录
 copy rust\target\release\wgpu_mc_jni.dll ^
-     "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\"
+     "$env:APPDATA\.minecraft\versions\26.1.2-Fabric_0.19.3\dx12mod\"
 
-# 3. 启动 Minecraft 1.21.1-Fabric_0.19.3
+# 3. 启动 Minecraft 26.1.2-Fabric_0.19.3
 ```
 
 > **注意**：模组打包时 DLL 嵌入 JAR，运行时会自动提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`。
@@ -367,10 +325,10 @@ copy rust\target\release\wgpu_mc_jni.dll ^
 编辑 `fabric/gradle.properties`：
 
 ```properties
-minecraft_version=1.21.1
-yarn_mappings=1.21.1+build.3
+minecraft_version=26.1.2
+yarn_mappings=26.1.2+build.1
 loader_version=0.19.3
-fabric_version=0.116.13+1.21.1
+fabric_version=0.154.2+26.1.2
 ```
 
 ### Rust 构建配置
@@ -395,7 +353,7 @@ wgpu-mc = { path = "../wgpu-mc" }
 
 例如版本隔离目录：
 ```
-D:\.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\wgpu_mc_jni.dll
+D:\.minecraft\versions\26.1.2-Fabric_0.19.3\dx12mod\wgpu_mc_jni.dll
 ```
 
 ### 日志级别控制
@@ -414,7 +372,7 @@ java -jar minecraft.jar
 
 1. 按照 [构建与运行](#构建与运行) 章节完成构建
 2. 将 JAR 和 DLL 部署到 Minecraft 目录
-3. 启动 Minecraft 1.21.1-Fabric_0.19.3
+3. 启动 Minecraft 26.1.2-Fabric_0.19.3
 4. 观察控制台日志确认模组加载成功
 5. 进入游戏验证 — 当前会显示 3D 场景覆盖层（绿色地面 + 5 个橙色立方体，相机随 MC 移动）
 
@@ -424,7 +382,7 @@ java -jar minecraft.jar
 
 ```powershell
 # 确认 DLL 文件存在
-dir "$env:APPDATA\.minecraft\versions\1.21.1-Fabric_0.19.3\dx12mod\wgpu_mc_jni.dll"
+dir "$env:APPDATA\.minecraft\versions\26.1.2-Fabric_0.19.3\dx12mod\wgpu_mc_jni.dll"
 
 # 检查 DLL 依赖 (需 Dependency Walker 或 dumpbin)
 dumpbin /dependents rust\target\release\wgpu_mc_jni.dll
