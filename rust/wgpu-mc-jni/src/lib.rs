@@ -177,8 +177,9 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeRenderFrame<'a>(
     }
 }
 
-/// No-op: renderer is now created during nativeInit().
-/// Kept for backward compatibility.
+/// Pass the Minecraft window HWND to create a D3D12 surface/swapchain.
+/// Enables surface mode: D3D12 presents directly to the window, bypassing
+/// OpenGL readback entirely.
 ///
 /// # Safety
 /// This function is called from Java via JNI.
@@ -188,7 +189,31 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetWindow<'a>(
     _class: JClass<'a>,
     hwnd: i64,
 ) {
-    log::info!("nativeSetWindow called with hwnd: {} (renderer already created in nativeInit)", hwnd);
+    log::info!("nativeSetWindow: initializing D3D12 surface on HWND 0x{:x}", hwnd);
+    let mut guard = RENDERER.lock().unwrap();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.init_surface(hwnd as usize);
+    }
+}
+
+/// Returns true if the renderer has an active surface (swapchain mode).
+/// When surface mode is active, D3D12 presents directly to the window
+/// and no pixel readback is needed.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHasSurface(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    let guard = RENDERER.lock().unwrap();
+    match guard.as_ref() {
+        Some(Ok(renderer)) => {
+            if renderer.has_surface() { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
+        }
+        _ => jni::sys::JNI_FALSE,
+    }
 }
 
 /// Update the camera MVP matrix for the wgpu renderer.

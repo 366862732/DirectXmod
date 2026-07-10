@@ -1,10 +1,8 @@
 //! wgpu-mc: wgpu renderer with depth buffer, geometry pipeline, and readback.
 //!
-//! Architecture: Triple-buffered ring on JNI thread.
-//! - Each render_frame() submit is non-blocking
-//! - Ring(3) texture+staging buffers rotate: render / async map / readback in parallel
-//! - Camera smoothing with per-frame lerp
-//! - Push constants for model matrix → 1 uniform write/frame
+//! Architecture: Triple-buffered ring on JNI thread with optional surface mode.
+//! - Surface mode:  render directly to window swapchain, present → no readback
+//! - Offscreen mode: render to textures, async readback via triple-buffer ring
 
 use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
@@ -213,6 +211,39 @@ fn create_cube_mesh(device: &wgpu::Device, color: [f32; 3])
     (vbuf, ibuf, indices.len() as u32)
 }
 
+// ── Create wgpu Surface from Windows HWND ─────────────────────────
+
+fn create_surface_from_hwnd(
+    instance: &wgpu::Instance,
+    hwnd: usize,
+) -> Option<wgpu::Surface<'static>> {
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, WindowsDisplayHandle, Win32WindowHandle,
+    };
+
+    let hwnd_isize = hwnd as isize;
+    let raw_handle = RawWindowHandle::Win32(
+        Win32WindowHandle::new(std::num::NonZeroIsize::new(hwnd_isize)?)
+    );
+    let display_handle = RawDisplayHandle::Windows(WindowsDisplayHandle::new());
+
+    let surface = unsafe {
+        instance.create_surface_unsafe(
+            wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_window_handle: raw_handle,
+                raw_display_handle: display_handle,
+            }
+        )
+    };
+    match surface {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[dx12-wm] create_surface_unsafe failed: {:?}", e);
+            None
+        }
+    }
+}
+
 // ── Ring slot ─────────────────────────────────────────────────────
 
 struct Slot {
@@ -234,21 +265,24 @@ impl Slot {
     }
 }
 
-// ── Renderer ──────────────────────────────────────────────────────
+// ████████████████████████████████████████████████████████████████████████
+// ██  RENDERER                                                       ██
+// ████████████████████████████████████████████████████████████████████████
 
 pub struct WmRenderer {
+    #[allow(dead_code)]
+    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
 
     width: u32,
     height: u32,
 
-    // Camera state
     pub camera_mvp: [[f32; 4]; 4],
     camera_prev: [[f32; 4]; 4],
     camera_target: [[f32; 4]; 4],
 
-    // Immutable resources
+    // Immutable GPU resources
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
@@ -259,17 +293,26 @@ pub struct WmRenderer {
     cube_ib: wgpu::Buffer,
     cube_count: u32,
 
-    // Ring state
+    // Surface mode (native swapchain, no readback)
+    surface: Option<wgpu::Surface<'static>>,
+    surface_config: Option<wgpu::SurfaceConfiguration>,
+    surface_format: wgpu::TextureFormat,
+
+    // Offscreen mode (triple-buffer readback)
     slots: [Slot; RING_SIZE],
     idx: usize,
     pending_rx: [Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; RING_SIZE],
     prev_pixels: Vec<u8>,
 }
 
+// SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
+// The Surface is !Send (tied to window system), but we never send it across threads.
+unsafe impl Send for WmRenderer {}
+
 impl WmRenderer {
     pub fn create(width: u32, height: u32) -> Result<Self, &'static str> {
-        eprintln!("[dx12-wm] Creating WmRenderer (triple-buffer) {}x{}", width, height);
-        log::info!("Creating WmRenderer (triple-buffer) {}x{}", width, height);
+        eprintln!("[dx12-wm] Creating WmRenderer {}x{} (triple-buffer + surface support)", width, height);
+        log::info!("Creating WmRenderer {}x{}", width, height);
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
@@ -392,9 +435,10 @@ impl WmRenderer {
             Slot::new(&device, width, height),
         ];
 
-        eprintln!("[dx12-wm] Slots created OK ({}x{})", width, height);
+        eprintln!("[dx12-wm] Offscreen slots created ({}x{})", width, height);
 
         Ok(Self {
+            instance,
             device,
             queue,
             width,
@@ -411,6 +455,9 @@ impl WmRenderer {
             cube_vb,
             cube_ib,
             cube_count,
+            surface: None,
+            surface_config: None,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -418,44 +465,219 @@ impl WmRenderer {
         })
     }
 
+    /// Initialize a D3D12 swapchain surface on the given Windows HWND.
+    /// Called from JNI when the Minecraft window handle becomes available.
+    pub fn init_surface(&mut self, hwnd: usize) {
+        if self.surface.is_some() {
+            return; // Already initialized
+        }
+
+        let Some(surface) = create_surface_from_hwnd(&self.instance, hwnd) else {
+            eprintln!("[dx12-wm] Failed to create surface from HWND 0x{:x}", hwnd);
+            return;
+        };
+
+        // Choose adapter compatible with this surface
+        let adapter = match futures::executor::block_on(self.instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            },
+        )) {
+            Some(a) => a,
+            None => {
+                eprintln!("[dx12-wm] No adapter compatible with surface");
+                return;
+            }
+        };
+
+        let caps = surface.get_capabilities(&adapter);
+        let fmt = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        self.surface_format = fmt;
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: fmt,
+            width: self.width,
+            height: self.height,
+            present_mode: wgpu::PresentMode::Immediate,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&self.device, &config);
+        self.surface_config = Some(config);
+
+        eprintln!(
+            "[dx12-wm] Surface OK! HWND=0x{:x} fmt={:?} {}x{}",
+            hwnd, fmt, self.width, self.height
+        );
+        self.surface = Some(surface);
+    }
+
+    /// Returns true if the renderer has an active surface (swapchain mode).
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some()
+    }
+
     pub fn set_camera(&mut self, mvp: [[f32; 4]; 4]) {
         self.camera_target = mvp;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        eprintln!("[dx12-wm] Resize: {}x{}", width, height);
+        if width == 0 || height == 0 {
+            return;
+        }
         self.width = width;
         self.height = height;
+
+        // Reconfigure surface if active
+        if let (Some(surface), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
+            config.width = width;
+            config.height = height;
+            surface.configure(&self.device, config);
+            eprintln!("[dx12-wm] Surface resized to {}x{}", width, height);
+            return;
+        }
+
+        // Recreate offscreen slots
         for slot in self.slots.iter_mut() {
             *slot = Slot::new(&self.device, width, height);
         }
         self.idx = 0;
         self.pending_rx = [None, None, None];
-        // Keep prev_pixels — will be served until first new frame arrives
     }
 
-    /// Render one frame with triple-buffered async readback.
-    /// Returns pixels from ~2 frames ago (or cached if not ready).
-    /// GPU is never blocked: submit is non-blocking, readback is async.
+    /// Render one frame. Returns empty Vec in surface mode (D3D12 presents directly).
     pub fn render_frame(&mut self) -> Vec<u8> {
+        if self.surface.is_some() {
+            self.render_surface();
+            return Vec::new();
+        }
+        self.render_offscreen()
+    }
+
+    // ── Surface mode: render directly to swapchain ────────────────
+
+    fn render_surface(&mut self) {
+        // Lerp camera
+        self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+        self.camera_prev = self.camera_mvp;
+
+        // Write camera VP uniform
+        self.queue.write_buffer(&self.uniform_buffer, 0,
+            bytemuck::cast_slice(&self.camera_mvp));
+
+        // Get surface frame
+        let surface = self.surface.as_ref().unwrap();
+        let frame = match surface.get_current_texture() {
+            Ok(f) => f,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                if let Some(config) = &self.surface_config {
+                    surface.configure(&self.device, config);
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("[dx12-wm] Surface error: {:?}", e);
+                return;
+            }
+        };
+
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("RenderSurface") },
+        );
+
+        {
+            // Depth texture for surface mode
+            let depth = make_depth_texture(&self.device, self.width, self.height);
+            let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Surface Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            rp.set_pipeline(&self.pipeline);
+            rp.set_bind_group(0, &self.bind_group, &[]);
+
+            // Plane
+            rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
+                bytemuck::cast_slice(&IDENTITY));
+            rp.set_vertex_buffer(0, self.plane_vb.slice(..));
+            rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
+            rp.draw_indexed(0..self.plane_count, 0, 0..1);
+
+            // Cubes
+            let cube_positions: [(f32, f32, f32); 5] = [
+                (0.0, 1.0, 0.0), (4.0, 1.0, 2.0), (-4.0, 1.0, -1.0),
+                (2.0, 1.0, -4.0), (-3.0, 1.0, 3.0),
+            ];
+            for &(cx, cy, cz) in &cube_positions {
+                let model: [[f32; 4]; 4] = [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [cx, cy, cz, 1.0],
+                ];
+                rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
+                    bytemuck::cast_slice(&model));
+                rp.set_vertex_buffer(0, self.cube_vb.slice(..));
+                rp.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..self.cube_count, 0, 0..1);
+            }
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+    }
+
+    // ── Offscreen mode: triple-buffer readback ────────────────────
+
+    fn render_offscreen(&mut self) -> Vec<u8> {
         let w = self.width;
         let h = self.height;
         if w == 0 || h == 0 {
             return Vec::new();
         }
 
-        // ── 1. Lerp camera ────────────────────────────────────────
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        // ── 2. Write camera VP uniform (once) ─────────────────────
         self.queue.write_buffer(&self.uniform_buffer, 0,
             bytemuck::cast_slice(&self.camera_mvp));
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);
 
-        // ── 3. Render pass ────────────────────────────────────────
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("Render") },
         );
@@ -489,20 +711,15 @@ impl WmRenderer {
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
 
-            // Plane
             rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
                 bytemuck::cast_slice(&IDENTITY));
             rp.set_vertex_buffer(0, self.plane_vb.slice(..));
             rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
             rp.draw_indexed(0..self.plane_count, 0, 0..1);
 
-            // Cubes
             let cube_positions: [(f32, f32, f32); 5] = [
-                (0.0, 1.0, 0.0),
-                (4.0, 1.0, 2.0),
-                (-4.0, 1.0, -1.0),
-                (2.0, 1.0, -4.0),
-                (-3.0, 1.0, 3.0),
+                (0.0, 1.0, 0.0), (4.0, 1.0, 2.0), (-4.0, 1.0, -1.0),
+                (2.0, 1.0, -4.0), (-3.0, 1.0, 3.0),
             ];
             for &(cx, cy, cz) in &cube_positions {
                 let model: [[f32; 4]; 4] = [
@@ -519,7 +736,6 @@ impl WmRenderer {
             }
         }
 
-        // ── 4. Copy color → staging, submit, start async map ─────
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: &slot.color,
@@ -538,11 +754,9 @@ impl WmRenderer {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
 
-        // Submit render + copy (non-blocking)
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Poll);
 
-        // Start async map on current slot's staging
         {
             let slice = slot.staging.slice(..);
             let (tx, rx) = mpsc::channel();
@@ -553,7 +767,6 @@ impl WmRenderer {
             self.pending_rx[self.idx] = Some(rx);
         }
 
-        // ── 5. Read from previous slot if ready ───────────────────
         let read_idx = (self.idx + RING_SIZE - 1) % RING_SIZE;
         let mut pixels = Vec::new();
 
@@ -574,24 +787,19 @@ impl WmRenderer {
                     pixels = new_pixels;
                 }
                 _ => {
-                    // Not ready — retry next frame
                     self.pending_rx[read_idx] = Some(rx);
                 }
             }
         }
 
-        // Fall back to cached pixels
         if pixels.is_empty() && !self.prev_pixels.is_empty() {
             pixels = self.prev_pixels.clone();
         }
-
         if !pixels.is_empty() {
             self.prev_pixels = pixels.clone();
         }
 
-        // ── 6. Advance ring pointer ───────────────────────────────
         self.idx = (self.idx + 1) % RING_SIZE;
-
         pixels
     }
 }

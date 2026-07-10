@@ -137,8 +137,6 @@ public class Dx12Mod implements ClientModInitializer {
             lastRenderTime = now;
 
             // Extract camera view-projection matrix from Minecraft.
-            // In Mojang mappings, Camera class has minimal public API.
-            // Use player entity directly — eye position matches camera view.
             try {
                 Minecraft mc = Minecraft.getInstance();
                 if (mc.player != null) {
@@ -168,7 +166,7 @@ public class Dx12Mod implements ClientModInitializer {
                 return;
             }
 
-            // Notify Rust of HWND change (renderer created async on bg thread)
+            // Notify Rust of HWND change + sync size
             try {
             long hwnd = D3D12Bridge.getWindowHandle();
             if (hwnd != 0 && hwnd != lastHwnd) {
@@ -186,13 +184,20 @@ public class Dx12Mod implements ClientModInitializer {
                 lastRendererStatus = status;
             }
 
+            // Surface mode: render happens in onPreRender() via GameRendererMixin HEAD.
+            // Skip renderFrame here — D3D12 presents directly in onPreRender.
+            if (D3D12Bridge.hasSurface()) {
+                return;
+            }
+
+            // Offscreen mode: render to texture, read back pixels for GL overlay
             ByteBuffer pixels = D3D12Bridge.renderFrame();
             if (pixels == null || !pixels.hasRemaining()) {
                 if (frameCount == 0) LOGGER.warn("renderFrame returned null/empty (status={})", status);
                 return;
             }
 
-            // Store frame data for HUD callback
+            // Store frame data for onPostRender (GL overlay in offscreen mode)
             pendingPixels = pixels;
             pendingWidth = width;
             pendingHeight = height;
@@ -202,6 +207,23 @@ public class Dx12Mod implements ClientModInitializer {
             }
         });
         LOGGER.info("GL4DX12 Mod initialized!");
+    }
+
+    /**
+     * Called by GameRendererMixin at HEAD of render() when surface mode is active.
+     * D3D12 renders and presents directly to the window swapchain, then the
+     * Minecraft OpenGL render is cancelled (ci.cancel()).
+     */
+    public static void onPreRender() {
+        if (!D3D12Bridge.hasSurface()) return;
+
+        // Surface mode: D3D12 presents directly. Camera was already updated
+        // in ClientTickEvents.END_CLIENT_TICK above.
+        try {
+            D3D12Bridge.renderFrame();
+        } catch (Throwable t) {
+            LOGGER.warn("Surface render failed: {}", t.getMessage());
+        }
     }
 
     // GL drawing: called by GameRendererMixin at TAIL of render().

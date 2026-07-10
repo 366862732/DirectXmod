@@ -65,6 +65,7 @@ public class D3D12Bridge {
     public static native void nativeUpdateCamera(float[] matrix);
     public static native int nativeIsReady();
     public static native String nativeGetStatus();
+    public static native boolean nativeHasSurface();
 
     // === Convenience methods ===
     private static boolean initialized = false;
@@ -202,6 +203,16 @@ public class D3D12Bridge {
             return nativeGetStatus();
         } catch (UnsatisfiedLinkError e) {
             return "native_error: " + e.getMessage();
+        }
+    }
+
+    /** Returns true if D3D12 surface mode is active (swapchain presents directly). */
+    public static boolean hasSurface() {
+        if (!initialized) return false;
+        try {
+            return nativeHasSurface();
+        } catch (UnsatisfiedLinkError e) {
+            return false;
         }
     }
 }
