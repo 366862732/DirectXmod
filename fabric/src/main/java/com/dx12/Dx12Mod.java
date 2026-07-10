@@ -38,6 +38,7 @@ public class Dx12Mod implements ClientModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12");
 
     private static long frameCount = 0;
+    private static boolean firstTickLogged = false;
     private static int pendingWidth = 0;
     private static int pendingHeight = 0;
     private static ByteBuffer pendingPixels = null;
@@ -57,6 +58,9 @@ public class Dx12Mod implements ClientModInitializer {
 
     // PBO for safe texture upload — bypasses NVIDIA driver's client-memory DMA
     private static int pboId = 0;
+
+    // Polling: track renderer init status to log transitions
+    private static String lastRendererStatus = "not_started";
 
     // Startup delay: skip GL operations during Minecraft's resource loading phase
     // (Shader Loader, texture loading, etc. run on render thread and conflict with our GL calls)
@@ -100,6 +104,7 @@ public class Dx12Mod implements ClientModInitializer {
                     LOGGER.info("Resource reload detected ({} s gap), delaying rendering",
                         (now - lastTickTime) / 1000);
                     renderReady = false;
+                    firstTickLogged = false;
                     initTime = now;
                     vaoId = 0;
                     shaderValid = false;
@@ -125,8 +130,9 @@ public class Dx12Mod implements ClientModInitializer {
             if (now - renderStartTime < 2000) return;
 
             // Diagnostic: log when we actually start rendering
-            if (frameCount == 0) {
+            if (!firstTickLogged) {
                 LOGGER.info("First render tick: width={}, height={}", width, height);
+                firstTickLogged = true;
             }
 
             // Throttle to ~20fps: GPU readback pipeline naturally limits to ~20fps,
@@ -172,21 +178,27 @@ public class Dx12Mod implements ClientModInitializer {
                 return;
             }
 
-            // Call Rust renderer — only update HWND when it changes
+            // Notify Rust of HWND change (renderer created async on bg thread)
             try {
             long hwnd = D3D12Bridge.getWindowHandle();
             if (hwnd != 0 && hwnd != lastHwnd) {
-                LOGGER.info("Creating renderer for HWND=0x{} size={}x{}",
+                LOGGER.info("HWND update: 0x{} (size={}x{})",
                     Long.toHexString(hwnd), width, height);
                 D3D12Bridge.setWindow(hwnd);
                 lastHwnd = hwnd;
-                LOGGER.info("Renderer created successfully");
             }
             D3D12Bridge.syncWindowSize(width, height);
 
+            // Poll renderer init status, log state transitions
+            String status = D3D12Bridge.getStatus();
+            if (!status.equals(lastRendererStatus)) {
+                LOGGER.info("Renderer status: {} → {}", lastRendererStatus, status);
+                lastRendererStatus = status;
+            }
+
             ByteBuffer pixels = D3D12Bridge.renderFrame();
             if (pixels == null || !pixels.hasRemaining()) {
-                if (frameCount == 0) LOGGER.warn("renderFrame returned null/empty");
+                if (frameCount == 0) LOGGER.warn("renderFrame returned null/empty (status={})", status);
                 return;
             }
 
@@ -221,6 +233,8 @@ public class Dx12Mod implements ClientModInitializer {
             int expectedBytes = width * height * 4;
             int bufferBytes = pixels.remaining();
             if (bufferBytes < expectedBytes) {
+                LOGGER.warn("Pixel buffer size mismatch: got={} expected={} ({}x{})",
+                    bufferBytes, expectedBytes, width, height);
                 if (width * 4 > 0) {
                     height = bufferBytes / (width * 4);
                 }
@@ -288,8 +302,7 @@ public class Dx12Mod implements ClientModInitializer {
                 glUniform1i(texUniformLoc, 0);
                 glBindVertexArray(vaoId);
                 glDisable(GL_DEPTH_TEST);
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDisable(GL_BLEND);
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
 
                 // Unbind (Minecraft's RenderSystem will set its own state next)
@@ -312,10 +325,11 @@ public class Dx12Mod implements ClientModInitializer {
     // Create a fullscreen quad VAO (vertex + index buffers included)
     // Returns VAO id. Caller must glDeleteVertexArrays it when done.
     private static int createVAO() {
+        // Full-screen quad in NDC (-1 to 1)
         float[] data = {
-             0f,  0f,  0f,  0f, 0f,
-             1f,  0f,  0f,  1f, 0f,
-             0f,  1f,  0f,  0f, 1f,
+            -1f, -1f,  0f,  0f, 0f,
+             1f, -1f,  0f,  1f, 0f,
+            -1f,  1f,  0f,  0f, 1f,
              1f,  1f,  0f,  1f, 1f,
         };
         byte[] idx = { 0, 1, 2, 2, 1, 3 };

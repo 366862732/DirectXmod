@@ -29,8 +29,6 @@ struct CameraUniform {
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
-var<push_constant> model: mat4x4<f32>;
-
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
@@ -39,7 +37,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
     var out: VertexOutput;
-    out.position = camera.mvp * model * vec4<f32>(pos, 1.0);
+    out.position = camera.mvp * vec4<f32>(pos, 1.0);
     out.color = color;
     return out;
 }
@@ -50,14 +48,18 @@ fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Create a translation + scale model matrix (column-major for WGSL).
-fn model_matrix(tx: f32, ty: f32, tz: f32, scale: f32) -> [[f32; 4]; 4] {
-    [
-        [scale, 0.0, 0.0, 0.0],
-        [0.0, scale, 0.0, 0.0],
-        [0.0, 0.0, scale, 0.0],
-        [tx, ty, tz, 1.0],
-    ]
+/// Multiply two 4x4 matrices (both row-major: m[row][col]).
+fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0f32; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            result[r][c] = a[r][0] * b[0][c]
+                + a[r][1] * b[1][c]
+                + a[r][2] * b[2][c]
+                + a[r][3] * b[3][c];
+        }
+    }
+    result
 }
 
 fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -213,12 +215,16 @@ pub struct WmRenderer {
 impl WmRenderer {
     pub fn create(width: u32, height: u32) -> Result<Self, &'static str> {
         log::info!("Creating WmRenderer (offscreen) {}x{}", width, height);
+        eprintln!("[dx12-wm] Creating WmRenderer (offscreen) {}x{}", width, height);
 
+        eprintln!("[dx12-wm] Creating wgpu Instance (DX12 backend)...");
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..Default::default()
         });
+        eprintln!("[dx12-wm] wgpu Instance created OK");
 
+        eprintln!("[dx12-wm] Requesting adapter...");
         let adapter = futures::executor::block_on(instance.request_adapter(
             &wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -227,13 +233,14 @@ impl WmRenderer {
             },
         ))
         .ok_or("No adapter")?;
-
+        eprintln!("[dx12-wm] Adapter: {:?}", adapter.get_info().name);
         log::info!("DX12 adapter: {:?}", adapter.get_info().name);
 
+        eprintln!("[dx12-wm] Requesting device...");
         let (device, queue) = futures::executor::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wgpu-mc"),
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
                     max_push_constant_size: 64,
                     ..Default::default()
@@ -243,6 +250,7 @@ impl WmRenderer {
             None,
         ))
         .map_err(|_| "Device failed")?;
+        eprintln!("[dx12-wm] Device created OK");
 
         // Shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -283,14 +291,11 @@ impl WmRenderer {
             }],
         });
 
-        // Pipeline layout with push constant for model matrix
+        // Pipeline layout (no push constants — model folded into MVP on CPU)
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::VERTEX,
-                range: 0..64, // mat4x4<f32>
-            }],
+            push_constant_ranges: &[],
         });
 
         // Render pipeline with depth testing
@@ -400,6 +405,7 @@ impl WmRenderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        log::info!("Resizing renderer: {}x{} -> {}x{}", self.width, self.height, width, height);
         self.width = width;
         self.height = height;
 
@@ -439,7 +445,6 @@ impl WmRenderer {
     pub fn render_frame(&mut self) -> Vec<u8> {
         let w = self.width as usize;
         let h = self.height as usize;
-        let size = (w * h * 4) as u64;
 
         // 1. Update uniform buffer with camera MVP
         let mvp_bytes: &[u8] = bytemuck::cast_slice(&self.camera_mvp);
@@ -487,10 +492,18 @@ impl WmRenderer {
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
 
-            // Draw ground plane at y=0
-            let plane_model = model_matrix(0.0, 0.0, 0.0, 1.0);
-            rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
-                bytemuck::cast_slice(&plane_model));
+            // Model→MVP baked on CPU: upload combined matrix before each draw.
+
+            // Draw ground plane at y=0 (identity model)
+            let plane_model: [[f32; 4]; 4] = [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            let plane_mvp = mat4_mul(&self.camera_mvp, &plane_model);
+            self.queue.write_buffer(&self.uniform_buffer, 0,
+                bytemuck::cast_slice(&plane_mvp));
             rp.set_vertex_buffer(0, self.plane_vb.slice(..));
             rp.set_index_buffer(self.plane_ib.slice(..), wgpu::IndexFormat::Uint16);
             rp.draw_indexed(0..self.plane_count, 0, 0..1);
@@ -504,14 +517,16 @@ impl WmRenderer {
                 (-3.0, 1.0, 3.0),
             ];
 
-            // Render each cube
-            // We'll re-use the same cube geometry with different push constants.
-            // To vary colors, we could create separate cube meshes, but for now
-            // all cubes share the same orange base color.
             for &(cx, cy, cz) in &cube_positions {
-                let cube_model = model_matrix(cx, cy, cz, 1.0);
-                rp.set_push_constants(wgpu::ShaderStages::VERTEX, 0,
-                    bytemuck::cast_slice(&cube_model));
+                let cube_model: [[f32; 4]; 4] = [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [cx, cy, cz, 1.0],
+                ];
+                let cube_mvp = mat4_mul(&self.camera_mvp, &cube_model);
+                self.queue.write_buffer(&self.uniform_buffer, 0,
+                    bytemuck::cast_slice(&cube_mvp));
                 rp.set_vertex_buffer(0, self.cube_vb.slice(..));
                 rp.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..self.cube_count, 0, 0..1);
@@ -519,10 +534,12 @@ impl WmRenderer {
         }
 
         // 4. Copy texture to staging buffer
-        if self.staging_buffer.size() < size {
+        let aligned_row = ((self.width * 4 + 255) / 256) * 256;
+        let padded_size = (aligned_row as u64) * (self.height as u64);
+        if self.staging_buffer.size() < padded_size {
             self.staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Staging"),
-                size,
+                size: padded_size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -538,7 +555,7 @@ impl WmRenderer {
                 buffer: &self.staging_buffer,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * self.width),
+                    bytes_per_row: Some(aligned_row),
                     rows_per_image: Some(self.height),
                 },
             },
@@ -553,13 +570,20 @@ impl WmRenderer {
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
-        // 6. Read back pixels
+        // 6. Read back pixels (skip row padding from alignment)
         let sb_slice = self.staging_buffer.slice(..);
         sb_slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
 
         let data = sb_slice.get_mapped_range();
-        let pixels = data.to_vec();
+        let actual_row = (self.width * 4) as usize;
+        let aligned_row = aligned_row as usize;
+        let mut pixels = Vec::with_capacity(actual_row * self.height as usize);
+        for row in 0..self.height as usize {
+            let start = row * aligned_row;
+            let end = start + actual_row;
+            pixels.extend_from_slice(&data[start..end]);
+        }
         drop(data);
         self.staging_buffer.unmap();
 

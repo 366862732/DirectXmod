@@ -63,6 +63,8 @@ public class D3D12Bridge {
     public static native byte[] nativeRenderFrame();
     public static native void nativeResize(int width, int height);
     public static native void nativeUpdateCamera(float[] matrix);
+    public static native int nativeIsReady();
+    public static native String nativeGetStatus();
 
     // === Convenience methods ===
     private static boolean initialized = false;
@@ -164,6 +166,7 @@ public class D3D12Bridge {
     public static void syncWindowSize(int width, int height) {
         if (!initialized) return;
         if (lastWidth == width && lastHeight == height) return;
+        Dx12Mod.LOGGER.info("Resize: {}x{} -> {}x{}", lastWidth, lastHeight, width, height);
         lastWidth = width;
         lastHeight = height;
         try {
@@ -179,6 +182,26 @@ public class D3D12Bridge {
             nativeUpdateCamera(matrix);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore if native lib not available
+        }
+    }
+
+    /** Returns 1 if renderer ready, 0 if initializing, -1 if failed. */
+    public static int isReady() {
+        if (!initialized) return -1;
+        try {
+            return nativeIsReady();
+        } catch (UnsatisfiedLinkError e) {
+            return -1;
+        }
+    }
+
+    /** Returns human-readable renderer status string. */
+    public static String getStatus() {
+        if (!initialized) return "not_initialized";
+        try {
+            return nativeGetStatus();
+        } catch (UnsatisfiedLinkError e) {
+            return "native_error: " + e.getMessage();
         }
     }
 }
