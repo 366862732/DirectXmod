@@ -276,9 +276,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeResize(
     if width <= 0 || height <= 0 {
         return;
     }
-    let mut renderer_guard = lock_or_poisoned();
-    if let Some(Ok(ref mut renderer)) = renderer_guard.as_mut() {
-        renderer.resize(width as u32, height as u32);
-        log::info!("Renderer resized to {}x{}", width, height);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut renderer_guard = lock_or_poisoned();
+        if let Some(Ok(ref mut renderer)) = renderer_guard.as_mut() {
+            renderer.resize(width as u32, height as u32);
+        }
+    }));
+    match result {
+        Ok(()) => log::info!("Renderer resized to {}x{}", width, height),
+        Err(panic_info) => {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            log::error!("resize PANICKED ({}x{}): {}", width, height, msg);
+            // Mutex is now poisoned — subsequent calls recover via lock_or_poisoned()
+        }
     }
 }

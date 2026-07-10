@@ -291,6 +291,7 @@ dx12-lib-template-26.1.2/
 | 语言 | Rust | 2021 edition |
 | JNI | jni crate | 0.21 |
 | 渲染 | OpenGL (Java 端，Offscreen 模式) | Core Profile 330 |
+| 限制 | Surface 模式暂停 | GPU 驱动 TDR 问题 |
 
 ---
 
@@ -482,10 +483,12 @@ $env:RUST_LOG = "debug"
 - `nativeInit()` — 初始化 Rust 环境，创建 WmRenderer（Offscreen 模式）
 - `nativeHello("Hello from Minecraft!")` — 双向字符串传递
 - `nativeTestDeviceInfo()` — GPU 适配器检测
-- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄，切换到 Surface 模式
-- `nativeRenderFrame()` — 每帧渲染（Surface 模式直接呈现，Offscreen 模式返回 byte[]）
+- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄（Surface 模式暂停）
+- `nativeRenderFrame()` — 每帧渲染，Offscreen 模式返回 byte[]
 - `nativeUpdateCamera(float[])` — 传递 MC 相机 MVP 矩阵
 - `nativeHasSurface()` — 检测当前是否为 Surface 模式
+- `nativeIsReady()` — 返回 1/0/-1 状态码
+- `nativeGetStatus()` — 返回人类可读状态字符串
 
 #### 运行独立测试程序
 
@@ -558,7 +561,7 @@ cargo run --example simple
 | GL 状态管理 | ✅ | 完整的保存/恢复机制 |
 | VAO/Shader 持久化 | ✅ | 首次创建，丢失后自动重建 |
 
-### 阶段 4：Surface 模式（DX12 直接呈现）✅ 已完成
+### 阶段 4：Surface 模式（DX12 直接呈现）⏸️ 暂停
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
@@ -567,12 +570,15 @@ cargo run --example simple
 | Surface 渲染 | ✅ | `render_surface()` 直接 present 到窗口 |
 | Surface 自适应 resize | ✅ | 窗口尺寸变化时 reconfigure |
 | Surface 错误恢复 | ✅ | Outdated/Lost 时自动 reconfigure |
-| 双模切换 | ✅ | `nativeSetWindow` 后自动切换到 Surface 模式 |
+| 双模切换 | ✅ | `nativeSetWindow` 后尝试切换到 Surface 模式 |
 | Triple-buffer 读回 | ✅ | Offscreen 模式三槽环形缓冲 + 异步 map_async |
+| **GPU TDR 问题** | ❌ | GL/D3D12 同窗口共存导致驱动超时，需 Mixin 取消 GL 渲染 |
+
+> **Surface 模式暂停原因**：Minecraft 原生 OpenGL 渲染与 wgpu DX12 swapchain 在同一窗口共存时，NVIDIA 驱动会在约 2 秒后触发 TDR（Timeout Detection and Recovery）超时，导致 GPU 设备移除和 JVM 崩溃。解决方法需要先通过 Mixin 取消 `GameRenderer.renderLevel()` 和 `Window.updateDisplay()`，才能安全启用 Surface 模式。
 
 ### 阶段 5：VulkanMod 级全接管 🚧 进行中
 
-当前已实现 Surface 模式（DX12 直接呈现 3D 场景），相机视角随 MC 移动实时更新。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
+当前使用 Offscreen 模式（PBO 纹理上传 + OpenGL 全屏 quad），GPU 利用率较低。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
@@ -629,8 +635,9 @@ passes:
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| Mixin 框架搭建 | 🔴 P0 | 拦截 LevelRenderer.renderLevel() |
+| Mixin 框架搭建 | 🔴 P0 | 拦截 LevelRenderer.renderLevel()，解决 TDR 问题 |
 | 区块渲染 | 🔴 P0 | 预计算 Chunk Mesh，DX12 直接渲染 |
+| Surface 模式恢复 | 🟠 P1 | Mixin 取消 GL 渲染后重新启用 DX12 swapchain |
 | 天空盒渲染 | 🟠 P1 | 简单着色器即可 |
 
 ---

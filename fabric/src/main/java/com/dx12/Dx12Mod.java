@@ -1,25 +1,76 @@
 package com.dx12;
 
-import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import org.lwjgl.BufferUtils;
-import org.lwjgl.glfw.GLFW;
-import org.lwjgl.opengl.GL11;
-import org.lwjgl.opengl.GL15;
-import org.lwjgl.opengl.GL30;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import net.minecraft.client.Minecraft;
-import org.joml.Matrix4f;
-
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 
-import static org.lwjgl.opengl.GL11.*;
-import static org.lwjgl.opengl.GL15.*;
-import static org.lwjgl.opengl.GL21.*;
-import static org.lwjgl.opengl.GL30.*;
+import org.joml.Matrix4f;
+import org.lwjgl.BufferUtils;
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.opengl.GL11;
+import static org.lwjgl.opengl.GL11.GL_BLEND;
+import static org.lwjgl.opengl.GL11.GL_DEPTH_TEST;
+import static org.lwjgl.opengl.GL11.GL_FLOAT;
+import static org.lwjgl.opengl.GL11.GL_LINEAR;
+import static org.lwjgl.opengl.GL11.GL_RGBA;
+import static org.lwjgl.opengl.GL11.GL_RGBA8;
+import static org.lwjgl.opengl.GL11.GL_SCISSOR_TEST;
+import static org.lwjgl.opengl.GL11.GL_TEXTURE_2D;
+import static org.lwjgl.opengl.GL11.GL_TEXTURE_MAG_FILTER;
+import static org.lwjgl.opengl.GL11.GL_TEXTURE_MIN_FILTER;
+import static org.lwjgl.opengl.GL11.GL_TEXTURE_WRAP_S;
+import static org.lwjgl.opengl.GL11.GL_TEXTURE_WRAP_T;
+import static org.lwjgl.opengl.GL11.GL_TRIANGLES;
+import static org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE;
+import static org.lwjgl.opengl.GL11.glBindTexture;
+import static org.lwjgl.opengl.GL11.glDeleteTextures;
+import static org.lwjgl.opengl.GL11.glDisable;
+import static org.lwjgl.opengl.GL11.glDrawElements;
+import static org.lwjgl.opengl.GL11.glEnable;
+import static org.lwjgl.opengl.GL11.glGenTextures;
+import static org.lwjgl.opengl.GL11.glIsEnabled;
+import static org.lwjgl.opengl.GL11.glTexImage2D;
+import static org.lwjgl.opengl.GL11.glTexParameteri;
+import static org.lwjgl.opengl.GL11.glTexSubImage2D;
+import static org.lwjgl.opengl.GL11.glViewport;
+import static org.lwjgl.opengl.GL12.GL_CLAMP_TO_EDGE;
+import static org.lwjgl.opengl.GL13.GL_TEXTURE0;
+import static org.lwjgl.opengl.GL13.glActiveTexture;
+import static org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER;
+import static org.lwjgl.opengl.GL15.GL_ELEMENT_ARRAY_BUFFER;
+import static org.lwjgl.opengl.GL15.GL_STATIC_DRAW;
+import static org.lwjgl.opengl.GL15.GL_STREAM_DRAW;
+import static org.lwjgl.opengl.GL15.GL_WRITE_ONLY;
+import static org.lwjgl.opengl.GL15.glBindBuffer;
+import static org.lwjgl.opengl.GL15.glBufferData;
+import static org.lwjgl.opengl.GL15.glGenBuffers;
+import static org.lwjgl.opengl.GL15.glMapBuffer;
+import static org.lwjgl.opengl.GL15.glUnmapBuffer;
+import static org.lwjgl.opengl.GL20.GL_FRAGMENT_SHADER;
+import static org.lwjgl.opengl.GL20.GL_VERTEX_SHADER;
+import static org.lwjgl.opengl.GL20.glAttachShader;
+import static org.lwjgl.opengl.GL20.glCompileShader;
+import static org.lwjgl.opengl.GL20.glCreateProgram;
+import static org.lwjgl.opengl.GL20.glCreateShader;
+import static org.lwjgl.opengl.GL20.glDeleteProgram;
+import static org.lwjgl.opengl.GL20.glDeleteShader;
+import static org.lwjgl.opengl.GL20.glEnableVertexAttribArray;
+import static org.lwjgl.opengl.GL20.glGetUniformLocation;
+import static org.lwjgl.opengl.GL20.glLinkProgram;
+import static org.lwjgl.opengl.GL20.glShaderSource;
+import static org.lwjgl.opengl.GL20.glUniform1i;
+import static org.lwjgl.opengl.GL20.glUseProgram;
+import static org.lwjgl.opengl.GL20.glVertexAttribPointer;
+import static org.lwjgl.opengl.GL21.GL_PIXEL_UNPACK_BUFFER;
+import static org.lwjgl.opengl.GL30.glBindVertexArray;
+import static org.lwjgl.opengl.GL30.glDeleteVertexArrays;
+import static org.lwjgl.opengl.GL30.glGenVertexArrays;
+import static org.lwjgl.opengl.GL30.glIsVertexArray;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.minecraft.client.Minecraft;
 
 /**
  * GL4DX12 - Cross-version compatible Fabric mod.
@@ -137,9 +188,11 @@ public class Dx12Mod implements ClientModInitializer {
             lastRenderTime = now;
 
             // Extract camera view-projection matrix from Minecraft.
+            boolean inWorld = false;
             try {
                 Minecraft mc = Minecraft.getInstance();
-                if (mc.player != null) {
+                if (mc.player != null && mc.level != null) {
+                    inWorld = true; 
                     var player = mc.player;
                     var pos = player.getEyePosition();
                     float pitch = player.getXRot();
@@ -169,7 +222,8 @@ public class Dx12Mod implements ClientModInitializer {
             // Notify Rust of HWND change + sync size
             try {
             long hwnd = D3D12Bridge.getWindowHandle();
-            if (hwnd != 0 && hwnd != lastHwnd) {
+            // Only create D3D12 surface when in-world (avoid driver contention at title screen)
+            if (inWorld && hwnd != 0 && hwnd != lastHwnd) {
                 LOGGER.info("HWND update: 0x{} (size={}x{})",
                     Long.toHexString(hwnd), width, height);
                 D3D12Bridge.setWindow(hwnd);
@@ -184,11 +238,12 @@ public class Dx12Mod implements ClientModInitializer {
                 lastRendererStatus = status;
             }
 
-            // Surface mode: MC's GL render is cancelled at GameRendererMixin HEAD.
+            // Surface mode: only active when in-world (title screen uses offscreen mode).
+            // MC's GL render is cancelled at GameRendererMixin HEAD.
             // Camera was updated above. renderFrame() is called later from
             // MinecraftMixin.runTick TAIL — D3D12 presents directly to window.
             // Skip renderFrame here to avoid duplicate rendering.
-            if (D3D12Bridge.hasSurface()) {
+            if (D3D12Bridge.hasSurface() && inWorld) {
                 return;
             }
 

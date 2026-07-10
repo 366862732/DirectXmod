@@ -561,13 +561,16 @@ impl WmRenderer {
         self.width = width;
         self.height = height;
 
-        // Reconfigure surface if active (+ recreate cached depth texture)
-        if let (Some(surface), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
+        // Surface mode: only update stored config + recreate depth texture.
+        // Do NOT call surface.configure() here — DXGI ResizeBuffers can throw
+        // a C++ exception (0xe06d7363) when called while GL is active on the
+        // same HWND. Instead, the swapchain is resized lazily in render_surface()
+        // when get_current_texture() returns SurfaceError::Lost/Outdated.
+        if let (Some(_), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
             config.width = width;
             config.height = height;
-            surface.configure(&self.device, config);
             self.surface_depth = Some(make_depth_texture(&self.device, width, height));
-            log::info!("[dx12-wm] Surface resized to {}x{}", width, height);
+            log::info!("[dx12-wm] Surface size updated to {}x{} (lazy resize in render_surface)", width, height);
             return;
         }
 
