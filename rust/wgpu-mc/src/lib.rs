@@ -42,6 +42,7 @@ impl Vertex {
 const SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
@@ -53,7 +54,10 @@ struct VertexOutput {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
     var out: VertexOutput;
-    out.position = camera.view_proj * vec4<f32>(pos, 1.0);
+    // Offset local-space geometry by camera world position so it
+    // stays visible near the camera regardless of player location.
+    let world_pos = pos + camera.camera_pos;
+    out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.color = color;
     return out;
 }
@@ -82,6 +86,15 @@ fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
         }
     }
     result
+}
+
+/// Write camera MVP + camera_pos to the uniform buffer.
+/// Layout: mat4x4 (64 bytes) + vec3 padded to vec4 (16 bytes) = 80 bytes.
+fn write_camera_uniform(queue: &wgpu::Queue, buffer: &wgpu::Buffer, mvp: &[[f32; 4]; 4], pos: &[f32; 3]) {
+    let mut data = [0u8; 80];
+    data[0..64].copy_from_slice(bytemuck::cast_slice(mvp));
+    data[64..76].copy_from_slice(bytemuck::cast_slice(pos));
+    queue.write_buffer(buffer, 0, &data);
 }
 
 fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -278,6 +291,7 @@ pub struct WmRenderer {
     pub camera_mvp: [[f32; 4]; 4],
     camera_prev: [[f32; 4]; 4],
     camera_target: [[f32; 4]; 4],
+    camera_pos: [f32; 3],
 
     // Immutable GPU resources
     pipeline: wgpu::RenderPipeline,
@@ -295,7 +309,6 @@ pub struct WmRenderer {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
     surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
-    fs_tri_vb: wgpu::Buffer,               // Full-screen triangle (NDC) for surface test
 
     // Offscreen mode (triple-buffer readback)
     slots: [Slot; RING_SIZE],
@@ -347,7 +360,7 @@ impl WmRenderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniform"),
-            size: 64,
+            size: 80, // mat4x4 (64) + vec3 (16 with padding)
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -453,24 +466,6 @@ impl WmRenderer {
             cube_vbs.push(create_cube_mesh_at(&device, cube_color, pos));
         }
 
-        // Full-screen triangle in NDC — always visible regardless of camera position.
-        // Two triangles covering the entire screen: [-1,-1] [3,-1] [-1,3].
-        // Shader outputs gradient colors: red, green, blue.
-        let fs_tri_vertices: [Vertex; 3] = [
-            Vertex { position: [-1.0, -1.0, 0.0], color: [1.0, 0.0, 0.0] },
-            Vertex { position: [ 3.0, -1.0, 0.0], color: [0.0, 1.0, 0.0] },
-            Vertex { position: [-1.0,  3.0, 0.0], color: [0.0, 0.0, 1.0] },
-        ];
-        let fs_tri_vb = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Fullscreen Tri VB"),
-            size: std::mem::size_of_val(&fs_tri_vertices) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        fs_tri_vb.slice(..).get_mapped_range_mut()[..]
-            .copy_from_slice(bytemuck::cast_slice(&fs_tri_vertices));
-        fs_tri_vb.unmap();
-
         let slots = [
             Slot::new(&device, width, height),
             Slot::new(&device, width, height),
@@ -489,6 +484,7 @@ impl WmRenderer {
             camera_mvp: IDENTITY,
             camera_prev: IDENTITY,
             camera_target: IDENTITY,
+            camera_pos: [0.0; 3],
             pipeline,
             bind_group,
             uniform_buffer,
@@ -502,7 +498,6 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
-            fs_tri_vb,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -585,6 +580,11 @@ impl WmRenderer {
         self.camera_target = mvp;
     }
 
+    /// Set the camera world position (used to offset geometry near the camera).
+    pub fn set_camera_pos(&mut self, x: f32, y: f32, z: f32) {
+        self.camera_pos = [x, y, z];
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -644,16 +644,12 @@ impl WmRenderer {
     // ── Surface mode: render directly to swapchain ────────────────
 
     fn render_surface(&mut self) {
-        // Use identity camera MVP for fullscreen NDC rendering.
-        // The fullscreen triangle vertices are already in NDC space [-1, 1].
-        // This ensures the test pattern is always visible regardless of
-        // the MC player's world position.
-        self.camera_mvp = IDENTITY;
-        self.camera_prev = IDENTITY;
+        // Use real MC camera MVP with lerp smoothing.
+        self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+        self.camera_prev = self.camera_mvp;
 
-        // Write identity camera VP uniform
-        self.queue.write_buffer(&self.uniform_buffer, 0,
-            bytemuck::cast_slice(&IDENTITY));
+        // Write camera uniform (MVP + world position offset)
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
 
         // Get surface frame
         let surface = self.surface.as_ref().unwrap();
@@ -669,12 +665,10 @@ impl WmRenderer {
             }
             Err(wgpu::SurfaceError::Timeout) => {
                 log::warn!("[dx12-wm] Surface timeout — GPU TDR may have occurred; skipping frame");
-                // Do not reconfigure; wait for Lost/Outdated on next frame
                 return;
             }
             Err(e) => {
                 log::error!("[dx12-wm] Surface error: {:?}, falling back to offscreen", e);
-                // Fall back to offscreen mode: destroy surface
                 self.surface = None;
                 self.surface_depth = None;
                 self.surface_config = None;
@@ -719,12 +713,8 @@ impl WmRenderer {
                 occlusion_query_set: None,
             });
 
-            // Draw fullscreen triangle in NDC space (red→green→blue gradient).
-            // Uses identity camera MVP — vertices are already in clip space.
-            rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.bind_group, &[]);
-            rp.set_vertex_buffer(0, self.fs_tri_vb.slice(..));
-            rp.draw(0..3, 0..1);
+            // Draw 3D test scene (plane + cubes) offset by camera world position.
+            self.draw_scene(&mut rp);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -743,8 +733,7 @@ impl WmRenderer {
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        self.queue.write_buffer(&self.uniform_buffer, 0,
-            bytemuck::cast_slice(&self.camera_mvp));
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);

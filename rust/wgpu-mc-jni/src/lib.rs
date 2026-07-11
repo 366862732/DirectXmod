@@ -262,6 +262,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCamera<'a>(
     }
 }
 
+/// Set the camera world position (used to offset test geometry near camera).
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCameraPos(
+    _env: JNIEnv,
+    _class: JClass,
+    x: f32,
+    y: f32,
+    z: f32,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_camera_pos(x, y, z);
+    }
+}
+
 /// Resize the wgpu renderer to match MC window dimensions.
 ///
 /// # Safety

@@ -1,12 +1,12 @@
 package com.dx12;
 
-import org.lwjgl.BufferUtils;
-
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+
+import org.lwjgl.BufferUtils;
 
 /**
  * JNI bridge for wgpu-mc Rust library.
@@ -63,6 +63,7 @@ public class D3D12Bridge {
     public static native byte[] nativeRenderFrame();
     public static native void nativeResize(int width, int height);
     public static native void nativeUpdateCamera(float[] matrix);
+    public static native void nativeUpdateCameraPos(float x, float y, float z);
     public static native int nativeIsReady();
     public static native String nativeGetStatus();
     public static native boolean nativeHasSurface();
@@ -183,6 +184,15 @@ public class D3D12Bridge {
             nativeUpdateCamera(matrix);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore if native lib not available
+        }
+    }
+
+    public static void updateCameraPos(float x, float y, float z) {
+        if (!initialized) return;
+        try {
+            nativeUpdateCameraPos(x, y, z);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
         }
     }
 

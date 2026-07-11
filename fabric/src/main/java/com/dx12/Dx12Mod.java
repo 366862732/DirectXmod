@@ -212,6 +212,10 @@ public class Dx12Mod implements ClientModInitializer {
                     float[] mvpArray = new float[16];
                     mvp.get(mvpArray);
                     D3D12Bridge.updateCamera(mvpArray);
+
+                    // Pass camera world position to offset test geometry near the player.
+                    D3D12Bridge.updateCameraPos(
+                        (float) pos.x, (float) pos.y, (float) pos.z);
                 }
             } catch (Throwable t) {
                 LOGGER.error("Camera extraction failed: {}", t.getMessage());
