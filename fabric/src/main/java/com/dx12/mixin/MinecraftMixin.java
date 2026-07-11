@@ -1,5 +1,6 @@
 package com.dx12.mixin;
 
+import org.lwjgl.glfw.GLFW;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -12,26 +13,35 @@ import net.minecraft.client.Minecraft;
 /**
  * Surface mode: D3D12 Present() at TAIL of Minecraft.runTick().
  *
- * MC 26.1.2 removed Window.updateDisplay() — we cannot inject there.
- * Instead, D3D12 renders + presents AFTER the entire game tick (post GL swap).
- * GL swap shows MC content; D3D12 Present() immediately replaces it.
- * With PresentMode::Immediate, flicker is minimal.
+ * MC 26.1.2 removed Window.updateDisplay(). D3D12 renders + presents
+ * AFTER the entire game tick (post GL swap) via the MinecraftMixin TAIL.
  *
- * Offscreen mode: renderFrame() in ClientTickEvents, overlay via
- * GameRendererMixin TAIL (unchanged).
+ * To prevent GPU driver TDR (Timeout Detection & Recovery) from D3D12 and
+ * OpenGL contending on the same HWND, the GL context is temporarily
+ * detached (glfwMakeContextCurrent(0)) before calling D3D12 renderFrame(),
+ * and reattached after. This ensures only one API accesses the HWND at
+ * any time, eliminating the WDDM driver-level conflict.
  */
 @Mixin(Minecraft.class)
 public class MinecraftMixin {
     @Inject(method = "runTick", at = @At("TAIL"))
     private void onRunTickTail(CallbackInfo ci) {
-        // Only render via D3D12 swapchain when in-world (surface mode + level loaded).
-        // Title screen uses offscreen mode (GL overlay) to avoid D3D12/GL contention.
         if (D3D12Bridge.hasSurface()) {
-            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            Minecraft mc = Minecraft.getInstance();
             if (mc.level != null && mc.player != null) {
-                // Camera was updated in ClientTickEvents.END_CLIENT_TICK.
-                // renderFrame() dispatches to render_surface() → Present().
-                D3D12Bridge.renderFrame();
+                // Temporarily detach GL context to avoid DXGI ↔ WGL HWND contention.
+                // D3D12's Present() needs exclusive HWND access via DXGI.
+                long glfwWindow = mc.getWindow().getWindow();
+                GLFW.glfwMakeContextCurrent(0);
+
+                try {
+                    // Camera was updated in ClientTickEvents.END_CLIENT_TICK.
+                    // renderFrame() dispatches to render_surface() → get_current_texture() → render → Present()
+                    D3D12Bridge.renderFrame();
+                } finally {
+                    // Reattach GL context for the next tick's operations.
+                    GLFW.glfwMakeContextCurrent(glfwWindow);
+                }
             }
         }
     }

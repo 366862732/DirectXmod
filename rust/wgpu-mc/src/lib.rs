@@ -7,18 +7,15 @@
 //! Note: Push constants removed — not supported on all GPUs.
 //! Model transforms are baked into vertex buffers at creation time.
 //!
-//! Surface mode uses a **child overlay window** to avoid HWND sharing conflicts
-//! between D3D12 (DXGI) and OpenGL (WGL). A WS_CHILD window is created as a
-//! child of Minecraft's main window. D3D12 swapchain targets this child HWND,
-//! completely isolating it from the GL context on the parent HWND.
-//! This eliminates the GPU driver TDR from D3D12/GL HWND contention.
+//! TDR Prevention (HWND sharing with OpenGL):
+//! The D3D12 swapchain is created on the same HWND as MC's GL context.
+//! To prevent GPU driver TDR, the GL context is temporarily detached
+//! (GLFW.glfwMakeContextCurrent(0)) from the Java side before calling
+//! renderFrame(), and reattached after. This ensures only one API has
+//! access to the HWND at any time.
 
 use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
-
-// Win32 API for child overlay window creation
-use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -237,63 +234,9 @@ fn create_surface_from_hwnd(
     match surface {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[dx12-wm] create_surface_unsafe failed: {:?}", e);
+            log::error!("[dx12-wm] create_surface_unsafe failed: {:?}", e);
             None
         }
-    }
-}
-
-/// Create a WS_CHILD overlay window of `parent_hwnd` for the D3D12 swapchain.
-/// This avoids sharing Minecraft's main HWND between OpenGL (WGL) and D3D12 (DXGI),
-/// which causes GPU driver TDR timeouts on some configurations.
-fn create_child_overlay(parent_hwnd: usize, width: u32, height: u32) -> usize {
-    unsafe {
-        let parent = parent_hwnd as HWND;
-        let instance = GetWindowLongW(parent, GWLP_HINSTANCE);
-
-        // Use built-in STATIC class (pre-registered in every Win32 process).
-        // Any window class works for D3D12 swapchain targets.
-        let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
-
-        let child = CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            class_name.as_ptr(),
-            std::ptr::null(),
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-            0,
-            0,
-            width as i32,
-            height as i32,
-            parent,
-            std::ptr::null_mut(),
-            instance as HINSTANCE,
-            std::ptr::null_mut(),
-        );
-
-        if child.is_null() {
-            log::error!("[dx12-wm] CreateWindowExW failed (child overlay): error={}", GetLastError());
-            return 0;
-        }
-
-        let hwnd = child as usize;
-        log::info!("[dx12-wm] Created child overlay window: HWND 0x{:x} (parent=0x{:x}, {}x{})",
-            hwnd, parent_hwnd, width, height);
-        hwnd
-    }
-}
-
-/// Resize/move the child overlay window to match parent client area.
-fn resize_child_overlay(child_hwnd: isize, width: u32, height: u32) {
-    unsafe {
-        SetWindowPos(
-            child_hwnd as HWND,
-            std::ptr::null_mut(), // HWND_TOP
-            0,
-            0,
-            width as i32,
-            height as i32,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-        );
     }
 }
 
@@ -348,7 +291,6 @@ pub struct WmRenderer {
     cube_count: u32,
 
     // Surface mode (native swapchain, no readback)
-    child_hwnd: Option<isize>,       // Child overlay window HWND
     surface: Option<wgpu::Surface<'static>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
@@ -364,17 +306,6 @@ pub struct WmRenderer {
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
 // The Surface is !Send (tied to window system), but we never send it across threads.
 unsafe impl Send for WmRenderer {}
-
-impl Drop for WmRenderer {
-    fn drop(&mut self) {
-        if let Some(hwnd) = self.child_hwnd.take() {
-            unsafe {
-                DestroyWindow(hwnd as HWND);
-            }
-            log::info!("[dx12-wm] Destroyed child overlay window");
-        }
-    }
-}
 
 impl WmRenderer {
     pub fn create(width: u32, height: u32) -> Result<Self, &'static str> {
@@ -552,7 +483,6 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
-            child_hwnd: None,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -560,33 +490,24 @@ impl WmRenderer {
         })
     }
 
-    /// Initialize a D3D12 swapchain surface on a child overlay window of the given HWND.
-    /// Called from JNI when the Minecraft window handle becomes available.
+    /// Initialize a D3D12 swapchain surface on the given HWND.
     ///
-    /// To avoid GPU TDR (HWND sharing conflict between D3D12 and OpenGL),
-    /// we create a WS_CHILD overlay window of Minecraft's main window and
-    /// create the D3D12 swapchain on this child HWND instead of on the
-    /// OpenGL-bound parent HWND. This completely isolates the two APIs.
-    pub fn init_surface(&mut self, parent_hwnd: usize) {
+    /// To avoid GPU TDR, the GL context MUST be temporarily detached from the HWND
+    /// before calling renderFrame() (via GLFW.glfwMakeContextCurrent(0) on the Java
+    /// side) and reattached after. This ensures D3D12's Present() has exclusive
+    /// access to the HWND, preventing WDDM driver contention.
+    pub fn init_surface(&mut self, hwnd: usize) {
         if self.surface.is_some() {
             return;
         }
 
-        log::info!("[dx12-wm] init_surface: creating child overlay + D3D12 swapchain (parent HWND 0x{:x})",
-            parent_hwnd);
+        log::info!("[dx12-wm] init_surface: creating D3D12 swapchain on HWND 0x{:x} (parent HWND)",
+            hwnd);
 
-        // Create child overlay window (D3D12 swapchain target, NOT the GL-bound parent)
-        let child_hwnd = create_child_overlay(parent_hwnd, self.width, self.height);
-        if child_hwnd == 0 {
-            log::error!("[dx12-wm] Failed to create child overlay window — falling back to offscreen");
-            return;
-        }
-        self.child_hwnd = Some(child_hwnd as isize);
-
-        let surface = match create_surface_from_hwnd(&self.instance, child_hwnd) {
+        let surface = match create_surface_from_hwnd(&self.instance, hwnd) {
             Some(s) => s,
             None => {
-                log::error!("[dx12-wm] Failed to create wgpu surface from child HWND 0x{:x}", child_hwnd);
+                log::error!("[dx12-wm] Failed to create wgpu surface from HWND 0x{:x}", hwnd);
                 return;
             }
         };
@@ -597,7 +518,8 @@ impl WmRenderer {
             .copied()
             .unwrap_or(caps.formats[0]);
 
-        log::info!("[dx12-wm] Surface caps: format={:?}, present_modes={:?}", format, caps.present_modes);
+        log::info!("[dx12-wm] Surface caps: format={:?}, {}x{}, present_modes={:?}",
+            format, self.width, self.height, caps.present_modes);
 
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
@@ -627,7 +549,7 @@ impl WmRenderer {
         self.surface_config = Some(config);
         self.surface = Some(surface);
 
-        log::info!("[dx12-wm] Surface mode ENABLED on child overlay: {:?} {}x{}",
+        log::info!("[dx12-wm] Surface mode ENABLED on parent HWND: {:?} {}x{}",
             format, self.width, self.height);
     }
 
@@ -647,20 +569,14 @@ impl WmRenderer {
         self.width = width;
         self.height = height;
 
-        // Surface mode: resize child overlay + update stored config + recreate depth texture.
+        // Surface mode: only update stored config + recreate depth texture.
         // Do NOT call surface.configure() here — DXGI ResizeBuffers can throw
         // a C++ exception when called while GL is active on the same HWND.
         // Instead, the swapchain is resized lazily in render_surface()
         // when get_current_texture() returns SurfaceError::Lost/Outdated.
-        // Child overlay window is resized immediately (it's a separate HWND,
-        // no GL contention).
         if let (Some(_), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
             config.width = width;
             config.height = height;
-            // Resize child overlay window to match parent client area
-            if let Some(child_hwnd) = self.child_hwnd {
-                resize_child_overlay(child_hwnd, width, height);
-            }
             self.surface_depth = Some(make_depth_texture(&self.device, width, height));
             log::info!("[dx12-wm] Surface size updated to {}x{} (lazy resize in render_surface)", width, height);
             return;
@@ -732,10 +648,7 @@ impl WmRenderer {
             }
             Err(e) => {
                 log::error!("[dx12-wm] Surface error: {:?}, falling back to offscreen", e);
-                // Fall back to offscreen mode: destroy surface + child window
-                if let Some(hwnd) = self.child_hwnd.take() {
-                    unsafe { DestroyWindow(hwnd as HWND); }
-                }
+                // Fall back to offscreen mode: destroy surface
                 self.surface = None;
                 self.surface_depth = None;
                 self.surface_config = None;
