@@ -280,6 +280,36 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCameraPos(
     }
 }
 
+/// Upload captured GL framebuffer pixels as a D3D12 texture for surface mode display.
+///
+/// # Safety
+/// This function is called from Java via JNI. The ByteBuffer must be a direct buffer.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetFramePixels(
+    env: JNIEnv,
+    _class: JClass,
+    buffer: jni::objects::JObject,  // ByteBuffer as JObject
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+) {
+    if width <= 0 || height <= 0 { return; }
+    // Wrap as JByteBuffer to access direct buffer address
+    let byte_buf = jni::objects::JByteBuffer::from(buffer);
+    let data = match env.get_direct_buffer_address(&byte_buf) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            log::warn!("[dx12-wm] Frame pixel buffer is not direct");
+            return;
+        }
+    };
+    let len = (width * height * 4) as usize;
+    let slice = std::slice::from_raw_parts(data, len);
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_frame_pixels(slice, width as u32, height as u32);
+    }
+}
+
 /// Resize the wgpu renderer to match MC window dimensions.
 ///
 /// # Safety

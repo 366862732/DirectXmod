@@ -38,6 +38,28 @@ impl Vertex {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
+impl TexVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+        0 => Float32x2,
+        1 => Float32x2,
+    ];
+
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
 // No push constants — compatible with all GPUs
 const SHADER_SRC: &str = r#"
 struct CameraUniform {
@@ -65,6 +87,33 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> Vertex
 @fragment
 fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0);
+}
+"#;
+
+// Textured fullscreen quad shader — renders GL framebuffer capture as D3D12 texture.
+const TEX_SHADER_SRC: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOutput {
+    var out: VertexOutput;
+    out.position = vec4<f32>(pos, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Flip Y: GL framebuffer reads bottom-up, wgpu textures are top-down.
+    var uv = in.uv;
+    uv.y = 1.0 - uv.y;
+    return textureSample(tex, samp, uv);
 }
 "#;
 
@@ -312,6 +361,16 @@ pub struct WmRenderer {
     surface_format: wgpu::TextureFormat,
     surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
 
+    // Textured fullscreen quad (GL framebuffer → D3D12 display)
+    tex_pipeline: wgpu::RenderPipeline,
+    tex_bind_group: Option<wgpu::BindGroup>,
+    tex_sampler: wgpu::Sampler,
+    frame_texture: Option<wgpu::Texture>,
+    frame_width: u32,
+    frame_height: u32,
+    fs_quad_vb: wgpu::Buffer,
+    fs_quad_ib: wgpu::Buffer,
+
     // Offscreen mode (triple-buffer readback)
     slots: [Slot; RING_SIZE],
     idx: usize,
@@ -472,6 +531,109 @@ impl WmRenderer {
             cube_vbs.push(create_cube_mesh_at(&device, color, (pos[0], pos[1], pos[2])));
         }
 
+        // ---- Textured fullscreen quad pipeline (GL framebuffer → D3D12) ----
+        let tex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Texture Shader"),
+            source: wgpu::ShaderSource::Wgsl(TEX_SHADER_SRC.into()),
+        });
+
+        let tex_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let tex_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Texture Pipeline Layout"),
+            bind_group_layouts: &[&tex_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let tex_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Texture Pipeline"),
+            layout: Some(&tex_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &tex_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[TexVertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &tex_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let tex_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Texture Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // Fullscreen quad (two triangles covering NDC [-1,1]²)
+        let quad_vertices: [TexVertex; 4] = [
+            TexVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] },
+            TexVertex { position: [ 1.0, -1.0], uv: [1.0, 1.0] },
+            TexVertex { position: [-1.0,  1.0], uv: [0.0, 0.0] },
+            TexVertex { position: [ 1.0,  1.0], uv: [1.0, 0.0] },
+        ];
+        let quad_indices: [u16; 6] = [0, 1, 2, 1, 3, 2];
+
+        let fs_quad_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FS Quad VB"),
+            size: std::mem::size_of_val(&quad_vertices) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: true,
+        });
+        fs_quad_vb.slice(..).get_mapped_range_mut()[..]
+            .copy_from_slice(bytemuck::cast_slice(&quad_vertices));
+        fs_quad_vb.unmap();
+
+        let fs_quad_ib = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FS Quad IB"),
+            size: std::mem::size_of_val(&quad_indices) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::INDEX,
+            mapped_at_creation: true,
+        });
+        fs_quad_ib.slice(..).get_mapped_range_mut()[..]
+            .copy_from_slice(bytemuck::cast_slice(&quad_indices));
+        fs_quad_ib.unmap();
+
         let slots = [
             Slot::new(&device, width, height),
             Slot::new(&device, width, height),
@@ -504,6 +666,14 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
+            tex_pipeline,
+            tex_bind_group: None,
+            tex_sampler,
+            frame_texture: None,
+            frame_width: 0,
+            frame_height: 0,
+            fs_quad_vb,
+            fs_quad_ib,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -628,6 +798,68 @@ impl WmRenderer {
         self.render_offscreen()
     }
 
+    /// Upload RGBA8 pixel data from GL framebuffer capture as a D3D12 texture.
+    pub fn set_frame_pixels(&mut self, data: &[u8], width: u32, height: u32) {
+        if width == 0 || height == 0 { return; }
+        let size = (width * height * 4) as usize;
+
+        // Recreate texture if dimensions changed
+        let need_new = self.frame_texture.as_ref().map_or(true, |_t| {
+            self.frame_width != width || self.frame_height != height
+        });
+        if need_new {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Frame Texture"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Frame Bind Group"),
+                layout: &self.tex_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.tex_sampler),
+                    },
+                ],
+            });
+            self.frame_texture = Some(tex);
+            self.tex_bind_group = Some(bind_group);
+            self.frame_width = width;
+            self.frame_height = height;
+        }
+
+        // Upload pixel data to the texture
+        if let Some(ref tex) = self.frame_texture {
+            let effective_len = data.len().min(size);
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data[..effective_len],
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
     // ── Draw calls shared by surface and offscreen modes ──────────
 
     fn draw_scene<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
@@ -650,12 +882,7 @@ impl WmRenderer {
     // ── Surface mode: render directly to swapchain ────────────────
 
     fn render_surface(&mut self) {
-        // Use real MC camera MVP with lerp smoothing.
-        self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
-        self.camera_prev = self.camera_mvp;
-
-        // Write camera uniform (MVP + world position offset)
-        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+        let has_frame = self.tex_bind_group.is_some();
 
         // Get surface frame
         let surface = self.surface.as_ref().unwrap();
@@ -689,38 +916,67 @@ impl WmRenderer {
             &wgpu::CommandEncoderDescriptor { label: Some("RenderSurface") },
         );
 
-        {
-            let depth_view = self.surface_depth
-                .as_ref()
-                .expect("surface_depth must be created in init_surface")
-                .create_view(&wgpu::TextureViewDescriptor::default());
+        if has_frame {
+            // Textured fullscreen quad: display GL framebuffer capture
+            {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Surface Pass (Textured)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rp.set_pipeline(&self.tex_pipeline);
+                rp.set_bind_group(0, self.tex_bind_group.as_ref().unwrap(), &[]);
+                rp.set_vertex_buffer(0, self.fs_quad_vb.slice(..));
+                rp.set_index_buffer(self.fs_quad_ib.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..6, 0, 0..1);
+            }
+        } else {
+            // Fallback: 3D test scene (plane + cubes)
+            self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+            self.camera_prev = self.camera_mvp;
+            write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
 
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Surface Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+            {
+                let depth_view = self.surface_depth
+                    .as_ref()
+                    .expect("surface_depth must be created in init_surface")
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Surface Pass (3D)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
-            // Draw 3D test scene (plane + cubes) offset by camera world position.
-            self.draw_scene(&mut rp);
+                self.draw_scene(&mut rp);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));

@@ -64,6 +64,7 @@ public class D3D12Bridge {
     public static native void nativeResize(int width, int height);
     public static native void nativeUpdateCamera(float[] matrix);
     public static native void nativeUpdateCameraPos(float x, float y, float z);
+    public static native void nativeSetFramePixels(java.nio.ByteBuffer buffer, int width, int height);
     public static native int nativeIsReady();
     public static native String nativeGetStatus();
     public static native boolean nativeHasSurface();
@@ -191,6 +192,16 @@ public class D3D12Bridge {
         if (!initialized) return;
         try {
             nativeUpdateCameraPos(x, y, z);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    /** Upload captured GL framebuffer pixels as a D3D12 texture. */
+    public static void setFramePixels(java.nio.ByteBuffer buffer, int width, int height) {
+        if (!initialized) return;
+        try {
+            nativeSetFramePixels(buffer, width, height);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore
         }
