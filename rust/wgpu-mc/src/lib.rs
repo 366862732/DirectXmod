@@ -139,17 +139,19 @@ fn aligned_row(width: u32) -> u32 {
     ((width * 4 + 255) / 256) * 256
 }
 
-fn create_plane_mesh(device: &wgpu::Device, size: f32, color: [f32; 3])
+fn create_plane_mesh(device: &wgpu::Device, size: f32, y: f32, z_center: f32, color: [f32; 3])
     -> (wgpu::Buffer, wgpu::Buffer, u32)
 {
     let h = size * 0.5;
+    let z0 = z_center - h;
+    let z1 = z_center + h;
     let vertices: [Vertex; 4] = [
-        Vertex { position: [-h, 0.0, -h], color },
-        Vertex { position: [ h, 0.0, -h], color },
-        Vertex { position: [-h, 0.0,  h], color },
-        Vertex { position: [ h, 0.0,  h], color },
+        Vertex { position: [-h, y, z0], color },
+        Vertex { position: [ h, y, z0], color },
+        Vertex { position: [-h, y, z1], color },
+        Vertex { position: [ h, y, z1], color },
     ];
-    let indices: [u16; 6] = [0, 1, 2, 2, 1, 3];
+    let indices: [u16; 6] = [0, 3, 1, 0, 2, 3];  // CCW → +Y normal
 
     let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Plane VB"),
@@ -432,13 +434,17 @@ impl WmRenderer {
         });
 
         let (plane_vb, plane_ib, plane_count) =
-            create_plane_mesh(&device, 200.0, [0.2, 0.65, 0.2]);
+            create_plane_mesh(&device, 20.0, -4.0, 8.0, [0.2, 0.65, 0.2]);
 
-        // Create one cube VB per position (model offsets baked into vertices)
-        let cube_color = [0.8, 0.4, 0.1];
-        let cube_positions: [(f32, f32, f32); 5] = [
-            (0.0, 1.0, 0.0), (4.0, 1.0, 2.0), (-4.0, 1.0, -1.0),
-            (2.0, 1.0, -4.0), (-3.0, 1.0, 3.0),
+        // Create one cube VB per position (model offsets baked into vertices).
+        // Positions are RELATIVE to camera (camera_pos added in shader).
+        // y = -3.5: on the ground plane; spread over xz for visibility.
+        let cube_positions: [([f32; 3], [f32; 3]); 5] = [
+            ([-5.0, -3.5,  5.0], [0.9, 0.3, 0.15]),  // front-left, orange
+            ([ 5.0, -3.5,  5.0], [0.15, 0.5, 0.9]),  // front-right, blue
+            ([ 0.0, -1.0,  3.0], [0.9, 0.7, 0.1]),   // center, yellow
+            ([-5.0, -3.5, 10.0], [0.4, 0.8, 0.2]),   // far front-left, green
+            ([ 5.0, -3.5, 10.0], [0.7, 0.2, 0.5]),   // far front-right, magenta
         ];
 
         // Shared index buffer — all cubes use identical index data
@@ -462,8 +468,8 @@ impl WmRenderer {
         cube_ib.unmap();
 
         let mut cube_vbs = Vec::with_capacity(cube_positions.len());
-        for &pos in &cube_positions {
-            cube_vbs.push(create_cube_mesh_at(&device, cube_color, pos));
+        for &(pos, color) in &cube_positions {
+            cube_vbs.push(create_cube_mesh_at(&device, color, (pos[0], pos[1], pos[2])));
         }
 
         let slots = [
