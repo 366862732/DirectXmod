@@ -33,7 +33,7 @@
 
 ### 核心设计原则
 
-- **不使用 Mixin**（避免与 Fabric 渲染器冲突）
+- **Mixin 拦截渲染管线** — 通过 3 个 Mixin 精确控制 GL/D3D12 共存时机，解决 TDR 问题
 - **不创建额外窗口**（直接使用 Minecraft 窗口 HWND）
 - **版本通用**（1.21.1 ~ 1.21.11 + 26.x，不依赖 Yarn 映射）
 - **双模渲染**：Surface 模式（DX12 直接呈现）+ Offscreen 模式（像素读回 + PBO 上传）
@@ -43,10 +43,10 @@
 | 旧方案 (C++/D3D12) | 新方案 (Rust/wgpu) |
 |---------------------|---------------------|
 | 手动管理 D3D12 资源 | wgpu 自动资源管理 |
-| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | Surface 模式：独立 swapchain 直接呈现 |
+| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | Mixin 精确控制 GL/D3D12 共存时机 |
 | 内存安全依赖开发者 | Rust 编译器保证内存安全 |
 | 复杂的 C++ 构建配置 | Cargo 依赖管理 |
-| TDR 崩溃频发 | 架构层面规避 TDR |
+| TDR 崩溃频发 | GLFW 上下文分离 + Mixin 取消 GL 渲染 |
 
 ### 核心优势
 
@@ -59,8 +59,16 @@
 
 | 模式 | 渲染路径 | 适用场景 |
 |------|----------|----------|
-| **Surface 模式** | DX12 swapchain 直接呈现到窗口 | 已获取 HWND 后，零读回、零 PBO |
-| **Offscreen 模式** | 离屏纹理 → staging buffer → PBO → OpenGL 全屏 quad | 初始化阶段或无 HWND 时 |
+| **Surface 模式** | DX12 swapchain 直接呈现到窗口 | World 中，GL 渲染被 Mixin 取消 |
+| **Offscreen 模式** | 离屏纹理 → staging buffer → PBO → OpenGL 全屏 quad | Title screen / 初始化阶段 |
+
+### TDR 问题解决原理
+
+Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱动 TDR 超时。解决方案通过 3 个 Mixin 协同工作：
+
+1. **GameRendererMixin** — HEAD 注入取消 MC OpenGL 渲染，TAIL 注入在 offscreen 模式下上传 PBO
+2. **MinecraftMixin** — TAIL 注入时 `glfwMakeContextCurrent(0)` 临时分离 GL 上下文，调用 D3D12 Present() 后恢复
+3. **GlDeviceMixin** — 取消 `GlDevice.presentFrame()` 的 GL buffer swap，让 D3D12 Present() 成为唯一呈现
 
 ---
 
@@ -73,21 +81,25 @@
 │  │              Fabric Loader 0.19.3                      │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │           Fabric API (ClientTickEvents)          │  │  │
-|  │  │  Tick Callback → 节流 50ms → Rust renderFrame()  │  │  │
+│  │  │  Tick Callback → 全速渲染 → Rust renderFrame()   │  │  │
 │  │  │  + 相机 MVP 矩阵提取 → nativeUpdateCamera()      │  │  │
-│  │  │  + 渲染状态查询 → nativeIsReady/nativeGetStatus  │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │         Fabric API (HudRenderCallback)           │  │  │
-│  │  │  PBO 纹理上传 + VAO + Shader → 全屏 quad         │  │  │
-│  │  │  (Surface 模式暂停 — GPU 驱动 TDR 问题)          │  │  │
+│  │  │         Mixin: GameRenderer.render() TAIL        │  │  │
+│  │  │  Offscreen 模式: PBO 纹理上传 + 全屏 quad        │  │  │
+│  │  │  Surface 模式: 跳过 GL 绘制                      │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │         Mixin: Minecraft.runTick() TAIL          │  │  │
+│  │  │  glfwMakeContextCurrent(0) → D3D12 Present()     │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕ JNI                              │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              wgpu_mc_jni.dll (Rust)                    │  │
-│  │  nativeSetWindow(HWND) → 初始化 DX12 Surface (⏸️ 暂停) │  │
-│  │  nativeRenderFrame() → Offscreen 模式返回 byte[]        │  │
+│  │  nativeSetWindow(HWND) → 初始化 DX12 Surface/Swapchain │  │
+│  │  nativeRenderFrame() → Surface 模式直接 present,        │  │
+│  │                       Offscreen 模式返回 byte[]         │  │
 │  │  nativeResize(width, height) → 更新窗口尺寸            │  │
 │  │  nativeUpdateCamera(float[16]) → 同步相机 MVP 矩阵     │  │
 │  │  nativeHasSurface() → 返回当前是否为 Surface 模式      │  │
@@ -101,9 +113,8 @@
 │  │  render_frame() → 3D 场景渲染（地面 + 立方体 + 深度）  │  │
 │  │  WGSL shader + 共享 IB + 深度测试                     │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │ ⏸️ Surface 模式: 暂停 (GPU 驱动 TDR 问题)       │  │  │
+│  │  │ ✅ Surface 模式: 直接 present 到 swapchain       │  │  │
 │  │  │ ✅ Offscreen 模式: triple-buffer 异步读回        │  │  │
-│  │  └─────────────────────────────────────────────────┘  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
@@ -116,18 +127,23 @@ dx12-lib-template-26.1.2/
 ├── fabric/                          # Fabric 模组（Java）
 │   ├── src/main/java/com/dx12/
 │   │   ├── Dx12Mod.java            # 模组入口，注册事件回调
-│   │   └── D3D12Bridge.java        # JNI 桥接层
+│   │   ├── D3D12Bridge.java        # JNI 桥接层
+│   │   └── mixin/                  # Mixin 渲染管线控制
+│   │       ├── GameRendererMixin.java   # 取消 GL 渲染 / PBO 上传
+│   │       ├── MinecraftMixin.java      # GL 上下文分离 + D3D12 Present
+│   │       └── GlDeviceMixin.java       # 取消 GL buffer swap
 │   ├── src/main/resources/
-│   │   └── fabric.mod.json         # Fabric 模组描述
+│   │   ├── fabric.mod.json         # Fabric 模组描述
+│   │   └── gl4dx12.mixins.json     # Mixin 配置
 │   ├── build.gradle                # Gradle 构建配置
 │   └── gradle.properties           # 版本参数
 ├── rust/
 │   ├── Cargo.toml                  # Workspace 配置
 │   ├── wgpu-mc/                    # 核心渲染库
-│   │   ├── src/lib.rs              # WmRenderer 结构 + Surface/Offscreen 双模
+│   │   ├── src/lib.rs              # WmRenderer + Surface/Offscreen 双模
 │   │   └── Cargo.toml              # wgpu 23, futures, bytemuck
 │   └── wgpu-mc-jni/                # JNI 桥接层
-│       ├── src/lib.rs              # nativeSetWindow/renderFrame/resize/updateCamera/hasSurface
+│       ├── src/lib.rs              # 10 个 native 方法
 │       └── Cargo.toml              # jni 0.21, log, env_logger
 ```
 
@@ -135,30 +151,31 @@ dx12-lib-template-26.1.2/
 
 ## 项目状态
 
-### 当前阶段：阶段 1-3 已完成，阶段 4 进行中
+### 当前阶段：阶段 1-5 全部完成
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | **第一阶段：JNI 通信链路** | ✅ 已完成 | Java ↔ Rust 双向通信正常 |
-| **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter + 3D 几何管线 + Offscreen 渲染 |
-| **第三阶段：Fabric 事件系统集成** | ✅ 已完成 | ClientTickEvents + HudRenderCallback，PBO 纹理上传 |
-| **第四阶段：Surface 模式（DX12 直接呈现）** | ⏸️ 暂停 | GPU 驱动 TDR 问题，需 Mixin 取消 GL 渲染后重新启用 |
-| **第五阶段：VulkanMod 级全接管** | 🚧 进行中 | 待实现 Mixin 拦截 LevelRenderer，DX12 直接渲染全部游戏场景 |
+| **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter + 3D 几何管线 + 双模渲染 |
+| **第三阶段：Fabric 事件系统集成** | ✅ 已完成 | ClientTickEvents + PBO 纹理上传 |
+| **第四阶段：Surface 模式（DX12 直接呈现）** | ✅ 已完成 | Mixin 解决 TDR，Surface 模式在 world 中正常工作 |
+| **第五阶段：VulkanMod 级全接管** | 🚧 进行中 | 已实现 Surface 模式零读回呈现，待接入真实游戏场景 |
 
 ### 已完成功能
 
 | 模块 | 说明 |
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
+| **Mixin 框架** | 3 个 Mixin 精确控制 GL/D3D12 共存：GameRendererMixin, MinecraftMixin, GlDeviceMixin |
 | **JNI 桥接层** | 10 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeHasSurface`, `nativeIsReady`, `nativeGetStatus` |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 26.1.2，Fabric API 0.154.2 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
-| **Surface 模式** | ⏸️ 暂停 — GPU 驱动 TDR 问题，需 Mixin 取消 GL 渲染后重新启用 |
-| **Offscreen 模式** | Triple-buffer 异步读回 + PBO 纹理上传，当前唯一可用渲染模式 |
+| **Surface 模式** | DX12 swapchain 直接呈现到 MC 窗口，零读回、零 PBO（world 中） |
+| **Offscreen 模式** | Triple-buffer 异步读回 + PBO 纹理上传（title screen / 初始化阶段） |
 | **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步（带 LERP 平滑） |
-| **3D 几何管线** | WGSL 着色器 + 共享索引缓冲 + 深度测试 + 背面剔除（移除 push constants） |
+| **3D 几何管线** | WGSL 着色器 + 共享索引缓冲 + 深度测试 + 背面剔除 |
 | **地面平面网格** | 200x200 绿色平面（y=0） |
 | **彩色立方体网格** | 5 个立方体，每个独立 VB（预烘焙偏移），共享 IB |
 | **深度缓冲区** | `Depth32Float` 格式，支持正确遮挡关系 |
@@ -171,17 +188,44 @@ dx12-lib-template-26.1.2/
 ### 验收结果
 
 - 模组加载成功，无 crash
-- **Offscreen 模式**：PBO 纹理上传 + OpenGL 全屏 quad 覆盖，当前唯一可用渲染模式
+- **Surface 模式**：DX12 swapchain 直接呈现 3D 场景（绿色地面 + 5 个橙色立方体），零读回，全速渲染
+- **Offscreen 模式**：PBO 纹理上传 + OpenGL 全屏 quad 覆盖（title screen 阶段）
 - 相机视角随 MC 移动实时更新（MVP 矩阵 + LERP 平滑）
 - 进游戏、按 Esc、调设置均无 JVM 崩溃
+- TDR 问题已解决：GL 上下文分离 + Mixin 取消 GL 渲染
 
 ---
 
 ## 变更日志
 
-### [1.3.0] - 2026-07-08
+### [1.4.0] - 2026-07-08
 
 > **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
+
+#### Added
+- **Mixin 框架（3 个 Mixin）**：精确控制 GL/D3D12 共存，解决 TDR 问题
+  - `GameRendererMixin` — HEAD 取消 MC OpenGL 渲染，TAIL 在 offscreen 模式下上传 PBO
+  - `MinecraftMixin` — TAIL 注入时分离 GL 上下文 (`glfwMakeContextCurrent(0)`)，调用 D3D12 Present() 后恢复
+  - `GlDeviceMixin` — 取消 `GlDevice.presentFrame()` 的 GL buffer swap
+- **Surface 模式恢复**：world 中 DX12 swapchain 直接呈现，零读回、零 PBO
+- **全速渲染**：移除 50ms 节流，`render_frame()` 每 tick 调用
+- **`create_cube_mesh_at()`** — 支持指定位置和颜色的立方体生成
+- **`create_plane_mesh()`** — 地面平面网格生成（200x200 绿色）
+- 纹理格式从 `Rgba8UnormSrgb` 改为 `Bgra8UnormSrgb`
+
+#### Changed
+- 渲染架构从"Offscreen 为主"升级为"Surface 模式优先"
+- `render_frame()` 根据 Surface 模式返回不同结果（Surface 模式直接 present，Offscreen 模式返回 byte[]）
+- `onInitializeClient()` 中相机提取改为 in-world 检测（`mc.player != null && mc.level != null`）
+- `renderFrame()` 从 Tick Callback 移到 `MinecraftMixin.runTick TAIL` 调用
+
+#### Fixed
+- GPU 驱动 TDR 超时（约 2 秒后 GPU 设备移除）— 通过 Mixin 取消 GL 渲染 + GLFW 上下文分离
+- 双重 buffer swap 导致的 GPU 竞争 — GlDeviceMixin 取消 GL swap
+
+---
+
+### [1.3.0] - 2026-07-08
 
 #### Added
 - 10 个 JNI native 方法完整实现（新增 `nativeIsReady`, `nativeGetStatus`）
@@ -202,8 +246,6 @@ dx12-lib-template-26.1.2/
 ---
 
 ### [1.2.0] - 2026-07-08
-
-> **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
 
 #### Added
 - **Surface 模式（DX12 直接呈现）**：`nativeSetWindow` 后创建 swapchain，`render_frame()` 直接 present 到窗口，零读回
@@ -291,7 +333,7 @@ dx12-lib-template-26.1.2/
 | 语言 | Rust | 2021 edition |
 | JNI | jni crate | 0.21 |
 | 渲染 | OpenGL (Java 端，Offscreen 模式) | Core Profile 330 |
-| 限制 | Surface 模式暂停 | GPU 驱动 TDR 问题 |
+| 注入 | SpongePowered Mixin | 通过 Fabric API |
 
 ---
 
@@ -391,10 +433,10 @@ copy rust\target\release\wgpu_mc_jni.dll ^
 进入游戏中，当 HWND 可用后会看到：
 
 ```
-[dx12-wm] Surface OK! HWND=0x123456 fmt=Rgba8UnormSrgb 1920x1080
+[dx12-wm] Surface OK! HWND=0x123456 fmt=Bgra8UnormSrgb 1920x1080
 ```
 
-此时渲染模式自动切换到 **Surface 模式**，DX12 直接呈现到窗口。
+此时渲染模式自动切换到 **Surface 模式**（world 中），DX12 直接呈现到窗口。
 
 ---
 
@@ -480,11 +522,11 @@ $env:RUST_LOG = "debug"
 #### 验证 JNI 通信
 
 模组启动时会自动执行以下测试：
-- `nativeInit()` — 初始化 Rust 环境，创建 WmRenderer（Offscreen 模式）
+- `nativeInit()` — 初始化 Rust 环境，创建 WmRenderer
 - `nativeHello("Hello from Minecraft!")` — 双向字符串传递
 - `nativeTestDeviceInfo()` — GPU 适配器检测
-- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄（Surface 模式暂停）
-- `nativeRenderFrame()` — 每帧渲染，Offscreen 模式返回 byte[]
+- `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄，创建 DX12 swapchain
+- `nativeRenderFrame()` — 每帧渲染（Surface 模式直接 present，Offscreen 模式返回 byte[]）
 - `nativeUpdateCamera(float[])` — 传递 MC 相机 MVP 矩阵
 - `nativeHasSurface()` — 检测当前是否为 Surface 模式
 - `nativeIsReady()` — 返回 1/0/-1 状态码
@@ -520,9 +562,9 @@ cargo run --example simple
 | 按 Esc/设置菜单 crash | HUD callback 与 Screen 渲染 GL 状态冲突 | `currentScreen != null` 时跳过 GL 绘制 | ✅ 已修复 |
 | 纹理闪烁不完整 | 窗口 resize 后纹理尺寸不匹配 | `texWidth`/`texHeight` 追踪 + 自动重建 | ✅ 已修复 |
 | 资源重载后渲染 crash | GL 状态未清理 | 重载检测时重置 `vaoId`/`shaderValid`/`texAllocated`/`pendingPixels` | ✅ 已修复 |
-| 帧率波动（一会快一会慢） | GPU 读回管线延迟不稳定 | 节流 50ms ≈ 20fps | ✅ 已修复 |
 | 调试日志导致卡顿 | 每 tick 写磁盘 | 移除所有 `C:\tmp\` 文件日志 | ✅ 已修复 |
 | `setWindow` 重复调用 | JNI 开销 | `lastSetHwnd` 缓存 | ✅ 已修复 |
+| **GPU TDR 超时（~2s 后崩溃）** | GL + D3D12 同窗口共存导致 WDDM 驱动级冲突 | **3 个 Mixin**：取消 GL 渲染 + GLFW 上下文分离 + 取消 GL swap | ✅ 已修复 |
 
 ---
 
@@ -543,9 +585,9 @@ cargo run --example simple
 | 任务 | 状态 | 说明 |
 |------|------|------|
 | WmRenderer 创建 | ✅ | wgpu DX12 Instance → Adapter → Device |
-| 3D 几何管线 | ✅ | WGSL 着色器 + push constants + 深度测试 + 背面剔除 |
+| 3D 几何管线 | ✅ | WGSL 着色器 + 共享 IB + 深度测试 + 背面剔除 |
 | 地面网格 | ✅ | 200x200 绿色平面 |
-| 立方体网格 | ✅ | 24 顶点/6 面，每面明暗区分 |
+| 立方体网格 | ✅ | 5 个独立 VB + 共享 IB |
 | 深度缓冲 | ✅ | `Depth32Float` 格式 |
 | 像素回传 | ✅ | Rust → Java byte[] → PBO → OpenGL 纹理 → 全屏 Quad |
 | 独立测试程序 | ✅ | `examples/simple.rs` 可独立运行渲染三角形 |
@@ -557,11 +599,11 @@ cargo run --example simple
 | 任务 | 状态 | 说明 |
 |------|------|------|
 | ClientTickEvents | ✅ | 计时、资源重载检测、相机提取、调用 Rust 渲染 |
-| HudRenderCallback | ✅ | PBO 纹理上传 + 全屏 quad 绘制 |
+| PBO 纹理上传 | ✅ | glMapBuffer + CPU memcpy + glTexSubImage2D(offset=0) |
 | GL 状态管理 | ✅ | 完整的保存/恢复机制 |
 | VAO/Shader 持久化 | ✅ | 首次创建，丢失后自动重建 |
 
-### 阶段 4：Surface 模式（DX12 直接呈现）⏸️ 暂停
+### 阶段 4：Surface 模式（DX12 直接呈现）✅ 已完成
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
@@ -570,19 +612,19 @@ cargo run --example simple
 | Surface 渲染 | ✅ | `render_surface()` 直接 present 到窗口 |
 | Surface 自适应 resize | ✅ | 窗口尺寸变化时 reconfigure |
 | Surface 错误恢复 | ✅ | Outdated/Lost 时自动 reconfigure |
-| 双模切换 | ✅ | `nativeSetWindow` 后尝试切换到 Surface 模式 |
+| 双模切换 | ✅ | `nativeSetWindow` 后自动切换到 Surface 模式 |
 | Triple-buffer 读回 | ✅ | Offscreen 模式三槽环形缓冲 + 异步 map_async |
-| **GPU TDR 问题** | ❌ | GL/D3D12 同窗口共存导致驱动超时，需 Mixin 取消 GL 渲染 |
-
-> **Surface 模式暂停原因**：Minecraft 原生 OpenGL 渲染与 wgpu DX12 swapchain 在同一窗口共存时，NVIDIA 驱动会在约 2 秒后触发 TDR（Timeout Detection and Recovery）超时，导致 GPU 设备移除和 JVM 崩溃。解决方法需要先通过 Mixin 取消 `GameRenderer.renderLevel()` 和 `Window.updateDisplay()`，才能安全启用 Surface 模式。
+| **Mixin 框架** | ✅ | 3 个 Mixin 解决 TDR 问题 |
+| GLFW 上下文分离 | ✅ | `glfwMakeContextCurrent(0)` 临时分离 GL 上下文 |
+| GL 渲染取消 | ✅ | GameRendererMixin HEAD 取消 MC OpenGL 渲染 |
+| GL swap 取消 | ✅ | GlDeviceMixin 取消 buffer swap |
 
 ### 阶段 5：VulkanMod 级全接管 🚧 进行中
 
-当前使用 Offscreen 模式（PBO 纹理上传 + OpenGL 全屏 quad），GPU 利用率较低。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
+当前已实现 Surface 模式（DX12 直接呈现 3D 场景），相机视角随 MC 移动实时更新。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| **Mixin 框架搭建** | 🔴 P0 | 拦截 `LevelRenderer.renderLevel()`，证明可以接管渲染 |
 | **区块渲染** | 🔴 P0 | 预计算 Chunk Mesh + 顶点缓冲，零读回 |
 | **天空盒与云雾** | 🟠 P1 | 简单着色器即可 |
 | **实体渲染** | 🟠 P1 | 模型加载 + 骨骼动画 |
@@ -635,10 +677,9 @@ passes:
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| Mixin 框架搭建 | 🔴 P0 | 拦截 LevelRenderer.renderLevel()，解决 TDR 问题 |
 | 区块渲染 | 🔴 P0 | 预计算 Chunk Mesh，DX12 直接渲染 |
-| Surface 模式恢复 | 🟠 P1 | Mixin 取消 GL 渲染后重新启用 DX12 swapchain |
 | 天空盒渲染 | 🟠 P1 | 简单着色器即可 |
+| 实体渲染 | 🟠 P1 | 模型加载 + 骨骼动画 |
 
 ---
 

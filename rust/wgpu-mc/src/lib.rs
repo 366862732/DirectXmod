@@ -295,6 +295,7 @@ pub struct WmRenderer {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
     surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
+    fs_tri_vb: wgpu::Buffer,               // Full-screen triangle (NDC) for surface test
 
     // Offscreen mode (triple-buffer readback)
     slots: [Slot; RING_SIZE],
@@ -452,6 +453,24 @@ impl WmRenderer {
             cube_vbs.push(create_cube_mesh_at(&device, cube_color, pos));
         }
 
+        // Full-screen triangle in NDC — always visible regardless of camera position.
+        // Two triangles covering the entire screen: [-1,-1] [3,-1] [-1,3].
+        // Shader outputs gradient colors: red, green, blue.
+        let fs_tri_vertices: [Vertex; 3] = [
+            Vertex { position: [-1.0, -1.0, 0.0], color: [1.0, 0.0, 0.0] },
+            Vertex { position: [ 3.0, -1.0, 0.0], color: [0.0, 1.0, 0.0] },
+            Vertex { position: [-1.0,  3.0, 0.0], color: [0.0, 0.0, 1.0] },
+        ];
+        let fs_tri_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fullscreen Tri VB"),
+            size: std::mem::size_of_val(&fs_tri_vertices) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: true,
+        });
+        fs_tri_vb.slice(..).get_mapped_range_mut()[..]
+            .copy_from_slice(bytemuck::cast_slice(&fs_tri_vertices));
+        fs_tri_vb.unmap();
+
         let slots = [
             Slot::new(&device, width, height),
             Slot::new(&device, width, height),
@@ -483,6 +502,7 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
+            fs_tri_vb,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -513,8 +533,11 @@ impl WmRenderer {
         };
 
         let caps = surface.get_capabilities(&self.adapter);
+        // Prefer Rgba8UnormSrgb to match the pipeline format.
+        // If not available, fall back to any sRGB format.
         let format = caps.formats.iter()
-            .find(|f| f.is_srgb())
+            .find(|f| **f == wgpu::TextureFormat::Rgba8UnormSrgb)
+            .or_else(|| caps.formats.iter().find(|f| f.is_srgb()))
             .copied()
             .unwrap_or(caps.formats[0]);
 
@@ -621,13 +644,16 @@ impl WmRenderer {
     // ── Surface mode: render directly to swapchain ────────────────
 
     fn render_surface(&mut self) {
-        // Lerp camera
-        self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
-        self.camera_prev = self.camera_mvp;
+        // Use identity camera MVP for fullscreen NDC rendering.
+        // The fullscreen triangle vertices are already in NDC space [-1, 1].
+        // This ensures the test pattern is always visible regardless of
+        // the MC player's world position.
+        self.camera_mvp = IDENTITY;
+        self.camera_prev = IDENTITY;
 
-        // Write camera VP uniform
+        // Write identity camera VP uniform
         self.queue.write_buffer(&self.uniform_buffer, 0,
-            bytemuck::cast_slice(&self.camera_mvp));
+            bytemuck::cast_slice(&IDENTITY));
 
         // Get surface frame
         let surface = self.surface.as_ref().unwrap();
@@ -664,7 +690,6 @@ impl WmRenderer {
         );
 
         {
-            // Use cached depth texture (reused every frame, recreated on resize)
             let depth_view = self.surface_depth
                 .as_ref()
                 .expect("surface_depth must be created in init_surface")
@@ -694,7 +719,12 @@ impl WmRenderer {
                 occlusion_query_set: None,
             });
 
-            self.draw_scene(&mut rp);
+            // Draw fullscreen triangle in NDC space (red→green→blue gradient).
+            // Uses identity camera MVP — vertices are already in clip space.
+            rp.set_pipeline(&self.pipeline);
+            rp.set_bind_group(0, &self.bind_group, &[]);
+            rp.set_vertex_buffer(0, self.fs_tri_vb.slice(..));
+            rp.draw(0..3, 0..1);
         }
 
         self.queue.submit(Some(encoder.finish()));

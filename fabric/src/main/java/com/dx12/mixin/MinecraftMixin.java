@@ -1,6 +1,7 @@
 package com.dx12.mixin;
 
 import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWNativeWin32;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -28,18 +29,18 @@ public class MinecraftMixin {
     private void onRunTickTail(CallbackInfo ci) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level != null && mc.player != null) {
-            // Temporarily detach GL context to avoid DXGI ↔ WGL HWND contention.
-            // D3D12's Present() and surface creation (surface.configure)
-            // both need exclusive HWND access via DXGI.
-            // Use glfwGetCurrentContext() instead of mc.getWindow().getWindow()
-            // because MC 26.1.2's Window class does not expose getWindow().
+            // Get GLFW window and HWND BEFORE detaching GL context.
+            // glfwGetWin32Window requires the GL context to be current.
             long glfwWindow = GLFW.glfwGetCurrentContext();
             if (glfwWindow == 0) return;
+            long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+
+            // Detach GL context to avoid DXGI ↔ WGL HWND contention
+            // during D3D12 surface creation and Present().
             GLFW.glfwMakeContextCurrent(0);
 
             try {
                 // Init D3D12 surface if needed (must be done without GL context bound)
-                long hwnd = D3D12Bridge.getWindowHandle();
                 if (hwnd != 0) {
                     D3D12Bridge.setWindow(hwnd);
                 }
