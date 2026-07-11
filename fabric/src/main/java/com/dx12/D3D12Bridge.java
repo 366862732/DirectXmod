@@ -65,9 +65,12 @@ public class D3D12Bridge {
     public static native void nativeUpdateCamera(float[] matrix);
     public static native void nativeUpdateCameraPos(float x, float y, float z);
     public static native void nativeSetFramePixels(java.nio.ByteBuffer buffer, int width, int height);
+    public static native void nativeUploadChunkMesh(int sectionX, int sectionY, int sectionZ,
+        java.nio.ByteBuffer buffer, int vertexCount, int vertexStride);
     public static native int nativeIsReady();
     public static native String nativeGetStatus();
     public static native boolean nativeHasSurface();
+    public static native boolean nativeHasChunkGeometry();
 
     // === Convenience methods ===
     private static boolean initialized = false;
@@ -227,11 +230,32 @@ public class D3D12Bridge {
         }
     }
 
+    /** Upload MC chunk section mesh to D3D12 for native rendering. */
+    public static void uploadChunkMesh(int sectionX, int sectionY, int sectionZ,
+            java.nio.ByteBuffer buffer, int vertexCount, int vertexStride) {
+        if (!initialized) return;
+        try {
+            nativeUploadChunkMesh(sectionX, sectionY, sectionZ, buffer, vertexCount, vertexStride);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
     /** Returns true if D3D12 surface mode is active (swapchain presents directly). */
     public static boolean hasSurface() {
         if (!initialized) return false;
         try {
             return nativeHasSurface();
+        } catch (UnsatisfiedLinkError e) {
+            return false;
+        }
+    }
+
+    /** Returns true if any MC chunk geometry has been uploaded to D3D12. */
+    public static boolean hasChunkGeometry() {
+        if (!initialized) return false;
+        try {
+            return nativeHasChunkGeometry();
         } catch (UnsatisfiedLinkError e) {
             return false;
         }

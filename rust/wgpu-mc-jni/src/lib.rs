@@ -78,6 +78,44 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeInit(_env: JNIEnv, _cla
     }
 }
 
+/// Upload MC chunk section mesh to D3D12 for native rendering.
+/// `data` contains raw vertex bytes (36 bytes/vertex, MC default block format).
+/// `section_x/y/z` are chunk section coordinates (world pos >> 4).
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadChunkMesh(
+    _env: JNIEnv,
+    _class: JClass,
+    section_x: jni::sys::jint,
+    section_y: jni::sys::jint,
+    section_z: jni::sys::jint,
+    buffer: jni::objects::JObject,
+    vertex_count: jni::sys::jint,
+    vertex_stride: jni::sys::jint,
+) {
+    if vertex_count <= 0 || vertex_stride <= 0 { return; }
+
+    let byte_buf = jni::objects::JByteBuffer::from(buffer);
+    let data = match _env.get_direct_buffer_address(&byte_buf) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            eprintln!("[dx12-wm] uploadChunkMesh FAILED: buffer is not direct");
+            return;
+        }
+    };
+    let len = (vertex_count * vertex_stride) as usize;
+    let slice = std::slice::from_raw_parts(data, len);
+
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.upload_chunk_mesh(
+            section_x, section_y, section_z,
+            slice,
+            vertex_count as u32,
+            vertex_stride as u32,
+        );
+    }
+}
+
 /// Check if the wgpu renderer is ready for rendering.
 /// Returns 1 if ready, 0 if still initializing, -1 if failed.
 ///
@@ -227,6 +265,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHasSurface(
     match guard.as_ref() {
         Some(Ok(renderer)) => {
             if renderer.has_surface() { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
+        }
+        _ => jni::sys::JNI_FALSE,
+    }
+}
+
+/// Returns true if any MC chunk geometry has been uploaded to the D3D12 renderer.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHasChunkGeometry(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    let guard = lock_or_poisoned();
+    match guard.as_ref() {
+        Some(Ok(renderer)) => {
+            if renderer.has_chunk_geometry() { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
         }
         _ => jni::sys::JNI_FALSE,
     }

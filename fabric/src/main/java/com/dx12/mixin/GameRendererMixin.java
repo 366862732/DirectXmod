@@ -22,28 +22,29 @@ public class GameRendererMixin {
     private static ByteBuffer frameCaptureBuffer;
 
     /**
-     * Surface mode: let MC render the world normally via OpenGL.
-     * The GL context detachment in MinecraftMixin prevents DXGI-WGL
-     * HWND contention during D3D12 Present().
-     * The rendered framebuffer is captured at TAIL and uploaded to a
-     * D3D12 texture for display through the swapchain.
+     * HEAD injection: if D3D12 has native chunk geometry, cancel GL world rendering.
+     * The chunks are rendered directly by D3D12; GL only needs to run for HUD/UI.
+     * Only cancel when surface mode AND chunk geometry are both active.
      */
     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
     private void onRenderHead(CallbackInfo ci) {
-        // Offscreen mode: existing behavior (upload overlay at TAIL).
-        // Surface mode: pass through (let GL render, capture at TAIL).
-        // No cancellation needed — GL + D3D12 coexist via context detach.
+        if (D3D12Bridge.hasSurface() && D3D12Bridge.hasChunkGeometry()) {
+            ci.cancel();
+        }
     }
 
     /**
      * TAIL injection: after MC finishes rendering the frame.
-     * - Surface mode: capture GL framebuffer → D3D12 texture.
-     * - Offscreen mode: upload D3D12-rendered pixels as GL quad overlay.
+     * - Surface + chunks: skip capture (D3D12 renders chunks directly)
+     * - Surface (no chunks): capture GL framebuffer → D3D12 texture
+     * - Offscreen mode: upload D3D12-rendered pixels as GL quad overlay
      */
     @Inject(method = "render", at = @At("TAIL"))
     private void onRenderTail(CallbackInfo ci) {
         if (D3D12Bridge.hasSurface()) {
-            captureFramebufferForD3D12();
+            if (!D3D12Bridge.hasChunkGeometry()) {
+                captureFramebufferForD3D12();
+            }
         } else {
             Dx12Mod.onPostRender();
         }

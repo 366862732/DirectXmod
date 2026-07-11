@@ -5,7 +5,8 @@
     "client": [
         "GameRendererMixin",
         "GlDeviceMixin",
-        "MinecraftMixin"
+        "MinecraftMixin",
+        "SectionCompilerMixin"
     ],
     "injectors": {
         "defaultRequire": 1

@@ -304,6 +304,17 @@ fn create_surface_from_hwnd(
     }
 }
 
+// ── Chunk mesh storage (MC section geometry → D3D12) ─────────────
+
+/// One mesh = one RenderLayer of one 16×16×16 chunk section.
+/// Keyed by (section_x, section_y, section_z).
+struct ChunkMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    vertex_count: u32,
+    index_count: u32,
+}
+
 // ── Ring slot ─────────────────────────────────────────────────────
 
 struct Slot {
@@ -376,6 +387,10 @@ pub struct WmRenderer {
     idx: usize,
     pending_rx: [Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; RING_SIZE],
     prev_pixels: Vec<u8>,
+
+    // Chunk geometry (Phase 7: native MC geometry → D3D12)
+    chunk_meshes: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>>,
+    has_chunk_geometry: bool,
 }
 
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
@@ -678,6 +693,8 @@ impl WmRenderer {
             idx: 0,
             pending_rx: [None, None, None],
             prev_pixels: Vec::new(),
+            chunk_meshes: std::collections::HashMap::new(),
+            has_chunk_geometry: false,
         })
     }
 
@@ -750,6 +767,11 @@ impl WmRenderer {
     /// Returns true if the renderer has an active surface (swapchain mode).
     pub fn has_surface(&self) -> bool {
         self.surface.is_some()
+    }
+
+    /// Returns true if any MC chunk geometry has been uploaded.
+    pub fn has_chunk_geometry(&self) -> bool {
+        self.has_chunk_geometry
     }
 
     pub fn set_camera(&mut self, mvp: [[f32; 4]; 4]) {
@@ -901,6 +923,175 @@ impl WmRenderer {
         }
     }
 
+    /// Store a chunk section mesh for D3D12 rendering.
+    /// `data` contains MC vertex data (28 bytes/vertex for BLOCK format in MC 26.1.2).
+    /// `section_x/y/z` are chunk section coordinates (world coord >> 4).
+    pub fn upload_chunk_mesh(
+        &mut self,
+        section_x: i32,
+        section_y: i32,
+        section_z: i32,
+        data: &[u8],
+        vertex_count: u32,
+        vertex_stride: u32,
+    ) {
+        let stride = vertex_stride as usize;
+        let expected_size = (vertex_count as usize) * stride;
+        if data.len() < expected_size || vertex_count == 0 || stride == 0 {
+            log::warn!("[dx12-wm] Chunk mesh REJECTED: data.len={} < expected={}, vcount={}, stride={}",
+                data.len(), expected_size, vertex_count, stride);
+            return;
+        }
+
+        // MC uses GL_QUADS: 4 vertices per quad.
+        // D3D12 uses TriangleList: need 6 indices per quad.
+        let quad_count = vertex_count / 4;
+        let tri_index_count = quad_count * 6;         // 6 indices per quad
+
+        let world_ox = (section_x as f32) * 16.0;
+        let world_oy = (section_y as f32) * 16.0;
+        let world_oz = (section_z as f32) * 16.0;
+
+        // Camera-relative offset: subtract camera_pos so shader offset cancels out.
+        // Chunk vertices are in world space, but shader adds camera_pos for test geo.
+        // We make chunk vertices camera-relative by subtracting camera_pos here.
+        let cx = self.camera_pos[0];
+        let cy = self.camera_pos[1];
+        let cz = self.camera_pos[2];
+
+        // Convert MC vertex data to Vertex (position + color) and build index buffer.
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(vertex_count as usize);
+        let max_index = vertex_count;
+
+        // Use u32 indices if vertex count exceeds u16 max
+        let use_u32_indices = max_index > 65535;
+
+        for v in 0..vertex_count {
+            let base = (v as usize) * stride;
+            if base + 15 > data.len() { break; }
+
+            // Position: 3 f32 at offset 0 (section-relative, 0..16)
+            let px = f32::from_le_bytes([data[base], data[base+1], data[base+2], data[base+3]]);
+            let py = f32::from_le_bytes([data[base+4], data[base+5], data[base+6], data[base+7]]);
+            let pz = f32::from_le_bytes([data[base+8], data[base+9], data[base+10], data[base+11]]);
+
+            // Color: 4 u8 (RGBA in memory) at offset 12 → float
+            let cr = data[base + 12] as f32 / 255.0;
+            let cg = data[base + 13] as f32 / 255.0;
+            let cb = data[base + 14] as f32 / 255.0;
+
+            // World position (section origin + local pos), then make camera-relative
+            let wx = px + world_ox - cx;
+            let wy = py + world_oy - cy;
+            let wz = pz + world_oz - cz;
+
+            vertices.push(Vertex {
+                position: [wx, wy, wz],
+                color: [cr, cg, cb],
+            });
+        }
+
+        // Diagnostic: dump first 4 vertices on first chunk upload
+        static mut FIRST_UPLOAD: bool = true;
+        if unsafe { FIRST_UPLOAD } {
+            unsafe { FIRST_UPLOAD = false; }
+            log::info!("[dx12-wm] First chunk upload: section=({},{},{}) stride={} vcount={} len={} camera=({:.1},{:.1},{:.1})",
+                section_x, section_y, section_z, stride, vertex_count, data.len(), cx, cy, cz);
+            for i in 0..vertices.len().min(4) {
+                let v = &vertices[i];
+                log::info!("[dx12-wm]   v[{}]: pos=({:.2},{:.2},{:.2}) color=({:.3},{:.3},{:.3})",
+                    i, v.position[0], v.position[1], v.position[2], v.color[0], v.color[1], v.color[2]);
+            }
+        }
+
+        if vertices.is_empty() { return; }
+
+        // Build per-quad triangle indices
+        if use_u32_indices {
+            let mut indices: Vec<u32> = Vec::with_capacity(tri_index_count as usize);
+            for q in 0..quad_count {
+                let vi = q * 4;
+                if vi + 3 >= vertex_count { break; }
+                indices.extend_from_slice(&[vi, vi+1, vi+3, vi, vi+3, vi+2]);
+            }
+
+            if indices.is_empty() { return; }
+
+            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk VB"),
+                size: (std::mem::size_of::<Vertex>() * vertices.len()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: true,
+            });
+            vb.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&vertices));
+            vb.unmap();
+
+            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk IB"),
+                size: (std::mem::size_of::<u32>() * indices.len()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: true,
+            });
+            ib.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&indices));
+            ib.unmap();
+
+            let mesh = ChunkMesh {
+                vertex_buffer: vb,
+                index_buffer: ib,
+                vertex_count: vertices.len() as u32,
+                index_count: indices.len() as u32,
+            };
+
+            let key = (section_x, section_y, section_z);
+            self.chunk_meshes.entry(key).or_insert_with(Vec::new).push(mesh);
+            self.has_chunk_geometry = true;
+
+            log::info!("[dx12-wm] Chunk mesh uploaded (u32): section=({},{},{}) {} verts, {} indices",
+                section_x, section_y, section_z, vertices.len(), indices.len());
+        } else {
+            let mut indices: Vec<u16> = Vec::with_capacity(tri_index_count as usize);
+            for q in 0..quad_count {
+                let vi = (q * 4) as u16;
+                if (vi as u32) + 3 >= vertex_count { break; }
+                indices.extend_from_slice(&[vi, vi+1, vi+3, vi, vi+3, vi+2]);
+            }
+
+            if indices.is_empty() { return; }
+
+            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk VB"),
+                size: (std::mem::size_of::<Vertex>() * vertices.len()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: true,
+            });
+            vb.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&vertices));
+            vb.unmap();
+
+            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk IB"),
+                size: (std::mem::size_of::<u16>() * indices.len()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: true,
+            });
+            ib.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&indices));
+            ib.unmap();
+
+            let mesh = ChunkMesh {
+                vertex_buffer: vb,
+                index_buffer: ib,
+                vertex_count: vertices.len() as u32,
+                index_count: indices.len() as u32,
+            };
+
+            let key = (section_x, section_y, section_z);
+            self.chunk_meshes.entry(key).or_insert_with(Vec::new).push(mesh);
+            self.has_chunk_geometry = true;
+
+            log::info!("[dx12-wm] Chunk mesh uploaded: section=({},{},{}) {} verts, {} indices",
+                section_x, section_y, section_z, vertices.len(), indices.len());
+        }
+    }
+
     // ── Draw calls shared by surface and offscreen modes ──────────
 
     fn draw_scene<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
@@ -920,10 +1111,25 @@ impl WmRenderer {
         }
     }
 
+    /// Render all stored MC chunk meshes using the standard 3D pipeline.
+    fn draw_chunks<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        rp.set_pipeline(&self.pipeline);
+        rp.set_bind_group(0, &self.bind_group, &[]);
+
+        for (_key, meshes) in &self.chunk_meshes {
+            for mesh in meshes {
+                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                rp.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+    }
+
     // ── Surface mode: render directly to swapchain ────────────────
 
     fn render_surface(&mut self) {
         let has_frame = self.tex_bind_group.is_some();
+        let has_chunks = self.has_chunk_geometry;
 
         // Get surface frame
         let surface = self.surface.as_ref().unwrap();
@@ -957,7 +1163,45 @@ impl WmRenderer {
             &wgpu::CommandEncoderDescriptor { label: Some("RenderSurface") },
         );
 
-        if has_frame {
+        if has_chunks {
+            // Phase 7: Render native MC chunk geometry with D3D12
+            self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+            self.camera_prev = self.camera_mvp;
+            write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+
+            let depth_view = self.surface_depth
+                .as_ref()
+                .expect("surface_depth must be created in init_surface")
+                .create_view(&wgpu::TextureViewDescriptor::default());
+
+            {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Surface Pass (Chunks)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
+                self.draw_chunks(&mut rp);
+            }
+        } else if has_frame {
             // Textured fullscreen quad: display GL framebuffer capture
             {
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
