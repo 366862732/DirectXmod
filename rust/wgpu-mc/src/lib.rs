@@ -313,6 +313,7 @@ struct ChunkMesh {
     index_buffer: wgpu::Buffer,
     vertex_count: u32,
     index_count: u32,
+    index_is_u32: bool,
 }
 
 // ── Ring slot ─────────────────────────────────────────────────────
@@ -1040,6 +1041,7 @@ impl WmRenderer {
                 index_buffer: ib,
                 vertex_count: vertices.len() as u32,
                 index_count: indices.len() as u32,
+                index_is_u32: true,
             };
 
             let key = (section_x, section_y, section_z);
@@ -1081,6 +1083,7 @@ impl WmRenderer {
                 index_buffer: ib,
                 vertex_count: vertices.len() as u32,
                 index_count: indices.len() as u32,
+                index_is_u32: false,
             };
 
             let key = (section_x, section_y, section_z);
@@ -1119,7 +1122,12 @@ impl WmRenderer {
         for (_key, meshes) in &self.chunk_meshes {
             for mesh in meshes {
                 rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                rp.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                let index_format = if mesh.index_is_u32 {
+                    wgpu::IndexFormat::Uint32
+                } else {
+                    wgpu::IndexFormat::Uint16
+                };
+                rp.set_index_buffer(mesh.index_buffer.slice(..), index_format);
                 rp.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }

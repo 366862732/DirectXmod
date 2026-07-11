@@ -25,18 +25,16 @@
 - [贡献指南](#贡献指南)
 - [许可证](#许可证)
 
----
-
 ## 项目概述
 
 **GL4DX12** 是一个 Fabric 模组，通过 Rust + wgpu 实现 DirectX 12 渲染后端，利用 JNI（Java Native Interface）桥接 Minecraft 的 Java 层与本地渲染引擎。
 
 ### 核心设计原则
 
-- **Mixin 捕获 GL 帧** — Surface 模式下让 MC 正常 GL 渲染，捕获 framebuffer 后传给 D3D12 swapchain 呈现
+- **Mixin 智能捕获** — Surface + chunk 就绪时取消 GL 渲染；否则正常 GL 渲染并捕获 framebuffer
 - **不创建额外窗口**（直接使用 Minecraft 窗口 HWND）
 - **版本通用**（1.21.1 ~ 1.21.11 + 26.x，不依赖 Yarn 映射）
-- **双模渲染**：Surface 模式（GL 帧捕获 + DX12 swapchain 呈现）+ Offscreen 模式（像素读回 + PBO 上传）
+- **双模渲染**：Surface 模式（GL 帧捕获/D3D12 直接渲染）+ Offscreen 模式（像素读回 + PBO 上传）
 
 ### 为什么重构为 Rust + wgpu？
 
@@ -59,15 +57,15 @@
 
 | 模式 | 渲染路径 | 适用场景 |
 |------|----------|----------|
-| **Surface 模式** | MC GL 渲染 → `glReadPixels` → D3D12 纹理 → swapchain present | World 中，MC 正常 GL 渲染 |
+| **Surface 模式** | Surface 模式：chunk 就绪 → D3D12 直接渲染 MC 场景 / chunk 未就绪 → GL 帧捕获 → D3D12 纹理 present | World 中，MC 正常 GL 渲染或 D3D12 直接渲染 |
 | **Offscreen 模式** | Rust wgpu 渲染 → staging buffer → PBO → OpenGL 全屏 quad | Title screen / 初始化阶段 |
 
 ### TDR 问题解决原理
 
 Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱动 TDR 超时。解决方案通过 3 个 Mixin 协同工作：
 
-1. **GameRendererMixin** — HEAD 注入让 MC 正常 GL 渲染，TAIL 注入捕获 framebuffer → 传给 D3D12 纹理
-2. **MinecraftMixin** — `render()` HEAD 时 `glfwMakeContextCurrent(0)` 分离 GL 上下文，调用 D3D12 Present() 后恢复
+1. **GameRendererMixin** — HEAD 注入：Surface + chunk 就绪时取消 GL 渲染；否则让 MC 正常 GL 渲染。TAIL 注入：无 chunk 时捕获 framebuffer（FBO-aware），有 chunk 时跳过
+2. **MinecraftMixin** — `runTick` TAIL 注入时 `glfwMakeContextCurrent(0)` 分离 GL 上下文，调用 D3D12 Present() 后恢复
 3. **GlDeviceMixin** — 取消 `GlDevice.presentFrame()` 的 GL buffer swap，让 D3D12 Present() 成为唯一呈现
 
 ---
@@ -83,10 +81,13 @@ Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱�
 │  │  │           Fabric API (ClientTickEvents)          │  │  │
 │  │  │  Tick Callback → 全速渲染 → Rust renderFrame()   │  │  │
 │  │  │  + 相机 MVP 矩阵提取 → nativeUpdateCamera()      │  │  │
+│  │  │  + 相机位置传递 → nativeUpdateCameraPos()        │  │  │
+│  │  │  + 区块网格上传 → nativeUploadChunkMesh()        │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │         Mixin: GameRenderer.render() HEAD/TAIL   │  │  │
-│  │  │  Surface 模式: MC 正常 GL 渲染 → 捕获 framebuffer │  │  │
+│  │  │  Surface+chunks: 取消 GL 渲染                    │  │  │
+│  │  │  Surface+无chunks: GL 渲染 → 捕获 framebuffer    │  │  │
 │  │  │  Offscreen 模式: PBO 纹理上传 + 全屏 quad        │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
@@ -104,16 +105,17 @@ Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱�
 │  │  nativeUpdateCamera(float[16]) → 同步相机 MVP 矩阵     │  │
 │  │  nativeSetFramePixels(byte[], w, h) → Surface 模式接收 │  │
 │  │                       GL 捕获的 framebuffer 像素       │  │
-│  │  nativeHasSurface() → 返回当前是否为 Surface 模式      │  │
+│  │  nativeUploadChunkMesh(sectionXYZ, buffer, verts, stride) → 上传 MC 区块网格 │  │
+│  │  nativeHasChunkGeometry() → 返回当前是否已上传区块网格 |  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕                                  │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              wgpu-mc (Rust)                            │  │
 │  │  wgpu::Instance(DX12) → Adapter → Device + Queue       │  │
 │  │  render_frame() → 3D 场景渲染（地面 + 立方体 + 深度）  │  │
-│  │  WGSL shader + 共享 IB + 深度测试                     │  │
+│  │  WGSL shader + camera_pos + 共享 IB + 深度测试        │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │ ✅ Surface 模式: 直接 present 到 swapchain       │  │  │
+│  │  │ ✅ Surface 模式: chunk→直接渲染 / 无chunk→GL帧捕获 │  │  │
 │  │  │ ✅ Offscreen 模式: triple-buffer 异步读回        │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -143,7 +145,7 @@ dx12-lib-template-26.1.2/
 │   │   ├── src/lib.rs              # WmRenderer + Surface/Offscreen 双模
 │   │   └── Cargo.toml              # wgpu 23, futures, bytemuck
 │   └── wgpu-mc-jni/                # JNI 桥接层
-│       ├── src/lib.rs              # 10 个 native 方法
+│       ├── src/lib.rs              # 12 个 native 方法
 │       └── Cargo.toml              # jni 0.21, log, env_logger
 ```
 
@@ -167,16 +169,17 @@ dx12-lib-template-26.1.2/
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
 | **Mixin 框架** | 3 个 Mixin 精确控制 GL/D3D12 共存：GameRendererMixin, MinecraftMixin, GlDeviceMixin |
-| **JNI 桥接层** | 10 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeHasSurface`, `nativeIsReady`, `nativeGetStatus`, `nativeSetFramePixels` |
+| **JNI 桥接层** | 12 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeUpdateCameraPos`, `nativeSetFramePixels`, `nativeUploadChunkMesh`, `nativeHasSurface`, `nativeHasChunkGeometry`, `nativeIsReady`, `nativeGetStatus` |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 26.1.2，Fabric API 0.154.2 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
-| **Surface 模式** | MC 正常 GL 渲染 → `glReadPixels` → D3D12 纹理 → swapchain present，零读回延迟 |
+| **Surface 模式** | 智能渲染：chunk 就绪 → D3D12 直接渲染 MC 场景 / chunk 未就绪 → GL 帧捕获 → D3D12 纹理 present | World 中，MC 正常 GL 渲染或 D3D12 直接渲染 |
 | **Offscreen 模式** | Triple-buffer 异步读回 + PBO 纹理上传（title screen / 初始化阶段） |
-| **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步（带 LERP 平滑） |
+| **Chunk 几何上传** | Java → Rust 区块网格数据（vertex + index），D3D12 直接渲染 MC 场景 |
 | **相机位置传递** | Java 提取 MC 玩家世界坐标 → `nativeUpdateCameraPos()` → Rust 偏移测试几何体 |
-| **3D 几何管线** | WGSL 着色器 + 共享索引缓冲 + 深度测试 + 背面剔除 |
+| **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步（带 LERP 平滑） |
+| **3D 几何管线** | WGSL 着色器 + camera_pos + 共享索引缓冲 + 深度测试 + 背面剔除 |
 | **地面平面网格** | 200x200 绿色平面（y=0） |
 | **彩色立方体网格** | 5 个立方体，每个独立 VB（预烘焙偏移），共享 IB |
 | **深度缓冲区** | `Depth32Float` 格式，支持正确遮挡关系 |
@@ -189,9 +192,11 @@ dx12-lib-template-26.1.2/
 ### 验收结果
 
 - 模组加载成功，无 crash
-- **Surface 模式**：MC 正常 GL 渲染 → `glReadPixels` 捕获 → D3D12 swapchain present，零读回延迟
+- **Surface 模式（智能渲染）**：chunk 就绪时 D3D12 直接渲染 MC 场景；chunk 未就绪时 GL 帧捕获 → D3D12 swapchain present
 - **Offscreen 模式**：PBO 纹理上传 + OpenGL 全屏 quad 覆盖（title screen 阶段）
+- **GL 帧捕获增强**：FBO-aware，从 MC 实际 draw FBO 读取而非 GL_BACK
 - 相机视角随 MC 移动实时更新（MVP 矩阵 + LERP 平滑）
+- 相机世界坐标传递，几何体跟随玩家位置
 - 进游戏、按 Esc、调设置均无 JVM 崩溃
 - TDR 问题已解决：GL 上下文分离 + Mixin 取消 GL swap
 
@@ -204,16 +209,21 @@ dx12-lib-template-26.1.2/
 > **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
 
 #### Added
-- **Surface 模式 GL 帧捕获**：GameRendererMixin TAIL 注入 `glReadPixels` 捕获 MC 渲染的 framebuffer，通过 `nativeSetFramePixels()` 传给 D3D12 纹理呈现
-- **相机世界位置传递**：`nativeUpdateCameraPos(x, y, z)` — Java 提取玩家眼睛坐标，Rust 偏移测试几何体靠近玩家
-- **`captureFramebufferForD3D12()`** — 从 GL_BACK 读取 framebuffer → D3D12 纹理 → swapchain present
+- **Chunk 几何上传**：`nativeUploadChunkMesh()` — Java → Rust 区块网格数据（vertex + index），D3D12 直接渲染 MC 场景
+- **Smart Surface 渲染**：`render_surface()` 三种模式 — chunk 几何 → D3D12 直接渲染 / GL 帧捕获 → textured quad / 回退到 3D 测试场景
+- **FBO-aware 帧捕获**：GameRendererMixin 从 MC 实际 draw FBO 读取而非 GL_BACK
+- **Shader camera_pos**：顶点着色器中 `world_pos = pos + camera.camera_pos`，几何体跟随玩家位置
+- **`nativeHasChunkGeometry()`** — Java 端检测是否已上传 chunk 几何
+- **纹理格式改回 `Rgba8UnormSrgb`**（pipeline fragment target 格式）
+- **Chunk mesh 上传**：MC GL_QUADS → D3D12 TriangleList 转换，世界坐标偏移
 
 #### Changed
-- **Surface 模式从"Rust 渲染"改为"GL 帧捕获"**：不再渲染 Rust 测试场景，而是捕获 MC 原生 OpenGL 渲染结果
-- **MinecraftMixin 从 TAIL 改为 render() HEAD**：GL 上下文分离时机调整到 GameRenderer.render() 之前
-- **Dx12Mod 大幅简化**：移除 `onPostRender()` 中的 GL 状态管理、Shader、VAO 等全部代码，改为 Offscreen 模式专用的 PBO 上传
-- **GameRendererMixin 完全反转**：从"取消 GL 渲染"变为"让 GL 正常渲染 + 捕获 framebuffer"
-- **纹理格式从 `Rgba8UnormSrgb` 改为 `Bgra8UnormSrgb`**
+- **Surface 模式升级为智能渲染**：不再总是 GL 帧捕获，而是根据 chunk 几何可用性选择渲染路径
+- **GameRendererMixin 智能判断**：Surface + chunk 就绪时取消 GL 渲染，否则正常 GL 渲染 + 捕获
+- **MinecraftMixin 保持 `runTick` TAIL**（不是 render HEAD）
+- **Shader 新增 `camera_pos: vec3<f32>`** uniform，几何体偏移跟随玩家
+- **`captureFramebufferForD3D12()` FBO 感知**：从 MC draw FBO 读取，而非固定 GL_BACK
+- **纹理格式从 `Bgra8UnormSrgb` 改回 `Rgba8UnormSrgb`**
 
 #### Fixed
 - Surface 模式下 D3D12 纹理格式不匹配导致的画面异常

@@ -37,7 +37,11 @@ public class SectionCompilerMixin {
     ) {
         try {
             SectionCompiler.Results results = cir.getReturnValue();
-            if (results == null || results.renderedLayers.isEmpty()) return;
+            if (results == null || results.renderedLayers.isEmpty()) {
+                Dx12Mod.LOGGER.debug("[dx12-wm] compile returned empty or null for section=({},{},{})",
+                    sectionPos.getX(), sectionPos.getY(), sectionPos.getZ());
+                return;
+            }
 
             int sx = sectionPos.getX();
             int sy = sectionPos.getY();
@@ -54,11 +58,15 @@ public class SectionCompilerMixin {
                 ByteBuffer vertexBuffer = meshData.vertexBuffer();
                 if (vertexBuffer == null) continue;
 
+                Dx12Mod.LOGGER.debug("[dx12-wm] Uploading chunk mesh: section=({},{},{}) layer={} vcount={} stride={}",
+                    sx, sy, sz, entry.getKey(), vertexCount, vertexStride);
+
                 D3D12Bridge.uploadChunkMesh(sx, sy, sz, vertexBuffer, vertexCount, vertexStride);
-                return; // One upload per section (all layers share same section coords)
+                // Upload ALL layers, not just the first one
             }
         } catch (Exception e) {
-            Dx12Mod.LOGGER.warn("[dx12-wm] Chunk mesh capture failed: {}", e.getMessage());
+            Dx12Mod.LOGGER.warn("[dx12-wm] Chunk mesh capture failed: {}", e.toString());
+            e.printStackTrace();
         }
     }
 }
