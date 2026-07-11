@@ -6,7 +6,8 @@
         "GameRendererMixin",
         "GlDeviceMixin",
         "MinecraftMixin",
-        "SectionCompilerMixin"
+        "SectionCompilerMixin",
+        "TextureAtlasMixin"
     ],
     "injectors": {
         "defaultRequire": 1

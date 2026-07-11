@@ -38,6 +38,31 @@ impl Vertex {
     }
 }
 
+/// Chunk vertex with UV for texture atlas sampling.
+/// 32 bytes: position(12) + color(12) + uv(8).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct ChunkVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+    uv: [f32; 2],
+}
+
+impl ChunkVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+        2 => Float32x2,
+    ];
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct TexVertex {
@@ -87,6 +112,43 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> Vertex
 @fragment
 fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0);
+}
+"#;
+
+// Chunk shader: samples atlas texture, multiplies by vertex color as lighting tint.
+const CHUNK_SHADER_SRC: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+@group(0) @binding(1) var atlas: texture_2d<f32>;
+@group(0) @binding(2) var atlas_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tint: vec3<f32>,
+}
+
+@vertex
+fn vs_main(
+    @location(0) pos: vec3<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+) -> VertexOutput {
+    var out: VertexOutput;
+    let world_pos = pos + camera.camera_pos;
+    out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.uv = uv;
+    out.tint = color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let tex_color = textureSample(atlas, atlas_sampler, in.uv);
+    return vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
 }
 "#;
 
@@ -392,6 +454,18 @@ pub struct WmRenderer {
     // Chunk geometry (Phase 7: native MC geometry → D3D12)
     chunk_meshes: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>>,
     has_chunk_geometry: bool,
+
+    // Chunk textured pipeline + atlas
+    chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
+    chunk_pipeline: Option<wgpu::RenderPipeline>,
+    chunk_bind_group: Option<wgpu::BindGroup>,
+    chunk_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    atlas_texture: Option<wgpu::Texture>,
+    atlas_sampler: wgpu::Sampler,
+    atlas_width: u32,
+    atlas_height: u32,
+    /// Raw atlas pixels stored for diagnostics
+    atlas_pixels: Option<Vec<u8>>,
 }
 
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
@@ -658,6 +732,58 @@ impl WmRenderer {
 
         eprintln!("[dx12-wm] Offscreen slots created ({}x{})", width, height);
 
+        // Chunk atlas sampler: use Linear filtering for smooth block textures
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Atlas Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Chunk bind group layout: camera uniform + atlas texture + sampler
+        let chunk_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Chunk BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let _chunk_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Chunk Pipeline Layout"),
+            bind_group_layouts: &[&chunk_bgl],
+            push_constant_ranges: &[],
+        });
+
+        eprintln!("[dx12-wm] Chunk pipeline layout created (texture atlas support ready)");
+
         Ok(Self {
             instance,
             adapter,
@@ -696,6 +822,15 @@ impl WmRenderer {
             prev_pixels: Vec::new(),
             chunk_meshes: std::collections::HashMap::new(),
             has_chunk_geometry: false,
+            chunk_shader: None,
+            chunk_pipeline: None,
+            chunk_bind_group: None,
+            chunk_bind_group_layout: Some(chunk_bgl),
+            atlas_texture: None,
+            atlas_sampler,
+            atlas_width: 0,
+            atlas_height: 0,
+            atlas_pixels: None,
         })
     }
 
@@ -761,8 +896,14 @@ impl WmRenderer {
         self.surface_config = Some(config);
         self.surface = Some(surface);
 
+        // Rebuild chunk pipeline with the actual surface format if atlas already uploaded.
+        // Drop the old pipeline first — it may have been created with the wrong format.
+        self.chunk_pipeline = None;
+        self.ensure_chunk_pipeline();
+
         log::info!("[dx12-wm] Surface mode ENABLED on parent HWND: {:?} {}x{}",
             format, self.width, self.height);
+        eprintln!("[dx12-wm] Surface mode ENABLED: {:?} {}x{}", format, self.width, self.height);
     }
 
     /// Returns true if the renderer has an active surface (swapchain mode).
@@ -773,6 +914,88 @@ impl WmRenderer {
     /// Returns true if any MC chunk geometry has been uploaded.
     pub fn has_chunk_geometry(&self) -> bool {
         self.has_chunk_geometry
+    }
+
+    /// Upload MC terrain atlas texture for chunk rendering.
+    /// `pixels` is RGBA8 data, width and height are atlas dimensions.
+    pub fn upload_terrain_atlas(&mut self, pixels: &[u8], width: u32, height: u32) {
+        if pixels.len() < (width * height * 4) as usize { return; }
+
+        log::info!("[dx12-wm] Uploading terrain atlas: {}x{} ({} bytes)",
+            width, height, pixels.len());
+
+        self.atlas_width = width;
+        self.atlas_height = height;
+        self.atlas_pixels = Some(pixels.to_vec());  // stored for diagnostics
+
+        let atlas = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Terrain Atlas"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        // Diagnostic: verify first few pixels of the uploaded atlas
+        if pixels.len() >= 16 {
+            let r = pixels[0]; let g = pixels[1]; let b = pixels[2]; let a = pixels[3];
+            eprintln!("[dx12-wm] Atlas first pixel: RGBA=({},{},{},{})", r, g, b, a);
+        }
+        eprintln!("[dx12-wm] Atlas texture uploaded: {}x{} ({:.1} MB)", width, height, pixels.len() as f64 / 1048576.0);
+
+        // Create the chunk bind group
+        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let chunk_bgl = self.chunk_bind_group_layout.as_ref().unwrap();
+        let chunk_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Chunk Bind Group"),
+            layout: chunk_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                },
+            ],
+        });
+
+        self.atlas_texture = Some(atlas);
+        self.chunk_bind_group = Some(chunk_bg);
+
+        // Create and store the chunk shader for lazy pipeline creation.
+        // Pipeline is built via ensure_chunk_pipeline() so it uses the
+        // correct surface format (not hardcoded Rgba8UnormSrgb).
+        self.chunk_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Chunk Shader"),
+            source: wgpu::ShaderSource::Wgsl(CHUNK_SHADER_SRC.into()),
+        }));
+        self.ensure_chunk_pipeline();
     }
 
     pub fn set_camera(&mut self, mvp: [[f32; 4]; 4]) {
@@ -960,8 +1183,9 @@ impl WmRenderer {
         let cy = self.camera_pos[1];
         let cz = self.camera_pos[2];
 
-        // Convert MC vertex data to Vertex (position + color) and build index buffer.
-        let mut vertices: Vec<Vertex> = Vec::with_capacity(vertex_count as usize);
+        // Convert MC vertex data to ChunkVertex (position + color + uv) and build index buffer.
+        // MC 26.1.2 BLOCK format (28 bytes): Pos(12) + Color(4) + UV0(8) + UV2(4)
+        let mut vertices: Vec<ChunkVertex> = Vec::with_capacity(vertex_count as usize);
         let max_index = vertex_count;
 
         // Use u32 indices if vertex count exceeds u16 max
@@ -969,26 +1193,32 @@ impl WmRenderer {
 
         for v in 0..vertex_count {
             let base = (v as usize) * stride;
-            if base + 15 > data.len() { break; }
+            // Need at least 24 bytes: Pos(12) + Color(4) + UV(8)
+            if base + 24 > data.len() { break; }
 
             // Position: 3 f32 at offset 0 (section-relative, 0..16)
             let px = f32::from_le_bytes([data[base], data[base+1], data[base+2], data[base+3]]);
             let py = f32::from_le_bytes([data[base+4], data[base+5], data[base+6], data[base+7]]);
             let pz = f32::from_le_bytes([data[base+8], data[base+9], data[base+10], data[base+11]]);
 
-            // Color: 4 u8 (RGBA in memory) at offset 12 → float
+            // Color: 4 u8 (RGBA in memory) at offset 12 → float (used as lighting tint)
             let cr = data[base + 12] as f32 / 255.0;
             let cg = data[base + 13] as f32 / 255.0;
             let cb = data[base + 14] as f32 / 255.0;
+
+            // UV: 2 f32 at offset 16 (texture atlas coords)
+            let u = f32::from_le_bytes([data[base+16], data[base+17], data[base+18], data[base+19]]);
+            let v_uv = f32::from_le_bytes([data[base+20], data[base+21], data[base+22], data[base+23]]);
 
             // World position (section origin + local pos), then make camera-relative
             let wx = px + world_ox - cx;
             let wy = py + world_oy - cy;
             let wz = pz + world_oz - cz;
 
-            vertices.push(Vertex {
+            vertices.push(ChunkVertex {
                 position: [wx, wy, wz],
                 color: [cr, cg, cb],
+                uv: [u, v_uv],
             });
         }
 
@@ -996,12 +1226,28 @@ impl WmRenderer {
         static mut FIRST_UPLOAD: bool = true;
         if unsafe { FIRST_UPLOAD } {
             unsafe { FIRST_UPLOAD = false; }
-            log::info!("[dx12-wm] First chunk upload: section=({},{},{}) stride={} vcount={} len={} camera=({:.1},{:.1},{:.1})",
+            eprintln!("[dx12-wm] First chunk upload: section=({},{},{}) stride={} vcount={} len={} camera=({:.1},{:.1},{:.1})",
                 section_x, section_y, section_z, stride, vertex_count, data.len(), cx, cy, cz);
             for i in 0..vertices.len().min(4) {
                 let v = &vertices[i];
-                log::info!("[dx12-wm]   v[{}]: pos=({:.2},{:.2},{:.2}) color=({:.3},{:.3},{:.3})",
-                    i, v.position[0], v.position[1], v.position[2], v.color[0], v.color[1], v.color[2]);
+                eprintln!("[dx12-wm]   v[{}]: pos=({:.2},{:.2},{:.2}) color=({:.3},{:.3},{:.3}) uv=({:.4},{:.4})",
+                    i, v.position[0], v.position[1], v.position[2],
+                    v.color[0], v.color[1], v.color[2],
+                    v.uv[0], v.uv[1]);
+            }
+            // Dump atlas pixel at the first vertex's UV to verify texture data
+            if let Some(ref pixels) = self.atlas_pixels {
+                let u = vertices[0].uv[0].clamp(0.0, 1.0);
+                let v_uv = vertices[0].uv[1].clamp(0.0, 1.0);
+                let px = (u * self.atlas_width as f32) as usize;
+                let py = (v_uv * self.atlas_height as f32) as usize;
+                let offset = (py * self.atlas_width as usize + px) * 4;
+                if offset + 4 <= pixels.len() {
+                    let pr = pixels[offset]; let pg = pixels[offset+1];
+                    let pb = pixels[offset+2]; let pa = pixels[offset+3];
+                    eprintln!("[dx12-wm]   atlas pixel at uv=({:.4},{:.4}) → ({},{}) RGBA=({},{},{},{})",
+                        u, v_uv, px, py, pr, pg, pb, pa);
+                }
             }
         }
 
@@ -1020,7 +1266,7 @@ impl WmRenderer {
 
             let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Chunk VB"),
-                size: (std::mem::size_of::<Vertex>() * vertices.len()) as wgpu::BufferAddress,
+                size: (std::mem::size_of::<ChunkVertex>() * vertices.len()) as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::VERTEX,
                 mapped_at_creation: true,
             });
@@ -1062,7 +1308,7 @@ impl WmRenderer {
 
             let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Chunk VB"),
-                size: (std::mem::size_of::<Vertex>() * vertices.len()) as wgpu::BufferAddress,
+                size: (std::mem::size_of::<ChunkVertex>() * vertices.len()) as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::VERTEX,
                 mapped_at_creation: true,
             });
@@ -1116,8 +1362,20 @@ impl WmRenderer {
 
     /// Render all stored MC chunk meshes using the standard 3D pipeline.
     fn draw_chunks<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
-        rp.set_pipeline(&self.pipeline);
-        rp.set_bind_group(0, &self.bind_group, &[]);
+        // Require chunk pipeline (with atlas texture) to be ready.
+        // Don't fall back to main pipeline — vertex formats differ!
+        let Some(pipeline) = &self.chunk_pipeline else { return; };
+        let Some(bind_group) = &self.chunk_bind_group else { return; };
+
+        static mut CHUNK_DRAW_FIRST: bool = true;
+        if unsafe { CHUNK_DRAW_FIRST } {
+            unsafe { CHUNK_DRAW_FIRST = false; }
+            let total_meshes: usize = self.chunk_meshes.values().map(|v| v.len()).sum();
+            eprintln!("[dx12-wm] draw_chunks: {} sections, {} meshes total", self.chunk_meshes.len(), total_meshes);
+        }
+
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, bind_group, &[]);
 
         for (_key, meshes) in &self.chunk_meshes {
             for mesh in meshes {
@@ -1131,6 +1389,60 @@ impl WmRenderer {
                 rp.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }
+    }
+
+    /// Create or recreate the chunk render pipeline using the current surface format.
+    /// Called after atlas upload and after surface initialization to ensure
+    /// the color target format matches the swapchain.
+    fn ensure_chunk_pipeline(&mut self) {
+        if self.chunk_pipeline.is_some() { return; }
+
+        let Some(shader) = &self.chunk_shader else { return; };
+        let Some(bgl) = &self.chunk_bind_group_layout else { return; };
+
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Chunk Pipeline"),
+            layout: Some(&self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Chunk PL"),
+                bind_group_layouts: &[bgl],
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                buffers: &[ChunkVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.chunk_pipeline = Some(pipeline);
+        log::info!("[dx12-wm] Chunk pipeline created with format={:?}", self.surface_format);
+        eprintln!("[dx12-wm] Chunk pipeline created with format={:?}", self.surface_format);
     }
 
     // ── Surface mode: render directly to swapchain ────────────────

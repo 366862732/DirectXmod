@@ -71,6 +71,7 @@ public class D3D12Bridge {
     public static native String nativeGetStatus();
     public static native boolean nativeHasSurface();
     public static native boolean nativeHasChunkGeometry();
+    public static native void nativeUploadTerrainAtlas(java.nio.ByteBuffer buffer, int width, int height);
 
     // === Convenience methods ===
     private static boolean initialized = false;
@@ -258,6 +259,17 @@ public class D3D12Bridge {
             return nativeHasChunkGeometry();
         } catch (UnsatisfiedLinkError e) {
             return false;
+        }
+    }
+
+    /** Upload MC terrain atlas texture to D3D12 for chunk rendering.
+     *  Call after MC textures are fully loaded and the terrain atlas is stitched. */
+    public static void uploadTerrainAtlas(java.nio.ByteBuffer buffer, int width, int height) {
+        if (!initialized) return;
+        try {
+            nativeUploadTerrainAtlas(buffer, width, height);
+        } catch (UnsatisfiedLinkError e) {
+            Dx12Mod.LOGGER.warn("[dx12-wm] uploadTerrainAtlas failed: {}", e.toString());
         }
     }
 }

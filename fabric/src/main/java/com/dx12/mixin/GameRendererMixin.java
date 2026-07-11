@@ -22,15 +22,17 @@ public class GameRendererMixin {
     private static ByteBuffer frameCaptureBuffer;
 
     /**
-     * HEAD injection: if D3D12 has native chunk geometry, cancel GL world rendering.
-     * The chunks are rendered directly by D3D12; GL only needs to run for HUD/UI.
-     * Only cancel when surface mode AND chunk geometry are both active.
+     * HEAD injection: pass through always.
+     * We let GL render normally so UI/HUD overlay still works.
+     * GL world rendering is wasted work when chunks are active,
+     * but cancelling GameRenderer.render() entirely also kills
+     * the HUD overlay and pause menu rendering.
+     * TODO: inject into renderLevel() specifically for cleaner solution.
      */
     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
     private void onRenderHead(CallbackInfo ci) {
-        if (D3D12Bridge.hasSurface() && D3D12Bridge.hasChunkGeometry()) {
-            ci.cancel();
-        }
+        // Pass through — let GL render everything for UI/HUD compatibility.
+        // The D3D12 swapchain present in MinecraftMixin will override the visual output.
     }
 
     /**

@@ -227,6 +227,7 @@ dx12-lib-template-26.1.2/
 
 #### Fixed
 - Surface 模式下 D3D12 纹理格式不匹配导致的画面异常
+- GL 帧捕获从 MC 自定义 FBO 读取（而非 GL_BACK）导致的黑屏
 
 ---
 
@@ -463,10 +464,10 @@ copy rust\target\release\wgpu_mc_jni.dll ^
 进入游戏中，当 HWND 可用后会看到：
 
 ```
-[dx12-wm] Surface OK! HWND=0x123456 fmt=Bgra8UnormSrgb 1920x1080
+[dx12-wm] Surface OK! HWND=0x123456 fmt=Rgba8UnormSrgb 1920x1080
 ```
 
-此时渲染模式自动切换到 **Surface 模式**（world 中），MC 正常 GL 渲染 → 帧捕获 → D3D12 swapchain present。
+此时渲染模式自动切换到 **Surface 模式**（world 中）。当 chunk 几何上传后，D3D12 直接渲染 MC 场景；否则 GL 帧捕获 → D3D12 纹理呈现。
 
 ---
 
@@ -559,10 +560,12 @@ $env:RUST_LOG = "debug"
 - `nativeRenderFrame()` — 每帧渲染（Surface 模式直接 present，Offscreen 模式返回 byte[]）
 - `nativeUpdateCamera(float[])` — 传递 MC 相机 MVP 矩阵
 - `nativeUpdateCameraPos(x, y, z)` — 传递 MC 相机世界坐标
+- `nativeSetFramePixels(byte[], w, h)` — Surface 模式接收 GL 捕获的像素
+- `nativeUploadChunkMesh(sectionXYZ, buffer, verts, stride)` — 上传 MC 区块网格
 - `nativeHasSurface()` — 检测当前是否为 Surface 模式
+- `nativeHasChunkGeometry()` — 检测是否已上传 chunk 几何
 - `nativeIsReady()` — 返回 1/0/-1 状态码
 - `nativeGetStatus()` — 返回人类可读状态字符串
-- `nativeSetFramePixels(byte[], w, h)` — Surface 模式接收 GL 捕获的像素
 
 #### 运行独立测试程序
 
@@ -641,20 +644,22 @@ cargo run --example simple
 | 任务 | 状态 | 说明 |
 |------|------|------|
 | Surface 创建 | ✅ | `create_surface_from_hwnd()` 基于 raw-window-handle |
-| Swapchain 配置 | ✅ | `present_mode: Immediate` + `desired_maximum_frame_latency: 2` |
-| Surface 渲染 | ✅ | `render_surface()` 直接 present 到窗口 |
-| Surface 自适应 resize | ✅ | 窗口尺寸变化时 reconfigure |
+| Swapchain 配置 | ✅ | `present_mode: Immediate` + `desired_maximum_frame_latency: 1` |
+| Surface 渲染 | ✅ | `render_surface()` 智能三种渲染路径（chunk/GL帧/测试场景） |
+| Surface 自适应 resize | ✅ | 窗口尺寸变化时 lazy resize（不在 render() 中 reconfigure） |
 | Surface 错误恢复 | ✅ | Outdated/Lost 时自动 reconfigure |
 | 双模切换 | ✅ | `nativeSetWindow` 后自动切换到 Surface 模式 |
 | Triple-buffer 读回 | ✅ | Offscreen 模式三槽环形缓冲 + 异步 map_async |
 | **Mixin 框架** | ✅ | 3 个 Mixin 解决 TDR 问题 |
 | GLFW 上下文分离 | ✅ | `glfwMakeContextCurrent(0)` 临时分离 GL 上下文 |
-| GL 帧捕获 | ✅ | GameRendererMixin TAIL `glReadPixels` → D3D12 纹理 |
+| GL 帧捕获 | ✅ | GameRendererMixin TAIL `glReadPixels`（FBO-aware） |
 | GL swap 取消 | ✅ | GlDeviceMixin 取消 buffer swap |
+| **Chunk 几何上传** | ✅ | `nativeUploadChunkMesh()` — MC GL_QUADS → D3D12 TriangleList |
+| **Shader camera_pos** | ✅ | 几何体跟随玩家世界坐标偏移 |
 
 ### 阶段 5：VulkanMod 级全接管 🚧 进行中
 
-当前 Surface 模式已实现 MC 原生 GL 渲染 → 帧捕获 → D3D12 swapchain present。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
+当前 Surface 模式已实现智能渲染：chunk 就绪时 D3D12 直接渲染 MC 场景，否则 GL 帧捕获 → D3D12 swapchain present。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|

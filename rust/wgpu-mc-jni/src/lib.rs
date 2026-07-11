@@ -116,6 +116,38 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadChunkMesh(
     }
 }
 
+/// Upload the MC terrain atlas texture for chunk rendering.
+/// `data` is RGBA8 pixel data, width and height are atlas dimensions.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadTerrainAtlas(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer: jni::objects::JObject,
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+) {
+    if width <= 0 || height <= 0 { return; }
+
+    let byte_buf = jni::objects::JByteBuffer::from(buffer);
+    let data = match _env.get_direct_buffer_address(&byte_buf) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            eprintln!("[dx12-wm] uploadTerrainAtlas FAILED: buffer is not direct");
+            return;
+        }
+    };
+    let len = (width * height * 4) as usize;
+    let slice = std::slice::from_raw_parts(data, len);
+
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.upload_terrain_atlas(slice, width as u32, height as u32);
+    }
+}
+
 /// Check if the wgpu renderer is ready for rendering.
 /// Returns 1 if ready, 0 if still initializing, -1 if failed.
 ///
