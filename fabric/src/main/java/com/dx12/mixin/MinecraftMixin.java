@@ -26,22 +26,33 @@ import net.minecraft.client.Minecraft;
 public class MinecraftMixin {
     @Inject(method = "runTick", at = @At("TAIL"))
     private void onRunTickTail(CallbackInfo ci) {
-        if (D3D12Bridge.hasSurface()) {
-            Minecraft mc = Minecraft.getInstance();
-            if (mc.level != null && mc.player != null) {
-                // Temporarily detach GL context to avoid DXGI ↔ WGL HWND contention.
-                // D3D12's Present() needs exclusive HWND access via DXGI.
-                long glfwWindow = mc.getWindow().getWindow();
-                GLFW.glfwMakeContextCurrent(0);
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level != null && mc.player != null) {
+            // Temporarily detach GL context to avoid DXGI ↔ WGL HWND contention.
+            // D3D12's Present() and surface creation (surface.configure)
+            // both need exclusive HWND access via DXGI.
+            // Use glfwGetCurrentContext() instead of mc.getWindow().getWindow()
+            // because MC 26.1.2's Window class does not expose getWindow().
+            long glfwWindow = GLFW.glfwGetCurrentContext();
+            if (glfwWindow == 0) return;
+            GLFW.glfwMakeContextCurrent(0);
 
-                try {
+            try {
+                // Init D3D12 surface if needed (must be done without GL context bound)
+                long hwnd = D3D12Bridge.getWindowHandle();
+                if (hwnd != 0) {
+                    D3D12Bridge.setWindow(hwnd);
+                }
+
+                // Render frame via D3D12 swapchain (only if surface is active)
+                if (D3D12Bridge.hasSurface()) {
                     // Camera was updated in ClientTickEvents.END_CLIENT_TICK.
                     // renderFrame() dispatches to render_surface() → get_current_texture() → render → Present()
                     D3D12Bridge.renderFrame();
-                } finally {
-                    // Reattach GL context for the next tick's operations.
-                    GLFW.glfwMakeContextCurrent(glfwWindow);
                 }
+            } finally {
+                // Reattach GL context for the next tick's operations.
+                GLFW.glfwMakeContextCurrent(glfwWindow);
             }
         }
     }

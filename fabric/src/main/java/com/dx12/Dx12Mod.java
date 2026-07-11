@@ -92,7 +92,6 @@ public class Dx12Mod implements ClientModInitializer {
     private static ByteBuffer pendingPixels = null;
     private static long lastRenderTime = 0;
     private static long renderStartTime = 0;
-    private static long lastHwnd = 0;
 
     // Persistent shading resources (reused across frames)
     private static int vaoId = 0;
@@ -219,16 +218,8 @@ public class Dx12Mod implements ClientModInitializer {
                 return;
             }
 
-            // Notify Rust of HWND change + sync size
+            // Sync window size to Rust (safe, no GL/HWND access)
             try {
-            long hwnd = D3D12Bridge.getWindowHandle();
-            // Only create D3D12 surface when in-world (avoid driver contention at title screen)
-            if (inWorld && hwnd != 0 && hwnd != lastHwnd) {
-                LOGGER.info("HWND update: 0x{} (size={}x{})",
-                    Long.toHexString(hwnd), width, height);
-                D3D12Bridge.setWindow(hwnd);
-                lastHwnd = hwnd;
-            }
             D3D12Bridge.syncWindowSize(width, height);
 
             // Poll renderer init status, log state transitions
