@@ -286,24 +286,39 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCameraPos(
 /// This function is called from Java via JNI. The ByteBuffer must be a direct buffer.
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetFramePixels(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
     buffer: jni::objects::JObject,  // ByteBuffer as JObject
     width: jni::sys::jint,
     height: jni::sys::jint,
 ) {
+    static mut FIRST_CALL: bool = true;
     if width <= 0 || height <= 0 { return; }
+
     // Wrap as JByteBuffer to access direct buffer address
     let byte_buf = jni::objects::JByteBuffer::from(buffer);
-    let data = match env.get_direct_buffer_address(&byte_buf) {
+    let data = match _env.get_direct_buffer_address(&byte_buf) {
         Ok(ptr) => ptr,
         Err(_) => {
+            eprintln!("[dx12-wm] nativeSetFramePixels FAILED: buffer is not direct");
             log::warn!("[dx12-wm] Frame pixel buffer is not direct");
             return;
         }
     };
     let len = (width * height * 4) as usize;
     let slice = std::slice::from_raw_parts(data, len);
+
+    // One-time diagnostic on first call
+    if FIRST_CALL {
+        FIRST_CALL = false;
+        if len >= 8 {
+            let r0 = slice[0]; let g0 = slice[1]; let b0 = slice[2]; let a0 = slice[3];
+            let r1 = slice[len-4]; let g1 = slice[len-3]; let b1 = slice[len-2]; let a1 = slice[len-1];
+            eprintln!("[dx12-wm] First pixel RGBA=({},{},{},{})  Last pixel RGBA=({},{},{},{})",
+                r0, g0, b0, a0, r1, g1, b1, a1);
+        }
+    }
+
     let mut guard = lock_or_poisoned();
     if let Some(Ok(ref mut renderer)) = guard.as_mut() {
         renderer.set_frame_pixels(slice, width as u32, height as u32);

@@ -33,20 +33,20 @@
 
 ### 核心设计原则
 
-- **Mixin 拦截渲染管线** — 通过 3 个 Mixin 精确控制 GL/D3D12 共存时机，解决 TDR 问题
+- **Mixin 捕获 GL 帧** — Surface 模式下让 MC 正常 GL 渲染，捕获 framebuffer 后传给 D3D12 swapchain 呈现
 - **不创建额外窗口**（直接使用 Minecraft 窗口 HWND）
 - **版本通用**（1.21.1 ~ 1.21.11 + 26.x，不依赖 Yarn 映射）
-- **双模渲染**：Surface 模式（DX12 直接呈现）+ Offscreen 模式（像素读回 + PBO 上传）
+- **双模渲染**：Surface 模式（GL 帧捕获 + DX12 swapchain 呈现）+ Offscreen 模式（像素读回 + PBO 上传）
 
 ### 为什么重构为 Rust + wgpu？
 
 | 旧方案 (C++/D3D12) | 新方案 (Rust/wgpu) |
 |---------------------|---------------------|
 | 手动管理 D3D12 资源 | wgpu 自动资源管理 |
-| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | Mixin 精确控制 GL/D3D12 共存时机 |
+| OpenGL + D3D12 共享 HWND 导致 GPU 设备移除 | GL 帧捕获 + D3D12 swapchain 呈现 |
 | 内存安全依赖开发者 | Rust 编译器保证内存安全 |
 | 复杂的 C++ 构建配置 | Cargo 依赖管理 |
-| TDR 崩溃频发 | GLFW 上下文分离 + Mixin 取消 GL 渲染 |
+| TDR 崩溃频发 | GLFW 上下文分离 + GL 帧捕获 |
 
 ### 核心优势
 
@@ -59,15 +59,15 @@
 
 | 模式 | 渲染路径 | 适用场景 |
 |------|----------|----------|
-| **Surface 模式** | DX12 swapchain 直接呈现到窗口 | World 中，GL 渲染被 Mixin 取消 |
-| **Offscreen 模式** | 离屏纹理 → staging buffer → PBO → OpenGL 全屏 quad | Title screen / 初始化阶段 |
+| **Surface 模式** | MC GL 渲染 → `glReadPixels` → D3D12 纹理 → swapchain present | World 中，MC 正常 GL 渲染 |
+| **Offscreen 模式** | Rust wgpu 渲染 → staging buffer → PBO → OpenGL 全屏 quad | Title screen / 初始化阶段 |
 
 ### TDR 问题解决原理
 
 Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱动 TDR 超时。解决方案通过 3 个 Mixin 协同工作：
 
-1. **GameRendererMixin** — HEAD 注入取消 MC OpenGL 渲染，TAIL 注入在 offscreen 模式下上传 PBO
-2. **MinecraftMixin** — TAIL 注入时 `glfwMakeContextCurrent(0)` 临时分离 GL 上下文，调用 D3D12 Present() 后恢复
+1. **GameRendererMixin** — HEAD 注入让 MC 正常 GL 渲染，TAIL 注入捕获 framebuffer → 传给 D3D12 纹理
+2. **MinecraftMixin** — `render()` HEAD 时 `glfwMakeContextCurrent(0)` 分离 GL 上下文，调用 D3D12 Present() 后恢复
 3. **GlDeviceMixin** — 取消 `GlDevice.presentFrame()` 的 GL buffer swap，让 D3D12 Present() 成为唯一呈现
 
 ---
@@ -85,12 +85,12 @@ Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱�
 │  │  │  + 相机 MVP 矩阵提取 → nativeUpdateCamera()      │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │         Mixin: GameRenderer.render() TAIL        │  │  │
+│  │  │         Mixin: GameRenderer.render() HEAD/TAIL   │  │  │
+│  │  │  Surface 模式: MC 正常 GL 渲染 → 捕获 framebuffer │  │  │
 │  │  │  Offscreen 模式: PBO 纹理上传 + 全屏 quad        │  │  │
-│  │  │  Surface 模式: 跳过 GL 绘制                      │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │         Mixin: Minecraft.runTick() TAIL          │  │  │
+│  │  │         Mixin: Minecraft.runTick() HEAD          │  │  │
 │  │  │  glfwMakeContextCurrent(0) → D3D12 Present()     │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -102,9 +102,9 @@ Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱�
 │  │                       Offscreen 模式返回 byte[]         │  │
 │  │  nativeResize(width, height) → 更新窗口尺寸            │  │
 │  │  nativeUpdateCamera(float[16]) → 同步相机 MVP 矩阵     │  │
+│  │  nativeSetFramePixels(byte[], w, h) → Surface 模式接收 │  │
+│  │                       GL 捕获的 framebuffer 像素       │  │
 │  │  nativeHasSurface() → 返回当前是否为 Surface 模式      │  │
-│  │  nativeIsReady() → 返回 1/0/-1 状态码                 │  │
-│  │  nativeGetStatus() → 返回人类可读状态字符串            │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕                                  │
 │  ┌───────────────────────────────────────────────────────┐  │
@@ -129,8 +129,8 @@ dx12-lib-template-26.1.2/
 │   │   ├── Dx12Mod.java            # 模组入口，注册事件回调
 │   │   ├── D3D12Bridge.java        # JNI 桥接层
 │   │   └── mixin/                  # Mixin 渲染管线控制
-│   │       ├── GameRendererMixin.java   # 取消 GL 渲染 / PBO 上传
-│   │       ├── MinecraftMixin.java      # GL 上下文分离 + D3D12 Present
+│   │       ├── GameRendererMixin.java   # GL 帧捕获 / Offscreen PBO 上传
+│   │       ├── MinecraftMixin.java      # GLFW 上下文分离 + D3D12 Present
 │   │       └── GlDeviceMixin.java       # 取消 GL buffer swap
 │   ├── src/main/resources/
 │   │   ├── fabric.mod.json         # Fabric 模组描述
@@ -158,8 +158,8 @@ dx12-lib-template-26.1.2/
 | **第一阶段：JNI 通信链路** | ✅ 已完成 | Java ↔ Rust 双向通信正常 |
 | **第二阶段：wgpu 渲染引擎骨架** | ✅ 已完成 | DX12 adapter + 3D 几何管线 + 双模渲染 |
 | **第三阶段：Fabric 事件系统集成** | ✅ 已完成 | ClientTickEvents + PBO 纹理上传 |
-| **第四阶段：Surface 模式（DX12 直接呈现）** | ✅ 已完成 | Mixin 解决 TDR，Surface 模式在 world 中正常工作 |
-| **第五阶段：VulkanMod 级全接管** | 🚧 进行中 | 已实现 Surface 模式零读回呈现，待接入真实游戏场景 |
+| **第四阶段：Surface 模式（GL 帧捕获 + DX12 呈现）** | ✅ 已完成 | MC 正常 GL 渲染 → 捕获 → D3D12 swapchain present |
+| **第五阶段：VulkanMod 级全接管** | 🚧 进行中 | Surface 模式已工作，待接入真实游戏场景 |
 
 ### 已完成功能
 
@@ -167,14 +167,15 @@ dx12-lib-template-26.1.2/
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
 | **Mixin 框架** | 3 个 Mixin 精确控制 GL/D3D12 共存：GameRendererMixin, MinecraftMixin, GlDeviceMixin |
-| **JNI 桥接层** | 10 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeHasSurface`, `nativeIsReady`, `nativeGetStatus` |
+| **JNI 桥接层** | 10 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeHasSurface`, `nativeIsReady`, `nativeGetStatus`, `nativeSetFramePixels` |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 26.1.2，Fabric API 0.154.2 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
 | **日志系统** | Rust `env_logger` + Java SLF4J 双端日志 |
-| **Surface 模式** | DX12 swapchain 直接呈现到 MC 窗口，零读回、零 PBO（world 中） |
+| **Surface 模式** | MC 正常 GL 渲染 → `glReadPixels` → D3D12 纹理 → swapchain present，零读回延迟 |
 | **Offscreen 模式** | Triple-buffer 异步读回 + PBO 纹理上传（title screen / 初始化阶段） |
 | **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步（带 LERP 平滑） |
+| **相机位置传递** | Java 提取 MC 玩家世界坐标 → `nativeUpdateCameraPos()` → Rust 偏移测试几何体 |
 | **3D 几何管线** | WGSL 着色器 + 共享索引缓冲 + 深度测试 + 背面剔除 |
 | **地面平面网格** | 200x200 绿色平面（y=0） |
 | **彩色立方体网格** | 5 个立方体，每个独立 VB（预烘焙偏移），共享 IB |
@@ -188,23 +189,42 @@ dx12-lib-template-26.1.2/
 ### 验收结果
 
 - 模组加载成功，无 crash
-- **Surface 模式**：DX12 swapchain 直接呈现 3D 场景（绿色地面 + 5 个橙色立方体），零读回，全速渲染
+- **Surface 模式**：MC 正常 GL 渲染 → `glReadPixels` 捕获 → D3D12 swapchain present，零读回延迟
 - **Offscreen 模式**：PBO 纹理上传 + OpenGL 全屏 quad 覆盖（title screen 阶段）
 - 相机视角随 MC 移动实时更新（MVP 矩阵 + LERP 平滑）
 - 进游戏、按 Esc、调设置均无 JVM 崩溃
-- TDR 问题已解决：GL 上下文分离 + Mixin 取消 GL 渲染
+- TDR 问题已解决：GL 上下文分离 + Mixin 取消 GL swap
 
 ---
 
 ## 变更日志
 
-### [1.4.0] - 2026-07-08
+### [1.5.0] - 2026-07-08
 
 > **注意：此版本为开发预览版，尚未生成 `.jar` 发布文件。** 需手动构建 Fabric 模组（`gradlew build`）方可运行。
 
 #### Added
+- **Surface 模式 GL 帧捕获**：GameRendererMixin TAIL 注入 `glReadPixels` 捕获 MC 渲染的 framebuffer，通过 `nativeSetFramePixels()` 传给 D3D12 纹理呈现
+- **相机世界位置传递**：`nativeUpdateCameraPos(x, y, z)` — Java 提取玩家眼睛坐标，Rust 偏移测试几何体靠近玩家
+- **`captureFramebufferForD3D12()`** — 从 GL_BACK 读取 framebuffer → D3D12 纹理 → swapchain present
+
+#### Changed
+- **Surface 模式从"Rust 渲染"改为"GL 帧捕获"**：不再渲染 Rust 测试场景，而是捕获 MC 原生 OpenGL 渲染结果
+- **MinecraftMixin 从 TAIL 改为 render() HEAD**：GL 上下文分离时机调整到 GameRenderer.render() 之前
+- **Dx12Mod 大幅简化**：移除 `onPostRender()` 中的 GL 状态管理、Shader、VAO 等全部代码，改为 Offscreen 模式专用的 PBO 上传
+- **GameRendererMixin 完全反转**：从"取消 GL 渲染"变为"让 GL 正常渲染 + 捕获 framebuffer"
+- **纹理格式从 `Rgba8UnormSrgb` 改为 `Bgra8UnormSrgb`**
+
+#### Fixed
+- Surface 模式下 D3D12 纹理格式不匹配导致的画面异常
+
+---
+
+### [1.4.0] - 2026-07-08
+
+#### Added
 - **Mixin 框架（3 个 Mixin）**：精确控制 GL/D3D12 共存，解决 TDR 问题
-  - `GameRendererMixin` — HEAD 取消 MC OpenGL 渲染，TAIL 在 offscreen 模式下上传 PBO
+  - `GameRendererMixin` — HEAD 取消 MC OpenGL 渲染（TAIL 在 offscreen 模式下上传 PBO）
   - `MinecraftMixin` — TAIL 注入时分离 GL 上下文 (`glfwMakeContextCurrent(0)`)，调用 D3D12 Present() 后恢复
   - `GlDeviceMixin` — 取消 `GlDevice.presentFrame()` 的 GL buffer swap
 - **Surface 模式恢复**：world 中 DX12 swapchain 直接呈现，零读回、零 PBO
@@ -436,7 +456,7 @@ copy rust\target\release\wgpu_mc_jni.dll ^
 [dx12-wm] Surface OK! HWND=0x123456 fmt=Bgra8UnormSrgb 1920x1080
 ```
 
-此时渲染模式自动切换到 **Surface 模式**（world 中），DX12 直接呈现到窗口。
+此时渲染模式自动切换到 **Surface 模式**（world 中），MC 正常 GL 渲染 → 帧捕获 → D3D12 swapchain present。
 
 ---
 
@@ -496,7 +516,7 @@ java -jar minecraft.jar
 2. 将 JAR 和 DLL 部署到 Minecraft 目录
 3. 启动 Minecraft 26.1.2-Fabric_0.19.3
 4. 观察控制台日志确认模组加载成功
-5. 进入游戏验证 — 当前会显示 3D 场景覆盖层（绿色地面 + 5 个橙色立方体，相机随 MC 移动）
+5. 进入游戏验证 — Surface 模式下 MC 正常 GL 渲染，D3D12 swapchain 呈现
 
 ### 调试技巧
 
@@ -528,9 +548,11 @@ $env:RUST_LOG = "debug"
 - `nativeSetWindow(hwnd)` — 传递 MC 窗口句柄，创建 DX12 swapchain
 - `nativeRenderFrame()` — 每帧渲染（Surface 模式直接 present，Offscreen 模式返回 byte[]）
 - `nativeUpdateCamera(float[])` — 传递 MC 相机 MVP 矩阵
+- `nativeUpdateCameraPos(x, y, z)` — 传递 MC 相机世界坐标
 - `nativeHasSurface()` — 检测当前是否为 Surface 模式
 - `nativeIsReady()` — 返回 1/0/-1 状态码
 - `nativeGetStatus()` — 返回人类可读状态字符串
+- `nativeSetFramePixels(byte[], w, h)` — Surface 模式接收 GL 捕获的像素
 
 #### 运行独立测试程序
 
@@ -564,7 +586,7 @@ cargo run --example simple
 | 资源重载后渲染 crash | GL 状态未清理 | 重载检测时重置 `vaoId`/`shaderValid`/`texAllocated`/`pendingPixels` | ✅ 已修复 |
 | 调试日志导致卡顿 | 每 tick 写磁盘 | 移除所有 `C:\tmp\` 文件日志 | ✅ 已修复 |
 | `setWindow` 重复调用 | JNI 开销 | `lastSetHwnd` 缓存 | ✅ 已修复 |
-| **GPU TDR 超时（~2s 后崩溃）** | GL + D3D12 同窗口共存导致 WDDM 驱动级冲突 | **3 个 Mixin**：取消 GL 渲染 + GLFW 上下文分离 + 取消 GL swap | ✅ 已修复 |
+| **GPU TDR 超时（~2s 后崩溃）** | GL + D3D12 同窗口共存导致 WDDM 驱动级冲突 | **3 个 Mixin**：取消 GL swap + GLFW 上下文分离 | ✅ 已修复 |
 
 ---
 
@@ -593,6 +615,7 @@ cargo run --example simple
 | 独立测试程序 | ✅ | `examples/simple.rs` 可独立运行渲染三角形 |
 | 窗口尺寸同步 | ✅ | `nativeResize()` 更新渲染器尺寸 |
 | 相机 MVP 同步 | ✅ | Java → Rust 实时传递 MC 相机视角（带 LERP 平滑） |
+| 相机位置同步 | ✅ | Java → Rust 实时传递 MC 玩家世界坐标 |
 
 ### 阶段 3：Fabric 事件系统集成 ✅ 已完成
 
@@ -603,7 +626,7 @@ cargo run --example simple
 | GL 状态管理 | ✅ | 完整的保存/恢复机制 |
 | VAO/Shader 持久化 | ✅ | 首次创建，丢失后自动重建 |
 
-### 阶段 4：Surface 模式（DX12 直接呈现）✅ 已完成
+### 阶段 4：Surface 模式（GL 帧捕获 + DX12 呈现）✅ 已完成
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
@@ -616,12 +639,12 @@ cargo run --example simple
 | Triple-buffer 读回 | ✅ | Offscreen 模式三槽环形缓冲 + 异步 map_async |
 | **Mixin 框架** | ✅ | 3 个 Mixin 解决 TDR 问题 |
 | GLFW 上下文分离 | ✅ | `glfwMakeContextCurrent(0)` 临时分离 GL 上下文 |
-| GL 渲染取消 | ✅ | GameRendererMixin HEAD 取消 MC OpenGL 渲染 |
+| GL 帧捕获 | ✅ | GameRendererMixin TAIL `glReadPixels` → D3D12 纹理 |
 | GL swap 取消 | ✅ | GlDeviceMixin 取消 buffer swap |
 
 ### 阶段 5：VulkanMod 级全接管 🚧 进行中
 
-当前已实现 Surface 模式（DX12 直接呈现 3D 场景），相机视角随 MC 移动实时更新。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
+当前 Surface 模式已实现 MC 原生 GL 渲染 → 帧捕获 → D3D12 swapchain present。要实现真实 Minecraft 场景渲染（类似 VulkanMod），需要：
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|

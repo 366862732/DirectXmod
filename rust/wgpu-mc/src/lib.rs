@@ -600,8 +600,8 @@ impl WmRenderer {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -803,11 +803,20 @@ impl WmRenderer {
         if width == 0 || height == 0 { return; }
         let size = (width * height * 4) as usize;
 
+        // D3D12 requires bytes_per_row to be a multiple of 256.
+        // glReadPixels returns tightly-packed rows, so we must repack.
+        const ROW_ALIGN: u32 = 256;
+        let src_row_bytes = width * 4;
+        let dst_row_bytes = ((src_row_bytes + ROW_ALIGN - 1) / ROW_ALIGN) * ROW_ALIGN;
+        let padded_size = (dst_row_bytes * height) as usize;
+
         // Recreate texture if dimensions changed
         let need_new = self.frame_texture.as_ref().map_or(true, |_t| {
             self.frame_width != width || self.frame_height != height
         });
         if need_new {
+            log::info!("[dx12-wm] Creating new frame texture {}x{} (row {}→{} padded)",
+                width, height, src_row_bytes, dst_row_bytes);
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Frame Texture"),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -837,26 +846,58 @@ impl WmRenderer {
             self.tex_bind_group = Some(bind_group);
             self.frame_width = width;
             self.frame_height = height;
+            log::info!("[dx12-wm] Frame texture + bind_group created OK");
         }
 
-        // Upload pixel data to the texture
+        // Upload pixel data with D3D12-aligned row pitch (pad if needed)
         if let Some(ref tex) = self.frame_texture {
             let effective_len = data.len().min(size);
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &data[..effective_len],
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            );
+            if dst_row_bytes == src_row_bytes {
+                // Tightly packed — direct upload
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data[..effective_len],
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(src_row_bytes),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+            } else {
+                // Repack: copy each row from tightly-packed source to padded destination
+                let mut padded = vec![0u8; padded_size];
+                let src = &data[..effective_len];
+                for row in 0..height as usize {
+                    let src_start = row * src_row_bytes as usize;
+                    let dst_start = row * dst_row_bytes as usize;
+                    let row_len = src_row_bytes as usize;
+                    if src_start + row_len <= src.len() && dst_start + row_len <= padded.len() {
+                        padded[dst_start..dst_start + row_len]
+                            .copy_from_slice(&src[src_start..src_start + row_len]);
+                    }
+                }
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &padded,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(dst_row_bytes),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+            }
         }
     }
 

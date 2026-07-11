@@ -59,14 +59,47 @@ public class GameRendererMixin {
         if (frameCaptureBuffer == null || frameCaptureBuffer.capacity() < size) {
             frameCaptureBuffer = BufferUtils.createByteBuffer(size);
         }
-        frameCaptureBuffer.clear();
 
-        // MC renders to custom FBOs; the back buffer may not be the read target.
-        // Bind default framebuffer (0) for reading, then read from GL_BACK.
-        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0);
-        GL11.glReadBuffer(GL11.GL_BACK);
+        // IMPORTANT: glReadPixels writes to native memory but does NOT update
+        // the Java ByteBuffer's position. Do NOT use clear()/flip() here.
+        // Instead, manually set position to 0 before the read and set limit
+        // to the amount of data written after.
+        frameCaptureBuffer.position(0);
+        // Ensure limit is large enough for the read
+        if (frameCaptureBuffer.limit() < size) {
+            frameCaptureBuffer.limit(size);
+        }
+
+        // Save current GL read/draw FBO state
+        int oldReadFbo = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int oldDrawFbo = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+
+        // Read from whichever framebuffer MC is currently drawing to.
+        // MC 26.1.2 uses custom FBOs for world rendering; GL_BACK may be empty.
+        if (oldDrawFbo != 0 && !firstCaptureLogged) {
+            com.dx12.Dx12Mod.LOGGER.info(
+                "[dx12-wm] Reading from draw FBO {} (not GL_BACK)", oldDrawFbo);
+        }
+
+        if (oldDrawFbo != 0) {
+            // MC renders to a custom FBO — read from its color attachment 0
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, oldDrawFbo);
+            GL11.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);
+        } else {
+            // Default framebuffer — read from GL_BACK
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0);
+            GL11.glReadBuffer(GL11.GL_BACK);
+        }
+
         GL11.glReadPixels(0, 0, w, h, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, frameCaptureBuffer);
-        frameCaptureBuffer.flip();
+
+        // Restore previous GL state
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, oldReadFbo);
+
+        // glReadPixels wrote w*h*4 bytes starting at position 0.
+        // Set limit to mark the written region as readable.
+        frameCaptureBuffer.position(0);
+        frameCaptureBuffer.limit(size);
 
         // One-time diagnostic
         if (!firstCaptureLogged) {
@@ -76,7 +109,7 @@ public class GameRendererMixin {
             int b = frameCaptureBuffer.get(2) & 0xFF;
             int a = frameCaptureBuffer.get(3) & 0xFF;
             com.dx12.Dx12Mod.LOGGER.info(
-                "First GL capture: {}x{}, first pixel RGBA=({},{},{},{})",
+                "[dx12-wm] First GL capture: {}x{}, first pixel RGBA=({},{},{},{})",
                 w, h, r, g, b, a);
         }
 
