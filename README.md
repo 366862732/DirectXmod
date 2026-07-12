@@ -106,6 +106,7 @@ Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱�
 │  │  nativeSetFramePixels(byte[], w, h) → Surface 模式接收 │  │
 │  │                       GL 捕获的 framebuffer 像素       │  │
 │  │  nativeUploadChunkMesh(sectionXYZ, buffer, verts, stride) → 上传 MC 区块网格 │  │
+│  │  nativeUploadTerrainAtlas(buffer, w, h) → 上传 terrain 纹理图集 + mip chain  │  │
 │  │  nativeHasChunkGeometry() → 返回当前是否已上传区块网格 |  │
 │  └───────────────────────────────────────────────────────┘  │
 │                           ↕                                  │
@@ -114,6 +115,7 @@ Surface 模式的核心挑战：GL + D3D12 同窗口共存会导致 NVIDIA 驱�
 │  │  wgpu::Instance(DX12) → Adapter → Device + Queue       │  │
 │  │  render_frame() → 3D 场景渲染（地面 + 立方体 + 深度）  │  │
 │  │  WGSL shader + camera_pos + 共享 IB + 深度测试        │  │
+│  │  CHUNK_SHADER_SRC: chunk 渲染 + texture atlas UV       │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
 │  │  │ ✅ Surface 模式: chunk→直接渲染 / 无chunk→GL帧捕获 │  │  │
 │  │  │ ✅ Offscreen 模式: triple-buffer 异步读回        │  │  │
@@ -145,7 +147,7 @@ dx12-lib-template-26.1.2/
 │   │   ├── src/lib.rs              # WmRenderer + Surface/Offscreen 双模
 │   │   └── Cargo.toml              # wgpu 23, futures, bytemuck
 │   └── wgpu-mc-jni/                # JNI 桥接层
-│       ├── src/lib.rs              # 12 个 native 方法
+│       ├── src/lib.rs              # 13 个 native 方法
 │       └── Cargo.toml              # jni 0.21, log, env_logger
 ```
 
@@ -169,7 +171,7 @@ dx12-lib-template-26.1.2/
 |------|------|
 | **Rust Workspace** | `wgpu-mc` (渲染引擎) + `wgpu-mc-jni` (JNI 桥接) 双 crate 结构 |
 | **Mixin 框架** | 3 个 Mixin 精确控制 GL/D3D12 共存：GameRendererMixin, MinecraftMixin, GlDeviceMixin |
-| **JNI 桥接层** | 12 个 native 方法：`nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeUpdateCameraPos`, `nativeSetFramePixels`, `nativeUploadChunkMesh`, `nativeHasSurface`, `nativeHasChunkGeometry`, `nativeIsReady`, `nativeGetStatus` |
+| **JNI 桥接层** | 14 个 native 方法完整实现（含 `nativeInit`, `nativeHello`, `nativeTestDeviceInfo`, `nativeRenderFrame`, `nativeSetWindow`, `nativeResize`, `nativeUpdateCamera`, `nativeUpdateCameraPos`, `nativeSetFramePixels`, `nativeUploadChunkMesh`, `nativeHasSurface`, `nativeHasChunkGeometry`, `nativeUploadTerrainAtlas`, `nativeIsReady`, `nativeGetStatus`） |
 | **Java Fabric 模组** | 基于 Fabric Loom 1.10.3，MC 26.1.2，Fabric API 0.154.2 |
 | **DLL 自动加载** | 从 JAR 提取到 `{user.dir}/dx12mod/wgpu_mc_jni.dll`，支持版本隔离 |
 | **GPU 适配器检测** | 通过 wgpu 创建 DX12 后端实例并检测适配器可用性 |
@@ -177,9 +179,13 @@ dx12-lib-template-26.1.2/
 | **Surface 模式** | 智能渲染：chunk 就绪 → D3D12 直接渲染 MC 场景 / chunk 未就绪 → GL 帧捕获 → D3D12 纹理 present | World 中，MC 正常 GL 渲染或 D3D12 直接渲染 |
 | **Offscreen 模式** | Triple-buffer 异步读回 + PBO 纹理上传（title screen / 初始化阶段） |
 | **Chunk 几何上传** | Java → Rust 区块网格数据（vertex + index），D3D12 直接渲染 MC 场景 |
+| **Terrain 纹理图集上传** | Java → Rust terrain atlas 像素数据，CPU 生成 mip chain，GPU 采样 |
+| **Chunk 渲染管线** | 专用 `CHUNK_SHADER_SRC` WGSL shader：texture atlas UV 采样 + vertex color 光照 tint |
+| **ChunkVertex** | 32 字节顶点格式（位置 xyz + 颜色 rgba + UV xy），支持纹理图集采样 |
 | **相机位置传递** | Java 提取 MC 玩家世界坐标 → `nativeUpdateCameraPos()` → Rust 偏移测试几何体 |
 | **相机 MVP 传递** | Java 提取 MC 相机视角 → `nativeUpdateCamera(float[])` → Rust 实时同步（带 LERP 平滑） |
 | **3D 几何管线** | WGSL 着色器 + camera_pos + 共享索引缓冲 + 深度测试 + 背面剔除 |
+| **Chunk 渲染管线** | 专用 chunk shader：texture atlas UV 采样 + vertex color 光照 tint + 深度测试 |
 | **地面平面网格** | 200x200 绿色平面（y=0） |
 | **彩色立方体网格** | 5 个立方体，每个独立 VB（预烘焙偏移），共享 IB |
 | **深度缓冲区** | `Depth32Float` 格式，支持正确遮挡关系 |

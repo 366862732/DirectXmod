@@ -205,48 +205,81 @@ public class TextureAtlasMixin {
                 }
             }
 
-            // DIAGNOSTIC: compare Preparations vs texturesByName positions for first 5 sprites
-            int cmpCount = 0;
+            // DIAGNOSTIC: find which sprite covers the chunk UV pixel (16, 1232)
+            // This is where the first chunk vertex UV (0.0078, 0.6016) points in a 2048x2048 atlas
+            int chunkUvPx = 16, chunkUvPy = 1232;
+            Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_SEARCH: searching for sprites covering pixel ({},{})", chunkUvPx, chunkUvPy);
+            boolean chunkUvFound = false;
             for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
-                if (cmpCount >= 5) break;
+                TextureAtlasSprite ds = de.getValue();
+                PixelData dpd = cache.get(de.getKey());
+                if (dpd == null) continue;
+                int dsx = ds.getX(), dsy = ds.getY(), dsw = dpd.w, dsh = dpd.h;
+                if (chunkUvPx >= dsx && chunkUvPx < dsx + dsw && chunkUvPy >= dsy && chunkUvPy < dsy + dsh) {
+                    int off = (chunkUvPy * w + chunkUvPx) * 4;
+                    int a = off + 3 < atlas.capacity() ? atlas.get(off+3) & 0xFF : -1;
+                    Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_FOUND in texturesByName: {} at ({}-{},{}-{}) atlasAlpha={}",
+                        de.getKey(), dsx, dsx + dsw, dsy, dsy + dsh, a);
+                    chunkUvFound = true;
+                    break;
+                }
+            }
+            if (!chunkUvFound) {
+                Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_NOT_FOUND in texturesByName for pixel ({},{})", chunkUvPx, chunkUvPy);
+                // Now search Preparations cache instead
+                for (Map.Entry<Identifier, PixelData> ce : cache.entrySet()) {
+                    PixelData cpd = ce.getValue();
+                    int psx = cpd.prepX, psy = cpd.prepY, psw = cpd.w, psh = cpd.h;
+                    if (chunkUvPx >= psx && chunkUvPx < psx + psw && chunkUvPy >= psy && chunkUvPy < psy + psh) {
+                        Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_FOUND in Preparations: {} at prep=({}-{},{}-{}) firstBytes=({},{},{})",
+                            ce.getKey(), psx, psx + psw, psy, psy + psh,
+                            cpd.pixels[0] & 0xFF, cpd.pixels[1] & 0xFF, cpd.pixels[2] & 0xFF);
+                        chunkUvFound = true;
+                        break;
+                    }
+                }
+                if (!chunkUvFound) {
+                    Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_NOT_FOUND in Preparations either!");
+                    // Last resort: find the closest sprite to pixel (16,1232)
+                    int bestDist = Integer.MAX_VALUE;
+                    Identifier bestId = null;
+                    for (Map.Entry<Identifier, PixelData> ce : cache.entrySet()) {
+                        PixelData cpd = ce.getValue();
+                        int psx = cpd.prepX, psy = cpd.prepY, psw = cpd.w, psh = cpd.h;
+                        int dx = chunkUvPx < psx ? psx - chunkUvPx : (chunkUvPx > psx + psw ? chunkUvPx - (psx + psw) : 0);
+                        int dy = chunkUvPy < psy ? psy - chunkUvPy : (chunkUvPy > psy + psh ? chunkUvPy - (psy + psh) : 0);
+                        int dist = dx + dy;
+                        if (dist < bestDist) { bestDist = dist; bestId = ce.getKey(); }
+                    }
+                    if (bestId != null) {
+                        PixelData bpd = cache.get(bestId);
+                        Dx12Mod.LOGGER.info("[dx12-wm] CLOSEST sprite to ({},{}): {} at prep=({},{}) {}x{} dist={}",
+                            chunkUvPx, chunkUvPy, bestId, bpd.prepX, bpd.prepY, bpd.w, bpd.h, bestDist);
+                    }
+                }
+            }
+
+            // DIAGNOSTIC: sprite y-range distribution (to understand atlas packing)
+            int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+            int mismatchCount = 0, totalChecked = 0;
+            for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
                 TextureAtlasSprite ds = de.getValue();
                 int tx = ds.getX(), ty = ds.getY();
                 PixelData cp = cache.get(de.getKey());
-                if (cp != null) {
-                    boolean match = (tx == cp.prepX && ty == cp.prepY);
-                    Dx12Mod.LOGGER.info("[dx12-wm] CMP {}: prep=({},{}), tx=({},{}) {}",
-                        de.getKey(), cp.prepX, cp.prepY, tx, ty,
-                        match ? "MATCH" : "DIFFER!");
-                }
-                cmpCount++;
-            }
-            // Specific check: grass_block_top (the closest sprite to the first quad)
-            Identifier grassTopId = Identifier.withDefaultNamespace("block/grass_block_top");
-            TextureAtlasSprite grassTop = texturesByName.get(grassTopId);
-            PixelData grassTopPd = cache.get(grassTopId);
-            if (grassTop != null && grassTopPd != null) {
-                boolean match = (grassTop.getX() == grassTopPd.prepX && grassTop.getY() == grassTopPd.prepY);
-                Dx12Mod.LOGGER.info("[dx12-wm] CMP_GRASS_BLOCK_TOP: prep=({},{}), tx=({},{}) {}",
-                    grassTopPd.prepX, grassTopPd.prepY, grassTop.getX(), grassTop.getY(),
-                    match ? "MATCH" : "DIFFER! ← THIS IS THE BUG");
-            } else {
-                Dx12Mod.LOGGER.info("[dx12-wm] CMP_GRASS_BLOCK_TOP: sprite={} pd={}", grassTop != null, grassTopPd != null);
-            }
-            // Search: which sprite in Preparations was at quad pixel (1232,64)?
-            int qPx = 1232, qPy = 64;
-            boolean foundPrep = false;
-            for (Map.Entry<Identifier, PixelData> ce : cache.entrySet()) {
-                PixelData cpd = ce.getValue();
-                if (cpd.prepX == qPx && cpd.prepY == qPy && cpd.w > 0 && cpd.h > 0) {
-                    Dx12Mod.LOGGER.info("[dx12-wm] PREP_SPRITE_AT ({},{}): {} ({}x{}) prepRGB=({},{},{})",
-                        qPx, qPy, ce.getKey(), cpd.w, cpd.h,
-                        cpd.pixels[0] & 0xFF, cpd.pixels[1] & 0xFF, cpd.pixels[2] & 0xFF);
-                    foundPrep = true;
+                if (cp == null) continue;
+                totalChecked++;
+                minY = Math.min(minY, ty);
+                maxY = Math.max(maxY, ty);
+                if (tx != cp.prepX || ty != cp.prepY) {
+                    mismatchCount++;
+                    if (mismatchCount <= 3) {
+                        Dx12Mod.LOGGER.info("[dx12-wm] CMP_MISMATCH: {} prep=({},{}), tx=({},{})",
+                            de.getKey(), cp.prepX, cp.prepY, tx, ty);
+                    }
                 }
             }
-            if (!foundPrep) {
-                Dx12Mod.LOGGER.info("[dx12-wm] PREP_SPRITE_AT ({},{}): NOT FOUND in {} cached sprites", qPx, qPy, cache.size());
-            }
+            Dx12Mod.LOGGER.info("[dx12-wm] SPRITE_Y_RANGE: y=[{},{}] total={} mismatches={}",
+                minY, maxY, totalChecked, mismatchCount);
 
             D3D12Bridge.uploadTerrainAtlas(atlas, w, h);
             MemoryUtil.memFree(atlas);
