@@ -138,7 +138,10 @@ fn vs_main(
     @location(2) uv: vec2<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = pos + camera.camera_pos;
+    // Positions are in world space (section origin + local offset).
+    // The MVP (view_proj) already includes the view matrix that handles
+    // world→camera transformation, so no camera_pos addition is needed.
+    let world_pos = pos;
     out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = uv;
     out.tint = color;
@@ -148,7 +151,11 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(atlas, atlas_sampler, in.uv);
-    return vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    // Alpha test: discard transparent pixels (leaves, glass, etc.)
+    if (tex_color.a < 0.1) {
+        discard;
+    }
+    return vec4<f32>(tex_color.rgb * in.tint, 1.0);
 }
 "#;
 
@@ -434,6 +441,9 @@ pub struct WmRenderer {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
     surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
+    /// True when a window resize has been received but the swapchain has not
+    /// been reconfigured yet. Forces a surface reconfig in render_surface().
+    resize_pending: bool,
 
     // Textured fullscreen quad (GL framebuffer → D3D12 display)
     tex_pipeline: wgpu::RenderPipeline,
@@ -808,6 +818,7 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
+            resize_pending: false,
             tex_pipeline,
             tex_bind_group: None,
             tex_sampler,
@@ -1023,16 +1034,17 @@ impl WmRenderer {
         self.width = width;
         self.height = height;
 
-        // Surface mode: only update stored config + recreate depth texture.
-        // Do NOT call surface.configure() here — DXGI ResizeBuffers can throw
-        // a C++ exception when called while GL is active on the same HWND.
-        // Instead, the swapchain is resized lazily in render_surface()
-        // when get_current_texture() returns SurfaceError::Lost/Outdated.
+        // Surface mode: only update stored config dimensions.
+        // Do NOT call surface.configure() or recreate depth here —
+        // DXGI ResizeBuffers can throw a C++ exception when called while
+        // GL is active on the same HWND.
+        // The depth texture is recreated alongside the swapchain reconfig
+        // in render_surface() when get_current_texture() returns Lost/Outdated.
         if let (Some(_), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
             config.width = width;
             config.height = height;
-            self.surface_depth = Some(make_depth_texture(&self.device, width, height));
-            log::info!("[dx12-wm] Surface size updated to {}x{} (lazy resize in render_surface)", width, height);
+            self.resize_pending = true;
+            log::info!("[dx12-wm] Surface resize pending to {}x{} (reconfig in render_surface)", width, height);
             return;
         }
 
@@ -1185,13 +1197,6 @@ impl WmRenderer {
         let world_oy = (section_y as f32) * 16.0;
         let world_oz = (section_z as f32) * 16.0;
 
-        // Camera-relative offset: subtract camera_pos so shader offset cancels out.
-        // Chunk vertices are in world space, but shader adds camera_pos for test geo.
-        // We make chunk vertices camera-relative by subtracting camera_pos here.
-        let cx = self.camera_pos[0];
-        let cy = self.camera_pos[1];
-        let cz = self.camera_pos[2];
-
         // Convert MC vertex data to ChunkVertex (position + color + uv) and build index buffer.
         // MC 26.1.2 BLOCK format (28 bytes): Pos(12) + Color(4) + UV0(8) + UV2(4)
         let mut vertices: Vec<ChunkVertex> = Vec::with_capacity(vertex_count as usize);
@@ -1226,10 +1231,12 @@ impl WmRenderer {
             let u_corrected = (u + UV_OFFSET).clamp(0.0, 1.0);
             let v_corrected = (v_uv + UV_OFFSET).clamp(0.0, 1.0);
 
-            // World position (section origin + local pos), then make camera-relative
-            let wx = px + world_ox - cx;
-            let wy = py + world_oy - cy;
-            let wz = pz + world_oz - cz;
+            // World position (section origin + local pos).
+            // Store directly in world space so the shader MVP transform is consistent
+            // regardless of when the chunk was uploaded.
+            let wx = px + world_ox;
+            let wy = py + world_oy;
+            let wz = pz + world_oz;
 
             vertices.push(ChunkVertex {
                 position: [wx, wy, wz],
@@ -1243,7 +1250,8 @@ impl WmRenderer {
         if unsafe { FIRST_UPLOAD } {
             unsafe { FIRST_UPLOAD = false; }
             eprintln!("[dx12-wm] First chunk upload: section=({},{},{}) stride={} vcount={} len={} camera=({:.1},{:.1},{:.1})",
-                section_x, section_y, section_z, stride, vertex_count, data.len(), cx, cy, cz);
+                section_x, section_y, section_z, stride, vertex_count, data.len(),
+                self.camera_pos[0], self.camera_pos[1], self.camera_pos[2]);
             // Dump raw bytes of first vertex to verify format
             if data.len() >= 28 {
                 let raw = &data[0..28];
@@ -1526,8 +1534,20 @@ impl WmRenderer {
         let has_frame = self.tex_bind_group.is_some();
         let has_chunks = self.has_chunk_geometry;
 
-        // Get surface frame
         let surface = self.surface.as_ref().unwrap();
+
+        // If a resize is pending, reconfigure the swapchain BEFORE acquiring
+        // the next texture so that depth and color attachments stay in sync.
+        if self.resize_pending {
+            if let Some(config) = &self.surface_config {
+                log::info!("[dx12-wm] Applying pending surface reconfig to {}x{}", config.width, config.height);
+                surface.configure(&self.device, config);
+                self.surface_depth = Some(make_depth_texture(&self.device, self.width, self.height));
+            }
+            self.resize_pending = false;
+        }
+
+        // Get surface frame
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -1558,108 +1578,128 @@ impl WmRenderer {
             &wgpu::CommandEncoderDescriptor { label: Some("RenderSurface") },
         );
 
-        if has_chunks {
-            // Phase 7: Render native MC chunk geometry with D3D12
-            self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
-            self.camera_prev = self.camera_mvp;
-            write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+        // Wrap the fallible rendering in catch_unwind so we always present
+        // the frame — otherwise the swapchain image stays acquired forever.
+        let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if has_chunks {
+                // Phase 7: Render native MC chunk geometry with D3D12
+                self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+                self.camera_prev = self.camera_mvp;
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
 
-            let depth_view = self.surface_depth
-                .as_ref()
-                .expect("surface_depth must be created in init_surface")
-                .create_view(&wgpu::TextureViewDescriptor::default());
-
-            {
-                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Surface Pass (Chunks)"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.53, g: 0.81, b: 0.92, a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-
-                self.draw_chunks(&mut rp);
-            }
-        } else if has_frame {
-            // Textured fullscreen quad: display GL framebuffer capture
-            {
-                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Surface Pass (Textured)"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                rp.set_pipeline(&self.tex_pipeline);
-                rp.set_bind_group(0, self.tex_bind_group.as_ref().unwrap(), &[]);
-                rp.set_vertex_buffer(0, self.fs_quad_vb.slice(..));
-                rp.set_index_buffer(self.fs_quad_ib.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..6, 0, 0..1);
-            }
-        } else {
-            // Fallback: 3D test scene (plane + cubes)
-            self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
-            self.camera_prev = self.camera_mvp;
-            write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
-
-            {
                 let depth_view = self.surface_depth
                     .as_ref()
                     .expect("surface_depth must be created in init_surface")
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
-                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Surface Pass (3D)"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                {
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Surface Pass (Chunks)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
                             }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
 
-                self.draw_scene(&mut rp);
+                    self.draw_chunks(&mut rp);
+                }
+            } else if has_frame {
+                // Textured fullscreen quad: display GL framebuffer capture
+                {
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Surface Pass (Textured)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    rp.set_pipeline(&self.tex_pipeline);
+                    rp.set_bind_group(0, self.tex_bind_group.as_ref().unwrap(), &[]);
+                    rp.set_vertex_buffer(0, self.fs_quad_vb.slice(..));
+                    rp.set_index_buffer(self.fs_quad_ib.slice(..), wgpu::IndexFormat::Uint16);
+                    rp.draw_indexed(0..6, 0, 0..1);
+                }
+            } else {
+                // Fallback: 3D test scene (plane + cubes)
+                self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
+                self.camera_prev = self.camera_mvp;
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+
+                {
+                    let depth_view = self.surface_depth
+                        .as_ref()
+                        .expect("surface_depth must be created in init_surface")
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Surface Pass (3D)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+
+                    self.draw_scene(&mut rp);
+                }
+            }
+
+            self.queue.submit(Some(encoder.finish()));
+        }));
+
+        // Always present the frame, even if the render block panicked.
+        // This releases the swapchain image so subsequent frames can acquire.
+        match render_result {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                log::error!("[dx12-wm] render_surface panicked: {}", msg);
             }
         }
-
-        self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
 
