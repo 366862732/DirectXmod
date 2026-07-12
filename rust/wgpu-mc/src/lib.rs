@@ -151,11 +151,13 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(atlas, atlas_sampler, in.uv);
-    // Alpha test: discard transparent pixels (leaves, glass, etc.)
-    if (tex_color.a < 0.1) {
-        discard;
-    }
-    return vec4<f32>(tex_color.rgb * in.tint, 1.0);
+    // Alpha test temporarily disabled to diagnose UV mapping:
+    // most blocks (stone, dirt, grass) have alpha=255 everywhere on their
+    // sprites; transparent areas indicate UVs land in empty atlas space.
+    //if (tex_color.a < 0.1) {
+    //    discard;
+    //}
+    return vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
 }
 "#;
 
@@ -939,10 +941,44 @@ impl WmRenderer {
         self.atlas_height = height;
         self.atlas_pixels = Some(pixels.to_vec());  // stored for diagnostics
 
+        // Generate full mip chain on CPU for proper LOD behavior.
+        let mip_count = (width.max(height) as f64).log2().floor() as u32 + 1;
+        let mut mip_data: Vec<Vec<u8>> = Vec::with_capacity(mip_count as usize);
+        mip_data.push(pixels.to_vec());
+        let mut mw = width;
+        let mut mh = height;
+        for _ in 1..mip_count {
+            let nw = (mw / 2).max(1);
+            let nh = (mh / 2).max(1);
+            let prev = mip_data.last().unwrap();
+            let mut level = vec![0u8; (nw * nh * 4) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let mut rgba = [0u32; 4];
+                    let mut count = 0u32;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let px = (x * 2 + dx).min(mw - 1);
+                            let py = (y * 2 + dy).min(mh - 1);
+                            let idx = ((py * mw + px) * 4) as usize;
+                            for c in 0..4 { rgba[c] += prev[idx + c] as u32; }
+                            count += 1;
+                        }
+                    }
+                    let idx = ((y * nw + x) * 4) as usize;
+                    for c in 0..4 { level[idx + c] = (rgba[c] / count) as u8; }
+                }
+            }
+            mip_data.push(level);
+            mw = nw;
+            mh = nh;
+        }
+        log::info!("[dx12-wm] Generated {} mip levels for terrain atlas", mip_count);
+
         let atlas = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Terrain Atlas"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
+            mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -950,21 +986,25 @@ impl WmRenderer {
             view_formats: &[],
         });
 
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &atlas,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
+        for (i, mip) in mip_data.iter().enumerate() {
+            let lod_w = (width >> i).max(1);
+            let lod_h = (height >> i).max(1);
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &atlas,
+                    mip_level: i as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                mip,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lod_w * 4),
+                    rows_per_image: Some(lod_h),
+                },
+                wgpu::Extent3d { width: lod_w, height: lod_h, depth_or_array_layers: 1 },
+            );
+        }
 
         // Diagnostic: verify first few pixels of the uploaded atlas
         if pixels.len() >= 16 {
@@ -1224,12 +1264,10 @@ impl WmRenderer {
             let u = f32::from_le_bytes([data[base+16], data[base+17], data[base+18], data[base+19]]);
             let v_uv = f32::from_le_bytes([data[base+20], data[base+21], data[base+22], data[base+23]]);
 
-            // Apply UV offset to correct systematic shift of MC vertex UVs vs atlas.
-            // MC chunk vertex UVs are offset by (+16,+16) atlas pixels relative to where
-            // sprites actually are in the composited atlas.  Offset = -16/2048 = -0.0078125.
-            const UV_OFFSET: f32 = -16.0 / 2048.0;
-            let u_corrected = (u + UV_OFFSET).clamp(0.0, 1.0);
-            let v_corrected = (v_uv + UV_OFFSET).clamp(0.0, 1.0);
+            // Use raw MC vertex UVs directly — they are already correct for
+            // the composited terrain atlas generated by the TextureAtlasMixin.
+            let u_corrected = u.clamp(0.0, 1.0);
+            let v_corrected = v_uv.clamp(0.0, 1.0);
 
             // World position (section origin + local pos).
             // Store directly in world space so the shader MVP transform is consistent
@@ -1272,6 +1310,17 @@ impl WmRenderer {
                 }
                 // Check if offset 24-27 are normal (bytes)
                 eprintln!("[dx12-wm]     Normal at offset 24: ({}, {}, {})", data[24], data[25], data[26]);
+            }
+            // UV range statistics for ALL vertices in first chunk
+            if !vertices.is_empty() {
+                let mut u_min = f32::MAX; let mut u_max = f32::MIN;
+                let mut v_min = f32::MAX; let mut v_max = f32::MIN;
+                for vtx in &vertices {
+                    u_min = u_min.min(vtx.uv[0]); u_max = u_max.max(vtx.uv[0]);
+                    v_min = v_min.min(vtx.uv[1]); v_max = v_max.max(vtx.uv[1]);
+                }
+                eprintln!("[dx12-wm]   UV range over {} vertices: u=[{:.4},{:.4}] v=[{:.4},{:.4}]",
+                    vertices.len(), u_min, u_max, v_min, v_max);
             }
             for i in 0..vertices.len().min(4) {
                 let v = &vertices[i];
@@ -1323,6 +1372,36 @@ impl WmRenderer {
                         }
                     }
                     eprintln!("{}", line);
+                }
+                // Scan atlas for nearest non-zero pixel around chunk UV area
+                let scan_radius = 200i32; // scan up to 200px in each direction
+                let cx = 16i32; // center of chunk UV area
+                let cy = 1232i32;
+                let mut found_nonzero = false;
+                for r in 1..=scan_radius {
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            if dx.abs() != r && dy.abs() != r { continue; } // only check perimeter
+                            let px = cx + dx;
+                            let py = cy + dy;
+                            if px < 0 || px >= aw as i32 || py < 0 || py >= ah as i32 { continue; }
+                            let off = ((py as usize) * aw + (px as usize)) * 4;
+                            if off + 4 <= pixels.len() {
+                                if pixels[off+3] != 0 {
+                                    eprintln!("[dx12-wm]   NEAREST_NONZERO at dx={} dy={} pixel=({},{}) dist={}: RGBA=({},{},{},{})",
+                                        dx, dy, px, py, r,
+                                        pixels[off], pixels[off+1], pixels[off+2], pixels[off+3]);
+                                    found_nonzero = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if found_nonzero { break; }
+                    }
+                    if found_nonzero { break; }
+                }
+                if !found_nonzero {
+                    eprintln!("[dx12-wm]   NO_NONZERO_PIXEL within {}px of chunk UV area", scan_radius);
                 }
             }
         }
