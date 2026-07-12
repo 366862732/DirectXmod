@@ -1,10 +1,10 @@
-//! wgpu-mc: wgpu renderer with depth buffer, geometry pipeline, and readback.
+﻿//! wgpu-mc: wgpu renderer with depth buffer, geometry pipeline, and readback.
 //!
 //! Architecture: Triple-buffered ring on JNI thread with optional surface mode.
-//! - Surface mode:  render directly to window swapchain, present → no readback
+//! - Surface mode:  render directly to window swapchain, present 鈫?no readback
 //! - Offscreen mode: render to textures, async readback via triple-buffer ring
 //!
-//! Note: Push constants removed — not supported on all GPUs.
+//! Note: Push constants removed 鈥?not supported on all GPUs.
 //! Model transforms are baked into vertex buffers at creation time.
 //!
 //! TDR Prevention (HWND sharing with OpenGL):
@@ -85,7 +85,7 @@ impl TexVertex {
     }
 }
 
-// No push constants — compatible with all GPUs
+// No push constants 鈥?compatible with all GPUs
 const SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -152,7 +152,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Textured fullscreen quad shader — renders GL framebuffer capture as D3D12 texture.
+// Textured fullscreen quad shader 鈥?renders GL framebuffer capture as D3D12 texture.
 const TEX_SHADER_SRC: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -262,7 +262,7 @@ fn create_plane_mesh(device: &wgpu::Device, size: f32, y: f32, z_center: f32, co
         Vertex { position: [-h, y, z1], color },
         Vertex { position: [ h, y, z1], color },
     ];
-    let indices: [u16; 6] = [0, 3, 1, 0, 2, 3];  // CCW → +Y normal
+    let indices: [u16; 6] = [0, 3, 1, 0, 2, 3];  // CCW 鈫?+Y normal
 
     let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Plane VB"),
@@ -333,7 +333,7 @@ fn create_cube_mesh_at(
     vbuf
 }
 
-// ── Create wgpu Surface from Windows HWND ─────────────────────────
+// 鈹€鈹€ Create wgpu Surface from Windows HWND 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 fn create_surface_from_hwnd(
     instance: &wgpu::Instance,
@@ -366,9 +366,9 @@ fn create_surface_from_hwnd(
     }
 }
 
-// ── Chunk mesh storage (MC section geometry → D3D12) ─────────────
+// 鈹€鈹€ Chunk mesh storage (MC section geometry 鈫?D3D12) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-/// One mesh = one RenderLayer of one 16×16×16 chunk section.
+/// One mesh = one RenderLayer of one 16脳16脳16 chunk section.
 /// Keyed by (section_x, section_y, section_z).
 struct ChunkMesh {
     vertex_buffer: wgpu::Buffer,
@@ -378,7 +378,7 @@ struct ChunkMesh {
     index_is_u32: bool,
 }
 
-// ── Ring slot ─────────────────────────────────────────────────────
+// 鈹€鈹€ Ring slot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 struct Slot {
     #[allow(dead_code)]
@@ -399,9 +399,9 @@ impl Slot {
     }
 }
 
-// ████████████████████████████████████████████████████████████████████████
-// ██  RENDERER                                                       ██
-// ████████████████████████████████████████████████████████████████████████
+// 鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅
+// 鈻堚枅  RENDERER                                                       鈻堚枅
+// 鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅
 
 pub struct WmRenderer {
     #[allow(dead_code)]
@@ -434,9 +434,8 @@ pub struct WmRenderer {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
     surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
-    surface_hwnd: usize,  // Track HWND to detect fullscreen/resize transitions
 
-    // Textured fullscreen quad (GL framebuffer → D3D12 display)
+    // Textured fullscreen quad (GL framebuffer 鈫?D3D12 display)
     tex_pipeline: wgpu::RenderPipeline,
     tex_bind_group: Option<wgpu::BindGroup>,
     tex_sampler: wgpu::Sampler,
@@ -452,7 +451,7 @@ pub struct WmRenderer {
     pending_rx: [Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; RING_SIZE],
     prev_pixels: Vec<u8>,
 
-    // Chunk geometry (Phase 7: native MC geometry → D3D12)
+    // Chunk geometry (Phase 7: native MC geometry 鈫?D3D12)
     chunk_meshes: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>>,
     has_chunk_geometry: bool,
 
@@ -540,7 +539,7 @@ impl WmRenderer {
             }],
         });
 
-        // No push constant ranges — compatible with all GPUs
+        // No push constant ranges 鈥?compatible with all GPUs
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
@@ -597,7 +596,7 @@ impl WmRenderer {
             ([ 5.0, -3.5, 10.0], [0.7, 0.2, 0.5]),   // far front-right, magenta
         ];
 
-        // Shared index buffer — all cubes use identical index data
+        // Shared index buffer 鈥?all cubes use identical index data
         let cube_indices: [u16; 36] = [
              0,  1,  2,  2,  1,  3,
              4,  6,  5,  5,  6,  7,
@@ -622,7 +621,7 @@ impl WmRenderer {
             cube_vbs.push(create_cube_mesh_at(&device, color, (pos[0], pos[1], pos[2])));
         }
 
-        // ---- Textured fullscreen quad pipeline (GL framebuffer → D3D12) ----
+        // ---- Textured fullscreen quad pipeline (GL framebuffer 鈫?D3D12) ----
         let tex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Texture Shader"),
             source: wgpu::ShaderSource::Wgsl(TEX_SHADER_SRC.into()),
@@ -696,7 +695,7 @@ impl WmRenderer {
             ..Default::default()
         });
 
-        // Fullscreen quad (two triangles covering NDC [-1,1]²)
+        // Fullscreen quad (two triangles covering NDC [-1,1]虏)
         let quad_vertices: [TexVertex; 4] = [
             TexVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] },
             TexVertex { position: [ 1.0, -1.0], uv: [1.0, 1.0] },
@@ -809,7 +808,6 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
-            surface_hwnd: 0,
             tex_pipeline,
             tex_bind_group: None,
             tex_sampler,
@@ -843,19 +841,8 @@ impl WmRenderer {
     /// side) and reattached after. This ensures D3D12's Present() has exclusive
     /// access to the HWND, preventing WDDM driver contention.
     pub fn init_surface(&mut self, hwnd: usize) {
-        // If the HWND changed (fullscreen toggle, window resize, etc.),
-        // destroy the old surface and create a new one on the new HWND.
         if self.surface.is_some() {
-            if self.surface_hwnd == hwnd {
-                return; // Same HWND, surface already exists
-            }
-            // HWND changed — drop old surface first so a new one is created
-            log::info!("[dx12-wm] HWND changed 0x{:x} → 0x{:x}, recreating surface",
-                self.surface_hwnd, hwnd);
-            self.surface = None;
-            self.surface_depth = None;
-            self.surface_config = None;
-            self.surface_hwnd = 0;
+            return;
         }
 
         log::info!("[dx12-wm] init_surface: creating D3D12 swapchain on HWND 0x{:x} (parent HWND)",
@@ -908,10 +895,9 @@ impl WmRenderer {
         self.surface_format = format;
         self.surface_config = Some(config);
         self.surface = Some(surface);
-        self.surface_hwnd = hwnd;
 
         // Rebuild chunk pipeline with the actual surface format if atlas already uploaded.
-        // Drop the old pipeline first — it may have been created with the wrong format.
+        // Drop the old pipeline first 鈥?it may have been created with the wrong format.
         self.chunk_pipeline = None;
         self.ensure_chunk_pipeline();
 
@@ -976,15 +962,6 @@ impl WmRenderer {
         }
         eprintln!("[dx12-wm] Atlas texture uploaded: {}x{} ({:.1} MB)", width, height, pixels.len() as f64 / 1048576.0);
 
-        // Save atlas as PNG for visual debugging (open in Photoshop/GIMP to inspect texture positions)
-        let atlas_path = std::path::Path::new("atlas_debug.png");
-        if let Err(e) = image::save_buffer(atlas_path, pixels, width, height, image::ColorType::Rgba8) {
-            log::warn!("[dx12-wm] Failed to save atlas PNG: {}", e);
-        } else {
-            log::info!("[dx12-wm] Atlas saved to atlas_debug.png ({}x{})", width, height);
-            eprintln!("[dx12-wm] Atlas saved to atlas_debug.png ({}x{})", width, height);
-        }
-
         // Create the chunk bind group
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1038,7 +1015,7 @@ impl WmRenderer {
         self.height = height;
 
         // Surface mode: only update stored config + recreate depth texture.
-        // Do NOT call surface.configure() here — DXGI ResizeBuffers can throw
+        // Do NOT call surface.configure() here 鈥?DXGI ResizeBuffers can throw
         // a C++ exception when called while GL is active on the same HWND.
         // Instead, the swapchain is resized lazily in render_surface()
         // when get_current_texture() returns SurfaceError::Lost/Outdated.
@@ -1084,7 +1061,7 @@ impl WmRenderer {
             self.frame_width != width || self.frame_height != height
         });
         if need_new {
-            log::info!("[dx12-wm] Creating new frame texture {}x{} (row {}→{} padded)",
+            log::info!("[dx12-wm] Creating new frame texture {}x{} (row {}鈫抺} padded)",
                 width, height, src_row_bytes, dst_row_bytes);
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Frame Texture"),
@@ -1122,7 +1099,7 @@ impl WmRenderer {
         if let Some(ref tex) = self.frame_texture {
             let effective_len = data.len().min(size);
             if dst_row_bytes == src_row_bytes {
-                // Tightly packed — direct upload
+                // Tightly packed 鈥?direct upload
                 self.queue.write_texture(
                     wgpu::ImageCopyTexture {
                         texture: tex,
@@ -1224,7 +1201,7 @@ impl WmRenderer {
             let py = f32::from_le_bytes([data[base+4], data[base+5], data[base+6], data[base+7]]);
             let pz = f32::from_le_bytes([data[base+8], data[base+9], data[base+10], data[base+11]]);
 
-            // Color: 4 u8 (RGBA in memory) at offset 12 → float (used as lighting tint)
+            // Color: 4 u8 (RGBA in memory) at offset 12 鈫?float (used as lighting tint)
             let cr = data[base + 12] as f32 / 255.0;
             let cg = data[base + 13] as f32 / 255.0;
             let cb = data[base + 14] as f32 / 255.0;
@@ -1232,13 +1209,6 @@ impl WmRenderer {
             // UV: 2 f32 at offset 16 (texture atlas coords)
             let u = f32::from_le_bytes([data[base+16], data[base+17], data[base+18], data[base+19]]);
             let v_uv = f32::from_le_bytes([data[base+20], data[base+21], data[base+22], data[base+23]]);
-
-            // Apply UV offset to correct systematic shift of MC vertex UVs vs atlas.
-            // MC chunk vertex UVs are offset by (+16,+16) atlas pixels relative to where
-            // sprites actually are in the composited atlas.  Offset = -16/2048 = -0.0078125.
-            const UV_OFFSET: f32 = -16.0 / 2048.0;
-            let u_corrected = (u + UV_OFFSET).clamp(0.0, 1.0);
-            let v_corrected = (v_uv + UV_OFFSET).clamp(0.0, 1.0);
 
             // World position (section origin + local pos), then make camera-relative
             let wx = px + world_ox - cx;
@@ -1248,37 +1218,16 @@ impl WmRenderer {
             vertices.push(ChunkVertex {
                 position: [wx, wy, wz],
                 color: [cr, cg, cb],
-                uv: [u_corrected, v_corrected],
+                uv: [u, v_uv],
             });
         }
 
-        // Diagnostic: dump first 4 vertices + atlas area on first chunk upload
+        // Diagnostic: dump first 4 vertices on first chunk upload
         static mut FIRST_UPLOAD: bool = true;
         if unsafe { FIRST_UPLOAD } {
             unsafe { FIRST_UPLOAD = false; }
             eprintln!("[dx12-wm] First chunk upload: section=({},{},{}) stride={} vcount={} len={} camera=({:.1},{:.1},{:.1})",
                 section_x, section_y, section_z, stride, vertex_count, data.len(), cx, cy, cz);
-            // Dump raw bytes of first vertex to verify format
-            if data.len() >= 28 {
-                let raw = &data[0..28];
-                eprintln!("[dx12-wm]   RAW v0 bytes: {:02X?}", raw);
-                // Try reading UV at different offsets
-                for off in [16usize, 20, 12, 8] {
-                    if off + 8 <= data.len() {
-                        let u = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-                        let v_val = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
-                        eprintln!("[dx12-wm]     UV attempt at offset {}: ({:.6}, {:.6})", off, u, v_val);
-                    }
-                }
-                // Check bytes at offset 24-27 (UV2/lightmap)
-                if data.len() >= 28 {
-                    let uv2_u = u16::from_le_bytes([data[24], data[25]]);
-                    let uv2_v = u16::from_le_bytes([data[26], data[27]]);
-                    eprintln!("[dx12-wm]     UV2 as u16 at offset 24: ({}, {})", uv2_u, uv2_v);
-                }
-                // Check if offset 24-27 are normal (bytes)
-                eprintln!("[dx12-wm]     Normal at offset 24: ({}, {}, {})", data[24], data[25], data[26]);
-            }
             for i in 0..vertices.len().min(4) {
                 let v = &vertices[i];
                 eprintln!("[dx12-wm]   v[{}]: pos=({:.2},{:.2},{:.2}) color=({:.3},{:.3},{:.3}) uv=({:.4},{:.4})",
@@ -1286,49 +1235,18 @@ impl WmRenderer {
                     v.color[0], v.color[1], v.color[2],
                     v.uv[0], v.uv[1]);
             }
-            // Dump atlas pixel grid for all 4 corners of the first quad
+            // Dump atlas pixel at the first vertex's UV to verify texture data
             if let Some(ref pixels) = self.atlas_pixels {
-                let aw = self.atlas_width as usize;
-                let ah = self.atlas_height as usize;
-                for vi in 0..vertices.len().min(4) {
-                    let u = vertices[vi].uv[0].clamp(0.0, 1.0);
-                    let v_uv = vertices[vi].uv[1].clamp(0.0, 1.0);
-                    let px = (u * aw as f32) as usize;
-                    let py = (v_uv * ah as f32) as usize;
-                    let off = (py * aw + px) * 4;
-                    if off + 4 <= pixels.len() {
-                        eprintln!("[dx12-wm]   v[{}] atlas ({},{}) RGBA=({},{},{},{})",
-                            vi, px, py,
-                            pixels[off], pixels[off+1], pixels[off+2], pixels[off+3]);
-                    } else {
-                        eprintln!("[dx12-wm]   v[{}] atlas ({},{}) OUT OF BOUNDS", vi, px, py);
-                    }
-                }
-                // Dump a 4x4 grid of pixels inside the first quad (16x16 atlas area)
-                // Show 5 sample pixels per row: start, 25%, 50%, 75%, end
-                let aw_f = self.atlas_width as f32;
-                let ah_f = self.atlas_height as f32;
-                let u0 = vertices[0].uv[0].clamp(0.0, 1.0);
-                let u1 = vertices[1].uv[0].clamp(0.0, 1.0);
-                let v0 = vertices[0].uv[1].clamp(0.0, 1.0);
-                let v2 = vertices[2].uv[1].clamp(0.0, 1.0);
-                eprintln!("[dx12-wm]   16x16 atlas quad uv_x=[{:.4},{:.4}] uv_y=[{:.4},{:.4}]",
-                    u0.min(u1), u0.max(u1), v0.min(v2), v0.max(v2));
-                for row_pct in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                    let row = v0 + (v2 - v0) * row_pct as f32;
-                    let py = (row * ah_f) as usize;
-                    let mut line = format!("[dx12-wm]   row y={:.1}% (pixel y={}):", row_pct * 100.0, py);
-                    for col_pct in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                        let col = u0 + (u1 - u0) * col_pct as f32;
-                        let px = (col * aw_f) as usize;
-                        let off = (py * aw + px) * 4;
-                        if off + 4 <= pixels.len() {
-                            let r = pixels[off]; let g = pixels[off+1];
-                            let b = pixels[off+2]; let a = pixels[off+3];
-                            line.push_str(&format!(" ({},{})→({},{},{},{})", px, py, r, g, b, a));
-                        }
-                    }
-                    eprintln!("{}", line);
+                let u = vertices[0].uv[0].clamp(0.0, 1.0);
+                let v_uv = vertices[0].uv[1].clamp(0.0, 1.0);
+                let px = (u * self.atlas_width as f32) as usize;
+                let py = (v_uv * self.atlas_height as f32) as usize;
+                let offset = (py * self.atlas_width as usize + px) * 4;
+                if offset + 4 <= pixels.len() {
+                    let pr = pixels[offset]; let pg = pixels[offset+1];
+                    let pb = pixels[offset+2]; let pa = pixels[offset+3];
+                    eprintln!("[dx12-wm]   atlas pixel at uv=({:.4},{:.4}) 鈫?({},{}) RGBA=({},{},{},{})",
+                        u, v_uv, px, py, pr, pg, pb, pa);
                 }
             }
         }
@@ -1341,7 +1259,7 @@ impl WmRenderer {
             for q in 0..quad_count {
                 let vi = q * 4;
                 if vi + 3 >= vertex_count { break; }
-                indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
+                indices.extend_from_slice(&[vi, vi+1, vi+3, vi, vi+3, vi+2]);
             }
 
             if indices.is_empty() { return; }
@@ -1383,7 +1301,7 @@ impl WmRenderer {
             for q in 0..quad_count {
                 let vi = (q * 4) as u16;
                 if (vi as u32) + 3 >= vertex_count { break; }
-                indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
+                indices.extend_from_slice(&[vi, vi+1, vi+3, vi, vi+3, vi+2]);
             }
 
             if indices.is_empty() { return; }
@@ -1423,14 +1341,7 @@ impl WmRenderer {
         }
     }
 
-    /// Remove all chunk meshes for a given section.
-    /// Called before recompiling a section to prevent stale mesh accumulation.
-    pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
-        let key = (section_x, section_y, section_z);
-        self.chunk_meshes.remove(&key);
-    }
-
-    // ── Draw calls shared by surface and offscreen modes ──────────
+    // 鈹€鈹€ Draw calls shared by surface and offscreen modes 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     fn draw_scene<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
         rp.set_pipeline(&self.pipeline);
@@ -1452,7 +1363,7 @@ impl WmRenderer {
     /// Render all stored MC chunk meshes using the standard 3D pipeline.
     fn draw_chunks<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
         // Require chunk pipeline (with atlas texture) to be ready.
-        // Don't fall back to main pipeline — vertex formats differ!
+        // Don't fall back to main pipeline 鈥?vertex formats differ!
         let Some(pipeline) = &self.chunk_pipeline else { return; };
         let Some(bind_group) = &self.chunk_bind_group else { return; };
 
@@ -1534,7 +1445,7 @@ impl WmRenderer {
         eprintln!("[dx12-wm] Chunk pipeline created with format={:?}", self.surface_format);
     }
 
-    // ── Surface mode: render directly to swapchain ────────────────
+    // 鈹€鈹€ Surface mode: render directly to swapchain 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     fn render_surface(&mut self) {
         let has_frame = self.tex_bind_group.is_some();
@@ -1553,7 +1464,7 @@ impl WmRenderer {
                 return;
             }
             Err(wgpu::SurfaceError::Timeout) => {
-                log::warn!("[dx12-wm] Surface timeout — GPU TDR may have occurred; skipping frame");
+                log::warn!("[dx12-wm] Surface timeout 鈥?GPU TDR may have occurred; skipping frame");
                 return;
             }
             Err(e) => {
@@ -1561,7 +1472,6 @@ impl WmRenderer {
                 self.surface = None;
                 self.surface_depth = None;
                 self.surface_config = None;
-                self.surface_hwnd = 0;
                 log::info!("[dx12-wm] Fallen back to offscreen rendering");
                 return;
             }
@@ -1678,7 +1588,7 @@ impl WmRenderer {
         frame.present();
     }
 
-    // ── Offscreen mode: triple-buffer readback ────────────────────
+    // 鈹€鈹€ Offscreen mode: triple-buffer readback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     fn render_offscreen(&mut self) -> Vec<u8> {
         let w = self.width;

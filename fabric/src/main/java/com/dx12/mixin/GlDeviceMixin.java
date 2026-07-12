@@ -20,8 +20,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(targets = "com.mojang.blaze3d.opengl.GlDevice")
 public class GlDeviceMixin {
+    private static boolean glDeviceMixinApplied = false;
+
     @Inject(method = "presentFrame", at = @At("HEAD"), cancellable = true)
     private void onPresentFrame(CallbackInfo ci) {
+        if (!glDeviceMixinApplied) {
+            glDeviceMixinApplied = true;
+            com.dx12.Dx12Mod.LOGGER.info("[dx12-wm] GlDeviceMixin applied — presentFrame intercepted");
+        }
         if (D3D12Bridge.hasSurface()) {
             Minecraft mc = Minecraft.getInstance();
             if (mc.level != null && mc.player != null) {

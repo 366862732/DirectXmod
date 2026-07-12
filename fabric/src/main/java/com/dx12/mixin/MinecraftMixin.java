@@ -25,10 +25,17 @@ import net.minecraft.client.Minecraft;
  */
 @Mixin(Minecraft.class)
 public class MinecraftMixin {
+    private static boolean minecraftMixinApplied = false;
+
     @Inject(method = "runTick", at = @At("TAIL"))
     private void onRunTickTail(CallbackInfo ci) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level != null && mc.player != null) {
+            if (!minecraftMixinApplied) {
+                minecraftMixinApplied = true;
+                com.dx12.Dx12Mod.LOGGER.info("[dx12-wm] MinecraftMixin applied — runTick TAIL");
+            }
+
             // Get GLFW window and HWND BEFORE detaching GL context.
             // glfwGetWin32Window requires the GL context to be current.
             long glfwWindow = GLFW.glfwGetCurrentContext();
