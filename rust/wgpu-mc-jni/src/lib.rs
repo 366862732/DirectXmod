@@ -302,6 +302,25 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeHasSurface(
     }
 }
 
+/// Clear all meshes for a given chunk section before recompilation.
+/// Prevents stale mesh accumulation when blocks are broken or placed.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeClearChunkSection(
+    _env: JNIEnv,
+    _class: JClass,
+    section_x: jni::sys::jint,
+    section_y: jni::sys::jint,
+    section_z: jni::sys::jint,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.clear_chunk_section(section_x, section_y, section_z);
+    }
+}
+
 /// Returns true if any MC chunk geometry has been uploaded to the D3D12 renderer.
 ///
 /// # Safety

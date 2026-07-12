@@ -71,6 +71,7 @@ public class D3D12Bridge {
     public static native String nativeGetStatus();
     public static native boolean nativeHasSurface();
     public static native boolean nativeHasChunkGeometry();
+    public static native void nativeClearChunkSection(int sectionX, int sectionY, int sectionZ);
     public static native void nativeUploadTerrainAtlas(java.nio.ByteBuffer buffer, int width, int height);
 
     // === Convenience methods ===
@@ -237,6 +238,16 @@ public class D3D12Bridge {
         if (!initialized) return;
         try {
             nativeUploadChunkMesh(sectionX, sectionY, sectionZ, buffer, vertexCount, vertexStride);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    /** Clear all old meshes for a chunk section before recompilation. */
+    public static void clearChunkSection(int sectionX, int sectionY, int sectionZ) {
+        if (!initialized) return;
+        try {
+            nativeClearChunkSection(sectionX, sectionY, sectionZ);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore
         }

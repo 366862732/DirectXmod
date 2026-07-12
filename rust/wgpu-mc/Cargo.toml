@@ -12,3 +12,6 @@ futures = "0.3"
 raw-window-handle = "0.6"
 winit = "0.30"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+
+# PNG dump for atlas debugging
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -47,6 +47,9 @@ public class SectionCompilerMixin {
             int sy = sectionPos.getY();
             int sz = sectionPos.getZ();
 
+            // Clear stale meshes from previous compilations before uploading new ones
+            D3D12Bridge.clearChunkSection(sx, sy, sz);
+
             for (Map.Entry<ChunkSectionLayer, MeshData> entry : results.renderedLayers.entrySet()) {
                 MeshData meshData = entry.getValue();
                 MeshData.DrawState drawState = meshData.drawState();

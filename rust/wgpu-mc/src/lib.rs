@@ -962,6 +962,15 @@ impl WmRenderer {
         }
         eprintln!("[dx12-wm] Atlas texture uploaded: {}x{} ({:.1} MB)", width, height, pixels.len() as f64 / 1048576.0);
 
+        // Save atlas as PNG for visual debugging (open in Photoshop/GIMP to inspect texture positions)
+        let atlas_path = std::path::Path::new("atlas_debug.png");
+        if let Err(e) = image::save_buffer(atlas_path, pixels, width, height, image::ColorType::Rgba8) {
+            log::warn!("[dx12-wm] Failed to save atlas PNG: {}", e);
+        } else {
+            log::info!("[dx12-wm] Atlas saved to atlas_debug.png ({}x{})", width, height);
+            eprintln!("[dx12-wm] Atlas saved to atlas_debug.png ({}x{})", width, height);
+        }
+
         // Create the chunk bind group
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1210,6 +1219,13 @@ impl WmRenderer {
             let u = f32::from_le_bytes([data[base+16], data[base+17], data[base+18], data[base+19]]);
             let v_uv = f32::from_le_bytes([data[base+20], data[base+21], data[base+22], data[base+23]]);
 
+            // Apply UV offset to correct systematic shift of MC vertex UVs vs atlas.
+            // MC chunk vertex UVs are offset by (+16,+16) atlas pixels relative to where
+            // sprites actually are in the composited atlas.  Offset = -16/2048 = -0.0078125.
+            const UV_OFFSET: f32 = -16.0 / 2048.0;
+            let u_corrected = (u + UV_OFFSET).clamp(0.0, 1.0);
+            let v_corrected = (v_uv + UV_OFFSET).clamp(0.0, 1.0);
+
             // World position (section origin + local pos), then make camera-relative
             let wx = px + world_ox - cx;
             let wy = py + world_oy - cy;
@@ -1218,16 +1234,37 @@ impl WmRenderer {
             vertices.push(ChunkVertex {
                 position: [wx, wy, wz],
                 color: [cr, cg, cb],
-                uv: [u, v_uv],
+                uv: [u_corrected, v_corrected],
             });
         }
 
-        // Diagnostic: dump first 4 vertices on first chunk upload
+        // Diagnostic: dump first 4 vertices + atlas area on first chunk upload
         static mut FIRST_UPLOAD: bool = true;
         if unsafe { FIRST_UPLOAD } {
             unsafe { FIRST_UPLOAD = false; }
             eprintln!("[dx12-wm] First chunk upload: section=({},{},{}) stride={} vcount={} len={} camera=({:.1},{:.1},{:.1})",
                 section_x, section_y, section_z, stride, vertex_count, data.len(), cx, cy, cz);
+            // Dump raw bytes of first vertex to verify format
+            if data.len() >= 28 {
+                let raw = &data[0..28];
+                eprintln!("[dx12-wm]   RAW v0 bytes: {:02X?}", raw);
+                // Try reading UV at different offsets
+                for off in [16usize, 20, 12, 8] {
+                    if off + 8 <= data.len() {
+                        let u = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                        let v_val = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                        eprintln!("[dx12-wm]     UV attempt at offset {}: ({:.6}, {:.6})", off, u, v_val);
+                    }
+                }
+                // Check bytes at offset 24-27 (UV2/lightmap)
+                if data.len() >= 28 {
+                    let uv2_u = u16::from_le_bytes([data[24], data[25]]);
+                    let uv2_v = u16::from_le_bytes([data[26], data[27]]);
+                    eprintln!("[dx12-wm]     UV2 as u16 at offset 24: ({}, {})", uv2_u, uv2_v);
+                }
+                // Check if offset 24-27 are normal (bytes)
+                eprintln!("[dx12-wm]     Normal at offset 24: ({}, {}, {})", data[24], data[25], data[26]);
+            }
             for i in 0..vertices.len().min(4) {
                 let v = &vertices[i];
                 eprintln!("[dx12-wm]   v[{}]: pos=({:.2},{:.2},{:.2}) color=({:.3},{:.3},{:.3}) uv=({:.4},{:.4})",
@@ -1235,18 +1272,49 @@ impl WmRenderer {
                     v.color[0], v.color[1], v.color[2],
                     v.uv[0], v.uv[1]);
             }
-            // Dump atlas pixel at the first vertex's UV to verify texture data
+            // Dump atlas pixel grid for all 4 corners of the first quad
             if let Some(ref pixels) = self.atlas_pixels {
-                let u = vertices[0].uv[0].clamp(0.0, 1.0);
-                let v_uv = vertices[0].uv[1].clamp(0.0, 1.0);
-                let px = (u * self.atlas_width as f32) as usize;
-                let py = (v_uv * self.atlas_height as f32) as usize;
-                let offset = (py * self.atlas_width as usize + px) * 4;
-                if offset + 4 <= pixels.len() {
-                    let pr = pixels[offset]; let pg = pixels[offset+1];
-                    let pb = pixels[offset+2]; let pa = pixels[offset+3];
-                    eprintln!("[dx12-wm]   atlas pixel at uv=({:.4},{:.4}) → ({},{}) RGBA=({},{},{},{})",
-                        u, v_uv, px, py, pr, pg, pb, pa);
+                let aw = self.atlas_width as usize;
+                let ah = self.atlas_height as usize;
+                for vi in 0..vertices.len().min(4) {
+                    let u = vertices[vi].uv[0].clamp(0.0, 1.0);
+                    let v_uv = vertices[vi].uv[1].clamp(0.0, 1.0);
+                    let px = (u * aw as f32) as usize;
+                    let py = (v_uv * ah as f32) as usize;
+                    let off = (py * aw + px) * 4;
+                    if off + 4 <= pixels.len() {
+                        eprintln!("[dx12-wm]   v[{}] atlas ({},{}) RGBA=({},{},{},{})",
+                            vi, px, py,
+                            pixels[off], pixels[off+1], pixels[off+2], pixels[off+3]);
+                    } else {
+                        eprintln!("[dx12-wm]   v[{}] atlas ({},{}) OUT OF BOUNDS", vi, px, py);
+                    }
+                }
+                // Dump a 4x4 grid of pixels inside the first quad (16x16 atlas area)
+                // Show 5 sample pixels per row: start, 25%, 50%, 75%, end
+                let aw_f = self.atlas_width as f32;
+                let ah_f = self.atlas_height as f32;
+                let u0 = vertices[0].uv[0].clamp(0.0, 1.0);
+                let u1 = vertices[1].uv[0].clamp(0.0, 1.0);
+                let v0 = vertices[0].uv[1].clamp(0.0, 1.0);
+                let v2 = vertices[2].uv[1].clamp(0.0, 1.0);
+                eprintln!("[dx12-wm]   16x16 atlas quad uv_x=[{:.4},{:.4}] uv_y=[{:.4},{:.4}]",
+                    u0.min(u1), u0.max(u1), v0.min(v2), v0.max(v2));
+                for row_pct in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let row = v0 + (v2 - v0) * row_pct as f32;
+                    let py = (row * ah_f) as usize;
+                    let mut line = format!("[dx12-wm]   row y={:.1}% (pixel y={}):", row_pct * 100.0, py);
+                    for col_pct in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                        let col = u0 + (u1 - u0) * col_pct as f32;
+                        let px = (col * aw_f) as usize;
+                        let off = (py * aw + px) * 4;
+                        if off + 4 <= pixels.len() {
+                            let r = pixels[off]; let g = pixels[off+1];
+                            let b = pixels[off+2]; let a = pixels[off+3];
+                            line.push_str(&format!(" ({},{})→({},{},{},{})", px, py, r, g, b, a));
+                        }
+                    }
+                    eprintln!("{}", line);
                 }
             }
         }
@@ -1259,7 +1327,7 @@ impl WmRenderer {
             for q in 0..quad_count {
                 let vi = q * 4;
                 if vi + 3 >= vertex_count { break; }
-                indices.extend_from_slice(&[vi, vi+1, vi+3, vi, vi+3, vi+2]);
+                indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
             }
 
             if indices.is_empty() { return; }
@@ -1301,7 +1369,7 @@ impl WmRenderer {
             for q in 0..quad_count {
                 let vi = (q * 4) as u16;
                 if (vi as u32) + 3 >= vertex_count { break; }
-                indices.extend_from_slice(&[vi, vi+1, vi+3, vi, vi+3, vi+2]);
+                indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
             }
 
             if indices.is_empty() { return; }
@@ -1339,6 +1407,13 @@ impl WmRenderer {
             log::info!("[dx12-wm] Chunk mesh uploaded: section=({},{},{}) {} verts, {} indices",
                 section_x, section_y, section_z, vertices.len(), indices.len());
         }
+    }
+
+    /// Remove all chunk meshes for a given section.
+    /// Called before recompiling a section to prevent stale mesh accumulation.
+    pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
+        let key = (section_x, section_y, section_z);
+        self.chunk_meshes.remove(&key);
     }
 
     // ── Draw calls shared by surface and offscreen modes ──────────

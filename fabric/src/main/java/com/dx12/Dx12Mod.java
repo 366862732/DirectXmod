@@ -204,7 +204,7 @@ public class Dx12Mod implements ClientModInitializer {
 
                     float aspect = (float) width / (float) height;
                     Matrix4f proj = new Matrix4f();
-                    proj.perspective((float) Math.toRadians(70.0), aspect, 0.05f, 1000.0f);
+                    proj.perspective((float) Math.toRadians(70.0), aspect, 0.05f, 1000.0f, true);
 
                     Matrix4f mvp = new Matrix4f(proj);
                     mvp.mul(view);
