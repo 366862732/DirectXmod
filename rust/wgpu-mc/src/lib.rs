@@ -196,7 +196,7 @@ const IDENTITY: [[f32; 4]; 4] = [
 ];
 
 const RING_SIZE: usize = 3;
-const LERP_FACTOR: f32 = 0.3;
+const LERP_FACTOR: f32 = 0.85;
 
 fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
     let mut result = [[0.0f32; 4]; 4];
@@ -443,13 +443,10 @@ pub struct WmRenderer {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     surface_format: wgpu::TextureFormat,
     surface_depth: Option<wgpu::Texture>,  // Cached depth texture (reused per-frame)
-<<<<<<< HEAD
     surface_hwnd: usize,  // Track HWND to detect fullscreen/resize transitions
-=======
     /// True when a window resize has been received but the swapchain has not
     /// been reconfigured yet. Forces a surface reconfig in render_surface().
     resize_pending: bool,
->>>>>>> 82dd6b08994805c77ef2039f75139c4fbe644661
 
     // Textured fullscreen quad (GL framebuffer → D3D12 display)
     tex_pipeline: wgpu::RenderPipeline,
@@ -824,11 +821,8 @@ impl WmRenderer {
             surface_config: None,
             surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
             surface_depth: None,
-<<<<<<< HEAD
             surface_hwnd: 0,
-=======
             resize_pending: false,
->>>>>>> 82dd6b08994805c77ef2039f75139c4fbe644661
             tex_pipeline,
             tex_bind_group: None,
             tex_sampler,
@@ -1600,7 +1594,18 @@ impl WmRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: self.surface_format,
-                    blend: None,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1635,20 +1640,41 @@ impl WmRenderer {
 
         let surface = self.surface.as_ref().unwrap();
 
-        // If a resize is pending, reconfigure the swapchain BEFORE acquiring
-        // the next texture so that depth and color attachments stay in sync.
+        // If a resize is pending, reconfigure the swapchain dimensions.
+        // Depth texture is NOT recreated here — it is created AFTER
+        // get_current_texture() succeeds, using the actual frame texture
+        // dimensions. This guarantees depth and color attachments always
+        // match, avoiding "Attachments have differing sizes" validation
+        // errors during window resize transitions.
         if self.resize_pending {
             if let Some(config) = &self.surface_config {
                 log::info!("[dx12-wm] Applying pending surface reconfig to {}x{}", config.width, config.height);
                 surface.configure(&self.device, config);
-                self.surface_depth = Some(make_depth_texture(&self.device, self.width, self.height));
             }
             self.resize_pending = false;
         }
 
         // Get surface frame
         let frame = match surface.get_current_texture() {
-            Ok(f) => f,
+            Ok(f) => {
+                // Ensure depth texture matches the actual swapchain image size.
+                // This prevents mismatches when the swapchain hasn't fully
+                // transitioned to the new config size yet.
+                let actual = f.texture.size();
+                let needs_recreate = match &self.surface_depth {
+                    Some(depth) => depth.size().width != actual.width
+                                || depth.size().height != actual.height,
+                    None => true,
+                };
+                if needs_recreate {
+                    log::info!("[dx12-wm] Recreating depth texture to match swapchain {}x{}",
+                        actual.width, actual.height);
+                    self.surface_depth = Some(make_depth_texture(&self.device, actual.width, actual.height));
+                    self.width = actual.width;
+                    self.height = actual.height;
+                }
+                f
+            }
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 log::info!("[dx12-wm] Surface lost/outdated, reconfiguring");
                 if let Some(config) = &self.surface_config {
