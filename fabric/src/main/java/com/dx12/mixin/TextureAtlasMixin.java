@@ -150,116 +150,15 @@ public class TextureAtlasMixin {
                 count++;
             }
 
-            Dx12Mod.LOGGER.info("[dx12-wm] TAIL: composited {}/{} sprites", count, texturesByName.size());
+            // Count how many sprites were skipped (missing from HEAD cache)
+            int missingCount = 0;
+            for (Identifier key : texturesByName.keySet()) {
+                if (!cache.containsKey(key)) missingCount++;
+            }
+            Dx12Mod.LOGGER.info("[dx12-wm] TAIL: composited {}/{} sprites ({} missing from cache)",
+                count, texturesByName.size(), missingCount);
 
-            // DIAGNOSTIC: check all 4 UV corners from the first chunk quad against all sprites
-            float[][] quadUVs = {
-                {0.6094f, 0.0312f},  // v0
-                {0.6016f, 0.0312f},  // v1
-                {0.6016f, 0.0391f},  // v2
-                {0.6094f, 0.0391f},  // v3
-            };
-            for (int qi = 0; qi < quadUVs.length; qi++) {
-                float chunkU = quadUVs[qi][0], chunkV = quadUVs[qi][1];
-                int chunkPx = (int)(chunkU * w), chunkPy = (int)(chunkV * h);
-                boolean foundSprite = false;
-                for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
-                    TextureAtlasSprite ds = de.getValue();
-                    PixelData dpd = cache.get(de.getKey());
-                    if (dpd == null) continue;
-                    int dsx = ds.getX(), dsy = ds.getY();
-                    float su0 = (float)dsx / w, su1 = (float)(dsx + dpd.w) / w;
-                    float sv0 = (float)dsy / h, sv1 = (float)(dsy + dpd.h) / h;
-                    if (chunkU >= su0 && chunkU <= su1 && chunkV >= sv0 && chunkV <= sv1) {
-                        int off = (chunkPy * w + chunkPx) * 4;
-                        Dx12Mod.LOGGER.info("[dx12-wm] QUAD v{} UV ({},{}) INSIDE {} at ({},{}) {}x{}  atlasRGBA=({},{},{},{})",
-                            qi, chunkU, chunkV, de.getKey(), dsx, dsy, dpd.w, dpd.h,
-                            atlas.get(off) & 0xFF, atlas.get(off+1) & 0xFF,
-                            atlas.get(off+2) & 0xFF, atlas.get(off+3) & 0xFF);
-                        foundSprite = true;
-                        break;
-                    }
-                }
-                if (!foundSprite) {
-                    Dx12Mod.LOGGER.info("[dx12-wm] QUAD v{} UV ({},{}) → pixel ({},{}) NOT covered by any sprite", qi, chunkU, chunkV, chunkPx, chunkPy);
-                }
-            }
-            // Extended near-sprite search (by edge distance) around the quad center
-            float centerU = 0.6055f, centerV = 0.03515f;  // midpoint of the quad
-            int cpx = (int)(centerU * w), cpy = (int)(centerV * h);
-            Dx12Mod.LOGGER.info("[dx12-wm]   Nearest sprites to quad center ({},{}):", cpx, cpy);
-            int nearCount = 0;
-            for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
-                TextureAtlasSprite ds = de.getValue();
-                PixelData dpd = cache.get(de.getKey());
-                if (dpd == null) continue;
-                int dsx = ds.getX(), dsy = ds.getY(), dsw = dpd.w, dsh = dpd.h;
-                // Edge distance: 0 if (cpx,cpy) inside rect, else distance to nearest edge
-                int dx = cpx < dsx ? dsx - cpx : (cpx > dsx + dsw ? cpx - (dsx + dsw) : 0);
-                int dy = cpy < dsy ? dsy - cpy : (cpy > dsy + dsh ? cpy - (dsy + dsh) : 0);
-                int dist = Math.max(dx, 0) + Math.max(dy, 0);
-                if (dist < 100 && nearCount < 12) {
-                    Dx12Mod.LOGGER.info("[dx12-wm]   EdgeNear {}: rect=({}-{},{}-{}) edgeDist={}",
-                        de.getKey(), dsx, dsx + dsw, dsy, dsy + dsh, dist);
-                    nearCount++;
-                }
-            }
-
-            // DIAGNOSTIC: find which sprite covers the chunk UV pixel (16, 1232)
-            // This is where the first chunk vertex UV (0.0078, 0.6016) points in a 2048x2048 atlas
-            int chunkUvPx = 16, chunkUvPy = 1232;
-            Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_SEARCH: searching for sprites covering pixel ({},{})", chunkUvPx, chunkUvPy);
-            boolean chunkUvFound = false;
-            for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
-                TextureAtlasSprite ds = de.getValue();
-                PixelData dpd = cache.get(de.getKey());
-                if (dpd == null) continue;
-                int dsx = ds.getX(), dsy = ds.getY(), dsw = dpd.w, dsh = dpd.h;
-                if (chunkUvPx >= dsx && chunkUvPx < dsx + dsw && chunkUvPy >= dsy && chunkUvPy < dsy + dsh) {
-                    int off = (chunkUvPy * w + chunkUvPx) * 4;
-                    int a = off + 3 < atlas.capacity() ? atlas.get(off+3) & 0xFF : -1;
-                    Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_FOUND in texturesByName: {} at ({}-{},{}-{}) atlasAlpha={}",
-                        de.getKey(), dsx, dsx + dsw, dsy, dsy + dsh, a);
-                    chunkUvFound = true;
-                    break;
-                }
-            }
-            if (!chunkUvFound) {
-                Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_NOT_FOUND in texturesByName for pixel ({},{})", chunkUvPx, chunkUvPy);
-                // Now search Preparations cache instead
-                for (Map.Entry<Identifier, PixelData> ce : cache.entrySet()) {
-                    PixelData cpd = ce.getValue();
-                    int psx = cpd.prepX, psy = cpd.prepY, psw = cpd.w, psh = cpd.h;
-                    if (chunkUvPx >= psx && chunkUvPx < psx + psw && chunkUvPy >= psy && chunkUvPy < psy + psh) {
-                        Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_FOUND in Preparations: {} at prep=({}-{},{}-{}) firstBytes=({},{},{})",
-                            ce.getKey(), psx, psx + psw, psy, psy + psh,
-                            cpd.pixels[0] & 0xFF, cpd.pixels[1] & 0xFF, cpd.pixels[2] & 0xFF);
-                        chunkUvFound = true;
-                        break;
-                    }
-                }
-                if (!chunkUvFound) {
-                    Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_UV_NOT_FOUND in Preparations either!");
-                    // Last resort: find the closest sprite to pixel (16,1232)
-                    int bestDist = Integer.MAX_VALUE;
-                    Identifier bestId = null;
-                    for (Map.Entry<Identifier, PixelData> ce : cache.entrySet()) {
-                        PixelData cpd = ce.getValue();
-                        int psx = cpd.prepX, psy = cpd.prepY, psw = cpd.w, psh = cpd.h;
-                        int dx = chunkUvPx < psx ? psx - chunkUvPx : (chunkUvPx > psx + psw ? chunkUvPx - (psx + psw) : 0);
-                        int dy = chunkUvPy < psy ? psy - chunkUvPy : (chunkUvPy > psy + psh ? chunkUvPy - (psy + psh) : 0);
-                        int dist = dx + dy;
-                        if (dist < bestDist) { bestDist = dist; bestId = ce.getKey(); }
-                    }
-                    if (bestId != null) {
-                        PixelData bpd = cache.get(bestId);
-                        Dx12Mod.LOGGER.info("[dx12-wm] CLOSEST sprite to ({},{}): {} at prep=({},{}) {}x{} dist={}",
-                            chunkUvPx, chunkUvPy, bestId, bpd.prepX, bpd.prepY, bpd.w, bpd.h, bestDist);
-                    }
-                }
-            }
-
-            // DIAGNOSTIC: sprite y-range distribution (to understand atlas packing)
+            // DIAGNOSTIC: sprite position consistency check
             int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
             int mismatchCount = 0, totalChecked = 0;
             for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
@@ -280,6 +179,29 @@ public class TextureAtlasMixin {
             }
             Dx12Mod.LOGGER.info("[dx12-wm] SPRITE_Y_RANGE: y=[{},{}] total={} mismatches={}",
                 minY, maxY, totalChecked, mismatchCount);
+
+            // DIAGNOSTIC: Check atlas pixel at chunk UV (1952,976) right before JNI
+            int diagX = 1952, diagY = 976;
+            int diagOff = (diagY * w + diagX) * 4;
+            if (diagOff + 3 < atlas.capacity()) {
+                Dx12Mod.LOGGER.info("[dx12-wm] PRE-JNI pixel ({},{}) RGBA=({},{},{},{})",
+                    diagX, diagY,
+                    atlas.get(diagOff) & 0xFF,
+                    atlas.get(diagOff+1) & 0xFF,
+                    atlas.get(diagOff+2) & 0xFF,
+                    atlas.get(diagOff+3) & 0xFF);
+                // Check if any sprite covers this pixel
+                for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
+                    TextureAtlasSprite ds = de.getValue();
+                    int dsx = ds.getX(), dsy = ds.getY();
+                    PixelData dpd = cache.get(de.getKey());
+                    if (dpd == null) continue;
+                    if (diagX >= dsx && diagX < dsx + dpd.w && diagY >= dsy && diagY < dsy + dpd.h) {
+                        Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_PX ({},{}) INSIDE sprite {} at ({},{}) {}x{}",
+                            diagX, diagY, de.getKey(), dsx, dsy, dpd.w, dpd.h);
+                    }
+                }
+            }
 
             D3D12Bridge.uploadTerrainAtlas(atlas, w, h);
             MemoryUtil.memFree(atlas);

@@ -151,13 +151,15 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(atlas, atlas_sampler, in.uv);
-    // Alpha test temporarily disabled to diagnose UV mapping:
-    // most blocks (stone, dirt, grass) have alpha=255 everywhere on their
-    // sprites; transparent areas indicate UVs land in empty atlas space.
-    //if (tex_color.a < 0.1) {
-    //    discard;
-    //}
-    return vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    // Fallback: when the atlas pixel is transparent (UV doesn't match
+    // the rebuilt atlas position), use vertex color tint with full
+    // opacity so terrain blocks remain visible as colored shapes.
+    // The proper fix is to align the atlas composition with MC's
+    // internal GPU texture layout — this is a visual safety net.
+    let has_tex = tex_color.a > 0.01;
+    let out_rgb = select(in.tint, tex_color.rgb * in.tint, has_tex);
+    let out_a  = select(1.0, tex_color.a, has_tex);
+    return vec4<f32>(out_rgb, out_a);
 }
 "#;
 
@@ -1594,18 +1596,7 @@ impl WmRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: self.surface_format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
