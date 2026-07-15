@@ -151,13 +151,12 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(atlas, atlas_sampler, in.uv);
-    // Fallback: when the atlas pixel is transparent (UV doesn't match
-    // the rebuilt atlas position), use vertex color tint with full
-    // opacity so terrain blocks remain visible as colored shapes.
-    // The proper fix is to align the atlas composition with MC's
-    // internal GPU texture layout — this is a visual safety net.
+    // Fallback: when the atlas pixel is transparent (atlas composition
+    // doesn't match chunk UVs), use a dimmed vertex color so terrain
+    // blocks remain visible without blinding overexposure.
     let has_tex = tex_color.a > 0.01;
-    let out_rgb = select(in.tint, tex_color.rgb * in.tint, has_tex);
+    let fallback_rgb = in.tint * 0.6;                // Dim to avoid pure-white blowout
+    let out_rgb = select(fallback_rgb, tex_color.rgb * in.tint, has_tex);
     let out_a  = select(1.0, tex_color.a, has_tex);
     return vec4<f32>(out_rgb, out_a);
 }

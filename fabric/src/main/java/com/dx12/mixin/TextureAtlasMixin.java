@@ -40,12 +40,22 @@ public class TextureAtlasMixin {
     @Shadow
     private Map<Identifier, TextureAtlasSprite> texturesByName;
 
-    /** Cached pixel data + dimensions + Preparations position, captured at HEAD. */
+    /**
+     * Cached pixel data + dimensions + Preparations position, captured at HEAD.
+     * Uses FRAME dimensions (fw,fh) for writing, not NativeImage dimensions (w,h).
+     * MC's SpriteContents.originalImage may be larger than the frame for
+     * animated sprites (e.g. lava: 16x64 NativeImage but only 16x16 frame).
+     * Using frame dimensions prevents writing extra animation frames that
+     * overwrite adjacent sprite data in the composited atlas.
+     */
     private static class PixelData {
         final byte[] pixels;
-        final int w, h, prepX, prepY;
-        PixelData(byte[] pixels, int w, int h, int prepX, int prepY) {
+        final int w, h;       // NativeImage dimensions (may include all animation frames)
+        final int fw, fh;     // Frame dimensions (the actual rendered size)
+        final int prepX, prepY;
+        PixelData(byte[] pixels, int w, int h, int fw, int fh, int prepX, int prepY) {
             this.pixels = pixels; this.w = w; this.h = h;
+            this.fw = fw; this.fh = fh;
             this.prepX = prepX; this.prepY = prepY;
         }
     }
@@ -72,11 +82,17 @@ public class TextureAtlasMixin {
             Field contentsField = TextureAtlasSprite.class.getDeclaredField("contents");
             contentsField.setAccessible(true);
 
-            Object fc = contentsField.get(regions.values().iterator().next());
-            Field origImgField = fc.getClass().getDeclaredField("originalImage");
+            Object firstContents = contentsField.get(regions.values().iterator().next());
+            Field origImgField = firstContents.getClass().getDeclaredField("originalImage");
             origImgField.setAccessible(true);
 
-            Class<?> niCls = origImgField.get(fc).getClass();
+            // Frame dimensions from SpriteContents.width/height (not NativeImage dimensions)
+            Field contentsW = firstContents.getClass().getDeclaredField("width");
+            Field contentsH = firstContents.getClass().getDeclaredField("height");
+            contentsW.setAccessible(true);
+            contentsH.setAccessible(true);
+
+            Class<?> niCls = origImgField.get(firstContents).getClass();
             Field niPtr = null, niW = null, niH = null;
             for (Field f : niCls.getDeclaredFields()) {
                 f.setAccessible(true);
@@ -104,7 +120,11 @@ public class TextureAtlasMixin {
                 ByteBuffer src = MemoryUtil.memByteBuffer(ptr, w * h * bpp);
                 byte[] data = new byte[w * h * bpp];
                 for (int i = 0; i < data.length; i++) data[i] = src.get(i);
-                cache.put(id, new PixelData(data, w, h, sp.getX(), sp.getY()));
+                // SpriteContents.width/height = frame dimensions (from frameSize in constructor).
+                // These differ from NativeImage dimensions for animated sprites
+                // (e.g. lava: 16x64 NativeImage but only 16x16 frame).
+                int fw = contentsW.getInt(ct), fh = contentsH.getInt(ct);
+                cache.put(id, new PixelData(data, w, h, fw, fh, sp.getX(), sp.getY()));
             }
 
             Dx12Mod.LOGGER.info("[dx12-wm] HEAD: cached {} sprite pixel buffers", cache.size());
@@ -138,12 +158,18 @@ public class TextureAtlasMixin {
                 PixelData pd = cache.get(e.getKey());
                 if (pd == null) continue;
 
-                int rowBytes = pd.w * 4;
-                for (int py = 0; py < pd.h; py++) {
-                    int srcOff = py * rowBytes;
+                // Use FRAME dimensions (fw,fh) to write only the first frame.
+                // pd.w/pd.h = NativeImage size (may include all animation frames).
+                // pd.fw/pd.fh = frame size (from SpriteContents.frameSize).
+                // MC's uploadFirstFrame() also only writes frameSize region.
+                int srcStride = pd.w * 4;           // NativeImage row stride
+                int writeBytes = pd.fw * 4;          // Only write frame-width pixels
+                int writeRows = Math.min(pd.fh, pd.h); // Clamp to available data
+                for (int py = 0; py < writeRows; py++) {
+                    int srcOff = py * srcStride;
                     int dstOff = ((sy + py) * w + sx) * 4;
-                    if (dstOff + rowBytes > atlas.capacity()) break;
-                    for (int px = 0; px < rowBytes; px++) {
+                    if (dstOff + writeBytes > atlas.capacity()) break;
+                    for (int px = 0; px < writeBytes; px++) {
                         atlas.put(dstOff + px, pd.pixels[srcOff + px]);
                     }
                 }
@@ -180,8 +206,9 @@ public class TextureAtlasMixin {
             Dx12Mod.LOGGER.info("[dx12-wm] SPRITE_Y_RANGE: y=[{},{}] total={} mismatches={}",
                 minY, maxY, totalChecked, mismatchCount);
 
-            // DIAGNOSTIC: Check atlas pixel at chunk UV (1952,976) right before JNI
-            int diagX = 1952, diagY = 976;
+            // DIAGNOSTIC: Check atlas pixel at chunk UV position right before JNI
+            // UV (0.0078125, 0.6015625) = first chunk vertex's texcoord → pixel (16, 1232)
+            int diagX = 16, diagY = 1232;
             int diagOff = (diagY * w + diagX) * 4;
             if (diagOff + 3 < atlas.capacity()) {
                 Dx12Mod.LOGGER.info("[dx12-wm] PRE-JNI pixel ({},{}) RGBA=({},{},{},{})",
@@ -190,15 +217,16 @@ public class TextureAtlasMixin {
                     atlas.get(diagOff+1) & 0xFF,
                     atlas.get(diagOff+2) & 0xFF,
                     atlas.get(diagOff+3) & 0xFF);
-                // Check if any sprite covers this pixel
+                // Check if any sprite covers this pixel (using frame dimensions fw/fh)
                 for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
                     TextureAtlasSprite ds = de.getValue();
                     int dsx = ds.getX(), dsy = ds.getY();
                     PixelData dpd = cache.get(de.getKey());
                     if (dpd == null) continue;
-                    if (diagX >= dsx && diagX < dsx + dpd.w && diagY >= dsy && diagY < dsy + dpd.h) {
+                    // Use frame dimensions for the coverage check (dpd.w/dpd.h are NativeImage size)
+                    if (diagX >= dsx && diagX < dsx + dpd.fw && diagY >= dsy && diagY < dsy + dpd.fh) {
                         Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_PX ({},{}) INSIDE sprite {} at ({},{}) {}x{}",
-                            diagX, diagY, de.getKey(), dsx, dsy, dpd.w, dpd.h);
+                            diagX, diagY, de.getKey(), dsx, dsy, dpd.fw, dpd.fh);
                     }
                 }
             }
