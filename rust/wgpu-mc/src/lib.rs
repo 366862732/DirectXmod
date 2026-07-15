@@ -120,6 +120,7 @@ const CHUNK_SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
+    fog: vec4<f32>,  // fog.rgb = color, fog.a = density
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
@@ -148,17 +149,44 @@ fn vs_main(
     return out;
 }
 
+/// Apply exponential fog to a fragment color.
+fn apply_fog(color: vec4<f32>, depth: f32) -> vec4<f32> {
+    // Exponential fog: factor = exp(-density * depth^2)
+    // depth is window-space Z (0 = near, 1 = far).
+    let fog_factor = exp(-camera.fog.a * depth * depth * 100.0);
+    let final_rgb = mix(camera.fog.rgb, color.rgb, fog_factor);
+    return vec4<f32>(final_rgb, color.a);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(atlas, atlas_sampler, in.uv);
-    // Fallback: when the atlas pixel is transparent (atlas composition
-    // doesn't match chunk UVs), use a dimmed vertex color so terrain
-    // blocks remain visible without blinding overexposure.
-    let has_tex = tex_color.a > 0.01;
-    let fallback_rgb = in.tint * 0.6;                // Dim to avoid pure-white blowout
-    let out_rgb = select(fallback_rgb, tex_color.rgb * in.tint, has_tex);
-    let out_a  = select(1.0, tex_color.a, has_tex);
-    return vec4<f32>(out_rgb, out_a);
+    // Discard fully transparent pixels (e.g. plant background, leaf cutout).
+    // This prevents fallback solid color bleeding through transparent areas
+    // of the texture, which was causing plants to render as colored paper planes.
+    let threshold = 0.05;
+    if tex_color.a < threshold {
+        discard;
+    }
+    // Apply fog based on window-space depth, then output opaque color.
+    let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    return apply_fog(lit, in.position.z / in.position.w);
+}
+
+@fragment
+fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
+    let tex_color = textureSample(atlas, atlas_sampler, in.uv);
+    // Discard both fully transparent pixels (gaps in cutout textures)
+    // AND fully opaque pixels (already rendered by opaque pass).
+    // Only semi-transparent pixels (e.g. water, stained glass, leaf edges)
+    // pass through for alpha blending.
+    let threshold_low = 0.05;
+    let threshold_high = 0.95;
+    if tex_color.a < threshold_low || tex_color.a > threshold_high {
+        discard;
+    }
+    let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    return apply_fog(lit, in.position.z / in.position.w);
 }
 "#;
 
@@ -209,12 +237,23 @@ fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
     result
 }
 
-/// Write camera MVP + camera_pos to the uniform buffer.
-/// Layout: mat4x4 (64 bytes) + vec3 padded to vec4 (16 bytes) = 80 bytes.
-fn write_camera_uniform(queue: &wgpu::Queue, buffer: &wgpu::Buffer, mvp: &[[f32; 4]; 4], pos: &[f32; 3]) {
-    let mut data = [0u8; 80];
+/// Write camera MVP + camera_pos + fog to the uniform buffer.
+/// Layout:
+///   mat4x4  view_proj   (64 bytes, offset 0)
+///   vec3    camera_pos  (12 bytes, offset 64, padded to 16)
+///   vec4    fog         (16 bytes, offset 80)  — fog.rgb = color, fog.a = density
+/// Total: 96 bytes.
+fn write_camera_uniform(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    mvp: &[[f32; 4]; 4],
+    pos: &[f32; 3],
+    fog: &[f32; 4],
+) {
+    let mut data = [0u8; 96];
     data[0..64].copy_from_slice(bytemuck::cast_slice(mvp));
     data[64..76].copy_from_slice(bytemuck::cast_slice(pos));
+    data[80..96].copy_from_slice(bytemuck::cast_slice(&fog[..]));
     queue.write_buffer(buffer, 0, &data);
 }
 
@@ -427,6 +466,7 @@ pub struct WmRenderer {
     camera_prev: [[f32; 4]; 4],
     camera_target: [[f32; 4]; 4],
     camera_pos: [f32; 3],
+    fog_color: [f32; 4], // rgb + density
 
     // Immutable GPU resources
     pipeline: wgpu::RenderPipeline,
@@ -472,6 +512,7 @@ pub struct WmRenderer {
     // Chunk textured pipeline + atlas
     chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
     chunk_pipeline: Option<wgpu::RenderPipeline>,
+    chunk_pipeline_transparent: Option<wgpu::RenderPipeline>,
     chunk_bind_group: Option<wgpu::BindGroup>,
     chunk_bind_group_layout: Option<wgpu::BindGroupLayout>,
     atlas_texture: Option<wgpu::Texture>,
@@ -525,7 +566,7 @@ impl WmRenderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniform"),
-            size: 80, // mat4x4 (64) + vec3 (16 with padding)
+            size: 96, // mat4x4 (64) + camera_pos (16) + fog (16)
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -809,6 +850,7 @@ impl WmRenderer {
             camera_prev: IDENTITY,
             camera_target: IDENTITY,
             camera_pos: [0.0; 3],
+            fog_color: [0.5, 0.6, 0.8, 0.001], // default sky blue fog, very low density
             pipeline,
             bind_group,
             uniform_buffer,
@@ -840,6 +882,7 @@ impl WmRenderer {
             has_chunk_geometry: false,
             chunk_shader: None,
             chunk_pipeline: None,
+            chunk_pipeline_transparent: None,
             chunk_bind_group: None,
             chunk_bind_group_layout: Some(chunk_bgl),
             atlas_texture: None,
@@ -924,9 +967,10 @@ impl WmRenderer {
         self.surface = Some(surface);
         self.surface_hwnd = hwnd;
 
-        // Rebuild chunk pipeline with the actual surface format if atlas already uploaded.
-        // Drop the old pipeline first — it may have been created with the wrong format.
+        // Rebuild chunk pipelines with the actual surface format if atlas already uploaded.
+        // Drop the old pipelines first — they may have been created with the wrong format.
         self.chunk_pipeline = None;
+        self.chunk_pipeline_transparent = None;
         self.ensure_chunk_pipeline();
 
         log::info!("[dx12-wm] Surface mode ENABLED on parent HWND: {:?} {}x{}",
@@ -1388,15 +1432,44 @@ impl WmRenderer {
                     }
                     eprintln!("{}", line);
                 }
-                // Scan atlas for nearest non-zero pixel around chunk UV area
-                let scan_radius = 200i32; // scan up to 200px in each direction
-                let cx = 16i32; // center of chunk UV area
-                let cy = 1232i32;
+                // Scan atlas for nearest non-zero pixel around the ACTUAL chunk UV position
+                let scan_radius = 500i32; // scan up to 500px in each direction
+                // Use first vertex's UV to determine scan center
+                let u_center = vertices[0].uv[0].clamp(0.0, 1.0);
+                let v_center = vertices[0].uv[1].clamp(0.0, 1.0);
+                let cx = (u_center * aw as f32) as i32;
+                let cy = (v_center * ah as f32) as i32;
+                eprintln!("[dx12-wm]   SCAN_CENTER from v[0] uv=({:.4},{:.4}) → pixel=({},{})", u_center, v_center, cx, cy);
+                // First: check if the exact chunk UV area has any non-zero pixel
+                // Sample up to 5x5 grid around scan center
+                let mut chunk_has_data = false;
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        let px = cx + dx;
+                        let py = cy + dy;
+                        if px < 0 || px >= aw as i32 || py < 0 || py >= ah as i32 { continue; }
+                        let off = ((py as usize) * aw + (px as usize)) * 4;
+                        if off + 4 <= pixels.len() {
+                            if pixels[off+3] != 0 {
+                                if !chunk_has_data {
+                                    eprintln!("[dx12-wm]   CHUNK_AREA_HAS_DATA first at ({},{}): RGBA=({},{},{},{})",
+                                        px, py, pixels[off], pixels[off+1], pixels[off+2], pixels[off+3]);
+                                    chunk_has_data = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !chunk_has_data {
+                    eprintln!("[dx12-wm]   CHUNK_AREA_EMPTY: no non-zero pixel within 5x5 of ({},{})", cx, cy);
+                }
+                // Spiral search: find nearest non-zero pixel anywhere in atlas
                 let mut found_nonzero = false;
                 for r in 1..=scan_radius {
+                    // Search perimeter of square with radius r centered on chunk UV
                     for dy in -r..=r {
                         for dx in -r..=r {
-                            if dx.abs() != r && dy.abs() != r { continue; } // only check perimeter
+                            if dx.abs() != r && dy.abs() != r { continue; }
                             let px = cx + dx;
                             let py = cy + dy;
                             if px < 0 || px >= aw as i32 || py < 0 || py >= ah as i32 { continue; }
@@ -1511,6 +1584,13 @@ impl WmRenderer {
         }
     }
 
+    /// Set fog color and density for atmospheric fog effect.
+    /// fog_color_rgb = fog color (e.g. sky color from MC)
+    /// fog_density   = how quickly fog builds up with distance
+    pub fn set_fog(&mut self, fog_color_rgb: &[f32; 3], fog_density: f32) {
+        self.fog_color = [fog_color_rgb[0], fog_color_rgb[1], fog_color_rgb[2], fog_density];
+    }
+
     /// Remove all chunk meshes for a given section.
     /// Called before recompiling a section to prevent stale mesh accumulation.
     pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
@@ -1537,23 +1617,54 @@ impl WmRenderer {
         }
     }
 
-    /// Render all stored MC chunk meshes using the standard 3D pipeline.
+    /// Render all stored MC chunk meshes using two-pass rendering.
+    ///
+    /// Pass 1 (Opaque): depth_write=true, blend=None
+    ///   — Handles SOLID and CUTOUT blocks (including leaves, plants).
+    ///     Shader discards tex_color.a < 0.05 (fully transparent pixels are gaps).
+    ///     Opaque pixels write depth so they correctly occlude geometry behind them.
+    ///
+    /// Pass 2 (Transparent): depth_write=false, blend=ALPHA_BLENDING
+    ///   — Handles TRANSLUCENT blocks (water, stained glass, etc.).
+    ///     Shader discards both fully transparent (a<0.05) AND fully opaque (a>0.95)
+    ///     pixels — only semi-transparent fragments pass through for alpha blending.
+    ///     Depth write is DISABLED so these fragments never occlude objects behind them.
     fn draw_chunks<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
-        // Require chunk pipeline (with atlas texture) to be ready.
-        // Don't fall back to main pipeline — vertex formats differ!
         let Some(pipeline) = &self.chunk_pipeline else { return; };
+        let Some(pipeline_transparent) = &self.chunk_pipeline_transparent else { return; };
         let Some(bind_group) = &self.chunk_bind_group else { return; };
 
         static mut CHUNK_DRAW_FIRST: bool = true;
         if unsafe { CHUNK_DRAW_FIRST } {
             unsafe { CHUNK_DRAW_FIRST = false; }
             let total_meshes: usize = self.chunk_meshes.values().map(|v| v.len()).sum();
-            eprintln!("[dx12-wm] draw_chunks: {} sections, {} meshes total", self.chunk_meshes.len(), total_meshes);
+            eprintln!("[dx12-wm] draw_chunks: {} sections, {} meshes total (opaque + transparent passes)",
+                self.chunk_meshes.len(), total_meshes);
         }
 
+        // ════════════════════════════════════════════════
+        // Pass 1: Opaque — writes depth, no blending
+        // ════════════════════════════════════════════════
         rp.set_pipeline(pipeline);
         rp.set_bind_group(0, bind_group, &[]);
+        for (_key, meshes) in &self.chunk_meshes {
+            for mesh in meshes {
+                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                let index_format = if mesh.index_is_u32 {
+                    wgpu::IndexFormat::Uint32
+                } else {
+                    wgpu::IndexFormat::Uint16
+                };
+                rp.set_index_buffer(mesh.index_buffer.slice(..), index_format);
+                rp.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
 
+        // ════════════════════════════════════════════════
+        // Pass 2: Transparent — no depth write, alpha blending
+        // ════════════════════════════════════════════════
+        rp.set_pipeline(pipeline_transparent);
+        rp.set_bind_group(0, bind_group, &[]);
         for (_key, meshes) in &self.chunk_meshes {
             for mesh in meshes {
                 rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -1568,7 +1679,10 @@ impl WmRenderer {
         }
     }
 
-    /// Create or recreate the chunk render pipeline using the current surface format.
+    /// Create or recreate the chunk render pipelines using the current surface format.
+    /// Two pipelines are created:
+    ///   1. Opaque pipeline: depth_write=true, blend=None — handles SOLID and CUTOUT blocks
+    ///   2. Transparent pipeline: depth_write=false, blend=ALPHA_BLENDING — handles TRANSLUCENT blocks
     /// Called after atlas upload and after surface initialization to ensure
     /// the color target format matches the swapchain.
     fn ensure_chunk_pipeline(&mut self) {
@@ -1577,13 +1691,16 @@ impl WmRenderer {
         let Some(shader) = &self.chunk_shader else { return; };
         let Some(bgl) = &self.chunk_bind_group_layout else { return; };
 
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Chunk PL"),
+            bind_group_layouts: &[bgl],
+            push_constant_ranges: &[],
+        });
+
+        // ---- Opaque pipeline: depth_write ON, no blending ----
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Chunk Pipeline"),
-            layout: Some(&self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Chunk PL"),
-                bind_group_layouts: &[bgl],
-                push_constant_ranges: &[],
-            })),
+            label: Some("Chunk Pipeline (Opaque)"),
+            layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: shader,
                 entry_point: Some("vs_main"),
@@ -1618,8 +1735,54 @@ impl WmRenderer {
         });
 
         self.chunk_pipeline = Some(pipeline);
-        log::info!("[dx12-wm] Chunk pipeline created with format={:?}", self.surface_format);
-        eprintln!("[dx12-wm] Chunk pipeline created with format={:?}", self.surface_format);
+
+        // ---- Transparent pipeline: no depth write, alpha blending, no back-face culling ----
+        let pipeline_transparent = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Chunk Pipeline (Transparent)"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                buffers: &[ChunkVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_transparent"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                // No culling for transparent objects — back faces of water/glass
+                // need to render for proper semi-transparent appearance.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                // CRITICAL: Disable depth write for transparent pass so
+                // semi-transparent fragments don't occlude objects behind them.
+                // Depth test (Less) still prevents fragments behind opaque
+                // geometry from rendering through it.
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.chunk_pipeline_transparent = Some(pipeline_transparent);
+
+        log::info!("[dx12-wm] Chunk pipelines created (opaque + transparent) with format={:?}", self.surface_format);
+        eprintln!("[dx12-wm] Chunk pipelines created (opaque + transparent) with format={:?}", self.surface_format);
     }
 
     // ── Surface mode: render directly to swapchain ────────────────
@@ -1701,7 +1864,7 @@ impl WmRenderer {
                 // Phase 7: Render native MC chunk geometry with D3D12
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
 
                 let depth_view = self.surface_depth
                     .as_ref()
@@ -1762,7 +1925,7 @@ impl WmRenderer {
                 // Fallback: 3D test scene (plane + cubes)
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
 
                 {
                     let depth_view = self.surface_depth
@@ -1831,7 +1994,7 @@ impl WmRenderer {
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos);
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);

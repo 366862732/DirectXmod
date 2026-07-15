@@ -64,6 +64,7 @@ public class D3D12Bridge {
     public static native void nativeResize(int width, int height);
     public static native void nativeUpdateCamera(float[] matrix);
     public static native void nativeUpdateCameraPos(float x, float y, float z);
+    public static native void nativeUpdateFog(float r, float g, float b, float density);
     public static native void nativeSetFramePixels(java.nio.ByteBuffer buffer, int width, int height);
     public static native void nativeUploadChunkMesh(int sectionX, int sectionY, int sectionZ,
         java.nio.ByteBuffer buffer, int vertexCount, int vertexStride);

@@ -53,10 +53,12 @@ public class TextureAtlasMixin {
         final int w, h;       // NativeImage dimensions (may include all animation frames)
         final int fw, fh;     // Frame dimensions (the actual rendered size)
         final int prepX, prepY;
-        PixelData(byte[] pixels, int w, int h, int fw, int fh, int prepX, int prepY) {
+        final int padding;    // MC's sprite border padding (usually 1px per side)
+        PixelData(byte[] pixels, int w, int h, int fw, int fh, int prepX, int prepY, int padding) {
             this.pixels = pixels; this.w = w; this.h = h;
             this.fw = fw; this.fh = fh;
             this.prepX = prepX; this.prepY = prepY;
+            this.padding = padding;
         }
     }
 
@@ -83,8 +85,17 @@ public class TextureAtlasMixin {
             contentsField.setAccessible(true);
 
             Object firstContents = contentsField.get(regions.values().iterator().next());
-            Field origImgField = firstContents.getClass().getDeclaredField("originalImage");
-            origImgField.setAccessible(true);
+
+            // MC uploads byMipLevel[0] to GPU (uploadFirstFrame uses byMipLevel[level]).
+            // byMipLevel[0] after mipmap generation may differ from originalImage.
+            Field byMipLevelField = firstContents.getClass().getDeclaredField("byMipLevel");
+            byMipLevelField.setAccessible(true);
+            Object[] firstMips = (Object[]) byMipLevelField.get(firstContents);
+            Object firstNI = (firstMips != null && firstMips.length > 0) ? firstMips[0] : null;
+
+            // Sprite padding from TextureAtlasSprite (usually 1px per side)
+            Field paddingField = TextureAtlasSprite.class.getDeclaredField("padding");
+            paddingField.setAccessible(true);
 
             // Frame dimensions from SpriteContents.width/height (not NativeImage dimensions)
             Field contentsW = firstContents.getClass().getDeclaredField("width");
@@ -92,7 +103,8 @@ public class TextureAtlasMixin {
             contentsW.setAccessible(true);
             contentsH.setAccessible(true);
 
-            Class<?> niCls = origImgField.get(firstContents).getClass();
+            Class<?> niCls = (firstNI != null) ? firstNI.getClass() : null;
+            if (niCls == null) return;
             Field niPtr = null, niW = null, niH = null;
             for (Field f : niCls.getDeclaredFields()) {
                 f.setAccessible(true);
@@ -110,7 +122,9 @@ public class TextureAtlasMixin {
                 Identifier id = (Identifier) e.getKey();
                 TextureAtlasSprite sp = (TextureAtlasSprite) e.getValue();
                 Object ct = contentsField.get(sp);
-                Object ni = origImgField.get(ct);
+                // Read byMipLevel[0] instead of originalImage — matches uploadFirstFrame()
+                Object[] mips = (Object[]) byMipLevelField.get(ct);
+                Object ni = (mips != null && mips.length > 0) ? mips[0] : null;
                 if (ni == null) continue;
                 int w = niW.getInt(ni), h = niH.getInt(ni);
                 if (w <= 0 || h <= 0) continue;
@@ -124,7 +138,8 @@ public class TextureAtlasMixin {
                 // These differ from NativeImage dimensions for animated sprites
                 // (e.g. lava: 16x64 NativeImage but only 16x16 frame).
                 int fw = contentsW.getInt(ct), fh = contentsH.getInt(ct);
-                cache.put(id, new PixelData(data, w, h, fw, fh, sp.getX(), sp.getY()));
+                int pad = paddingField.getInt(sp);
+                cache.put(id, new PixelData(data, w, h, fw, fh, sp.getX(), sp.getY(), pad));
             }
 
             Dx12Mod.LOGGER.info("[dx12-wm] HEAD: cached {} sprite pixel buffers", cache.size());
@@ -162,12 +177,21 @@ public class TextureAtlasMixin {
                 // pd.w/pd.h = NativeImage size (may include all animation frames).
                 // pd.fw/pd.fh = frame size (from SpriteContents.frameSize).
                 // MC's uploadFirstFrame() also only writes frameSize region.
+                //
+                // CRITICAL: MC's TextureAtlasSprite UV coordinates are computed as
+                //   u0 = (x + padding) / atlasWidth
+                //   v0 = (y + padding) / atlasHeight
+                // where padding is the transparent border around each sprite (usually 1px).
+                // The GPU atlas blit also positions sprites at (x, y) with padding.
+                // Since padding shifts the actual pixel data right/down by `padding` px,
+                // we must write pixel data at (sx + padding, sy + padding).
+                int pad = pd.padding;
                 int srcStride = pd.w * 4;           // NativeImage row stride
                 int writeBytes = pd.fw * 4;          // Only write frame-width pixels
                 int writeRows = Math.min(pd.fh, pd.h); // Clamp to available data
                 for (int py = 0; py < writeRows; py++) {
                     int srcOff = py * srcStride;
-                    int dstOff = ((sy + py) * w + sx) * 4;
+                    int dstOff = ((sy + pad + py) * w + (sx + pad)) * 4;
                     if (dstOff + writeBytes > atlas.capacity()) break;
                     for (int px = 0; px < writeBytes; px++) {
                         atlas.put(dstOff + px, pd.pixels[srcOff + px]);
@@ -206,28 +230,79 @@ public class TextureAtlasMixin {
             Dx12Mod.LOGGER.info("[dx12-wm] SPRITE_Y_RANGE: y=[{},{}] total={} mismatches={}",
                 minY, maxY, totalChecked, mismatchCount);
 
-            // DIAGNOSTIC: Check atlas pixel at chunk UV position right before JNI
-            // UV (0.0078125, 0.6015625) = first chunk vertex's texcoord → pixel (16, 1232)
-            int diagX = 16, diagY = 1232;
-            int diagOff = (diagY * w + diagX) * 4;
-            if (diagOff + 3 < atlas.capacity()) {
-                Dx12Mod.LOGGER.info("[dx12-wm] PRE-JNI pixel ({},{}) RGBA=({},{},{},{})",
-                    diagX, diagY,
-                    atlas.get(diagOff) & 0xFF,
-                    atlas.get(diagOff+1) & 0xFF,
-                    atlas.get(diagOff+2) & 0xFF,
-                    atlas.get(diagOff+3) & 0xFF);
-                // Check if any sprite covers this pixel (using frame dimensions fw/fh)
-                for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
-                    TextureAtlasSprite ds = de.getValue();
-                    int dsx = ds.getX(), dsy = ds.getY();
-                    PixelData dpd = cache.get(de.getKey());
-                    if (dpd == null) continue;
-                    // Use frame dimensions for the coverage check (dpd.w/dpd.h are NativeImage size)
-                    if (diagX >= dsx && diagX < dsx + dpd.fw && diagY >= dsy && diagY < dsy + dpd.fh) {
-                        Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_PX ({},{}) INSIDE sprite {} at ({},{}) {}x{}",
-                            diagX, diagY, de.getKey(), dsx, dsy, dpd.fw, dpd.fh);
+            // DIAGNOSTIC: Check key atlas pixels right before JNI
+            int[][] checkXY = {{16,1232},{1616,256},{1632,320}};
+            String[] checkLabels = {"old_chunk","prev_chunk","this_chunk"};
+            for (int ck = 0; ck < checkXY.length; ck++) {
+                int cx = checkXY[ck][0], cy = checkXY[ck][1];
+                int off = (cy * w + cx) * 4;
+                if (off + 3 < atlas.capacity()) {
+                    int r = atlas.get(off) & 0xFF, g = atlas.get(off+1) & 0xFF;
+                    int b = atlas.get(off+2) & 0xFF, a = atlas.get(off+3) & 0xFF;
+                    Dx12Mod.LOGGER.info("[dx12-wm] PIXEL ({},{}) {} RGBA=({},{},{},{})",
+                        cx, cy, checkLabels[ck], r, g, b, a);
+                    // Find covering sprite (accounting for padding)
+                    for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
+                        TextureAtlasSprite ds = de.getValue();
+                        PixelData dpd = cache.get(de.getKey());
+                        if (dpd == null) continue;
+                        int spx = ds.getX() + dpd.padding;
+                        int spy = ds.getY() + dpd.padding;
+                        if (cx >= spx && cx < spx + dpd.fw &&
+                            cy >= spy && cy < spy + dpd.fh) {
+                            int pixOff = ((cy - spy) * dpd.w + (cx - spx)) * 4;
+                            int pr = dpd.pixels[pixOff] & 0xFF, pg = dpd.pixels[pixOff+1] & 0xFF;
+                            int pb = dpd.pixels[pixOff+2] & 0xFF, pa = dpd.pixels[pixOff+3] & 0xFF;
+                            Dx12Mod.LOGGER.info("[dx12-wm]   → sprite {} at ({},{}) padding={} src_pixel=({},{},{},{})",
+                                de.getKey(), ds.getX(), ds.getY(), dpd.padding, pr, pg, pb, pa);
+                        }
                     }
+                }
+            }
+            // Also check the first-pixel of sprite pixel data
+            int zeroSrcCount = 0;
+            for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
+                PixelData dpd = cache.get(de.getKey());
+                if (dpd == null) continue;
+                if (dpd.pixels.length >= 4) {
+                    int r = dpd.pixels[0] & 0xFF, g = dpd.pixels[1] & 0xFF;
+                    int b = dpd.pixels[2] & 0xFF, a = dpd.pixels[3] & 0xFF;
+                    if (r == 0 && g == 0 && b == 0 && a == 0) {
+                        zeroSrcCount++;
+                        if (zeroSrcCount <= 3) {
+                            Dx12Mod.LOGGER.info("[dx12-wm] ZERO_PIXEL_DATA: sprite {} at ({},{}) fw={} fh={}",
+                                de.getKey(), de.getValue().getX(), de.getValue().getY(),
+                                dpd.fw, dpd.fh);
+                        }
+                    }
+                }
+            }
+            Dx12Mod.LOGGER.info("[dx12-wm] ZERO_PIXEL_COUNT: {} out of {} sprites have zero first pixel",
+                zeroSrcCount, cache.size());
+
+            // DIAGNOSTIC: dump first 10 sprite padding values to verify fix
+            int padDumpCount = 0;
+            for (Map.Entry<Identifier, TextureAtlasSprite> de : texturesByName.entrySet()) {
+                PixelData dpd = cache.get(de.getKey());
+                if (dpd == null) continue;
+                if (padDumpCount < 10) {
+                    Dx12Mod.LOGGER.info("[dx12-wm] PADDING_CHECK: {} at ({},{}) padding={} fw={} fh={}",
+                        de.getKey(), dpd.prepX, dpd.prepY, dpd.padding, dpd.fw, dpd.fh);
+                    padDumpCount++;
+                }
+            }
+            // Also check if (1023,1039) area has sprite data in the ATLAS (post-composite)
+            // This helps verify the padding-fix write position
+            int[][] checkChunkPositions = {{1023,1039},{1024,1040},{1022,1038}};
+            String[] chunkLabels = {"near", "exact", "far"};
+            for (int ck = 0; ck < checkChunkPositions.length; ck++) {
+                int cx = checkChunkPositions[ck][0], cy = checkChunkPositions[ck][1];
+                int off = (cy * w + cx) * 4;
+                if (off + 3 < atlas.capacity()) {
+                    int r = atlas.get(off) & 0xFF, g = atlas.get(off+1) & 0xFF;
+                    int b = atlas.get(off+2) & 0xFF, a = atlas.get(off+3) & 0xFF;
+                    Dx12Mod.LOGGER.info("[dx12-wm] CHUNK_PIXEL ({},{}) {} RGBA=({},{},{},{})",
+                        cx, cy, chunkLabels[ck], r, g, b, a);
                 }
             }
 

@@ -387,6 +387,25 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCameraPos(
     }
 }
 
+/// Update fog color and density for atmospheric fog in chunk rendering.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateFog(
+    _env: JNIEnv,
+    _class: JClass,
+    r: f32,
+    g: f32,
+    b: f32,
+    density: f32,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_fog(&[r, g, b], density);
+    }
+}
+
 /// Upload captured GL framebuffer pixels as a D3D12 texture for surface mode display.
 ///
 /// # Safety

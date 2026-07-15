@@ -216,6 +216,22 @@ public class Dx12Mod implements ClientModInitializer {
                     // Pass camera world position to offset test geometry near the player.
                     D3D12Bridge.updateCameraPos(
                         (float) pos.x, (float) pos.y, (float) pos.z);
+
+                    // Extract sky/fog color from the level for atmospheric fog effect.
+                    try {
+                        Vec3 skyColor = mc.level.getSkyColor(pos, mc.getFrameTime());
+                        // Compute fog density based on weather
+                        float fogDensity = 0.003f;
+                        if (mc.level.isRaining()) fogDensity = 0.008f;
+                        if (mc.level.isThundering()) fogDensity = 0.015f;
+                        D3D12Bridge.nativeUpdateFog(
+                            (float) skyColor.x, (float) skyColor.y, (float) skyColor.z,
+                            fogDensity
+                        );
+                    } catch (Throwable fogEx) {
+                        // Fog is non-critical; use default sky blue
+                        D3D12Bridge.nativeUpdateFog(0.53f, 0.81f, 0.92f, 0.003f);
+                    }
                 }
             } catch (Throwable t) {
                 LOGGER.error("Camera extraction failed: {}", t.getMessage());
