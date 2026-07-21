@@ -65,6 +65,13 @@ public class D3D12Bridge {
     public static native void nativeUpdateCamera(float[] matrix);
     public static native void nativeUpdateCameraPos(float x, float y, float z);
     public static native void nativeUpdateFog(float r, float g, float b, float density);
+
+    // ─── Entities & Particles ──────────────────────────────────
+
+    /** Upload entity data for colored box rendering (9 floats per entity). */
+    public static native void nativeSetEntities(float[] data);
+    /** Upload particle data for point sprite rendering (8 floats per particle). */
+    public static native void nativeSetParticles(float[] data);
     public static native void nativeSetFramePixels(java.nio.ByteBuffer buffer, int width, int height);
     public static native void nativeUploadChunkMesh(int sectionX, int sectionY, int sectionZ,
         java.nio.ByteBuffer buffer, int vertexCount, int vertexStride);

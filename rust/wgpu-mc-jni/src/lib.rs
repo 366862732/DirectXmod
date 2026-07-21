@@ -406,6 +406,66 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateFog(
     }
 }
 
+/// Upload entity data for colored box rendering.
+///
+/// data format: [x, y, z, w, h, d, r, g, b] per entity (9 floats).
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetEntities(
+    env: JNIEnv,
+    _class: JClass,
+    data: JFloatArray,
+) {
+    let mut guard = lock_or_poisoned();
+    let renderer = match guard.as_mut() {
+        Some(Ok(r)) => r,
+        _ => return,
+    };
+
+    let len = env.get_array_length(&data).unwrap_or(0);
+    if len < 9 {
+        renderer.set_entities(&[]);
+        return;
+    }
+
+    let mut buf = vec![0.0f32; len as usize];
+    env.get_float_array_region(&data, 0, &mut buf).unwrap_or(());
+
+    renderer.set_entities(&buf);
+}
+
+/// Upload particle data for point sprite rendering.
+///
+/// data format: [x, y, z, size, r, g, b, a] per particle (8 floats).
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetParticles(
+    env: JNIEnv,
+    _class: JClass,
+    data: JFloatArray,
+) {
+    let mut guard = lock_or_poisoned();
+    let renderer = match guard.as_mut() {
+        Some(Ok(r)) => r,
+        _ => return,
+    };
+
+    let len = env.get_array_length(&data).unwrap_or(0);
+    if len < 8 {
+        renderer.set_particles(&[]);
+        return;
+    }
+
+    let mut buf = vec![0.0f32; len as usize];
+    env.get_float_array_region(&data, 0, &mut buf).unwrap_or(());
+
+    renderer.set_particles(&buf);
+}
+
 /// Upload captured GL framebuffer pixels as a D3D12 texture for surface mode display.
 ///
 /// # Safety

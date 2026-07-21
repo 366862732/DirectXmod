@@ -63,6 +63,31 @@ impl ChunkVertex {
     }
 }
 
+/// Particle vertex for point sprite rendering.
+/// 32 bytes: position(12) + color(16) + size(4).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct ParticleVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+    size: f32,
+}
+
+impl ParticleVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x4,
+        2 => Float32,
+    ];
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct TexVertex {
@@ -130,6 +155,7 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tint: vec3<f32>,
+    @location(2) linear_depth: f32,
 }
 
 @vertex
@@ -146,14 +172,20 @@ fn vs_main(
     out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = uv;
     out.tint = color;
+    // clip_w = view-space distance (positive for in-front geometry).
+    // Store the reciprocal so the fragment shader can compute distance = 1/linear_depth.
+    out.linear_depth = out.position.w;
     return out;
 }
 
 /// Apply exponential fog to a fragment color.
-fn apply_fog(color: vec4<f32>, depth: f32) -> vec4<f32> {
-    // Exponential fog: factor = exp(-density * depth^2)
-    // depth is window-space Z (0 = near, 1 = far).
-    let fog_factor = exp(-camera.fog.a * depth * depth * 100.0);
+/// depth is the linear view-space distance (clip-space w).
+fn apply_fog(color: vec4<f32>, clip_w: f32) -> vec4<f32> {
+    // clip_w is negative in right-handed coordinate systems (visible geometry has view_z < 0).
+    // JOML perspective(..., true) sets proj[3][2] = 1, so clip_w = view_z (not scaled).
+    // Take absolute value to get linear view-space distance in meters.
+    let distance = -clip_w;
+    let fog_factor = exp(-camera.fog.a * distance);
     let final_rgb = mix(camera.fog.rgb, color.rgb, fog_factor);
     return vec4<f32>(final_rgb, color.a);
 }
@@ -168,9 +200,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if tex_color.a < threshold {
         discard;
     }
-    // Apply fog based on window-space depth, then output opaque color.
     let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
-    return apply_fog(lit, in.position.z / in.position.w);
+    return apply_fog(lit, in.linear_depth);
 }
 
 @fragment
@@ -186,7 +217,7 @@ fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
-    return apply_fog(lit, in.position.z / in.position.w);
+    return apply_fog(lit, in.linear_depth);
 }
 "#;
 
@@ -223,6 +254,79 @@ const IDENTITY: [[f32; 4]; 4] = [
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ];
+
+/// Entity shader: renders colored boxes at entity positions.
+/// Uses same camera uniform as main pipeline.
+const ENTITY_SHADER_SRC: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
+    var out: VertexOutput;
+    // Entity positions are in world space (absolute coordinates).
+    out.position = camera.view_proj * vec4<f32>(pos, 1.0);
+    out.color = color;
+    return out;
+}
+
+@fragment
+fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(color, 1.0);
+}
+"#;
+
+/// Particle shader: renders point sprites with alpha blending.
+/// Uses same camera uniform. Point size is controlled by vertex attribute.
+const PARTICLE_SHADER_SRC: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @builtin(point_size) point_size: f32,
+}
+
+@vertex
+fn vs_main(
+    @location(0) pos: vec3<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) size: f32,
+) -> VertexOutput {
+    var out: VertexOutput;
+    out.position = camera.view_proj * vec4<f32>(pos, 1.0);
+    out.color = color;
+    out.point_size = size;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Soft circle point sprite: discard pixels outside the inner circle.
+    let coord = 2.0 * vec2<f32>(in.position.x % in.point_size, in.position.y % in.point_size) / in.point_size - 1.0;
+    let dist = length(coord);
+    if dist > 1.0 {
+        discard;
+    }
+    // Soft edge: alpha = 1 - smoothstep(0.8, 1.0, dist)
+    let alpha = 1.0 - smoothstep(0.7, 1.0, dist);
+    return vec4<f32>(in.color.rgb, in.color.a * alpha);
+}
+"#;
 
 const RING_SIZE: usize = 3;
 const LERP_FACTOR: f32 = 0.85;
@@ -521,6 +625,16 @@ pub struct WmRenderer {
     atlas_height: u32,
     /// Raw atlas pixels stored for diagnostics
     atlas_pixels: Option<Vec<u8>>,
+
+    // Entity rendering (Phase 7 task 1: colored boxes at entity positions)
+    entity_buffer: Option<wgpu::Buffer>,
+    entity_count: u32,
+    entity_pipeline: Option<wgpu::RenderPipeline>,
+
+    // Particle rendering (Phase 7 task 2: point sprites)
+    particle_buffer: Option<wgpu::Buffer>,
+    particle_count: u32,
+    particle_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
@@ -804,7 +918,7 @@ impl WmRenderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -890,6 +1004,14 @@ impl WmRenderer {
             atlas_width: 0,
             atlas_height: 0,
             atlas_pixels: None,
+
+            // Entity + particle rendering (created lazily)
+            entity_buffer: None,
+            entity_count: 0,
+            entity_pipeline: None,
+            particle_buffer: None,
+            particle_count: 0,
+            particle_pipeline: None,
         })
     }
 
@@ -971,6 +1093,8 @@ impl WmRenderer {
         // Drop the old pipelines first — they may have been created with the wrong format.
         self.chunk_pipeline = None;
         self.chunk_pipeline_transparent = None;
+        self.entity_pipeline = None;
+        self.particle_pipeline = None;
         self.ensure_chunk_pipeline();
 
         log::info!("[dx12-wm] Surface mode ENABLED on parent HWND: {:?} {}x{}",
@@ -1679,6 +1803,150 @@ impl WmRenderer {
         }
     }
 
+    /// Upload entity data and rebuild the entity vertex buffer.
+    /// data format: [x, y, z, w, h, d, r, g, b] per entity (9 floats).
+    /// Each entity is rendered as a colored box matching its bounding box dimensions.
+    pub fn set_entities(&mut self, data: &[f32]) {
+        let per_entity = 9;
+        let entity_count = data.len() / per_entity;
+        if entity_count == 0 || entity_count > 256 {
+            // 0 entities → clear; >256 is unreasonable, likely corrupted data
+            self.entity_count = 0;
+            return;
+        }
+
+        // Generate 36 vertices per entity (6 faces × 2 triangles × 3 verts, non-indexed)
+        let total_vertices = entity_count * 36;
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(total_vertices);
+
+        for i in 0..entity_count {
+            let off = i * per_entity;
+            let cx = data[off];
+            let cy = data[off + 1];
+            let cz = data[off + 2];
+            let sx = (data[off + 3] * 0.5).max(0.01);
+            let sy = (data[off + 4] * 0.5).max(0.01);
+            let sz = (data[off + 5] * 0.5).max(0.01);
+            let r = data[off + 6].clamp(0.0, 1.0);
+            let g = data[off + 7].clamp(0.0, 1.0);
+            let b = data[off + 8].clamp(0.0, 1.0);
+            let col = [r, g, b];
+
+            let (min_x, max_x) = (cx - sx, cx + sx);
+            let (min_y, max_y) = (cy - sy, cy + sy);
+            let (min_z, max_z) = (cz - sz, cz + sz);
+
+            // 6 faces, 2 triangles per face, 3 verts per triangle = 36 verts per entity
+            // Helper: push 3 verts for a triangle
+            let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+                vertices.push(Vertex { position: a, color: col });
+                vertices.push(Vertex { position: b, color: col });
+                vertices.push(Vertex { position: c, color: col });
+            };
+            // Front (+z)
+            tri([min_x, min_y, max_z], [max_x, max_y, max_z], [max_x, min_y, max_z]);
+            tri([min_x, min_y, max_z], [min_x, max_y, max_z], [max_x, max_y, max_z]);
+            // Back (-z)
+            tri([max_x, min_y, min_z], [max_x, max_y, min_z], [min_x, min_y, min_z]);
+            tri([min_x, min_y, min_z], [max_x, max_y, min_z], [min_x, max_y, min_z]);
+            // Top (+y)
+            tri([min_x, max_y, min_z], [max_x, max_y, max_z], [min_x, max_y, max_z]);
+            tri([min_x, max_y, min_z], [max_x, max_y, min_z], [max_x, max_y, max_z]);
+            // Bottom (-y)
+            tri([min_x, min_y, max_z], [max_x, min_y, min_z], [min_x, min_y, min_z]);
+            tri([min_x, min_y, max_z], [max_x, min_y, max_z], [max_x, min_y, min_z]);
+            // Right (+x)
+            tri([max_x, min_y, min_z], [max_x, max_y, max_z], [max_x, min_y, max_z]);
+            tri([max_x, min_y, min_z], [max_x, max_y, min_z], [max_x, max_y, max_z]);
+            // Left (-x)
+            tri([min_x, min_y, max_z], [min_x, max_y, min_z], [min_x, min_y, min_z]);
+            tri([min_x, min_y, max_z], [min_x, max_y, max_z], [min_x, max_y, min_z]);
+        }
+
+        // Recreate vertex buffer if needed
+        let vb_size = (total_vertices * size_of::<Vertex>()) as u64;
+        if self.entity_buffer.as_ref().map_or(true, |b| b.size() < vb_size) {
+            self.entity_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Entity VB"),
+                size: vb_size.max(1),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        self.queue.write_buffer(self.entity_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&vertices));
+        self.entity_count = total_vertices as u32;
+
+        // Ensure entity pipeline exists
+        self.ensure_entity_pipeline();
+    }
+
+    /// Render entity boxes in the current render pass.
+    fn draw_entities<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        if self.entity_count == 0 { return; }
+        let Some(pipeline) = &self.entity_pipeline else { return; };
+        let Some(vb) = &self.entity_buffer else { return; };
+        let Some(bind_group) = &self.chunk_bind_group else { return; };
+
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, bind_group, &[]);
+        rp.set_vertex_buffer(0, vb.slice(..));
+        rp.draw(0..self.entity_count, 0..1);
+    }
+
+    /// Upload particle data and rebuild the particle point buffer.
+    /// data format: [x, y, z, size, r, g, b, a] per particle (8 floats).
+    pub fn set_particles(&mut self, data: &[f32]) {
+        let per_particle = 8;
+        let particle_count = data.len() / per_particle;
+        if particle_count == 0 || particle_count > 2048 {
+            self.particle_count = 0;
+            return;
+        }
+
+        let mut particles: Vec<ParticleVertex> = Vec::with_capacity(particle_count);
+        for i in 0..particle_count {
+            let off = i * per_particle;
+            particles.push(ParticleVertex {
+                position: [data[off], data[off + 1], data[off + 2]],
+                color: [
+                    data[off + 4].clamp(0.0, 1.0),
+                    data[off + 5].clamp(0.0, 1.0),
+                    data[off + 6].clamp(0.0, 1.0),
+                    data[off + 7].clamp(0.0, 1.0),
+                ],
+                size: data[off + 3].max(1.0),
+            });
+        }
+
+        let vb_size = (particle_count * size_of::<ParticleVertex>()) as u64;
+        if self.particle_buffer.as_ref().map_or(true, |b| b.size() < vb_size) {
+            self.particle_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Particle VB"),
+                size: vb_size.max(1),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        self.queue.write_buffer(self.particle_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&particles));
+        self.particle_count = particle_count as u32;
+
+        // Ensure particle pipeline exists
+        self.ensure_particle_pipeline();
+    }
+
+    /// Render particle point sprites in the current render pass.
+    fn draw_particles<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        if self.particle_count == 0 { return; }
+        let Some(pipeline) = &self.particle_pipeline else { return; };
+        let Some(vb) = &self.particle_buffer else { return; };
+        let Some(bind_group) = &self.chunk_bind_group else { return; };
+
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, bind_group, &[]);
+        rp.set_vertex_buffer(0, vb.slice(..));
+        rp.draw(0..self.particle_count, 0..1);
+    }
+
     /// Create or recreate the chunk render pipelines using the current surface format.
     /// Two pipelines are created:
     ///   1. Opaque pipeline: depth_write=true, blend=None — handles SOLID and CUTOUT blocks
@@ -1783,6 +2051,114 @@ impl WmRenderer {
 
         log::info!("[dx12-wm] Chunk pipelines created (opaque + transparent) with format={:?}", self.surface_format);
         eprintln!("[dx12-wm] Chunk pipelines created (opaque + transparent) with format={:?}", self.surface_format);
+    }
+
+    /// Create or recreate the entity rendering pipeline.
+    fn ensure_entity_pipeline(&mut self) {
+        if self.entity_pipeline.is_some() { return; }
+
+        let Some(bgl) = &self.chunk_bind_group_layout else { return; };
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Entity Shader"),
+            source: wgpu::ShaderSource::Wgsl(ENTITY_SHADER_SRC.into()),
+        });
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Entity PL"),
+            bind_group_layouts: &[bgl],
+            push_constant_ranges: &[],
+        });
+
+        self.entity_pipeline = Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Entity Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        }));
+    }
+
+    /// Create or recreate the particle point sprite pipeline.
+    fn ensure_particle_pipeline(&mut self) {
+        if self.particle_pipeline.is_some() { return; }
+
+        let Some(bgl) = &self.chunk_bind_group_layout else { return; };
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Particle Shader"),
+            source: wgpu::ShaderSource::Wgsl(PARTICLE_SHADER_SRC.into()),
+        });
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Particle PL"),
+            bind_group_layouts: &[bgl],
+            push_constant_ranges: &[],
+        });
+
+        self.particle_pipeline = Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Particle Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[ParticleVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::PointList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        }));
     }
 
     // ── Surface mode: render directly to swapchain ────────────────
@@ -1897,6 +2273,8 @@ impl WmRenderer {
                     });
 
                     self.draw_chunks(&mut rp);
+                    self.draw_entities(&mut rp);
+                    self.draw_particles(&mut rp);
                 }
             } else if has_frame {
                 // Textured fullscreen quad: display GL framebuffer capture
@@ -2030,6 +2408,8 @@ impl WmRenderer {
             });
 
             self.draw_scene(&mut rp);
+            self.draw_entities(&mut rp);
+            self.draw_particles(&mut rp);
         }
 
         encoder.copy_texture_to_buffer(

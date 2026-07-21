@@ -42,6 +42,7 @@ import static org.lwjgl.opengl.GL15.GL_STREAM_DRAW;
 import static org.lwjgl.opengl.GL15.GL_WRITE_ONLY;
 import static org.lwjgl.opengl.GL15.glBindBuffer;
 import static org.lwjgl.opengl.GL15.glBufferData;
+import static org.lwjgl.opengl.GL15.glDeleteBuffers;
 import static org.lwjgl.opengl.GL15.glGenBuffers;
 import static org.lwjgl.opengl.GL15.glMapBuffer;
 import static org.lwjgl.opengl.GL15.glUnmapBuffer;
@@ -64,13 +65,13 @@ import static org.lwjgl.opengl.GL21.GL_PIXEL_UNPACK_BUFFER;
 import static org.lwjgl.opengl.GL30.glBindVertexArray;
 import static org.lwjgl.opengl.GL30.glDeleteVertexArrays;
 import static org.lwjgl.opengl.GL30.glGenVertexArrays;
-import static org.lwjgl.opengl.GL30.glIsVertexArray;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.phys.Vec3;
 
 /**
  * GL4DX12 - Cross-version compatible Fabric mod.
@@ -93,18 +94,25 @@ public class Dx12Mod implements ClientModInitializer {
     private static long lastRenderTime = 0;
     private static long renderStartTime = 0;
 
-    // Persistent shading resources (reused across frames)
-    private static int vaoId = 0;
-    private static int shaderProg = 0;
-    private static int texUniformLoc = -1;
-    private static boolean shaderValid = false;
-    private static int texId = 0;
-    private static boolean texAllocated = false;
-    private static int texWidth = 0;
-    private static int texHeight = 0;
+    // Unified overlay GL resources (texture, PBO, mesh, shader)
+    private static GlOverlayResources overlayResources = new GlOverlayResources();
+    private static boolean releasePending = false;
 
-    // PBO for safe texture upload — bypasses NVIDIA driver's client-memory DMA
-    private static int pboId = 0;
+    private static void resetOverlayResources(String reason, boolean dropPendingFrame) {
+        LOGGER.warn("Reset overlay GL resources: {}", reason);
+        if (dropPendingFrame) {
+            pendingPixels = null;
+            pendingWidth = 0;
+            pendingHeight = 0;
+        }
+        releasePending = true;
+    }
+
+    private static void flushPendingRelease() {
+        if (!releasePending) return;
+        overlayResources.releaseAll();
+        releasePending = false;
+    }
 
     // Polling: track renderer init status to log transitions
     private static String lastRendererStatus = "not_started";
@@ -153,13 +161,7 @@ public class Dx12Mod implements ClientModInitializer {
                     renderReady = false;
                     firstTickLogged = false;
                     initTime = now;
-                    vaoId = 0;
-                    shaderValid = false;
-                    texAllocated = false;
-                    texWidth = 0;
-                    texHeight = 0;
-                    pboId = 0;
-                    pendingPixels = null;
+                    resetOverlayResources("resource reload detected", true);
                 }
             }
             lastTickTime = now;
@@ -217,20 +219,151 @@ public class Dx12Mod implements ClientModInitializer {
                     D3D12Bridge.updateCameraPos(
                         (float) pos.x, (float) pos.y, (float) pos.z);
 
-                    // Extract sky/fog color from the level for atmospheric fog effect.
+                    // Extract fog color from the level.
+                    // Clamp to a minimum brightness so underground fog isn't fully black.
                     try {
-                        Vec3 skyColor = mc.level.getSkyColor(pos, mc.getFrameTime());
-                        // Compute fog density based on weather
+                        Vec3 skyColor;
+                        try {
+                            Vec3 cameraPos = pos;
+                            float partialTick = 1.0f;
+                            var getSkyColorMethod = net.minecraft.world.level.Level.class
+                                .getMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
+                            skyColor = (Vec3) getSkyColorMethod.invoke(mc.level, cameraPos, partialTick);
+                        } catch (Exception e) {
+                            skyColor = new Vec3(0.53, 0.81, 0.92);
+                        }
+                        float fr = Math.max((float) skyColor.x, 0.20f);
+                        float fg = Math.max((float) skyColor.y, 0.25f);
+                        float fb = Math.max((float) skyColor.z, 0.35f);
+                        LOGGER.info("Fog raw=({}) final=({})",
+                            String.format("%.3f,%.3f,%.3f", skyColor.x, skyColor.y, skyColor.z),
+                            String.format("%.3f,%.3f,%.3f", fr, fg, fb));
                         float fogDensity = 0.003f;
                         if (mc.level.isRaining()) fogDensity = 0.008f;
                         if (mc.level.isThundering()) fogDensity = 0.015f;
-                        D3D12Bridge.nativeUpdateFog(
-                            (float) skyColor.x, (float) skyColor.y, (float) skyColor.z,
-                            fogDensity
-                        );
+                        D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
                     } catch (Throwable fogEx) {
-                        // Fog is non-critical; use default sky blue
+                        LOGGER.info("Fog fallback (exception): {}", fogEx.getMessage());
                         D3D12Bridge.nativeUpdateFog(0.53f, 0.81f, 0.92f, 0.003f);
+                    }
+
+                    // ─── Entity extraction ──────────────────────────
+                    try {
+                        // Use reflection to access entities (API differs across MC versions)
+                        var entityList = new java.util.ArrayList<net.minecraft.world.entity.Entity>();
+                        try {
+                            // Try Level.getEntities() + LevelEntityGetter via reflection
+                            var getEntitiesMethod = net.minecraft.world.level.Level.class
+                                .getDeclaredMethod("getEntities");
+                            getEntitiesMethod.setAccessible(true);
+                            var entityGetter = getEntitiesMethod.invoke(mc.level);
+                            var getAllMethod = entityGetter.getClass().getMethod("getAll", java.util.List.class);
+                            getAllMethod.invoke(entityGetter, entityList);
+                        } catch (Exception ignore) {
+                            // Entity iteration failed, skip
+                        }
+                        int count = entityList.size();
+                        if (count > 0 && count <= 256) {
+                            float[] entityData = new float[count * 9];
+                            for (int i = 0; i < count; i++) {
+                                var e = entityList.get(i);
+                                var ePos = e.position();
+                                var bb = e.getBoundingBox();
+                                float w = (float) (bb.maxX - bb.minX);
+                                float h = (float) (bb.maxY - bb.minY);
+                                float d = (float) (bb.maxZ - bb.minZ);
+                                int nameHash = e.getType().getDescription().getString().hashCode();
+                                float er = ((nameHash >> 0) & 0xFF) / 255.0f;
+                                float eg = ((nameHash >> 8) & 0xFF) / 255.0f;
+                                float eb = ((nameHash >> 16) & 0xFF) / 255.0f;
+                                int off = i * 9;
+                                entityData[off]     = (float) ePos.x;
+                                entityData[off + 1] = (float) ePos.y;
+                                entityData[off + 2] = (float) ePos.z;
+                                entityData[off + 3] = w;
+                                entityData[off + 4] = h;
+                                entityData[off + 5] = d;
+                                entityData[off + 6] = er;
+                                entityData[off + 7] = eg;
+                                entityData[off + 8] = eb;
+                            }
+                            D3D12Bridge.nativeSetEntities(entityData);
+                        } else {
+                            D3D12Bridge.nativeSetEntities(new float[0]);
+                        }
+                    } catch (Throwable entityEx) {
+                        D3D12Bridge.nativeSetEntities(new float[0]);
+                    }
+
+                    // ─── Particle extraction ────────────────────────
+                    try {
+                        var particleEngine = mc.particleEngine;
+                        if (particleEngine != null) {
+                            var particleList = new java.util.ArrayList<net.minecraft.client.particle.Particle>();
+                            try {
+                                var particlesField = net.minecraft.client.particle.ParticleEngine.class
+                                    .getDeclaredField("particles");
+                                particlesField.setAccessible(true);
+                                @SuppressWarnings("unchecked")
+                                var particleMap = (java.util.Map<?, ?>) particlesField.get(particleEngine);
+                                for (var entry : particleMap.entrySet()) {
+                                    var set = (java.util.Set<?>) entry.getValue();
+                                    for (var p : set) {
+                                        particleList.add((net.minecraft.client.particle.Particle) p);
+                                    }
+                                }
+                            } catch (Exception ignored) {
+                            }
+
+                            if (!particleList.isEmpty() && particleList.size() <= 2048) {
+                                float[] particleData = new float[particleList.size() * 8];
+                                int idx = 0;
+                                for (var p : particleList) {
+                                    // Read particle fields via reflection (protected in MC 26.1.2)
+                                    float px = 0f, py = 0f, pz = 0f;
+                                    try {
+                                        var xField = net.minecraft.client.particle.Particle.class
+                                            .getDeclaredField("x");
+                                        xField.setAccessible(true);
+                                        px = xField.getFloat(p);
+                                        var yField = net.minecraft.client.particle.Particle.class
+                                            .getDeclaredField("y");
+                                        yField.setAccessible(true);
+                                        py = yField.getFloat(p);
+                                        var zField = net.minecraft.client.particle.Particle.class
+                                            .getDeclaredField("z");
+                                        zField.setAccessible(true);
+                                        pz = zField.getFloat(p);
+                                    } catch (Exception ignored) {
+                                    }
+                                    float size = 4.0f;
+                                    float pr = 1.0f, pg = 1.0f, pb = 1.0f, pa = 0.8f;
+                                    int base = idx * 8;
+                                    particleData[base]     = px;
+                                    particleData[base + 1] = py;
+                                    particleData[base + 2] = pz;
+                                    particleData[base + 3] = size;
+                                    particleData[base + 4] = pr;
+                                    particleData[base + 5] = pg;
+                                    particleData[base + 6] = pb;
+                                    particleData[base + 7] = pa;
+                                    idx++;
+                                }
+                                if (idx > 0) {
+                                    float[] trimmed = new float[idx * 8];
+                                    System.arraycopy(particleData, 0, trimmed, 0, idx * 8);
+                                    D3D12Bridge.nativeSetParticles(trimmed);
+                                } else {
+                                    D3D12Bridge.nativeSetParticles(new float[0]);
+                                }
+                            } else {
+                                D3D12Bridge.nativeSetParticles(new float[0]);
+                            }
+                        } else {
+                            D3D12Bridge.nativeSetParticles(new float[0]);
+                        }
+                    } catch (Throwable particleEx) {
+                        D3D12Bridge.nativeSetParticles(new float[0]);
                     }
                 }
             } catch (Throwable t) {
@@ -305,27 +438,113 @@ public class Dx12Mod implements ClientModInitializer {
             return;
         }
 
+        // Flush any pending resource releases (from reload/error recovery)
+        flushPendingRelease();
+
         try {
             if (frameCount++ % 60 == 0) {
                 LOGGER.info("Rendering frame: {} bytes (frame={})", bufferBytes, frameCount);
             }
 
-            // Texture: allocate once, reallocate on resize
-            if (!texAllocated || texWidth != width || texHeight != height) {
-                if (texId != 0) glDeleteTextures(texId);
-                texId = glGenTextures();
-                glBindTexture(GL_TEXTURE_2D, texId);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
-                texAllocated = true;
-                texWidth = width;
-                texHeight = height;
-            }
+            // Ensure all rendering resources are ready
+            overlayResources.ensureReady(width, height);
 
-            // Upload pixels via PBO
+            // Upload pixel data via PBO
+            overlayResources.upload(pixels);
+
+            // Draw with GL state save/restore
+            withGlStateRestored(width, height, overlayResources::bindAndDraw);
+
+        } catch (Throwable t) {
+            resetOverlayResources("GL draw failed: " + t.getMessage(), false);
+        }
+    }
+
+    // Save/restore GL state around a draw action (glPushAttrib deprecated in core profile)
+    private static void withGlStateRestored(int width, int height, Runnable drawAction) {
+        boolean scissorWasOn = glIsEnabled(GL_SCISSOR_TEST);
+        boolean depthWasOn = glIsEnabled(GL_DEPTH_TEST);
+        boolean blendWasOn = glIsEnabled(GL_BLEND);
+        int[] oldViewport = new int[4];
+        GL11.glGetIntegerv(GL11.GL_VIEWPORT, oldViewport);
+
+        try {
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_BLEND);
+            glViewport(0, 0, width, height);
+            drawAction.run();
+        } finally {
+            if (scissorWasOn) glEnable(GL_SCISSOR_TEST);
+            if (depthWasOn) glEnable(GL_DEPTH_TEST);
+            if (blendWasOn) glEnable(GL_BLEND);
+            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+        }
+    }
+
+    // ---- Overlay GL resource lifecycle ---------------------------------
+
+    /**
+     * Owns all GL objects for offscreen overlay rendering:
+     * texture (RGBA8), PBO (pixel upload), VAO+VBO+IBO (fullscreen quad mesh),
+     * and shader program (passthrough texture blit).
+     * Provides ensure/create, upload, draw, and full release lifecycle.
+     */
+    private static final class GlOverlayResources {
+        int textureId;
+        int pboId;
+        int vaoId;
+        int vboId;
+        int iboId;
+        int programId;
+        int textureUniformLoc = -1;
+        int width;
+        int height;
+
+        void ensureReady(int w, int h) {
+            ensureTexture(w, h);
+            ensureShader();
+            ensureMesh();
+        }
+
+        void ensureTexture(int w, int h) {
+            if (textureId != 0 && width == w && height == h) return;
+            if (textureId != 0) glDeleteTextures(textureId);
+            textureId = glGenTextures();
+            glBindTexture(GL_TEXTURE_2D, textureId);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, (ByteBuffer) null);
+            width = w;
+            height = h;
+        }
+
+        void ensureShader() {
+            if (programId != 0) return;
+            programId = createShaderProgram();
+            textureUniformLoc = glGetUniformLocation(programId, "uTexture");
+        }
+
+        void ensureMesh() {
+            if (vaoId != 0) return;
+            vaoId = glGenVertexArrays();
+            vboId = glGenBuffers();
+            iboId = glGenBuffers();
+            glBindVertexArray(vaoId);
+            glBindBuffer(GL_ARRAY_BUFFER, vboId);
+            glBufferData(GL_ARRAY_BUFFER, buildVertexBuffer(), GL_STATIC_DRAW);
+            glVertexAttribPointer(0, 3, GL_FLOAT, false, 5 * Float.BYTES, 0);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(1, 2, GL_FLOAT, false, 5 * Float.BYTES, 3 * Float.BYTES);
+            glEnableVertexAttribArray(1);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboId);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, buildIndexBuffer(), GL_STATIC_DRAW);
+            glBindVertexArray(0);
+        }
+
+        void upload(ByteBuffer pixels) {
             int pboBytes = width * height * 4;
             if (pboId == 0) {
                 pboId = glGenBuffers();
@@ -338,129 +557,86 @@ public class Dx12Mod implements ClientModInitializer {
                 mapped.put(pixels);
                 glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
             }
-            glBindTexture(GL_TEXTURE_2D, texId);
+            glBindTexture(GL_TEXTURE_2D, textureId);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
 
-            // Shader: persistent
-            if (!shaderValid || shaderProg == 0) {
-                if (shaderProg != 0) glDeleteProgram(shaderProg);
-                shaderProg = createShaderProgram();
-                texUniformLoc = glGetUniformLocation(shaderProg, "uTexture");
-                shaderValid = (shaderProg != 0);
-            }
-
-            // VAO: persistent
-            if (vaoId == 0 || !glIsVertexArray(vaoId)) {
-                if (vaoId != 0) glDeleteVertexArrays(vaoId);
-                vaoId = createVAO();
-            }
-
-            // Manually save/restore GL state (glPushAttrib deprecated in core profile)
-            boolean scissorWasOn = glIsEnabled(GL_SCISSOR_TEST);
-            boolean depthWasOn = glIsEnabled(GL_DEPTH_TEST);
-            boolean blendWasOn = glIsEnabled(GL_BLEND);
-            int[] oldViewport = new int[4];
-            GL11.glGetIntegerv(GL11.GL_VIEWPORT, oldViewport);
-
-            glDisable(GL_SCISSOR_TEST);
-            glDisable(GL_DEPTH_TEST);
-            glDisable(GL_BLEND);
-            glViewport(0, 0, width, height);
-
-            glUseProgram(shaderProg);
-            glUniform1i(texUniformLoc, 0);
+        void bindAndDraw() {
+            glUseProgram(programId);
+            glUniform1i(textureUniformLoc, 0);
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texId);
+            glBindTexture(GL_TEXTURE_2D, textureId);
             glBindVertexArray(vaoId);
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, 0L);
-
             glBindVertexArray(0);
             glUseProgram(0);
-
-            // Restore GL state
-            if (scissorWasOn) glEnable(GL_SCISSOR_TEST);
-            if (depthWasOn) glEnable(GL_DEPTH_TEST);
-            if (blendWasOn) glEnable(GL_BLEND);
-            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
-
-        } catch (Throwable t) {
-            LOGGER.warn("GL draw failed: {}", t.getMessage());
-            vaoId = 0;
-            shaderValid = false;
-            texAllocated = false;
-            pboId = 0;
         }
-    }
 
-    // Create a fullscreen quad VAO (vertex + index buffers included)
-    // Returns VAO id. Caller must glDeleteVertexArrays it when done.
-    private static int createVAO() {
-        // Full-screen quad in NDC (-1 to 1)
-        float[] data = {
-            -1f, -1f,  0f,  0f, 0f,
-             1f, -1f,  0f,  1f, 0f,
-            -1f,  1f,  0f,  0f, 1f,
-             1f,  1f,  0f,  1f, 1f,
-        };
-        byte[] idx = { 0, 1, 2, 2, 1, 3 };
+        void releaseAll() {
+            if (textureId != 0) { glDeleteTextures(textureId); textureId = 0; }
+            if (pboId != 0) { glDeleteBuffers(pboId); pboId = 0; }
+            if (iboId != 0) { glDeleteBuffers(iboId); iboId = 0; }
+            if (vboId != 0) { glDeleteBuffers(vboId); vboId = 0; }
+            if (vaoId != 0) { glDeleteVertexArrays(vaoId); vaoId = 0; }
+            if (programId != 0) { glDeleteProgram(programId); programId = 0; }
+            textureUniformLoc = -1;
+            width = 0;
+            height = 0;
+        }
 
-        int vao = glGenVertexArrays();
-        glBindVertexArray(vao);
+        private static FloatBuffer buildVertexBuffer() {
+            // Full-screen quad in NDC (-1 to 1)
+            float[] data = {
+                -1f, -1f,  0f,  0f, 0f,
+                 1f, -1f,  0f,  1f, 0f,
+                -1f,  1f,  0f,  0f, 1f,
+                 1f,  1f,  0f,  1f, 1f,
+            };
+            FloatBuffer buf = BufferUtils.createFloatBuffer(data.length);
+            buf.put(data).flip();
+            return buf;
+        }
 
-        int vbo = glGenBuffers();
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        FloatBuffer vertexBuffer = BufferUtils.createFloatBuffer(data.length);
-        vertexBuffer.put(data).flip();
-        glBufferData(GL_ARRAY_BUFFER, vertexBuffer, GL_STATIC_DRAW);
+        private static ByteBuffer buildIndexBuffer() {
+            byte[] idx = { 0, 1, 2, 2, 1, 3 };
+            ByteBuffer buf = BufferUtils.createByteBuffer(idx.length);
+            buf.put(idx).flip();
+            return buf;
+        }
 
-        glVertexAttribPointer(0, 3, GL_FLOAT, false, 5 * Float.BYTES, 0);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 2, GL_FLOAT, false, 5 * Float.BYTES, 3 * Float.BYTES);
-        glEnableVertexAttribArray(1);
+        // Compile and link passthrough texture shader program
+        private static int createShaderProgram() {
+            String vertSrc =
+                "#version 330 core\n" +
+                "layout(location = 0) in vec3 aPos;\n" +
+                "layout(location = 1) in vec2 aTexCoord;\n" +
+                "out vec2 vTexCoord;\n" +
+                "void main(){ gl_Position = vec4(aPos, 1.0); vTexCoord = aTexCoord; }\n";
 
-        int ibo = glGenBuffers();
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-        ByteBuffer ibBuf = BufferUtils.createByteBuffer(idx.length);
-        ibBuf.put(idx).flip();
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, ibBuf, GL_STATIC_DRAW);
+            String fragSrc =
+                "#version 330 core\n" +
+                "in vec2 vTexCoord;\n" +
+                "uniform sampler2D uTexture;\n" +
+                "out vec4 FragColor;\n" +
+                "void main(){ FragColor = texture(uTexture, vTexCoord); }\n";
 
-        glBindVertexArray(0);
-        return vao;
-    }
+            int vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, vertSrc);
+            glCompileShader(vs);
 
-    // Compile and link shader program. Returns program id.
-    // Caller must glDeleteProgram it when done.
-    private static int createShaderProgram() {
-        String vertSrc =
-            "#version 330 core\n" +
-            "layout(location = 0) in vec3 aPos;\n" +
-            "layout(location = 1) in vec2 aTexCoord;\n" +
-            "out vec2 vTexCoord;\n" +
-            "void main(){ gl_Position = vec4(aPos, 1.0); vTexCoord = aTexCoord; }\n";
+            int fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, fragSrc);
+            glCompileShader(fs);
 
-        String fragSrc =
-            "#version 330 core\n" +
-            "in vec2 vTexCoord;\n" +
-            "uniform sampler2D uTexture;\n" +
-            "out vec4 FragColor;\n" +
-            "void main(){ FragColor = texture(uTexture, vTexCoord); }\n";
+            int prog = glCreateProgram();
+            glAttachShader(prog, vs);
+            glAttachShader(prog, fs);
+            glLinkProgram(prog);
 
-        int vs = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vs, vertSrc);
-        glCompileShader(vs);
-
-        int fs = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fs, fragSrc);
-        glCompileShader(fs);
-
-        int prog = glCreateProgram();
-        glAttachShader(prog, vs);
-        glAttachShader(prog, fs);
-        glLinkProgram(prog);
-
-        glDeleteShader(vs);
-        glDeleteShader(fs);
-        return prog;
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            return prog;
+        }
     }
 }
