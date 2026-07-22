@@ -220,16 +220,18 @@ public class Dx12Mod implements ClientModInitializer {
                         (float) pos.x, (float) pos.y, (float) pos.z);
 
                     // Extract fog color from the level.
-                    // Clamp to a minimum brightness so underground fog isn't fully black.
+                    // Uses getDeclaredMethod + setAccessible for access across MC versions.
                     try {
                         Vec3 skyColor;
                         try {
                             Vec3 cameraPos = pos;
                             float partialTick = 1.0f;
                             var getSkyColorMethod = net.minecraft.world.level.Level.class
-                                .getMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
+                                .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
+                            getSkyColorMethod.setAccessible(true);
                             skyColor = (Vec3) getSkyColorMethod.invoke(mc.level, cameraPos, partialTick);
                         } catch (Exception e) {
+                            LOGGER.info("getSkyColor failed: {}", e.getMessage());
                             skyColor = new Vec3(0.53, 0.81, 0.92);
                         }
                         float fr = Math.max((float) skyColor.x, 0.20f);
@@ -238,13 +240,14 @@ public class Dx12Mod implements ClientModInitializer {
                         LOGGER.info("Fog raw=({}) final=({})",
                             String.format("%.3f,%.3f,%.3f", skyColor.x, skyColor.y, skyColor.z),
                             String.format("%.3f,%.3f,%.3f", fr, fg, fb));
-                        float fogDensity = 0.003f;
-                        if (mc.level.isRaining()) fogDensity = 0.008f;
-                        if (mc.level.isThundering()) fogDensity = 0.015f;
+                        // Reduced density from 0.003 to 0.001 for lighter fog
+                        float fogDensity = 0.001f;
+                        if (mc.level.isRaining()) fogDensity = 0.003f;
+                        if (mc.level.isThundering()) fogDensity = 0.006f;
                         D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
                     } catch (Throwable fogEx) {
                         LOGGER.info("Fog fallback (exception): {}", fogEx.getMessage());
-                        D3D12Bridge.nativeUpdateFog(0.53f, 0.81f, 0.92f, 0.003f);
+                        D3D12Bridge.nativeUpdateFog(0.53f, 0.81f, 0.92f, 0.001f);
                     }
 
                     // ─── Entity extraction ──────────────────────────

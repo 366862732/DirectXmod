@@ -220,6 +220,18 @@ public class D3D12Bridge {
         }
     }
 
+    /** Upload captured GL HUD/UI pixels as a D3D12 overlay texture for compositing. */
+    public static void setHudPixels(java.nio.ByteBuffer buffer, int width, int height) {
+        if (!initialized) return;
+        try {
+            nativeSetHudPixels(buffer, width, height);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    public static native void nativeSetHudPixels(java.nio.ByteBuffer buffer, int width, int height);
+
     /** Returns 1 if renderer ready, 0 if initializing, -1 if failed. */
     public static int isReady() {
         if (!initialized) return -1;

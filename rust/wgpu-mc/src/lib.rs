@@ -179,12 +179,11 @@ fn vs_main(
 }
 
 /// Apply exponential fog to a fragment color.
-/// depth is the linear view-space distance (clip-space w).
+/// clip_w is the clip-space w from the vertex shader.
+/// For standard OpenGL projection (P[3][2] = -1), clip_w = -view_z (positive for visible geometry).
+/// For JOML perspective projection, we use abs() to always get a positive distance.
 fn apply_fog(color: vec4<f32>, clip_w: f32) -> vec4<f32> {
-    // clip_w is negative in right-handed coordinate systems (visible geometry has view_z < 0).
-    // JOML perspective(..., true) sets proj[3][2] = 1, so clip_w = view_z (not scaled).
-    // Take absolute value to get linear view-space distance in meters.
-    let distance = -clip_w;
+    let distance = abs(clip_w);
     let fog_factor = exp(-camera.fog.a * distance);
     let final_rgb = mix(camera.fog.rgb, color.rgb, fog_factor);
     return vec4<f32>(final_rgb, color.a);
@@ -603,6 +602,13 @@ pub struct WmRenderer {
     fs_quad_vb: wgpu::Buffer,
     fs_quad_ib: wgpu::Buffer,
 
+    // HUD overlay (GL-rendered UI composited on top of D3D12 world)
+    hud_pipeline: Option<wgpu::RenderPipeline>,
+    hud_texture: Option<wgpu::Texture>,
+    hud_bind_group: Option<wgpu::BindGroup>,
+    hud_width: u32,
+    hud_height: u32,
+
     // Offscreen mode (triple-buffer readback)
     slots: [Slot; RING_SIZE],
     idx: usize,
@@ -964,7 +970,7 @@ impl WmRenderer {
             camera_prev: IDENTITY,
             camera_target: IDENTITY,
             camera_pos: [0.0; 3],
-            fog_color: [0.5, 0.6, 0.8, 0.001], // default sky blue fog, very low density
+            fog_color: [1.0, 0.0, 0.0, 0.001], // DIAG: bright red fog to verify shader mixing
             pipeline,
             bind_group,
             uniform_buffer,
@@ -988,6 +994,11 @@ impl WmRenderer {
             frame_height: 0,
             fs_quad_vb,
             fs_quad_ib,
+            hud_pipeline: None,
+            hud_texture: None,
+            hud_bind_group: None,
+            hud_width: 0,
+            hud_height: 0,
             slots,
             idx: 0,
             pending_rx: [None, None, None],
@@ -1095,6 +1106,7 @@ impl WmRenderer {
         self.chunk_pipeline_transparent = None;
         self.entity_pipeline = None;
         self.particle_pipeline = None;
+        self.hud_pipeline = None;  // Will be recreated on first set_hud_pixels call
         self.ensure_chunk_pipeline();
 
         log::info!("[dx12-wm] Surface mode ENABLED on parent HWND: {:?} {}x{}",
@@ -2161,11 +2173,162 @@ impl WmRenderer {
         }));
     }
 
+    // ── HUD overlay pipeline (alpha-blended fullscreen quad) ────
+
+    /// Create or recreate the HUD compositing pipeline with the current surface format.
+    fn ensure_hud_pipeline(&mut self) {
+        if self.hud_pipeline.is_some() { return; }
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HUD Shader"),
+            source: wgpu::ShaderSource::Wgsl(TEX_SHADER_SRC.into()),
+        });
+
+        // Reuse the same bind group layout as tex_pipeline (texture2D + sampler)
+        let bgl = self.tex_pipeline.get_bind_group_layout(0);
+        let pl = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("HUD PL"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("HUD Pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[TexVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        self.hud_pipeline = Some(pipeline);
+        log::info!("[dx12-wm] HUD compositing pipeline created");
+    }
+
+    /// Upload GL-captured HUD/UI pixels as a D3D12 texture for compositing.
+    pub fn set_hud_pixels(&mut self, data: &[u8], width: u32, height: u32) {
+        if width == 0 || height == 0 { return; }
+        let size = (width * height * 4) as usize;
+        if data.len() < size { return; }
+
+        // D3D12 requires bytes_per_row to be a multiple of 256.
+        const ROW_ALIGN: u32 = 256;
+        let src_row_bytes = width * 4;
+        let dst_row_bytes = ((src_row_bytes + ROW_ALIGN - 1) / ROW_ALIGN) * ROW_ALIGN;
+        let padded_size = (dst_row_bytes * height) as usize;
+
+        // Recreate texture if dimensions changed
+        let need_new = self.hud_texture.as_ref().map_or(true, |_| {
+            self.hud_width != width || self.hud_height != height
+        });
+
+        if need_new {
+            log::info!("[dx12-wm] Creating new HUD texture {}x{} (row {}→{} padded)",
+                width, height, src_row_bytes, dst_row_bytes);
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("HUD Texture"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let bgl = self.tex_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("HUD Bind Group"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.tex_sampler),
+                    },
+                ],
+            });
+
+            self.hud_texture = Some(tex);
+            self.hud_bind_group = Some(bind_group);
+            self.hud_width = width;
+            self.hud_height = height;
+            log::info!("[dx12-wm] HUD texture + bind_group created OK");
+            self.ensure_hud_pipeline();
+        }
+
+        // Upload pixel data with D3D12-aligned row pitch
+        let mut padded = Vec::with_capacity(padded_size);
+        padded.resize(padded_size, 0u8);
+        for row in 0..height as usize {
+            let src_start = row * src_row_bytes as usize;
+            let dst_start = row * dst_row_bytes as usize;
+            if src_start + src_row_bytes as usize <= data.len() && dst_start + src_row_bytes as usize <= padded.len() {
+                padded[dst_start..dst_start + src_row_bytes as usize]
+                    .copy_from_slice(&data[src_start..src_start + src_row_bytes as usize]);
+            }
+        }
+
+        if let Some(ref tex) = self.hud_texture {
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &padded,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dst_row_bytes),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// Draw the HUD overlay as a fullscreen textured quad with alpha blending.
+    fn draw_hud_overlay<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        let Some(pipeline) = &self.hud_pipeline else { return; };
+        let Some(bg) = &self.hud_bind_group else { return; };
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, bg, &[]);
+        rp.set_vertex_buffer(0, self.fs_quad_vb.slice(..));
+        rp.set_index_buffer(self.fs_quad_ib.slice(..), wgpu::IndexFormat::Uint16);
+        rp.draw_indexed(0..6, 0, 0..1);
+    }
+
     // ── Surface mode: render directly to swapchain ────────────────
 
     fn render_surface(&mut self) {
         let has_frame = self.tex_bind_group.is_some();
         let has_chunks = self.has_chunk_geometry;
+        let has_hud = self.hud_bind_group.is_some();
 
         let surface = self.surface.as_ref().unwrap();
 
@@ -2247,6 +2410,7 @@ impl WmRenderer {
                     .expect("surface_depth must be created in init_surface")
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
+                // Pass 1: Render world (chunks + entities + particles) with depth
                 {
                     let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Surface Pass (Chunks)"),
@@ -2275,6 +2439,26 @@ impl WmRenderer {
                     self.draw_chunks(&mut rp);
                     self.draw_entities(&mut rp);
                     self.draw_particles(&mut rp);
+                }
+                // Pass 2: HUD overlay (load world output, no depth, alpha blending)
+                if has_hud {
+                    {
+                        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("HUD Overlay Pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        self.draw_hud_overlay(&mut rp);
+                    }
                 }
             } else if has_frame {
                 // Textured fullscreen quad: display GL framebuffer capture

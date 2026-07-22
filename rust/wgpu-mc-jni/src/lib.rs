@@ -511,6 +511,38 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetFramePixels(
     }
 }
 
+/// Upload captured GL HUD/UI pixels as a D3D12 overlay texture for compositing.
+///
+/// # Safety
+/// This function is called from Java via JNI. The ByteBuffer must be a direct buffer.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetHudPixels(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer: jni::objects::JObject,  // ByteBuffer as JObject
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+) {
+    if width <= 0 || height <= 0 { return; }
+
+    let byte_buf = jni::objects::JByteBuffer::from(buffer);
+    let data = match _env.get_direct_buffer_address(&byte_buf) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            eprintln!("[dx12-wm] nativeSetHudPixels FAILED: buffer is not direct");
+            log::warn!("[dx12-wm] HUD pixel buffer is not direct");
+            return;
+        }
+    };
+    let len = (width * height * 4) as usize;
+    let slice = std::slice::from_raw_parts(data, len);
+
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_hud_pixels(slice, width as u32, height as u32);
+    }
+}
+
 /// Resize the wgpu renderer to match MC window dimensions.
 ///
 /// # Safety
