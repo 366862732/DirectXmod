@@ -65,6 +65,9 @@ public class D3D12Bridge {
     public static native void nativeUpdateCamera(float[] matrix);
     public static native void nativeUpdateCameraPos(float x, float y, float z);
     public static native void nativeUpdateFog(float r, float g, float b, float density);
+    public static native void nativeSetAaMode(int mode);
+    public static native void nativeUpdateSky(float topR, float topG, float topB,
+        float horizonR, float horizonG, float horizonB, float sunAngle);
 
     // ─── Entities & Particles ──────────────────────────────────
 
@@ -81,6 +84,7 @@ public class D3D12Bridge {
     public static native boolean nativeHasChunkGeometry();
     public static native void nativeClearChunkSection(int sectionX, int sectionY, int sectionZ);
     public static native void nativeUploadTerrainAtlas(java.nio.ByteBuffer buffer, int width, int height);
+    public static native void nativeUploadLightmap(java.nio.ByteBuffer buffer, int width, int height);
 
     // === Convenience methods ===
     private static boolean initialized = false;
@@ -210,6 +214,27 @@ public class D3D12Bridge {
         }
     }
 
+    /** Apply anti-aliasing mode to D3D12 renderer. */
+    public static void setAaMode(int mode) {
+        if (!initialized) return;
+        try {
+            nativeSetAaMode(mode);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    /** Update D3D12 sky rendering parameters from MC sky data. */
+    public static void updateSky(float topR, float topG, float topB,
+            float horizonR, float horizonG, float horizonB, float sunAngle) {
+        if (!initialized) return;
+        try {
+            nativeUpdateSky(topR, topG, topB, horizonR, horizonG, horizonB, sunAngle);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
     /** Upload captured GL framebuffer pixels as a D3D12 texture. */
     public static void setFramePixels(java.nio.ByteBuffer buffer, int width, int height) {
         if (!initialized) return;
@@ -301,6 +326,16 @@ public class D3D12Bridge {
             nativeUploadTerrainAtlas(buffer, width, height);
         } catch (UnsatisfiedLinkError e) {
             Dx12Mod.LOGGER.warn("[dx12-wm] uploadTerrainAtlas failed: {}", e.toString());
+        }
+    }
+
+    /** Upload MC lightmap texture for dynamic block/sky lighting (16x16 per vanilla MC). */
+    public static void uploadLightmap(java.nio.ByteBuffer buffer, int width, int height) {
+        if (!initialized) return;
+        try {
+            nativeUploadLightmap(buffer, width, height);
+        } catch (UnsatisfiedLinkError e) {
+            Dx12Mod.LOGGER.warn("[dx12-wm] uploadLightmap failed: {}", e.toString());
         }
     }
 }

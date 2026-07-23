@@ -88,11 +88,17 @@ public class Dx12Mod implements ClientModInitializer {
 
     private static long frameCount = 0;
     private static boolean firstTickLogged = false;
+    private static boolean lightmapLogged = false;
+    private static boolean lightmapWarningLogged = false;
     private static int pendingWidth = 0;
     private static int pendingHeight = 0;
     private static ByteBuffer pendingPixels = null;
     private static long lastRenderTime = 0;
     private static long renderStartTime = 0;
+
+    // Fog: cache whether the reflection-based sky color extraction works.
+    // MC 26.1.2 renamed/moved getSkyColor, so fallback to hardcoded color if unavailable.
+    private static Boolean fogReflectionWorks = null;
 
     // Unified overlay GL resources (texture, PBO, mesh, shader)
     private static GlOverlayResources overlayResources = new GlOverlayResources();
@@ -131,6 +137,11 @@ public class Dx12Mod implements ClientModInitializer {
         LOGGER.info("GL4DX12 Mod initializing...");
 
         D3D12Bridge.init();
+
+        // Load config and sync AA mode to D3D12 renderer
+        var config = com.dx12.config.Dx12Config.getInstance();
+        D3D12Bridge.setAaMode(config.getAaMode());
+
         String response = D3D12Bridge.sayHello("Hello from Minecraft!");
         LOGGER.info("Rust responded: {}", response);
 
@@ -221,33 +232,206 @@ public class Dx12Mod implements ClientModInitializer {
 
                     // Extract fog color from the level.
                     // Uses getDeclaredMethod + setAccessible for access across MC versions.
-                    try {
-                        Vec3 skyColor;
+                    // fogReflectionWorks caches the result to avoid per-tick reflection spam.
+                    Vec3 skyColor;
+                    if (fogReflectionWorks == null) {
                         try {
-                            Vec3 cameraPos = pos;
-                            float partialTick = 1.0f;
                             var getSkyColorMethod = net.minecraft.world.level.Level.class
                                 .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
                             getSkyColorMethod.setAccessible(true);
-                            skyColor = (Vec3) getSkyColorMethod.invoke(mc.level, cameraPos, partialTick);
+                            skyColor = (Vec3) getSkyColorMethod.invoke(mc.level, pos, 1.0f);
+                            fogReflectionWorks = Boolean.TRUE;
                         } catch (Exception e) {
-                            LOGGER.info("getSkyColor failed: {}", e.getMessage());
+                            LOGGER.warn("Fog reflection failed (will use fallback): {}", e.getMessage());
+                            fogReflectionWorks = Boolean.FALSE;
                             skyColor = new Vec3(0.53, 0.81, 0.92);
                         }
-                        float fr = Math.max((float) skyColor.x, 0.20f);
-                        float fg = Math.max((float) skyColor.y, 0.25f);
-                        float fb = Math.max((float) skyColor.z, 0.35f);
-                        LOGGER.info("Fog raw=({}) final=({})",
-                            String.format("%.3f,%.3f,%.3f", skyColor.x, skyColor.y, skyColor.z),
-                            String.format("%.3f,%.3f,%.3f", fr, fg, fb));
-                        // Reduced density from 0.003 to 0.001 for lighter fog
-                        float fogDensity = 0.001f;
-                        if (mc.level.isRaining()) fogDensity = 0.003f;
-                        if (mc.level.isThundering()) fogDensity = 0.006f;
-                        D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
-                    } catch (Throwable fogEx) {
-                        LOGGER.info("Fog fallback (exception): {}", fogEx.getMessage());
-                        D3D12Bridge.nativeUpdateFog(0.53f, 0.81f, 0.92f, 0.001f);
+                    } else if (fogReflectionWorks) {
+                        try {
+                            var getSkyColorMethod = net.minecraft.world.level.Level.class
+                                .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
+                            getSkyColorMethod.setAccessible(true);
+                            skyColor = (Vec3) getSkyColorMethod.invoke(mc.level, pos, 1.0f);
+                        } catch (Exception e) {
+                            skyColor = new Vec3(0.53, 0.81, 0.92);
+                        }
+                    } else {
+                        skyColor = new Vec3(0.53, 0.81, 0.92);
+                    }
+                    float fr = Math.max((float) skyColor.x, 0.20f);
+                    float fg = Math.max((float) skyColor.y, 0.25f);
+                    float fb = Math.max((float) skyColor.z, 0.35f);
+                    LOGGER.debug("Fog raw=({}) final=({})",
+                        String.format("%.3f,%.3f,%.3f", skyColor.x, skyColor.y, skyColor.z),
+                        String.format("%.3f,%.3f,%.3f", fr, fg, fb));
+                    // Reduced density from 0.003 to 0.001 for lighter fog
+                    float fogDensity = 0.001f;
+                    if (mc.level.isRaining()) fogDensity = 0.003f;
+                    if (mc.level.isThundering()) fogDensity = 0.006f;
+                    D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
+
+                    // ─── Sky update (top color + horizon + sun) ───────
+                    // Compute horizon color: lighten the sky color
+                    float hr = Math.min(1.0f, (float) skyColor.x * 1.5f + 0.15f);
+                    float hg = Math.min(1.0f, (float) skyColor.y * 1.5f + 0.15f);
+                    float hb = Math.min(1.0f, (float) skyColor.z * 1.5f + 0.15f);
+                    // Sun angle from MC day time (0-24000 ticks → 0-2*PI radians)
+                    float sunAngle = -1.0f; // default: no sun disk
+                    try {
+                        // Use reflection for day time to avoid Yarn mapping issues
+                        var getTimeMethod = mc.level.getClass()
+                            .getMethod("getDayTime");
+                        long dayTime = (long) getTimeMethod.invoke(mc.level) % 24000L;
+                        // 0=dawn, 6000=noon, 12000=dusk, 18000=midnight
+                        sunAngle = (float) (dayTime / 24000.0 * Math.PI * 2.0);
+                    } catch (Exception e) {
+                        // fallback: no sun
+                    }
+                    D3D12Bridge.updateSky(
+                        (float) skyColor.x, (float) skyColor.y, (float) skyColor.z,
+                        hr, hg, hb, sunAngle);
+
+                    // ─── Lightmap extraction ──────────────────────────
+                    try {
+                        var gameRenderer = mc.gameRenderer;
+                        // Direct field access: "lightmap" is the Yarn name, Loom remaps at build time.
+                        // MC 26.1.2 type: net.minecraft.client.renderer.Lightmap
+                        var lightmapField = gameRenderer.getClass().getDeclaredField("lightmap");
+                        lightmapField.setAccessible(true);
+                        Object lightmap = lightmapField.get(gameRenderer);
+
+                        if (lightmap == null) {
+                            if (!lightmapWarningLogged) {
+                                lightmapWarningLogged = true;
+                                LOGGER.warn("[dx12-wm] Lightmap field is null");
+                            }
+                        } else {
+                            if (!lightmapLogged) {
+                                LOGGER.info("[dx12-wm] Lightmap class: {}", lightmap.getClass().getName());
+                                for (var m : lightmap.getClass().getDeclaredMethods()) {
+                                    LOGGER.info("[dx12-wm]   Lightmap method: {}() -> {}", m.getName(), m.getReturnType().getName());
+                                }
+                                for (var f : lightmap.getClass().getDeclaredFields()) {
+                                    LOGGER.info("[dx12-wm]   Lightmap field: {} type={}", f.getName(), f.getType().getName());
+                                }
+                            }
+
+                            int textureId = 0;
+
+                            // Approach 1: getTextureId()
+                            try {
+                                var m = lightmap.getClass().getDeclaredMethod("getTextureId");
+                                m.setAccessible(true);
+                                textureId = (int) m.invoke(lightmap);
+                            } catch (NoSuchMethodException e1) {}
+
+                            // Approach 2: Access Lightmap.texture (GpuTexture) → find its GL texture ID
+                            if (textureId == 0) {
+                                try {
+                                    var texField = lightmap.getClass().getDeclaredField("texture");
+                                    texField.setAccessible(true);
+                                    Object gpuTex = texField.get(lightmap);
+                                    if (gpuTex != null) {
+                                        // GpuTexture impl: com.mojang.blaze3d.opengl.GlGpuTexture
+                                        String[] glIdNames = {"glId", "id", "glTextureId"};
+                                        for (String idName : glIdNames) {
+                                            try {
+                                                var idField = gpuTex.getClass().getDeclaredField(idName);
+                                                idField.setAccessible(true);
+                                                textureId = idField.getInt(gpuTex);
+                                                if (textureId != 0) break;
+                                            } catch (NoSuchFieldException e3) {}
+                                        }
+                                        // Also try getGlId() method
+                                        if (textureId == 0) {
+                                            try {
+                                                var getGlId = gpuTex.getClass().getMethod("getGlId");
+                                                textureId = (int) getGlId.invoke(gpuTex);
+                                            } catch (NoSuchMethodException e4) {}
+                                        }
+                                    }
+                                } catch (Exception e) {
+                                    // GpuTexture approach failed
+                                }
+                            }
+
+                            // Approach 3: int field named "id" or "glId"
+                            if (textureId == 0) {
+                                for (var f : lightmap.getClass().getDeclaredFields()) {
+                                    f.setAccessible(true);
+                                    if (f.getType() == int.class) {
+                                        String fn = f.getName();
+                                        if (fn.equals("id") || fn.equals("glId")) {
+                                            textureId = f.getInt(lightmap);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Approach 4: scan all int fields, test via glIsTexture
+                            if (textureId == 0) {
+                                for (var f : lightmap.getClass().getDeclaredFields()) {
+                                    f.setAccessible(true);
+                                    if (f.getType() == int.class) {
+                                        int candidate = f.getInt(lightmap);
+                                        if (candidate != 0) {
+                                            try {
+                                                if (GL11.glIsTexture(candidate)) {
+                                                    textureId = candidate;
+                                                    break;
+                                                }
+                                            } catch (Throwable t) {}
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (textureId != 0) {
+                                int lmWidth = 16;
+                                int lmHeight = 16;
+                                GL11.glBindTexture(GL11.GL_TEXTURE_2D, textureId);
+
+                                int[] texWidth = new int[1], texHeight = new int[1];
+                                GL11.glGetTexLevelParameteriv(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH, texWidth);
+                                GL11.glGetTexLevelParameteriv(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_HEIGHT, texHeight);
+                                if (texWidth[0] > 0 && texHeight[0] > 0) {
+                                    lmWidth = texWidth[0];
+                                    lmHeight = texHeight[0];
+                                }
+
+                                ByteBuffer lmBuffer = BufferUtils.createByteBuffer(lmWidth * lmHeight * 4);
+                                GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, lmBuffer);
+
+                                lmBuffer.position(0);
+                                lmBuffer.limit(lmWidth * lmHeight * 4);
+
+                                if (!lightmapLogged) {
+                                    lightmapLogged = true;
+                                    int r = lmBuffer.get(0) & 0xFF;
+                                    int g = lmBuffer.get(1) & 0xFF;
+                                    int b = lmBuffer.get(2) & 0xFF;
+                                    int a = lmBuffer.get(3) & 0xFF;
+                                    LOGGER.info("[dx12-wm] Lightmap OK: {}x{}, first pixel RGBA=({},{},{},{})",
+                                        lmWidth, lmHeight, r, g, b, a);
+                                }
+
+                                // Throttle: upload lightmap at most every 10 ticks.
+                                 // Dynamic lightmap changes with day/night cycle, per-frame upload
+                                 // is wasteful (glGetTexImage readback + D3D12 upload each frame).
+                                 if (frameCount % 10 == 0) {
+                                     D3D12Bridge.uploadLightmap(lmBuffer, lmWidth, lmHeight);
+                                 }
+                            } else if (!lightmapWarningLogged) {
+                                lightmapWarningLogged = true;
+                                LOGGER.warn("[dx12-wm] Could not find lightmap GL texture ID");
+                            }
+                        }
+                    } catch (Throwable lmEx) {
+                        if (!lightmapWarningLogged) {
+                            lightmapWarningLogged = true;
+                            LOGGER.warn("[dx12-wm] Lightmap extraction failed: {}", lmEx.getMessage());
+                        }
                     }
 
                     // ─── Entity extraction ──────────────────────────

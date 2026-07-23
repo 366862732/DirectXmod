@@ -14,6 +14,9 @@
   "entrypoints": {
     "client": [
       "com.dx12.Dx12Mod"
+    ],
+    "modmenu": [
+      "com.dx12.ModMenuIntegration"
     ]
   },
   "depends": {

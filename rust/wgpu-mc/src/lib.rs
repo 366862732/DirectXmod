@@ -17,6 +17,16 @@
 use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
 
+/// Anti-aliasing mode for post-processing.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AaMode {
+    None = 0,
+    FXAA = 1,
+    SMAA = 2,
+    TAA = 3,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Vertex {
@@ -38,21 +48,23 @@ impl Vertex {
     }
 }
 
-/// Chunk vertex with UV for texture atlas sampling.
-/// 32 bytes: position(12) + color(12) + uv(8).
+/// Chunk vertex with UV for texture atlas sampling and lightmap UV for dynamic lighting.
+/// 40 bytes: position(12) + color(12) + uv(8) + light_uv(8).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct ChunkVertex {
     position: [f32; 3],
     color: [f32; 3],
     uv: [f32; 2],
+    light_uv: [f32; 2],  // NEW: normalized lightmap coordinates
 }
 
 impl ChunkVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x2,
+        3 => Float32x2,  // NEW: light_uv
     ];
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -140,7 +152,7 @@ fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Chunk shader: samples atlas texture, multiplies by vertex color as lighting tint.
+// Chunk shader: samples atlas texture and lightmap, multiplies by vertex color as AO tint.
 const CHUNK_SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -150,12 +162,15 @@ struct CameraUniform {
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+@group(1) @binding(0) var lightmap: texture_2d<f32>;
+@group(1) @binding(1) var lightmap_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tint: vec3<f32>,
     @location(2) linear_depth: f32,
+    @location(3) light_uv: vec2<f32>,
 }
 
 @vertex
@@ -163,6 +178,7 @@ fn vs_main(
     @location(0) pos: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) light_uv: vec2<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     // Positions are in world space (section origin + local offset).
@@ -172,6 +188,7 @@ fn vs_main(
     out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = uv;
     out.tint = color;
+    out.light_uv = light_uv;
     // clip_w = view-space distance (positive for in-front geometry).
     // Store the reciprocal so the fragment shader can compute distance = 1/linear_depth.
     out.linear_depth = out.position.w;
@@ -199,7 +216,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if tex_color.a < threshold {
         discard;
     }
-    let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    // Sample lightmap for dynamic lighting
+    let light_color = textureSample(lightmap, lightmap_sampler, in.light_uv);
+    // Final color = texture × vertex AO tint × lightmap color
+    let lit = vec4<f32>(tex_color.rgb * in.tint * light_color.rgb, tex_color.a);
     return apply_fog(lit, in.linear_depth);
 }
 
@@ -215,7 +235,10 @@ fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
     if tex_color.a < threshold_low || tex_color.a > threshold_high {
         discard;
     }
-    let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    // Sample lightmap for dynamic lighting
+    let light_color = textureSample(lightmap, lightmap_sampler, in.light_uv);
+    // Final color = texture × vertex AO tint × lightmap color
+    let lit = vec4<f32>(tex_color.rgb * in.tint * light_color.rgb, tex_color.a);
     return apply_fog(lit, in.linear_depth);
 }
 "#;
@@ -324,6 +347,164 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Soft edge: alpha = 1 - smoothstep(0.8, 1.0, dist)
     let alpha = 1.0 - smoothstep(0.7, 1.0, dist);
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
+}
+"#;
+
+/// Post-processing shader: FXAA anti-aliasing + Reinhard tonemapping + gamma correction.
+const POST_PROCESS_FXAA_SRC: &str = r#"
+@group(0) @binding(0) var input_tex: texture_2d<f32>;
+@group(0) @binding(1) var input_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+fn rgb2luma(rgb: vec3<f32>) -> f32 {
+    return dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    // Big fullscreen triangle: uv=(0,0)-(2,2), pos=(-1,-1)-(3,3), clipped to viewport
+    let uv = vec2<f32>(f32(idx & 1u) * 2.0, f32((idx >> 1u) & 1u) * 2.0);
+    let pos = uv * 2.0 - 1.0;
+    return VertexOutput(vec4<f32>(pos, 0.0, 1.0), uv);
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Flip Y for D3D12 texture origin (top-left)
+    var uv = in.uv;
+    uv.y = 1.0 - uv.y;
+
+    let tex_dim = vec2<f32>(textureDimensions(input_tex));
+    let one_pixel = vec2<f32>(1.0) / tex_dim;
+
+    // ── FXAA ────────────────────────────────────────────
+    let rgbNW = textureSampleLevel(input_tex, input_sampler, uv + vec2<f32>(-1.0, -1.0) * one_pixel, 0.0).rgb;
+    let rgbNE = textureSampleLevel(input_tex, input_sampler, uv + vec2<f32>( 1.0, -1.0) * one_pixel, 0.0).rgb;
+    let rgbSW = textureSampleLevel(input_tex, input_sampler, uv + vec2<f32>(-1.0,  1.0) * one_pixel, 0.0).rgb;
+    let rgbSE = textureSampleLevel(input_tex, input_sampler, uv + vec2<f32>( 1.0,  1.0) * one_pixel, 0.0).rgb;
+    let rgbM  = textureSampleLevel(input_tex, input_sampler, uv, 0.0).rgb;
+
+    let lumaNW = rgb2luma(rgbNW);
+    let lumaNE = rgb2luma(rgbNE);
+    let lumaSW = rgb2luma(rgbSW);
+    let lumaSE = rgb2luma(rgbSE);
+    let lumaM  = rgb2luma(rgbM);
+
+    let lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    let lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    let range = lumaMax - lumaMin;
+    let threshold = 0.0312;
+    if (range < max(threshold, 0.0312)) {
+        // No edge: skip FXAA, just do tonemapping + gamma
+        var color = rgbM;
+        // Reinhard tonemapping
+        color = color / (color + vec3<f32>(1.0));
+        // Gamma correction
+        color = pow(color, vec3<f32>(1.0 / 2.2));
+        return vec4<f32>(color, 1.0);
+    }
+
+    // FXAA direction estimation
+    var dir = vec2<f32>(
+        -(lumaNW + lumaNE) + (lumaSW + lumaSE),
+        -(lumaNW + lumaSW) + (lumaNE + lumaSE)
+    );
+    let dir_reduced = max(abs(dir.x), abs(dir.y));
+    if dir_reduced < 0.0001 {
+        var color = rgbM;
+        color = color / (color + vec3<f32>(1.0));
+        color = pow(color, vec3<f32>(1.0 / 2.2));
+        return vec4<f32>(color, 1.0);
+    }
+    dir = dir / dir_reduced;
+
+    // FXAA blend samples
+    let rgbA = 0.5 * (
+        textureSampleLevel(input_tex, input_sampler, uv + dir * (1.0/3.0) * one_pixel, 0.0).rgb +
+        textureSampleLevel(input_tex, input_sampler, uv - dir * (1.0/3.0) * one_pixel, 0.0).rgb
+    );
+    let rgbB = rgbA * 0.5 + 0.25 * (
+        textureSampleLevel(input_tex, input_sampler, uv + dir * (2.0/3.0) * one_pixel, 0.0).rgb +
+        textureSampleLevel(input_tex, input_sampler, uv - dir * (2.0/3.0) * one_pixel, 0.0).rgb
+    );
+
+    let lumaB = rgb2luma(rgbB);
+    var final_rgb = rgbM;
+    if (lumaB > lumaMin && lumaB < lumaMax) {
+        final_rgb = rgbB;
+    } else {
+        final_rgb = rgbA;
+    }
+
+    // ── Tonemapping + Gamma ─────────────────────────────
+    final_rgb = final_rgb / (final_rgb + vec3<f32>(1.0));
+    final_rgb = pow(final_rgb, vec3<f32>(1.0 / 2.2));
+
+    return vec4<f32>(final_rgb, 1.0);
+}
+"#;
+
+/// Post-processing shader (no AA): tonemapping + gamma only.
+const POST_PROCESS_NONE_SRC: &str = r#"
+@group(0) @binding(0) var input_tex: texture_2d<f32>;
+@group(0) @binding(1) var input_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    // Big fullscreen triangle: uv=(0,0)-(2,2), pos=(-1,-1)-(3,3), clipped to viewport
+    let uv = vec2<f32>(f32(idx & 1u) * 2.0, f32((idx >> 1u) & 1u) * 2.0);
+    let pos = uv * 2.0 - 1.0;
+    return VertexOutput(vec4<f32>(pos, 0.0, 1.0), uv);
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Flip Y for D3D12 texture origin (top-left)
+    var uv = in.uv;
+    uv.y = 1.0 - uv.y;
+    var color = textureSampleLevel(input_tex, input_sampler, uv, 0.0).rgb;
+    // Reinhard tonemapping
+    color = color / (color + vec3<f32>(1.0));
+    // Gamma correction
+    color = pow(color, vec3<f32>(1.0 / 2.2));
+    return vec4<f32>(color, 1.0);
+}
+"#;
+
+/// Sky gradient shader: fullscreen triangle with vertical gradient + optional sun disk.
+/// Colors are baked at pipeline creation time via string formatting.
+const SKY_GRADIENT_SRC: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    // Big fullscreen triangle: uv=(0,0)-(2,2), pos=(-1,-1)-(3,3), clipped to viewport
+    let uv = vec2<f32>(f32(idx & 1u) * 2.0, f32((idx >> 1u) & 1u) * 2.0);
+    let pos = uv * 2.0 - 1.0;
+    return VertexOutput(vec4<f32>(pos, 0.0, 1.0), uv);
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Flip Y so uv=(0,0) is top-left
+    var uv = in.uv;
+    uv.y = 1.0 - uv.y;
+    let sky_top = vec3<f32>(0.4, 0.6, 1.0);
+    let sky_horizon = vec3<f32>(0.7, 0.85, 1.0);
+    let color = mix(sky_top, sky_horizon, uv.y);
+    return vec4<f32>(color, 1.0);
 }
 "#;
 
@@ -632,6 +813,13 @@ pub struct WmRenderer {
     /// Raw atlas pixels stored for diagnostics
     atlas_pixels: Option<Vec<u8>>,
 
+    // Lightmap texture for dynamic lighting
+    lightmap_texture: Option<wgpu::Texture>,
+    lightmap_bind_group: Option<wgpu::BindGroup>,
+    lightmap_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    lightmap_width: u32,
+    lightmap_height: u32,
+
     // Entity rendering (Phase 7 task 1: colored boxes at entity positions)
     entity_buffer: Option<wgpu::Buffer>,
     entity_count: u32,
@@ -641,6 +829,23 @@ pub struct WmRenderer {
     particle_buffer: Option<wgpu::Buffer>,
     particle_count: u32,
     particle_pipeline: Option<wgpu::RenderPipeline>,
+
+    // Post-processing intermediate render target
+    post_texture: Option<wgpu::Texture>,
+    post_view: Option<wgpu::TextureView>,
+    post_pipeline: Option<wgpu::RenderPipeline>,
+    post_bind_group: Option<wgpu::BindGroup>,
+    post_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    post_sampler: wgpu::Sampler,
+
+    /// Current anti-aliasing mode
+    aa_mode: AaMode,
+
+    // Sky rendering (dynamic gradient, created lazily)
+    sky_top_color: [f32; 4],
+    sky_horizon_color: [f32; 4],
+    sun_angle: f32,
+    sky_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
@@ -918,6 +1123,18 @@ impl WmRenderer {
             ..Default::default()
         });
 
+        // Post-process sampler (created here before device is moved into Self)
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Post-process Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         // Chunk bind group layout: camera uniform + atlas texture + sampler
         let chunk_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Chunk BGL"),
@@ -957,7 +1174,83 @@ impl WmRenderer {
             push_constant_ranges: &[],
         });
 
+        // Lightmap bind group layout: binding 0 = texture, binding 1 = sampler
+        let lightmap_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Lightmap BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         eprintln!("[dx12-wm] Chunk pipeline layout created (texture atlas support ready)");
+
+        // Create default 1x1 white lightmap texture so bind group 1 is always available.
+        let default_lm_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Default Lightmap (1x1 white)"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let white_pixel: [u8; 4] = [255, 255, 255, 255];
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &default_lm_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &white_pixel[..],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let default_lm_view = default_lm_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let default_lm_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Default Lightmap Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let default_lm_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Default Lightmap BG"),
+            layout: &lightmap_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&default_lm_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&default_lm_sampler),
+                },
+            ],
+        });
 
         Ok(Self {
             instance,
@@ -1016,6 +1309,13 @@ impl WmRenderer {
             atlas_height: 0,
             atlas_pixels: None,
 
+            // Lightmap (initialized with default 1x1 white texture + layout)
+            lightmap_texture: Some(default_lm_texture),
+            lightmap_bind_group: Some(default_lm_bg),
+            lightmap_bind_group_layout: Some(lightmap_bgl),
+            lightmap_width: 1,
+            lightmap_height: 1,
+
             // Entity + particle rendering (created lazily)
             entity_buffer: None,
             entity_count: 0,
@@ -1023,6 +1323,22 @@ impl WmRenderer {
             particle_buffer: None,
             particle_count: 0,
             particle_pipeline: None,
+
+            // Post-processing (will create pipeline lazily)
+            post_texture: None,
+            post_view: None,
+            post_pipeline: None,
+            post_bind_group: None,
+            post_bind_group_layout: None,
+            post_sampler,
+
+            aa_mode: AaMode::FXAA,  // Default: FXAA anti-aliasing
+
+            // Sky rendering defaults
+            sky_top_color: [0.4, 0.6, 1.0, 1.0],
+            sky_horizon_color: [0.7, 0.85, 1.0, 1.0],
+            sun_angle: -1.0,  // < 0 means no sun disk
+            sky_pipeline: None,
         })
     }
 
@@ -1106,6 +1422,7 @@ impl WmRenderer {
         self.chunk_pipeline_transparent = None;
         self.entity_pipeline = None;
         self.particle_pipeline = None;
+        self.post_pipeline = None; // Will be recreated lazily in render_surface
         self.hud_pipeline = None;  // Will be recreated on first set_hud_pixels call
         self.ensure_chunk_pipeline();
 
@@ -1122,6 +1439,30 @@ impl WmRenderer {
     /// Returns true if any MC chunk geometry has been uploaded.
     pub fn has_chunk_geometry(&self) -> bool {
         self.has_chunk_geometry
+    }
+
+    /// Set the anti-aliasing mode for post-processing.
+    /// Destroys existing post-process pipeline so it gets recreated on next frame.
+    pub fn set_aa_mode(&mut self, mode: AaMode) {
+        if self.aa_mode == mode { return; }
+        self.aa_mode = mode;
+        // Invalidate pipeline so it gets recreated with new shader on next frame
+        self.post_pipeline = None;
+        self.post_bind_group = None;
+        self.post_bind_group_layout = None;
+        log::info!("[dx12-wm] AA mode set to {:?}", mode);
+    }
+
+    /// Set sky gradient colors and sun angle for dynamic sky rendering.
+    /// Colors are baked into the sky shader at pipeline creation time.
+    pub fn set_sky(&mut self, top_r: f32, top_g: f32, top_b: f32, horizon_r: f32, horizon_g: f32, horizon_b: f32, sun_angle: f32) {
+        self.sky_top_color = [top_r, top_g, top_b, 1.0];
+        self.sky_horizon_color = [horizon_r, horizon_g, horizon_b, 1.0];
+        self.sun_angle = sun_angle;
+        // Invalidate pipeline so it gets recreated with updated colors
+        self.sky_pipeline = None;
+        log::info!("[dx12-wm] Sky colors updated: top=({:.3},{:.3},{:.3}) horizon=({:.3},{:.3},{:.3}) angle={:.3}",
+            top_r, top_g, top_b, horizon_r, horizon_g, horizon_b, sun_angle);
     }
 
     /// Upload MC terrain atlas texture for chunk rendering.
@@ -1251,6 +1592,85 @@ impl WmRenderer {
             source: wgpu::ShaderSource::Wgsl(CHUNK_SHADER_SRC.into()),
         }));
         self.ensure_chunk_pipeline();
+    }
+
+    /// Upload the MC lightmap texture for dynamic block/sky lighting.
+    /// `data` is RGBA8 pixel data (16x16 by default for vanilla MC).
+    pub fn upload_lightmap(&mut self, data: &[u8], width: u32, height: u32) {
+        if width == 0 || height == 0 || data.len() < (width * height * 4) as usize {
+            return;
+        }
+
+        let texture_size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        // Create or update lightmap texture
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Lightmap Texture"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        // Create sampler
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Lightmap Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Create bind group for lightmap
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let lightmap_bgl = self.lightmap_bind_group_layout.as_ref().unwrap();
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lightmap Bind Group"),
+            layout: lightmap_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        self.lightmap_texture = Some(texture);
+        self.lightmap_bind_group = Some(bg);
+        self.lightmap_width = width;
+        self.lightmap_height = height;
+
+        log::debug!("[dx12-wm] Lightmap uploaded: {}x{}", width, height);
     }
 
     pub fn set_camera(&mut self, mvp: [[f32; 4]; 4]) {
@@ -1442,8 +1862,8 @@ impl WmRenderer {
 
         for v in 0..vertex_count {
             let base = (v as usize) * stride;
-            // Need at least 24 bytes: Pos(12) + Color(4) + UV(8)
-            if base + 24 > data.len() { break; }
+            // Need at least 28 bytes: Pos(12) + Color(4) + UV(8) + UV2(4)
+            if base + 28 > data.len() { break; }
 
             // Position: 3 f32 at offset 0 (section-relative, 0..16)
             let px = f32::from_le_bytes([data[base], data[base+1], data[base+2], data[base+3]]);
@@ -1471,10 +1891,15 @@ impl WmRenderer {
             let wy = py + world_oy;
             let wz = pz + world_oz;
 
+            // UV2 (lightmap coords): 2 u16 at offset 24
+            let light_u = u16::from_le_bytes([data[base+24], data[base+25]]) as f32 / 255.0;
+            let light_v = u16::from_le_bytes([data[base+26], data[base+27]]) as f32 / 255.0;
+
             vertices.push(ChunkVertex {
                 position: [wx, wy, wz],
                 color: [cr, cg, cb],
                 uv: [u_corrected, v_corrected],
+                light_uv: [light_u.clamp(0.0, 1.0), light_v.clamp(0.0, 1.0)],
             });
         }
 
@@ -1783,6 +2208,10 @@ impl WmRenderer {
         // ════════════════════════════════════════════════
         rp.set_pipeline(pipeline);
         rp.set_bind_group(0, bind_group, &[]);
+        // Set lightmap bind group
+        if let Some(lm_bg) = &self.lightmap_bind_group {
+            rp.set_bind_group(1, lm_bg, &[]);
+        }
         for (_key, meshes) in &self.chunk_meshes {
             for mesh in meshes {
                 rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -1801,6 +2230,10 @@ impl WmRenderer {
         // ════════════════════════════════════════════════
         rp.set_pipeline(pipeline_transparent);
         rp.set_bind_group(0, bind_group, &[]);
+        // Set lightmap bind group
+        if let Some(lm_bg) = &self.lightmap_bind_group {
+            rp.set_bind_group(1, lm_bg, &[]);
+        }
         for (_key, meshes) in &self.chunk_meshes {
             for mesh in meshes {
                 rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -1970,10 +2403,11 @@ impl WmRenderer {
 
         let Some(shader) = &self.chunk_shader else { return; };
         let Some(bgl) = &self.chunk_bind_group_layout else { return; };
+        let Some(lightmap_bgl) = &self.lightmap_bind_group_layout else { return; };
 
         let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Chunk PL"),
-            bind_group_layouts: &[bgl],
+            bind_group_layouts: &[bgl, lightmap_bgl],
             push_constant_ranges: &[],
         });
 
@@ -2063,6 +2497,228 @@ impl WmRenderer {
 
         log::info!("[dx12-wm] Chunk pipelines created (opaque + transparent) with format={:?}", self.surface_format);
         eprintln!("[dx12-wm] Chunk pipelines created (opaque + transparent) with format={:?}", self.surface_format);
+    }
+
+    /// Lazily create the post-processing pipeline (FXAA + tonemapping + gamma).
+    fn ensure_post_process_pipeline(&mut self) {
+        if self.post_pipeline.is_some() { return; }
+
+        // Select shader based on current AA mode
+        let shader_src = match self.aa_mode {
+            AaMode::None => POST_PROCESS_NONE_SRC,
+            AaMode::FXAA => POST_PROCESS_FXAA_SRC,
+            AaMode::SMAA | AaMode::TAA => {
+                log::warn!("[dx12-wm] AA mode {:?} not yet implemented, using FXAA", self.aa_mode);
+                POST_PROCESS_FXAA_SRC
+            }
+        };
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Post-Process Shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+        });
+
+        // Bind group layout: binding 0 = input texture, binding 1 = sampler
+        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Post-Process BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Post-Process PL"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Post-Process Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+
+        self.post_bind_group_layout = Some(bgl);
+        self.post_pipeline = Some(pipeline);
+    }
+
+    /// Lazily create the sky gradient pipeline with current color values baked into the shader.
+    fn ensure_sky_pipeline(&mut self) {
+        if self.sky_pipeline.is_some() { return; }
+
+        // Build WGSL with current sky colors baked into shader constants (no bind groups needed)
+        let tc = self.sky_top_color;
+        let hc = self.sky_horizon_color;
+        let sa = self.sun_angle;
+        let src = format!(r#"
+struct VertexOutput {{
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {{
+    // Big fullscreen triangle: uv=(0,0)-(2,2), pos=(-1,-1)-(3,3), clipped to viewport
+    let uv = vec2<f32>(f32(idx & 1u) * 2.0, f32((idx >> 1u) & 1u) * 2.0);
+    let pos = uv * 2.0 - 1.0;
+    return VertexOutput(vec4<f32>(pos, 0.0, 1.0), uv);
+}}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
+    // Flip Y so uv=(0,0) is top-left (matches D3D12 tex coords for sun disk math)
+    var uv = in.uv;
+    uv.y = 1.0 - uv.y;
+    let sky_top = vec3<f32>({top_r:.6}, {top_g:.6}, {top_b:.6});
+    let sky_horizon = vec3<f32>({hor_r:.6}, {hor_g:.6}, {hor_b:.6});
+    // mix(top, horizon, uv.y): uv.y=0 at top → sky_top, uv.y=1 at bottom → sky_horizon
+    let color = mix(sky_top, sky_horizon, uv.y);
+
+    var result = color;
+    let sun_a = {sun_angle:.6};
+    if (sun_a >= 0.0 && sun_a < 6.2832) {{
+        // Sun position moves in a semicircle across the upper sky
+        let sun_pos = vec2<f32>(0.5 + cos(sun_a) * 0.35, 0.5 - sin(sun_a) * 0.45);
+        let d = uv - sun_pos;
+        let dist = sqrt(d.x * d.x + d.y * d.y);
+        let r = 0.04;
+        if (dist < r) {{
+            let t = 1.0 - (dist / r);
+            result = mix(result, vec3<f32>(1.0, 0.95, 0.8), t * t);
+        }}
+    }}
+
+    return vec4<f32>(result, 1.0);
+}}
+"#,
+            top_r = tc[0], top_g = tc[1], top_b = tc[2],
+            hor_r = hc[0], hor_g = hc[1], hor_b = hc[2],
+            sun_angle = sa);
+
+        // Wrap pipeline creation in catch_unwind so a bad shader doesn't kill the whole frame.
+        let device: &wgpu::Device = &self.device;
+        let format = self.surface_format;
+        let pipeline_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Sky Shader"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+
+            // No bind group layout needed — colors are baked into the shader source
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Sky PL"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Sky Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,  // Overwrite mode
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        }));
+
+        match pipeline_result {
+            Ok(pipeline) => {
+                self.sky_pipeline = Some(pipeline);
+            }
+            Err(e) => {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown error".to_string()
+                };
+                log::error!("[dx12-wm] Sky pipeline creation failed: {}", msg);
+            }
+        }
+    }
+
+    /// Draw the sky gradient as a fullscreen triangle (3 vertices, no vertex buffer).
+    /// Must be called inside a render pass with the world pass color attachment.
+    fn draw_sky<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        if let Some(ref pipeline) = self.sky_pipeline {
+            rp.set_pipeline(pipeline);
+            rp.draw(0..3, 0..1); // Fullscreen triangle
+        }
     }
 
     /// Create or recreate the entity rendering pipeline.
@@ -2405,17 +3061,52 @@ impl WmRenderer {
                 self.camera_prev = self.camera_mvp;
                 write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
 
+                // Ensure intermediate post-process texture matches swapchain size
+                let frame_size = frame.texture.size();
+                let needs_new_post = match &self.post_texture {
+                    Some(t) => t.width() != frame_size.width || t.height() != frame_size.height,
+                    None => true,
+                };
+                if needs_new_post {
+                    let post_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Post-Process RT"),
+                        size: wgpu::Extent3d { width: frame_size.width, height: frame_size.height, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.surface_format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    let post_view = post_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    self.post_texture = Some(post_tex);
+                    self.post_view = Some(post_view);
+                    self.post_bind_group = None; // will be recreated
+                    log::info!("[dx12-wm] Post-process RT created: {}x{}", frame_size.width, frame_size.height);
+                }
+
+                // Ensure post-process pipeline
+                self.ensure_post_process_pipeline();
+
+                // Ensure sky pipeline before taking references to self.post_view
+                self.ensure_sky_pipeline();
+
                 let depth_view = self.surface_depth
                     .as_ref()
                     .expect("surface_depth must be created in init_surface")
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
-                // Pass 1: Render world (chunks + entities + particles) with depth
+                let post_view_ref = self.post_view.as_ref().unwrap();
+                let post_tex_ref = self.post_texture.as_ref().unwrap();
+
+                // ═══════════════════════════════════════════════════════
+                // Pass 1: World (sky + chunks + entities + particles) → Post-Process RT
+                // ═══════════════════════════════════════════════════════
                 {
                     let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Surface Pass (Chunks)"),
+                        label: Some("World Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
+                            view: post_view_ref,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2436,11 +3127,60 @@ impl WmRenderer {
                         occlusion_query_set: None,
                     });
 
+                    self.draw_sky(&mut rp);
                     self.draw_chunks(&mut rp);
                     self.draw_entities(&mut rp);
                     self.draw_particles(&mut rp);
                 }
-                // Pass 2: HUD overlay (load world output, no depth, alpha blending)
+
+                // ═══════════════════════════════════════════════════════
+                // Pass 2: Post-Processing (FXAA + tonemapping + gamma) → Swapchain
+                // ═══════════════════════════════════════════════════════
+                // Ensure post-process bind group
+                if self.post_bind_group.is_none() {
+                    if let Some(bgl) = &self.post_bind_group_layout {
+                        let pp_view = post_tex_ref.create_view(&wgpu::TextureViewDescriptor::default());
+                        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("Post-Process BG"),
+                            layout: bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&pp_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                                },
+                            ],
+                        });
+                        self.post_bind_group = Some(bg);
+                    }
+                }
+
+                {
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Post-Process Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    rp.set_pipeline(self.post_pipeline.as_ref().unwrap());
+                    rp.set_bind_group(0, self.post_bind_group.as_ref().unwrap(), &[]);
+                    rp.draw(0..3, 0..1); // Fullscreen triangle
+                }
+
+                // ═══════════════════════════════════════════════════════
+                // Pass 3: HUD Overlay (alpha blend) → Swapchain
+                // ═══════════════════════════════════════════════════════
                 if has_hud {
                     {
                         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
