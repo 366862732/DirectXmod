@@ -4,6 +4,8 @@ import java.nio.ByteBuffer;
 
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL15;
+import org.lwjgl.opengl.GL21;
 import org.lwjgl.opengl.GL30;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -38,8 +40,23 @@ public class GameRendererMixin {
     /** Pre-allocated buffer for GL framebuffer capture. */
     private static ByteBuffer frameCaptureBuffer;
 
-    /** Pre-allocated buffer for GL HUD capture. */
+    /** Pre-allocated buffer for GL HUD capture (PBO readback destination). */
     private static ByteBuffer hudCaptureBuffer;
+
+    // ── PBO async HUD readback ─────────────────────────────────────────
+    // Triple-buffered Pixel Buffer Objects for non-blocking framebuffer readback.
+    // Frame N: glReadPixels → PBO[writeIdx]  (async DMA, returns immediately)
+    // Frame N: glMapBuffer(PBO[readIdx])      → get previous frame's data
+    // glFlush() replaces glFinish() — submits commands without blocking CPU.
+    private static final int PBO_COUNT = 3;
+    private static int[] pboIds;         // null ≡ not initialized
+    private static int pboWriteIndex = 0;
+    private static int pboReadIndex = 0; // the PBO whose DMA finished last frame
+    private static int pboWarmup = 0;    // frames elapsed since PBO init
+    private static int lastHudWidth = 0;
+    private static int lastHudHeight = 0;
+    private static boolean pboSupported = true;
+    private static boolean pboInitAttempted = false;
 
     /**
      * HEAD injection: cancel renderLevel when D3D12 has chunks + surface.
@@ -143,9 +160,30 @@ public class GameRendererMixin {
         D3D12Bridge.setFramePixels(frameCaptureBuffer, w, h);
     }
 
-    /** Capture the HUD-only framebuffer for D3D12 overlay compositing.
-     *  The world was cleared to transparent in renderLevel TAIL,
-     *  so only HUD elements remain in the framebuffer. */
+    // ── PBO helpers ────────────────────────────────────────────────────
+
+    /** (Re)initialize PBOs for the given size. Keeps existing data if resizing. */
+    private static void initPBOs(int size) {
+        if (pboIds == null) {
+            pboIds = new int[PBO_COUNT];
+        }
+        for (int i = 0; i < PBO_COUNT; i++) {
+            int oldId = pboIds[i];
+            if (oldId != 0) {
+                GL15.glDeleteBuffers(oldId);
+            }
+            int id = GL15.glGenBuffers();
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, id);
+            GL15.glBufferData(GL21.GL_PIXEL_PACK_BUFFER, size, GL15.GL_STREAM_READ);
+            pboIds[i] = id;
+        }
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+        pboWarmup = 0;
+        pboWriteIndex = 0;
+        pboReadIndex = 0;
+    }
+
+    /** Capture HUD via PBO async DMA, falling back to synchronous readback. */
     private void captureHudForD3D12() {
         Minecraft mc = Minecraft.getInstance();
         int w = mc.getWindow().getWidth();
@@ -153,26 +191,20 @@ public class GameRendererMixin {
         if (w <= 0 || h <= 0) return;
 
         int size = w * h * 4; // RGBA8
-        if (hudCaptureBuffer == null || hudCaptureBuffer.capacity() < size) {
-            hudCaptureBuffer = BufferUtils.createByteBuffer(size);
-        }
 
-        hudCaptureBuffer.position(0);
-        if (hudCaptureBuffer.limit() < size) {
-            hudCaptureBuffer.limit(size);
-        }
-
-        // Query current GL FBO state for diagnostic
+        // ── (A) Save GL state ──────────────────────────────────────
         int oldReadFbo = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
         int oldDrawFbo = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        int oldPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
 
         // Log FBO info on first capture
         if (!firstHudCaptureLogged) {
-            com.dx12.Dx12Mod.LOGGER.info(
+            Dx12Mod.LOGGER.info(
                 "[dx12-wm] HUD capture FBO state: readFbo={} drawFbo={}",
                 oldReadFbo, oldDrawFbo);
         }
 
+        // ── (B) Setup read framebuffer ─────────────────────────────
         if (oldDrawFbo != 0) {
             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, oldDrawFbo);
             GL11.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);
@@ -181,53 +213,179 @@ public class GameRendererMixin {
             GL11.glReadBuffer(GL11.GL_BACK);
         }
 
-        // Force all pending GL commands to complete before reading pixels.
-        // MC 26.1.2 may batch HUD render commands through the render graph
-        // system (SubmitNodes), which might not flush to the default FBO
-        // until glFinish or an explicit flush. glReadPixels without finish
-        // may read stale/empty pixel data.
-        GL11.glFinish();
+        // ── (C) Try PBO async path ─────────────────────────────────
+        boolean usedPbo = false;
+        if (pboSupported) {
+            usedPbo = captureHudViaPbo(size, w, h);
+        }
 
-        GL11.glReadPixels(0, 0, w, h, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, hudCaptureBuffer);
+        // ── (D) Fallback: synchronous readback ─────────────────────
+        if (!usedPbo) {
+            captureHudSync(size, w, h);
+        }
 
-        // Restore previous GL state
+        // ── (E) Restore GL state ───────────────────────────────────
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, oldReadFbo);
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, oldPackBuffer);
+    }
 
-        hudCaptureBuffer.position(0);
-        hudCaptureBuffer.limit(size);
+    /**
+     * PBO-based async HUD readback.
+     * Returns true if successful, false to trigger synchronous fallback.
+     */
+    private boolean captureHudViaPbo(int size, int w, int h) {
+        // Init PBOs on first use or on resize
+        boolean needsInit = (pboIds == null)
+            || (w != lastHudWidth || h != lastHudHeight);
+        if (needsInit) {
+            try {
+                initPBOs(size);
+                lastHudWidth = w;
+                lastHudHeight = h;
+            } catch (Exception e) {
+                Dx12Mod.LOGGER.warn("[dx12-wm] PBO init failed, falling back: {}",
+                    e.getMessage());
+                pboSupported = false;
+                return false;
+            }
+        }
 
-        // One-time diagnostic
+        // Ensure the HUD capture buffer is ready
+        if (hudCaptureBuffer == null || hudCaptureBuffer.capacity() < size) {
+            hudCaptureBuffer = BufferUtils.createByteBuffer(size);
+        }
+
+        // ═══ Step 1: Start async DMA read into current write PBO ═══
+        int writeId = pboIds[pboWriteIndex];
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, writeId);
+
+        // glFlush submits pending HUD rendering commands to GPU.
+        // Without this, MC's render graph may not flush before glReadPixels.
+        GL11.glFlush();
+
+        GL11.glReadPixels(0, 0, w, h, GL11.GL_RGBA,
+            GL11.GL_UNSIGNED_BYTE, 0L); // offset 0 = write into PBO
+
+        // Unbind PBO so subsequent GL operations are not affected.
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+
+        // ═══ Step 2: Map previous frame's PBO (read completed DMA) ═══
+        // Triple buffering: PBO[readIndex] was written 2 frames ago.
+        // glMapBuffer blocks briefly until DMA is complete (~microseconds).
+        int readId = pboIds[pboReadIndex];
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, readId);
+
+        ByteBuffer mapped = null;
+        try {
+            mapped = GL15.glMapBuffer(GL21.GL_PIXEL_PACK_BUFFER, GL30.GL_READ_ONLY);
+        } catch (Exception e) {
+            // glMapBuffer can fail if driver doesn't support GL_READ_ONLY
+            // in core profile; fall back to synchronous path.
+        }
+
+        if (mapped == null) {
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+            // Still advance PBO indices so warmup counter can proceed
+            advancePboIndices();
+            pboWarmup++;
+            return false;
+        }
+
+        // ── Copy mapped PBO data into hudCaptureBuffer ──────────────
+        hudCaptureBuffer.clear();
+        int bytesToCopy = Math.min(mapped.remaining(), hudCaptureBuffer.remaining());
+        hudCaptureBuffer.limit(bytesToCopy);
+        mapped.limit(mapped.position() + bytesToCopy);
+        hudCaptureBuffer.put(mapped);
+        hudCaptureBuffer.flip();
+
+        GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+
+        // ── Diagnostic on first successful PBO readback ─────────────
         if (!firstHudCaptureLogged) {
             firstHudCaptureLogged = true;
             int r = hudCaptureBuffer.get(0) & 0xFF;
             int g = hudCaptureBuffer.get(1) & 0xFF;
             int b = hudCaptureBuffer.get(2) & 0xFF;
             int a = hudCaptureBuffer.get(3) & 0xFF;
-            com.dx12.Dx12Mod.LOGGER.info(
-                "[dx12-wm] First HUD capture: {}x{}, first pixel RGBA=({},{},{},{})",
+            Dx12Mod.LOGGER.info(
+                "[dx12-wm] First HUD capture (PBO): {}x{}, first pixel RGBA=({},{},{},{})",
                 w, h, r, g, b, a);
-            // Log edge pixel samples to verify HUD content vs transparent areas
-            StringBuilder sb = new StringBuilder("HUD edge samples:");
-            for (int i = 0; i < 5; i++) {
-                int px = hudCaptureBuffer.get(i * 4) & 0xFF;
-                int py = hudCaptureBuffer.get(i * 4 + 1) & 0xFF;
-                int pz = hudCaptureBuffer.get(i * 4 + 2) & 0xFF;
-                int pa = hudCaptureBuffer.get(i * 4 + 3) & 0xFF;
-                sb.append(String.format(" [%d]=(%d,%d,%d,%d)", i, px, py, pz, pa));
-            }
-            // Also sample center pixels
-            int centerOff = (h / 2 * w + w / 2) * 4;
-            if (centerOff + 4 <= size) {
-                sb.append(String.format(" center=(%d,%d,%d,%d)",
-                    hudCaptureBuffer.get(centerOff) & 0xFF,
-                    hudCaptureBuffer.get(centerOff + 1) & 0xFF,
-                    hudCaptureBuffer.get(centerOff + 2) & 0xFF,
-                    hudCaptureBuffer.get(centerOff + 3) & 0xFF));
-            }
-            com.dx12.Dx12Mod.LOGGER.info("[dx12-wm] HUD pixel samples: {}", sb.toString());
+            logHudEdgeSamples(hudCaptureBuffer, w, h, size);
+        }
+
+        hudCaptureBuffer.position(0);
+        hudCaptureBuffer.limit(bytesToCopy);
+        D3D12Bridge.setHudPixels(hudCaptureBuffer, w, h);
+
+        // ═══ Step 3: Advance PBO ring indices ═══
+        advancePboIndices();
+        pboWarmup++;
+        return true;
+    }
+
+    /** Advance the PBO write/read ring indices. */
+    private static void advancePboIndices() {
+        pboReadIndex = pboWriteIndex;
+        pboWriteIndex = (pboWriteIndex + 1) % PBO_COUNT;
+    }
+
+    /** Synchronous fallback: traditional glFinish + glReadPixels. */
+    private void captureHudSync(int size, int w, int h) {
+        if (hudCaptureBuffer == null || hudCaptureBuffer.capacity() < size) {
+            hudCaptureBuffer = BufferUtils.createByteBuffer(size);
+        }
+
+        hudCaptureBuffer.position(0);
+        hudCaptureBuffer.limit(size);
+
+        // Force all pending GL commands to complete before reading pixels.
+        // MC 26.1.2 may batch HUD render commands through the render graph
+        // system (SubmitNodes), which might not flush to the default FBO
+        // until glFinish or an explicit flush.
+        GL11.glFinish();
+
+        GL11.glReadPixels(0, 0, w, h, GL11.GL_RGBA,
+            GL11.GL_UNSIGNED_BYTE, hudCaptureBuffer);
+
+        hudCaptureBuffer.position(0);
+        hudCaptureBuffer.limit(size);
+
+        if (!firstHudCaptureLogged) {
+            firstHudCaptureLogged = true;
+            int r = hudCaptureBuffer.get(0) & 0xFF;
+            int g = hudCaptureBuffer.get(1) & 0xFF;
+            int b = hudCaptureBuffer.get(2) & 0xFF;
+            int a = hudCaptureBuffer.get(3) & 0xFF;
+            Dx12Mod.LOGGER.info(
+                "[dx12-wm] First HUD capture (sync): {}x{}, first pixel RGBA=({},{},{},{})",
+                w, h, r, g, b, a);
+            logHudEdgeSamples(hudCaptureBuffer, w, h, size);
         }
 
         D3D12Bridge.setHudPixels(hudCaptureBuffer, w, h);
+    }
+
+    /** Log edge + center pixel samples for diagnostics. */
+    private static void logHudEdgeSamples(ByteBuffer buf, int w, int h, int size) {
+        StringBuilder sb = new StringBuilder("HUD edge samples:");
+        for (int i = 0; i < 5; i++) {
+            int px = buf.get(i * 4) & 0xFF;
+            int py = buf.get(i * 4 + 1) & 0xFF;
+            int pz = buf.get(i * 4 + 2) & 0xFF;
+            int pa = buf.get(i * 4 + 3) & 0xFF;
+            sb.append(String.format(" [%d]=(%d,%d,%d,%d)", i, px, py, pz, pa));
+        }
+        int centerOff = (h / 2 * w + w / 2) * 4;
+        if (centerOff + 4 <= size) {
+            sb.append(String.format(" center=(%d,%d,%d,%d)",
+                buf.get(centerOff) & 0xFF,
+                buf.get(centerOff + 1) & 0xFF,
+                buf.get(centerOff + 2) & 0xFF,
+                buf.get(centerOff + 3) & 0xFF));
+        }
+        Dx12Mod.LOGGER.info("[dx12-wm] HUD pixel samples: {}", sb.toString());
     }
 
     private static boolean firstCaptureLogged = false;

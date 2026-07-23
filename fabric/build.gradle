@@ -16,6 +16,14 @@ repositories {
         name = "Fabric"
         url = "https://maven.fabricmc.net/"
     }
+    maven {
+        name = "Terraformers"
+        url = "https://maven.terraformersmc.com/releases/"
+    }
+    maven {
+        name = "Modrinth"
+        url = "https://maven.modrinth.com/releases/"
+    }
 }
 
 loom {
@@ -31,6 +39,8 @@ dependencies {
 
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    implementation files('libs/modmenu-18.0.0.jar')
 }
 
 processResources {

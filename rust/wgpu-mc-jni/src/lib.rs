@@ -148,6 +148,83 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadTerrainAtlas(
     }
 }
 
+/// Upload the MC lightmap texture for dynamic block/sky lighting.
+/// `data` is RGBA8 pixel data (16x16 by default for vanilla MC).
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadLightmap(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer: jni::objects::JObject,
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+) {
+    if width <= 0 || height <= 0 { return; }
+
+    let byte_buf = jni::objects::JByteBuffer::from(buffer);
+    let data = match _env.get_direct_buffer_address(&byte_buf) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            eprintln!("[dx12-wm] uploadLightmap FAILED: buffer is not direct");
+            return;
+        }
+    };
+    let len = (width * height * 4) as usize;
+    let slice = std::slice::from_raw_parts(data, len);
+
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.upload_lightmap(slice, width as u32, height as u32);
+    }
+}
+
+/// Set the anti-aliasing mode for the D3D12 renderer.
+/// mode: 0=None, 1=FXAA, 2=SMAA, 3=TAA
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetAaMode(
+    _env: JNIEnv,
+    _class: JClass,
+    mode: jni::sys::jint,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        use wgpu_mc::AaMode;
+        let aa_mode = match mode {
+            0 => AaMode::None,
+            1 => AaMode::FXAA,
+            2 => AaMode::SMAA,
+            3 => AaMode::TAA,
+            _ => AaMode::FXAA,
+        };
+        renderer.set_aa_mode(aa_mode);
+    }
+}
+
+/// Update sky gradient colors and sun angle for dynamic sky rendering.
+/// Colors are RGBA float values, sun_angle is in radians.
+/// sun_angle < 0 or >= 2PI disables the sun disk.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateSky(
+    _env: JNIEnv,
+    _class: JClass,
+    top_r: f32, top_g: f32, top_b: f32,
+    horizon_r: f32, horizon_g: f32, horizon_b: f32,
+    sun_angle: f32,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_sky(top_r, top_g, top_b, horizon_r, horizon_g, horizon_b, sun_angle);
+    }
+}
+
 /// Check if the wgpu renderer is ready for rendering.
 /// Returns 1 if ready, 0 if still initializing, -1 if failed.
 ///
