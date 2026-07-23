@@ -93,6 +93,7 @@ public class Dx12Mod implements ClientModInitializer {
     private static ByteBuffer pendingPixels = null;
     private static long lastRenderTime = 0;
     private static long renderStartTime = 0;
+    private static int getSkyColorFailCount = 0;
 
     // Unified overlay GL resources (texture, PBO, mesh, shader)
     private static GlOverlayResources overlayResources = new GlOverlayResources();
@@ -219,35 +220,34 @@ public class Dx12Mod implements ClientModInitializer {
                     D3D12Bridge.updateCameraPos(
                         (float) pos.x, (float) pos.y, (float) pos.z);
 
-                    // Extract fog color from the level.
-                    // Uses getDeclaredMethod + setAccessible for access across MC versions.
+                    // Extract fog color from the level for fog and sky rendering.
+                    // In MC 26.1.2, Level.getSkyColor may not be publicly accessible
+                    // and setAccessible can be blocked by Java module system.
+                    // Use throttled fallback to avoid log spam.
+                    Vec3 skyColor = null;
                     try {
-                        Vec3 skyColor;
-                        try {
-                            Vec3 cameraPos = pos;
-                            float partialTick = 1.0f;
-                            var getSkyColorMethod = net.minecraft.world.level.Level.class
-                                .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
-                            getSkyColorMethod.setAccessible(true);
-                            skyColor = (Vec3) getSkyColorMethod.invoke(mc.level, cameraPos, partialTick);
-                        } catch (Exception e) {
-                            LOGGER.info("getSkyColor failed: {}", e.getMessage());
-                            skyColor = new Vec3(0.53, 0.81, 0.92);
+                        var method = net.minecraft.world.level.Level.class
+                            .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
+                        method.setAccessible(true);
+                        skyColor = (Vec3) method.invoke(mc.level, pos, 1.0f);
+                    } catch (Exception e) {
+                        if (getSkyColorFailCount % 60 == 0) {
+                            LOGGER.info("getSkyColor fallback ({}): {}",
+                                getSkyColorFailCount, e.getMessage());
                         }
+                        getSkyColorFailCount++;
+                    }
+                    if (skyColor == null) {
+                        skyColor = new Vec3(0.53, 0.81, 0.92);
+                    }
+                    {
                         float fr = Math.max((float) skyColor.x, 0.20f);
                         float fg = Math.max((float) skyColor.y, 0.25f);
                         float fb = Math.max((float) skyColor.z, 0.35f);
-                        LOGGER.info("Fog raw=({}) final=({})",
-                            String.format("%.3f,%.3f,%.3f", skyColor.x, skyColor.y, skyColor.z),
-                            String.format("%.3f,%.3f,%.3f", fr, fg, fb));
-                        // Reduced density from 0.003 to 0.001 for lighter fog
                         float fogDensity = 0.001f;
                         if (mc.level.isRaining()) fogDensity = 0.003f;
                         if (mc.level.isThundering()) fogDensity = 0.006f;
                         D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
-                    } catch (Throwable fogEx) {
-                        LOGGER.info("Fog fallback (exception): {}", fogEx.getMessage());
-                        D3D12Bridge.nativeUpdateFog(0.53f, 0.81f, 0.92f, 0.001f);
                     }
 
                     // ─── Entity extraction ──────────────────────────

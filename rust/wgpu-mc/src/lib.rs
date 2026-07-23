@@ -88,6 +88,29 @@ impl ParticleVertex {
     }
 }
 
+/// Sky dome vertex: position + normal (24 bytes).
+/// normal is also the direction from origin for height-based color interpolation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct SkyVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
+impl SkyVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+    ];
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct TexVertex {
@@ -327,6 +350,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+// Sky dome shader: renders a gradient hemisphere at the horizon.
+// Vertex color interpolated between deep blue (zenith) and fog color (horizon).
+// Uses position + normal per vertex (24 bytes), pos is on the hemisphere surface.
+const SKY_SHADER_SRC: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>) -> VertexOutput {
+    var out: VertexOutput;
+    let world_pos = pos + camera.camera_pos;
+    out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    // Sky gradient: deep blue at zenith (t=1), fog color at horizon (t=0).
+    // Use a natural sky palette: richer blue at top, lighter/foggier at horizon.
+    let t = max(0.0, normal.y);
+    let zenith = vec3<f32>(0.08, 0.20, 0.55);
+    out.color = mix(camera.fog.rgb, zenith, t);
+    return out;
+}
+
+@fragment
+fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(color, 1.0);
+}
+"#;
+
 const RING_SIZE: usize = 3;
 const LERP_FACTOR: f32 = 0.85;
 
@@ -340,23 +398,26 @@ fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
     result
 }
 
-/// Write camera MVP + camera_pos + fog to the uniform buffer.
+/// Write camera MVP + camera_pos + fog + sky_color to the uniform buffer.
 /// Layout:
-///   mat4x4  view_proj   (64 bytes, offset 0)
-///   vec3    camera_pos  (12 bytes, offset 64, padded to 16)
-///   vec4    fog         (16 bytes, offset 80)  — fog.rgb = color, fog.a = density
-/// Total: 96 bytes.
+///   mat4x4  view_proj      (64 bytes, offset 0)
+///   vec3    camera_pos     (12 bytes, offset 64, padded to 16)
+///   vec4    fog            (16 bytes, offset 80)  — fog.rgb = color, fog.a = density
+///   vec3    sky_color_top  (12 bytes, offset 96, padded to 16)
+/// Total: 112 bytes (allocated 128 for safety).
 fn write_camera_uniform(
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
     mvp: &[[f32; 4]; 4],
     pos: &[f32; 3],
     fog: &[f32; 4],
+    sky_top: &[f32; 3],
 ) {
-    let mut data = [0u8; 96];
+    let mut data = [0u8; 128];
     data[0..64].copy_from_slice(bytemuck::cast_slice(mvp));
     data[64..76].copy_from_slice(bytemuck::cast_slice(pos));
     data[80..96].copy_from_slice(bytemuck::cast_slice(&fog[..]));
+    data[96..108].copy_from_slice(bytemuck::cast_slice(&sky_top[..]));
     queue.write_buffer(buffer, 0, &data);
 }
 
@@ -400,6 +461,48 @@ fn make_staging_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgpu::
 
 fn aligned_row(width: u32) -> u32 {
     ((width * 4 + 255) / 256) * 256
+}
+
+/// Generate a sky dome mesh (upper hemisphere) for gradient sky rendering.
+/// Returns (vertices, indices) with positions on a 500-unit sphere surface.
+/// Vertex count: (LAT+1)*(LON+1) = 17*33 = 561
+/// Index count: LAT*LON*6 = 16*32*6 = 3072
+fn create_sky_dome_mesh() -> (Vec<SkyVertex>, Vec<u16>) {
+    const LAT: u32 = 16;
+    const LON: u32 = 32;
+    const RADIUS: f32 = 500.0;
+
+    let lat1 = LAT + 1;
+    let lon1 = LON + 1;
+    let mut verts = Vec::with_capacity((lat1 * lon1) as usize);
+    let mut idxs = Vec::with_capacity((LAT * LON * 6) as usize);
+
+    for lat in 0..lat1 {
+        let theta = (lat as f32 / LAT as f32) * (std::f32::consts::PI / 2.0);
+        let (st, ct) = (theta.sin(), theta.cos());
+        for lon in 0..lon1 {
+            let phi = (lon as f32 / LON as f32) * 2.0 * std::f32::consts::PI;
+            let (sp, cp) = (phi.sin(), phi.cos());
+            let nx = st * cp;
+            let ny = ct;
+            let nz = st * sp;
+            verts.push(SkyVertex {
+                position: [nx * RADIUS, ny * RADIUS, nz * RADIUS],
+                normal: [nx, ny, nz],
+            });
+        }
+    }
+
+    for lat in 0..LAT {
+        for lon in 0..LON {
+            let a = lat * lon1 + lon;
+            let b = a + lon1;
+            idxs.extend_from_slice(&[a as u16, b as u16, (a + 1) as u16]);
+            idxs.extend_from_slice(&[b as u16, (b + 1) as u16, (a + 1) as u16]);
+        }
+    }
+
+    (verts, idxs)
 }
 
 fn create_plane_mesh(device: &wgpu::Device, size: f32, y: f32, z_center: f32, color: [f32; 3])
@@ -570,6 +673,7 @@ pub struct WmRenderer {
     camera_target: [[f32; 4]; 4],
     camera_pos: [f32; 3],
     fog_color: [f32; 4], // rgb + density
+    sky_color: [f32; 3], // zenith sky color for sky dome
 
     // Immutable GPU resources
     pipeline: wgpu::RenderPipeline,
@@ -641,6 +745,12 @@ pub struct WmRenderer {
     particle_buffer: Option<wgpu::Buffer>,
     particle_count: u32,
     particle_pipeline: Option<wgpu::RenderPipeline>,
+
+    // Sky dome rendering
+    sky_vb: Option<wgpu::Buffer>,
+    sky_ib: Option<wgpu::Buffer>,
+    sky_index_count: u32,
+    sky_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
@@ -686,7 +796,7 @@ impl WmRenderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniform"),
-            size: 96, // mat4x4 (64) + camera_pos (16) + fog (16)
+            size: 128, // mat4x4 (64) + camera_pos (16) + fog (16) + sky_top (16)
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -971,6 +1081,7 @@ impl WmRenderer {
             camera_target: IDENTITY,
             camera_pos: [0.0; 3],
             fog_color: [1.0, 0.0, 0.0, 0.001], // DIAG: bright red fog to verify shader mixing
+            sky_color: [0.4, 0.6, 0.9], // default sky blue zenith
             pipeline,
             bind_group,
             uniform_buffer,
@@ -1023,6 +1134,12 @@ impl WmRenderer {
             particle_buffer: None,
             particle_count: 0,
             particle_pipeline: None,
+
+            // Sky dome (created lazily)
+            sky_vb: None,
+            sky_ib: None,
+            sky_index_count: 0,
+            sky_pipeline: None,
         })
     }
 
@@ -1106,7 +1223,10 @@ impl WmRenderer {
         self.chunk_pipeline_transparent = None;
         self.entity_pipeline = None;
         self.particle_pipeline = None;
-        self.hud_pipeline = None;  // Will be recreated on first set_hud_pixels call
+        self.sky_pipeline = None;      // Recreated on next render with new surface format
+        self.hud_pipeline = None;      // Will be recreated on next set_hud_pixels call
+        self.hud_bind_group = None;    // Also invalidate bind group — has_hud checks this
+        self.hud_texture = None;       // Texture must be rebuilt with new surface config
         self.ensure_chunk_pipeline();
 
         log::info!("[dx12-wm] Surface mode ENABLED on parent HWND: {:?} {}x{}",
@@ -1727,6 +1847,12 @@ impl WmRenderer {
         self.fog_color = [fog_color_rgb[0], fog_color_rgb[1], fog_color_rgb[2], fog_density];
     }
 
+    /// Set sky dome zenith color (used for sky gradient top color).
+    /// Typically from MC's sky color, brightened for the top of the dome.
+    pub fn set_sky_color(&mut self, rgb: &[f32; 3]) {
+        self.sky_color = [rgb[0], rgb[1], rgb[2]];
+    }
+
     /// Remove all chunk meshes for a given section.
     /// Called before recompiling a section to prevent stale mesh accumulation.
     pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
@@ -1952,11 +2078,24 @@ impl WmRenderer {
         let Some(pipeline) = &self.particle_pipeline else { return; };
         let Some(vb) = &self.particle_buffer else { return; };
         let Some(bind_group) = &self.chunk_bind_group else { return; };
-
         rp.set_pipeline(pipeline);
         rp.set_bind_group(0, bind_group, &[]);
         rp.set_vertex_buffer(0, vb.slice(..));
         rp.draw(0..self.particle_count, 0..1);
+    }
+
+    /// Render the sky dome (gradient hemisphere) in the current render pass.
+    fn draw_sky_dome<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        let Some(pipeline) = &self.sky_pipeline else { return; };
+        let Some(vb) = &self.sky_vb else { return; };
+        let Some(ib) = &self.sky_ib else { return; };
+        let Some(bind_group) = &self.chunk_bind_group else { return; };
+        if self.sky_index_count == 0 { return; }
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, bind_group, &[]);
+        rp.set_vertex_buffer(0, vb.slice(..));
+        rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint16);
+        rp.draw_indexed(0..self.sky_index_count, 0, 0..1);
     }
 
     /// Create or recreate the chunk render pipelines using the current surface format.
@@ -2173,6 +2312,79 @@ impl WmRenderer {
         }));
     }
 
+    // ── Sky dome pipeline (gradient hemisphere) ─────────────────
+
+    /// Create or recreate the sky dome pipeline.
+    /// Mesh is allocated once on first call, pipeline is rebuilt on surface format change.
+    fn ensure_sky_pipeline(&mut self) {
+        // Allocate sky dome mesh on first call
+        if self.sky_vb.is_none() {
+            let (verts, idxs) = create_sky_dome_mesh();
+            self.sky_index_count = idxs.len() as u32;
+            let vb_size = (verts.len() * std::mem::size_of::<SkyVertex>()) as u64;
+            self.sky_vb = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Sky VB"),
+                size: vb_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.queue.write_buffer(self.sky_vb.as_ref().unwrap(), 0, bytemuck::cast_slice(&verts));
+            let ib_size = (idxs.len() * 2) as u64;
+            self.sky_ib = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Sky IB"),
+                size: ib_size,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.queue.write_buffer(self.sky_ib.as_ref().unwrap(), 0, bytemuck::cast_slice(&idxs));
+            log::info!("[dx12-wm] Sky dome mesh created: {} verts, {} indices", verts.len(), idxs.len());
+        }
+
+        if self.sky_pipeline.is_some() { return; }
+
+        let Some(bgl) = &self.chunk_bind_group_layout else { return; };
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Sky Shader"),
+            source: wgpu::ShaderSource::Wgsl(SKY_SHADER_SRC.into()),
+        });
+        let pl = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Sky PL"),
+            bind_group_layouts: &[bgl],
+            push_constant_ranges: &[],
+        });
+
+        self.sky_pipeline = Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Sky Pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[SkyVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,  // No culling — inside view of dome
+                ..Default::default()
+            },
+            depth_stencil: None,  // Sky dome does not write depth — chunks cover it
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        }));
+        log::info!("[dx12-wm] Sky dome pipeline created with format={:?}", self.surface_format);
+    }
+
     // ── HUD overlay pipeline (alpha-blended fullscreen quad) ────
 
     /// Create or recreate the HUD compositing pipeline with the current surface format.
@@ -2278,8 +2490,12 @@ impl WmRenderer {
             self.hud_width = width;
             self.hud_height = height;
             log::info!("[dx12-wm] HUD texture + bind_group created OK");
-            self.ensure_hud_pipeline();
         }
+
+        // Always ensure the pipeline exists — init_surface() sets it to None,
+        // and dimension may not have changed, so the ensure must run outside
+        // the need_new block to actually re-create the pipeline.
+        self.ensure_hud_pipeline();
 
         // Upload pixel data with D3D12-aligned row pitch
         let mut padded = Vec::with_capacity(padded_size);
@@ -2403,12 +2619,36 @@ impl WmRenderer {
                 // Phase 7: Render native MC chunk geometry with D3D12
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color);
 
                 let depth_view = self.surface_depth
                     .as_ref()
                     .expect("surface_depth must be created in init_surface")
                     .create_view(&wgpu::TextureViewDescriptor::default());
+
+                // Ensure sky pipeline exists for this surface format
+                self.ensure_sky_pipeline();
+
+                // Pass 0: Sky dome (gradient hemisphere, no depth)
+                {
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Sky Dome Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.draw_sky_dome(&mut rp);
+                }
 
                 // Pass 1: Render world (chunks + entities + particles) with depth
                 {
@@ -2418,9 +2658,7 @@ impl WmRenderer {
                             view: &view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.53, g: 0.81, b: 0.92, a: 1.0,
-                                }),
+                                load: wgpu::LoadOp::Load,  // Preserve sky dome output
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -2487,7 +2725,7 @@ impl WmRenderer {
                 // Fallback: 3D test scene (plane + cubes)
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color);
 
                 {
                     let depth_view = self.surface_depth
@@ -2556,7 +2794,7 @@ impl WmRenderer {
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color);
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color);
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);
