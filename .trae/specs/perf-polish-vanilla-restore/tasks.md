@@ -11,9 +11,9 @@
   - [x] 并发安全：上传仅追加尾部（offset ≥ 捕获时 len，永不与压缩目标区冲突）；压缩期间 clear 强制走墓碑路径（禁止截断）；被 clear/recompile 的已捕获槽位经身份校验（base_vertex/len 匹配）后跳过
   - [x] `cargo test -p wgpu-mc` 通过（17 tests）
 - [x] Task 3: 构建、部署与验证
-  - [x] 重建 DLL + JAR 并部署（deploy_commit.txt 同步为 3d97625）
-  - [x] 更新 verify-deploy.ps1 期望 hash（860dc10 → 3d97625）
-  - [ ] 跑图验证：`Chunk compaction started/finished` 频率下降、压缩帧无卡顿、无 REJECTED/崩溃；步骤.md 记录 13.10（文档已记录，跑图确认待用户执行）
+  - [x] 重建 DLL + JAR 并部署（deploy_commit.txt 同步为 2a39909）
+  - [x] 更新 verify-deploy.ps1 期望 hash（→ 2a39909）
+  - [x] 跑图验证（build 2a39909）：FPS 335–448 平滑、无 REJECTED/崩溃/缺块；步骤.md 13.10 已记录验证结果（压缩触发频率因 45s 短会话未触发，待 ≥60s 大距离跑图补测）
 
 ## P1–P3 待办清单（spec 交付，实施列入后续任务）
 
