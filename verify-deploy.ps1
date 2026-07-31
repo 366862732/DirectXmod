@@ -61,7 +61,7 @@ function Check {
 }
 
 # 1. DLL build identity (git commit hash injected by build.rs)
-Check "DLL version (wgpu-mc build cf40646)" "wgpu-mc build cf40646" $true
+Check "DLL version (wgpu-mc build b7a58a2)" "wgpu-mc build b7a58a2" $true
 
 # 2. Frame-rate unlock (Phase 11h)
 Check "Per-frame present (present moved to render TAIL)" "present moved to render TAIL" $true
@@ -90,7 +90,10 @@ Check "Particles uploaded (chain alive)" "Particles uploaded:" $true
 # 10. No wgpu Validation Error / fatal panic (256 MB buffer limit — 13.7)
 Check "No wgpu fatal error (Validation Error absent)" "Handling wgpu errors as fatal" $false
 
-# 11. Renderer ready
+# 11. No rejected chunk meshes (max_buffer_size raised to 1 GiB — 13.8)
+Check "No rejected chunk meshes (1 GiB limit)" "Chunk mesh REJECTED" $false
+
+# 12. Renderer ready
 Check "Renderer ready (Device created OK)" "Device created OK" $true
 
 Write-Host ""
@@ -105,8 +108,8 @@ Write-Host "========================================" -ForegroundColor Cyan
 if ($failCount -gt 0) {
     Write-Host ""
     Write-Host "NOTE: if DLL version / FPS checks fail, make sure the deployed"
-    Write-Host "      JAR is the 17:14 build (fabric\build\libs\gl4dx12-0.1.0.jar)"
-    Write-Host "      and the game was fully restarted." -ForegroundColor Yellow
+    Write-Host "      JAR is the b7a58a2 build (fabric\build\libs\gl4dx12-0.1.0.jar,"
+    Write-Host "      built 19:20) and the game was fully restarted." -ForegroundColor Yellow
 }
 
 exit $failCount
