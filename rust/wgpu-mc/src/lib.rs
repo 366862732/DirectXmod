@@ -2294,6 +2294,17 @@ impl WmRenderer {
     /// when the append exceeds their current allocation (copying existing data
     /// into the bigger buffer), otherwise issues a plain `queue.write_buffer`
     /// for just the new range.
+    ///
+    /// Growth uses async `queue.write_buffer` (NOT `mapped_at_creation` +
+    /// `get_mapped_range_mut` + `unmap`): the synchronous mapped path copies
+    /// the whole multi-hundred-MB buffer on the calling thread, which under a
+    /// heavy chunk-compile burst (all Worker-Main threads uploading) stalled
+    /// the GPU long enough for a TDR → DeviceLost → wgpu fatal panic → JVM
+    /// crash (hs_err_pid23980, wgpu create_buffer → handle_error_inner →
+    /// panic_unwind → EXCEPTION_UNCAUGHT_CXX_EXCEPTION).
+    const CHUNK_VB_MIN_CAP: u64 = 4 * 1024 * 1024; // 4 MB
+    const CHUNK_IB_MIN_CAP: u64 = 1 * 1024 * 1024; // 1 MB
+
     fn upload_chunk_slice(&mut self, verts_start: usize, idxs_start: usize) {
         if self.merged_verts.len() <= verts_start || self.merged_indices.len() <= idxs_start {
             return;
@@ -2306,43 +2317,48 @@ impl WmRenderer {
         let ib_bytes = (idxs_start as u64 + idxs.len() as u64)
             * std::mem::size_of::<u32>() as u64;
 
-        // Vertex buffer: grow (full copy of ALL data) or append (write_buffer).
+        // Vertex buffer: grow (async upload of ALL data) or append (write_buffer).
         let vb_grows = self.chunk_vb.as_ref().map_or(true, |b| b.size() < vb_bytes);
         if vb_grows {
-            let new_cap = (self.chunk_vb_capacity * 2).max(vb_bytes).max(64 * 1024);
+            let new_cap = (self.chunk_vb_capacity * 2)
+                .max(vb_bytes)
+                .max(Self::CHUNK_VB_MIN_CAP);
             let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Chunk Merged VB"),
                 size: new_cap,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
+                mapped_at_creation: false,
             });
-            // Resize path: copy the ENTIRE merged cache (old data + new slice)
-            // into the larger buffer, not just the newly appended range.
-            vb.slice(..).get_mapped_range_mut()[..vb_bytes as usize]
-                .copy_from_slice(bytemuck::cast_slice(&self.merged_verts));
-            vb.unmap();
+            // Resize path: upload the ENTIRE merged cache via async
+            // queue.write_buffer (driver-managed staging), not a synchronous
+            // mapped copy + unmap.
+            self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&self.merged_verts));
             self.chunk_vb = Some(vb);
             self.chunk_vb_capacity = new_cap;
+            log::info!("[dx12-wm] Chunk VB grown: {} MB ({} verts)",
+                new_cap / (1024 * 1024), self.merged_verts.len());
         } else if let Some(vb) = &self.chunk_vb {
             let start_bytes = (verts_start as u64) * std::mem::size_of::<ChunkVertex>() as u64;
             self.queue.write_buffer(vb, start_bytes, bytemuck::cast_slice(verts));
         }
 
-        // Index buffer: grow (full copy of ALL data) or append (write_buffer).
+        // Index buffer: grow (async upload of ALL data) or append (write_buffer).
         let ib_grows = self.chunk_ib.as_ref().map_or(true, |b| b.size() < ib_bytes);
         if ib_grows {
-            let new_cap = (self.chunk_ib_capacity * 2).max(ib_bytes).max(64 * 1024);
+            let new_cap = (self.chunk_ib_capacity * 2)
+                .max(ib_bytes)
+                .max(Self::CHUNK_IB_MIN_CAP);
             let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Chunk Merged IB"),
                 size: new_cap,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
+                mapped_at_creation: false,
             });
-            ib.slice(..).get_mapped_range_mut()[..ib_bytes as usize]
-                .copy_from_slice(bytemuck::cast_slice(&self.merged_indices));
-            ib.unmap();
+            self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&self.merged_indices));
             self.chunk_ib = Some(ib);
             self.chunk_ib_capacity = new_cap;
+            log::info!("[dx12-wm] Chunk IB grown: {} MB ({} indices)",
+                new_cap / (1024 * 1024), self.merged_indices.len());
         } else if let Some(ib) = &self.chunk_ib {
             let start_bytes = (idxs_start as u64) * std::mem::size_of::<u32>() as u64;
             self.queue.write_buffer(ib, start_bytes, bytemuck::cast_slice(idxs));
@@ -2425,31 +2441,29 @@ impl WmRenderer {
             return;
         }
 
+        let vb_cap = (std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
+            .max(Self::CHUNK_VB_MIN_CAP as usize) as wgpu::BufferAddress;
         let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Merged VB"),
-            size: (std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
-                as wgpu::BufferAddress,
+            size: vb_cap,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        vb.slice(..).get_mapped_range_mut()[..]
-            .copy_from_slice(bytemuck::cast_slice(&self.merged_verts));
-        vb.unmap();
+        self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&self.merged_verts));
         self.chunk_vb = Some(vb);
-        self.chunk_vb_capacity = (std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
-            as u64;
+        self.chunk_vb_capacity = vb_cap;
 
+        let ib_cap = (std::mem::size_of::<u32>() * self.merged_indices.len())
+            .max(Self::CHUNK_IB_MIN_CAP as usize) as wgpu::BufferAddress;
         let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Merged IB"),
-            size: (std::mem::size_of::<u32>() * self.merged_indices.len()) as wgpu::BufferAddress,
+            size: ib_cap,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        ib.slice(..).get_mapped_range_mut()[..]
-            .copy_from_slice(bytemuck::cast_slice(&self.merged_indices));
-        ib.unmap();
+        self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&self.merged_indices));
         self.chunk_ib = Some(ib);
-        self.chunk_ib_capacity = (std::mem::size_of::<u32>() * self.merged_indices.len()) as u64;
+        self.chunk_ib_capacity = ib_cap;
 
         // Indirect args buffer: one 16-byte entry per mesh. Needs INDIRECT
         // for multi_draw_indexed_indirect and COPY_DST for queue.write_buffer.

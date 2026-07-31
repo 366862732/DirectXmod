@@ -105,14 +105,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadChunkMesh(
     let len = (vertex_count * vertex_stride) as usize;
     let slice = std::slice::from_raw_parts(data, len);
 
-    let mut guard = lock_or_poisoned();
-    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
-        renderer.upload_chunk_mesh(
-            section_x, section_y, section_z,
-            slice,
-            vertex_count as u32,
-            vertex_stride as u32,
-        );
+    // Panic must NEVER cross the JNI C ABI boundary — a Rust panic unwinding
+    // into Java is UB and crashed the JVM (hs_err_pid23980: wgpu
+    // create_buffer → handle_error_inner → panic_unwind → C++ exception
+    // EXCEPTION_UNCAUGHT_CXX_EXCEPTION). Catch here, log, skip this upload.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = lock_or_poisoned();
+        if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+            renderer.upload_chunk_mesh(
+                section_x, section_y, section_z,
+                slice,
+                vertex_count as u32,
+                vertex_stride as u32,
+            );
+        }
+    }));
+    if let Err(panic_info) = result {
+        log::error!("[dx12-wm] upload_chunk_mesh PANICKED: {}",
+            panic_message(&panic_info));
     }
 }
 
@@ -385,9 +395,26 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeClearChunkSection(
     section_y: jni::sys::jint,
     section_z: jni::sys::jint,
 ) {
-    let mut guard = lock_or_poisoned();
-    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
-        renderer.clear_chunk_section(section_x, section_y, section_z);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = lock_or_poisoned();
+        if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+            renderer.clear_chunk_section(section_x, section_y, section_z);
+        }
+    }));
+    if let Err(panic_info) = result {
+        log::error!("[dx12-wm] clear_chunk_section PANICKED: {}",
+            panic_message(&panic_info));
+    }
+}
+
+/// Extract a readable message from a catch_unwind payload.
+fn panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic_info.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
