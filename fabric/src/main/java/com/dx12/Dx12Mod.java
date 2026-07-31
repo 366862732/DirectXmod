@@ -279,28 +279,27 @@ public class Dx12Mod implements ClientModInitializer {
                         (float) pos.x, (float) pos.y, (float) pos.z);
 
                     // Extract fog color from the level for fog and sky rendering.
-                    // MC 26.1.2 uses the EnvironmentAttributes system (SKY_COLOR)
-                    // instead of the removed Level.getSkyColor(Vec3, float).
-                    // Both paths are attempted reflectively for cross-version compatibility.
+                    // MC 26.1.2 uses EnvironmentAttributes.SKY_COLOR (RGB 0xRRGGBB)
+                    // via Level.environmentAttributes().getValue(attribute, pos).
+                    // Older versions used Level.getSkyColor(Vec3, float) — kept as
+                    // a reflective fallback for cross-version compatibility.
                     Vec3 skyColor = null;
                     try {
-                        // MC 26.1.2+: Level.environmentAttributes().getValue(EnvironmentAttributes.SKY_COLOR, pos)
-                        Class<?> envAttrClass = Class.forName("net.minecraft.world.attribute.EnvironmentAttribute");
-                        Class<?> readerClass = Class.forName("net.minecraft.world.attribute.EnvironmentAttributeReader");
-                        var envAttrsClass = Class.forName("net.minecraft.world.attribute.EnvironmentAttributes");
-                        Object skyColorAttr = envAttrsClass.getField("SKY_COLOR").get(null);
-                        var envSystemMethod = net.minecraft.world.level.Level.class.getMethod("environmentAttributes");
-                        Object envSystem = envSystemMethod.invoke(mc.level);
-                        var getValueMethod = readerClass.getMethod("getValue", envAttrClass, net.minecraft.world.phys.Vec3.class);
-                        Object colorObj = getValueMethod.invoke(envSystem, skyColorAttr, pos);
-                        if (colorObj instanceof Integer argb) {
+                        // Direct call: compiled with official mappings and the runtime
+                        // uses the same names, so no reflection is needed (reflection
+                        // strings are also NOT remapped by loom, making them fragile).
+                        var envSystem = mc.level.environmentAttributes();
+                        Integer argb = envSystem.getValue(
+                            net.minecraft.world.attribute.EnvironmentAttributes.SKY_COLOR,
+                            pos);
+                        if (argb != null) {
                             // SKY_COLOR is RGB (0xRRGGBB, no alpha)
                             skyColor = new Vec3(
                                 ((argb >> 16) & 0xFF) / 255.0,
                                 ((argb >> 8) & 0xFF) / 255.0,
                                 (argb & 0xFF) / 255.0);
                         }
-                    } catch (Exception e) {
+                    } catch (Exception | LinkageError e) {
                         // Older versions: Level.getSkyColor(Vec3, float)
                         try {
                             var method = net.minecraft.world.level.Level.class
