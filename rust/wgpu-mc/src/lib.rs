@@ -908,6 +908,16 @@ pub struct WmRenderer {
     chunk_ib_capacity: u64, // allocated index bytes in chunk_ib
     chunk_need_full_rebuild: bool, // true → rebuild_chunk_buffers() required
 
+    // Phase 13.9 tombstone stats: a cleared section is removed from
+    // chunk_meshes (draws skip it immediately because indirect args are
+    // rebuilt every frame) WITHOUT rebuilding the merged VB/IB — the GPU
+    // range becomes an unreferenced tombstone. deleted_*_bytes accumulates
+    // the waste so prepare_chunk_batch() can trigger an occasional
+    // compression rebuild instead of a per-frame full rebuild (the latter
+    // dropped FPS to ~2 while moving at large render distance: ~446 MB VB).
+    deleted_vb_bytes: u64,
+    deleted_ib_bytes: u64,
+
     // Chunk textured pipeline + atlas
     chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
     chunk_pipeline: Option<wgpu::RenderPipeline>,
@@ -1469,6 +1479,8 @@ impl WmRenderer {
             chunk_vb_capacity: 0,
             chunk_ib_capacity: 0,
             chunk_need_full_rebuild: false,
+            deleted_vb_bytes: 0,
+            deleted_ib_bytes: 0,
             chunk_shader: None,
             chunk_pipeline: None,
             chunk_pipeline_transparent: None,
@@ -2322,11 +2334,17 @@ impl WmRenderer {
                 log::debug!("[dx12-wm] clear_chunk_section {:?} truncated {} verts / {} indices (incremental)",
                     key, removed_verts, removed_indices);
             } else {
-                // Removals shift every later mesh's base_vertex /
-                // index_offset, so they must trigger a full rebuild. This is
-                // rarer than uploads (only on section recompile/unload), so
-                // the cost is acceptable — unlike the old per-upload rebuild.
-                self.chunk_need_full_rebuild = true;
+                // Tombstone path (Phase 13.9): a middle-section removal does NOT
+                // trigger a full rebuild. Every mesh's base_vertex/index_offset
+                // is an ABSOLUTE position assigned at upload time, so surviving
+                // meshes still point at valid GPU data; the cleared range simply
+                // becomes an unreferenced tombstone (draws skip it because the
+                // indirect args are rebuilt from chunk_meshes every frame).
+                // Accumulate the waste and let prepare_chunk_batch() compress
+                // occasionally — a per-frame full rebuild of a ~446 MB merged
+                // VB/IB (3.5k+ meshes at large render distance) dropped FPS to 2.
+                self.deleted_vb_bytes += removed_verts as u64 * std::mem::size_of::<ChunkVertex>() as u64;
+                self.deleted_ib_bytes += removed_indices as u64 * std::mem::size_of::<u32>() as u64;
             }
         }
     }
@@ -2478,6 +2496,8 @@ impl WmRenderer {
     fn rebuild_chunk_buffers(&mut self) {
         self.chunk_geometry_dirty = false;
         self.chunk_need_full_rebuild = false;
+        self.deleted_vb_bytes = 0;
+        self.deleted_ib_bytes = 0;
 
         // Rebuild the flat CPU caches from scratch (a clear/removal happened),
         // then re-upload everything into (possibly larger) GPU buffers.
@@ -2557,7 +2577,16 @@ impl WmRenderer {
     /// Phase 11j: uploads are applied incrementally at upload time, so this
     /// only performs a (rare) full rebuild after a section clear/removal.
     fn prepare_chunk_batch(&mut self) {
-        if self.chunk_need_full_rebuild || self.chunk_geometry_dirty {
+        // Tombstone compaction (Phase 13.9): rebuild only when the accumulated
+        // deleted bytes are meaningful — at least 64 MB AND at least 1/3 of the
+        // live merged data (or a hard 256 MB cap as a backstop). A middle-
+        // section clear while moving would otherwise force a full rebuild of
+        // the merged VB/IB every frame (~446 MB upload at 3.5k meshes → 2 FPS).
+        let merged_vb_bytes = self.merged_verts.len() as u64 * std::mem::size_of::<ChunkVertex>() as u64;
+        let waste_exceeds = self.deleted_vb_bytes > 64 * 1024 * 1024
+            && self.deleted_vb_bytes * 2 > merged_vb_bytes;
+        let waste_hard_cap = self.deleted_vb_bytes > 256 * 1024 * 1024;
+        if self.chunk_need_full_rebuild || self.chunk_geometry_dirty || waste_exceeds || waste_hard_cap {
             self.rebuild_chunk_buffers();
         }
     }
