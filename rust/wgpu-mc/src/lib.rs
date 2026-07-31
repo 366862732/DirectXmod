@@ -489,6 +489,39 @@ fn aabb_in_frustum(min: [f32; 3], max: [f32; 3], planes: &[[f32; 4]; 6]) -> bool
     true
 }
 
+/// Build the indirect draw list for all stored chunk meshes (Phase 11e),
+/// skipping sections outside the view frustum (Phase 11f). Every visible
+/// mesh yields one [`DrawIndexedIndirectArgs`] referencing the merged
+/// vertex/index buffers.
+/// Returns (draws, visible_sections, culled_sections).
+fn collect_visible_draws<'m>(
+    sections: impl Iterator<Item = (&'m (i32, i32, i32), &'m Vec<ChunkMesh>)>,
+    planes: &[[f32; 4]; 6],
+) -> (Vec<DrawIndexedIndirectArgs>, u32, u32) {
+    let mut draws: Vec<DrawIndexedIndirectArgs> = Vec::new();
+    let mut visible: u32 = 0;
+    let mut culled: u32 = 0;
+    for (key, meshes) in sections {
+        let min = [key.0 as f32 * 16.0, key.1 as f32 * 16.0, key.2 as f32 * 16.0];
+        let max = [min[0] + 16.0, min[1] + 16.0, min[2] + 16.0];
+        if !aabb_in_frustum(min, max, planes) {
+            culled += 1;
+            continue;
+        }
+        visible += 1;
+        for m in meshes {
+            draws.push(DrawIndexedIndirectArgs {
+                index_count: m.index_count,
+                instance_count: 1,
+                first_index: m.index_offset,
+                base_vertex: m.base_vertex as i32,
+                first_instance: 0,
+            });
+        }
+    }
+    (draws, visible, culled)
+}
+
 fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Depth Texture"),
@@ -693,12 +726,37 @@ fn create_surface_from_hwnd(
 
 /// One mesh = one RenderLayer of one 16×16×16 chunk section.
 /// Keyed by (section_x, section_y, section_z).
+///
+/// Phase 11e: vertex/index data is kept on the CPU and merged into two
+/// big GPU buffers by `rebuild_chunk_buffers()`. The `base_vertex` /
+/// `index_offset` / `index_count` fields locate this mesh inside those
+/// merged buffers.
 struct ChunkMesh {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    /// CPU copy of converted vertices (world-space ChunkVertex).
+    vertices: Vec<ChunkVertex>,
+    /// CPU copy of triangle indices (always u32 so the merged index buffer
+    /// has a single format).
+    indices: Vec<u32>,
+    /// First vertex of this mesh in the merged vertex buffer.
+    base_vertex: u32,
+    /// First index of this mesh in the merged index buffer.
+    index_offset: u32,
+    /// Number of indices (6 per quad).
     index_count: u32,
-    index_is_u32: bool,
+}
+
+/// One entry of a draw-indexed-indirect argument buffer.
+/// Layout must exactly match D3D12_DRAW_INDEXED_ARGUMENTS (20 bytes,
+/// little-endian): IndexCountPerInstance, InstanceCount, StartIndexLocation,
+/// BaseVertexLocation, StartInstanceLocation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct DrawIndexedIndirectArgs {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
 }
 
 // ── Ring slot ─────────────────────────────────────────────────────
@@ -791,6 +849,14 @@ pub struct WmRenderer {
     chunk_meshes: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>>,
     has_chunk_geometry: bool,
 
+    // Phase 11e: batched chunk rendering — merged VB/IB + indirect draws
+    chunk_vb: Option<wgpu::Buffer>,       // merged vertex buffer (all meshes)
+    chunk_ib: Option<wgpu::Buffer>,       // merged index buffer (u32)
+    chunk_indirect: Option<wgpu::Buffer>, // draw-indexed-indirect args buffer
+    chunk_indirect_capacity: u32,         // entries the indirect buffer can hold
+    chunk_geometry_dirty: bool,           // merged buffers need rebuilding
+    chunk_batch_enabled: bool,            // false → per-mesh draw_indexed fallback
+
     // Chunk textured pipeline + atlas
     chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
     chunk_pipeline: Option<wgpu::RenderPipeline>,
@@ -851,10 +917,27 @@ impl WmRenderer {
         .ok_or("No adapter")?;
         eprintln!("[dx12-wm] Adapter: {:?}", adapter.get_info().name);
 
+        // Phase 11e: MULTI_DRAW_INDIRECT lets us render all visible chunk
+        // meshes with a single multi_draw_indexed_indirect call per pass.
+        // D3D12 supports it natively (confirmed in wgpu-hal dx12/adapter.rs);
+        // if an adapter ever lacks it we fall back to per-mesh draw_indexed
+        // from the merged buffers.
+        let chunk_batch_enabled = adapter
+            .features()
+            .contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+        if !chunk_batch_enabled {
+            eprintln!("[dx12-wm] WARN: MULTI_DRAW_INDIRECT unsupported — using per-mesh draw fallback");
+        }
+        let required_features = if chunk_batch_enabled {
+            wgpu::Features::MULTI_DRAW_INDIRECT
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = futures::executor::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wgpu-mc"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
             },
@@ -1307,6 +1390,12 @@ impl WmRenderer {
             prev_pixels: Vec::new(),
             chunk_meshes: std::collections::HashMap::new(),
             has_chunk_geometry: false,
+            chunk_vb: None,
+            chunk_ib: None,
+            chunk_indirect: None,
+            chunk_indirect_capacity: 0,
+            chunk_geometry_dirty: false,
+            chunk_batch_enabled: chunk_batch_enabled,
             chunk_shader: None,
             chunk_pipeline: None,
             chunk_pipeline_transparent: None,
@@ -1854,10 +1943,6 @@ impl WmRenderer {
         // MC 26.1.2 BLOCK format (28 bytes): Pos(12) + Color(4) + UV0(8) + UV2(4)
         // UV2 at offset 24: 2 u16 values (block_light, sky_light), range 0-240 (each light value * 16).
         let mut vertices: Vec<ChunkVertex> = Vec::with_capacity(vertex_count as usize);
-        let max_index = vertex_count;
-
-        // Use u32 indices if vertex count exceeds u16 max
-        let use_u32_indices = max_index > 65535;
 
         for v in 0..vertex_count {
             let base = (v as usize) * stride;
@@ -2061,92 +2146,34 @@ impl WmRenderer {
 
         if vertices.is_empty() { return; }
 
-        // Build per-quad triangle indices
-        if use_u32_indices {
-            let mut indices: Vec<u32> = Vec::with_capacity(tri_index_count as usize);
-            for q in 0..quad_count {
-                let vi = q * 4;
-                if vi + 3 >= vertex_count { break; }
-                indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
-            }
-
-            if indices.is_empty() { return; }
-
-            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Chunk VB"),
-                size: (std::mem::size_of::<ChunkVertex>() * vertices.len()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX,
-                mapped_at_creation: true,
-            });
-            vb.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&vertices));
-            vb.unmap();
-
-            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Chunk IB"),
-                size: (std::mem::size_of::<u32>() * indices.len()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::INDEX,
-                mapped_at_creation: true,
-            });
-            ib.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&indices));
-            ib.unmap();
-
-            let mesh = ChunkMesh {
-                vertex_buffer: vb,
-                index_buffer: ib,
-                vertex_count: vertices.len() as u32,
-                index_count: indices.len() as u32,
-                index_is_u32: true,
-            };
-
-            let key = (section_x, section_y, section_z);
-            self.chunk_meshes.entry(key).or_insert_with(Vec::new).push(mesh);
-            self.has_chunk_geometry = true;
-
-            log::info!("[dx12-wm] Chunk mesh uploaded (u32): section=({},{},{}) {} verts, {} indices",
-                section_x, section_y, section_z, vertices.len(), indices.len());
-        } else {
-            let mut indices: Vec<u16> = Vec::with_capacity(tri_index_count as usize);
-            for q in 0..quad_count {
-                let vi = (q * 4) as u16;
-                if (vi as u32) + 3 >= vertex_count { break; }
-                indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
-            }
-
-            if indices.is_empty() { return; }
-
-            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Chunk VB"),
-                size: (std::mem::size_of::<ChunkVertex>() * vertices.len()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX,
-                mapped_at_creation: true,
-            });
-            vb.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&vertices));
-            vb.unmap();
-
-            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Chunk IB"),
-                size: (std::mem::size_of::<u16>() * indices.len()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::INDEX,
-                mapped_at_creation: true,
-            });
-            ib.slice(..).get_mapped_range_mut()[..].copy_from_slice(bytemuck::cast_slice(&indices));
-            ib.unmap();
-
-            let mesh = ChunkMesh {
-                vertex_buffer: vb,
-                index_buffer: ib,
-                vertex_count: vertices.len() as u32,
-                index_count: indices.len() as u32,
-                index_is_u32: false,
-            };
-
-            let key = (section_x, section_y, section_z);
-            self.chunk_meshes.entry(key).or_insert_with(Vec::new).push(mesh);
-            self.has_chunk_geometry = true;
-
-            log::info!("[dx12-wm] Chunk mesh uploaded: section=({},{},{}) {} verts, {} indices",
-                section_x, section_y, section_z, vertices.len(), indices.len());
+        // Build triangle indices (GL_QUADS → 2 triangles). Always u32 so the
+        // merged index buffer keeps a single format (Phase 11e batching).
+        let mut indices: Vec<u32> = Vec::with_capacity(tri_index_count as usize);
+        for q in 0..quad_count {
+            let vi = q * 4;
+            if vi + 3 >= vertex_count { break; }
+            indices.extend_from_slice(&[vi, vi + 1, vi + 2, vi, vi + 2, vi + 3]);
         }
+        if indices.is_empty() { return; }
+
+        let vcount = vertices.len() as u32;
+        let icount = indices.len() as u32;
+
+        let mesh = ChunkMesh {
+            vertices,
+            indices,
+            base_vertex: 0,   // assigned during rebuild_chunk_buffers()
+            index_offset: 0,
+            index_count: 0,
+        };
+
+        let key = (section_x, section_y, section_z);
+        self.chunk_meshes.entry(key).or_insert_with(Vec::new).push(mesh);
+        self.has_chunk_geometry = true;
+        self.chunk_geometry_dirty = true;
+
+        log::info!("[dx12-wm] Chunk mesh uploaded: section=({},{},{}) {} verts, {} indices (batch rebuild pending)",
+            section_x, section_y, section_z, vcount, icount);
     }
 
     /// Set fog color and density for atmospheric fog effect.
@@ -2166,7 +2193,9 @@ impl WmRenderer {
     /// Called before recompiling a section to prevent stale mesh accumulation.
     pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
         let key = (section_x, section_y, section_z);
-        self.chunk_meshes.remove(&key);
+        if self.chunk_meshes.remove(&key).is_some() {
+            self.chunk_geometry_dirty = true;
+        }
     }
 
     // ── Draw calls shared by surface and offscreen modes ──────────
@@ -2188,6 +2217,84 @@ impl WmRenderer {
         }
     }
 
+    /// Phase 11e: rebuild the merged vertex/index/indirect buffers from the
+    /// CPU-side mesh storage. Called lazily (at most once per frame) when any
+    /// section was uploaded or cleared since the last rebuild.
+    fn rebuild_chunk_buffers(&mut self) {
+        self.chunk_geometry_dirty = false;
+
+        // Assign ranges and concatenate all meshes into flat CPU arrays.
+        let mut all_verts: Vec<ChunkVertex> = Vec::new();
+        let mut all_indices: Vec<u32> = Vec::new();
+        let mut mesh_count: u32 = 0;
+        for meshes in self.chunk_meshes.values_mut() {
+            for m in meshes.iter_mut() {
+                m.base_vertex = all_verts.len() as u32;
+                m.index_offset = all_indices.len() as u32;
+                m.index_count = m.indices.len() as u32;
+                all_verts.extend_from_slice(&m.vertices);
+                all_indices.extend_from_slice(&m.indices);
+                mesh_count += 1;
+            }
+        }
+
+        if all_verts.is_empty() {
+            self.chunk_vb = None;
+            self.chunk_ib = None;
+            self.chunk_indirect = None;
+            self.chunk_indirect_capacity = 0;
+            self.has_chunk_geometry = false;
+            return;
+        }
+
+        let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Chunk Merged VB"),
+            size: (std::mem::size_of::<ChunkVertex>() * all_verts.len()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: true,
+        });
+        vb.slice(..).get_mapped_range_mut()[..]
+            .copy_from_slice(bytemuck::cast_slice(&all_verts));
+        vb.unmap();
+
+        let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Chunk Merged IB"),
+            size: (std::mem::size_of::<u32>() * all_indices.len()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::INDEX,
+            mapped_at_creation: true,
+        });
+        ib.slice(..).get_mapped_range_mut()[..]
+            .copy_from_slice(bytemuck::cast_slice(&all_indices));
+        ib.unmap();
+
+        // Indirect args buffer: one 16-byte entry per mesh. Needs INDIRECT
+        // for multi_draw_indexed_indirect and COPY_DST for queue.write_buffer.
+        let capacity = mesh_count.max(1024).next_power_of_two();
+        let indirect = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Chunk Indirect Args"),
+            size: (std::mem::size_of::<DrawIndexedIndirectArgs>() * capacity as usize)
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        self.chunk_vb = Some(vb);
+        self.chunk_ib = Some(ib);
+        self.chunk_indirect = Some(indirect);
+        self.chunk_indirect_capacity = capacity;
+        self.has_chunk_geometry = true;
+
+        eprintln!("[dx12-wm] Chunk batch rebuilt: {} meshes, {} verts, {} indices (indirect capacity {})",
+            mesh_count, all_verts.len(), all_indices.len(), capacity);
+    }
+
+    /// Ensure the merged chunk buffers are up to date before issuing draws.
+    fn prepare_chunk_batch(&mut self) {
+        if self.chunk_geometry_dirty {
+            self.rebuild_chunk_buffers();
+        }
+    }
+
     /// Render all stored MC chunk meshes using two-pass rendering.
     ///
     /// Pass 1 (Opaque): depth_write=true, blend=None
@@ -2200,10 +2307,16 @@ impl WmRenderer {
     ///     Shader discards both fully transparent (a<0.05) AND fully opaque (a>0.95)
     ///     pixels — only semi-transparent fragments pass through for alpha blending.
     ///     Depth write is DISABLED so these fragments never occlude objects behind them.
+    ///
+    /// Phase 11e: both passes are issued as a single multi_draw_indexed_indirect
+    /// over the AABB-culled draw list, instead of per-mesh state changes.
     fn draw_chunks<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
         let Some(pipeline) = &self.chunk_pipeline else { return; };
         let Some(pipeline_transparent) = &self.chunk_pipeline_transparent else { return; };
         let Some(bind_group) = &self.chunk_bind_group else { return; };
+        let Some(vb) = &self.chunk_vb else { return; };
+        let Some(ib) = &self.chunk_ib else { return; };
+        let Some(indirect) = &self.chunk_indirect else { return; };
 
         // Phase 11f: frustum culling — skip chunk sections outside the view.
         // Section AABBs are in world space; camera_mvp maps world → clip
@@ -2225,60 +2338,52 @@ impl WmRenderer {
         if unsafe { CHUNK_DRAW_FIRST } {
             unsafe { CHUNK_DRAW_FIRST = false; }
             let total_meshes: usize = self.chunk_meshes.values().map(|v| v.len()).sum();
-            eprintln!("[dx12-wm] draw_chunks: {} sections, {} meshes total (opaque + transparent passes)",
-                self.chunk_meshes.len(), total_meshes);
+            eprintln!("[dx12-wm] draw_chunks: {} sections, {} meshes total, batching={}",
+                self.chunk_meshes.len(), total_meshes, self.chunk_batch_enabled);
         }
 
-        // ════════════════════════════════════════════════
-        // Pass 1: Opaque — writes depth, no blending
-        // ════════════════════════════════════════════════
-        rp.set_pipeline(pipeline);
-        rp.set_bind_group(0, bind_group, &[]);
-        for (key, meshes) in &self.chunk_meshes {
-            let min = [key.0 as f32 * 16.0, key.1 as f32 * 16.0, key.2 as f32 * 16.0];
-            let max = [min[0] + 16.0, min[1] + 16.0, min[2] + 16.0];
-            if !aabb_in_frustum(min, max, &planes) {
-                unsafe { CHUNK_CULLED_TOTAL += 1; }
-                continue;
-            }
-            unsafe { CHUNK_VISIBLE_TOTAL += 1; }
-            for mesh in meshes {
-                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                let index_format = if mesh.index_is_u32 {
-                    wgpu::IndexFormat::Uint32
-                } else {
-                    wgpu::IndexFormat::Uint16
-                };
-                rp.set_index_buffer(mesh.index_buffer.slice(..), index_format);
-                rp.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
+        // Phase 11e: one AABB-culled draw list shared by both passes.
+        let (draws, visible_sections, culled_sections) =
+            collect_visible_draws(self.chunk_meshes.iter(), &planes);
 
-        // ════════════════════════════════════════════════
-        // Pass 2: Transparent — no depth write, alpha blending
-        // ════════════════════════════════════════════════
-        rp.set_pipeline(pipeline_transparent);
-        rp.set_bind_group(0, bind_group, &[]);
-        for (key, meshes) in &self.chunk_meshes {
-            let min = [key.0 as f32 * 16.0, key.1 as f32 * 16.0, key.2 as f32 * 16.0];
-            let max = [min[0] + 16.0, min[1] + 16.0, min[2] + 16.0];
-            if !aabb_in_frustum(min, max, &planes) {
-                continue;
+        if !draws.is_empty() && (draws.len() as u32) <= self.chunk_indirect_capacity {
+            // Per-frame upload of the visible draw list (a few KB). The merged
+            // VB/IB are static; only the args change with the camera.
+            self.queue.write_buffer(indirect, 0, bytemuck::cast_slice(&draws));
+
+            // ════════════════════════════════════════════════
+            // Pass 1: Opaque — writes depth, no blending
+            // ════════════════════════════════════════════════
+            rp.set_pipeline(pipeline);
+            rp.set_bind_group(0, bind_group, &[]);
+            rp.set_vertex_buffer(0, vb.slice(..));
+            rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            if self.chunk_batch_enabled {
+                rp.multi_draw_indexed_indirect(indirect, 0, draws.len() as u32);
+            } else {
+                for d in &draws {
+                    rp.draw_indexed(d.first_index..d.first_index + d.index_count, d.base_vertex, 0..1);
+                }
             }
-            for mesh in meshes {
-                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                let index_format = if mesh.index_is_u32 {
-                    wgpu::IndexFormat::Uint32
-                } else {
-                    wgpu::IndexFormat::Uint16
-                };
-                rp.set_index_buffer(mesh.index_buffer.slice(..), index_format);
-                rp.draw_indexed(0..mesh.index_count, 0, 0..1);
+
+            // ════════════════════════════════════════════════
+            // Pass 2: Transparent — no depth write, alpha blending
+            // ════════════════════════════════════════════════
+            rp.set_pipeline(pipeline_transparent);
+            rp.set_bind_group(0, bind_group, &[]);
+            if self.chunk_batch_enabled {
+                rp.multi_draw_indexed_indirect(indirect, 0, draws.len() as u32);
+            } else {
+                for d in &draws {
+                    rp.draw_indexed(d.first_index..d.first_index + d.index_count, d.base_vertex, 0..1);
+                }
             }
         }
 
         // Throttled culling stats (every 600 frames ≈ 10 s)
         unsafe {
+            CHUNK_CULLED_TOTAL += culled_sections;
+            CHUNK_VISIBLE_TOTAL += visible_sections;
             CHUNK_FRAME_COUNT += 1;
             if CHUNK_FRAME_COUNT % 600 == 0 {
                 let visible = CHUNK_VISIBLE_TOTAL;
@@ -2892,6 +2997,10 @@ impl WmRenderer {
     // ── Surface mode: render directly to swapchain ────────────────
 
     fn render_surface(&mut self) {
+        // Phase 11e: apply any pending chunk mesh changes (merged buffers)
+        // before deciding what to render this frame.
+        self.prepare_chunk_batch();
+
         let has_frame = self.tex_bind_group.is_some();
         let has_chunks = self.has_chunk_geometry;
         let has_hud = self.hud_bind_group.is_some();
@@ -3135,6 +3244,10 @@ impl WmRenderer {
     // ── Offscreen mode: triple-buffer readback ────────────────────
 
     fn render_offscreen(&mut self) -> Vec<u8> {
+        // Phase 11e: keep merged chunk buffers in sync even when rendering
+        // offscreen (title screen / init), so the first surface frame is ready.
+        self.prepare_chunk_batch();
+
         let w = self.width;
         let h = self.height;
         if w == 0 || h == 0 {
@@ -3260,7 +3373,7 @@ mod frustum_tests {
 
     /// Build a D3D-style perspective matrix (row-major storage, z ∈ [0, w]).
     /// Matches JOML: perspective(fovy, aspect, zNear, zFar, zZeroToOne=true).
-    fn d3d_perspective(fovy_rad: f32, aspect: f32, zn: f32, zf: f32) -> [[f32; 4]; 4] {
+    pub(crate) fn d3d_perspective(fovy_rad: f32, aspect: f32, zn: f32, zf: f32) -> [[f32; 4]; 4] {
         let f = 1.0 / (fovy_rad / 2.0).tan();
         let mut m = [[0.0f32; 4]; 4];
         m[0][0] = f / aspect;
@@ -3359,5 +3472,102 @@ mod frustum_tests {
         assert_eq!(id[3][2], 0.0);
         let proj = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
         assert_ne!(proj[3][2], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use super::frustum_tests::d3d_perspective;
+
+    /// Build a fake mesh whose merged-buffer ranges are preset (as if
+    /// rebuild_chunk_buffers() had already assigned them).
+    fn make_mesh(base_vertex: u32, index_offset: u32, index_count: u32) -> ChunkMesh {
+        ChunkMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            base_vertex,
+            index_offset,
+            index_count,
+        }
+    }
+
+    #[test]
+    fn indirect_args_layout_matches_dx12() {
+        // D3D12_DRAW_INDEXED_ARGUMENTS must be exactly 20 bytes little-endian:
+        // IndexCountPerInstance, InstanceCount, StartIndexLocation,
+        // BaseVertexLocation, StartInstanceLocation.
+        assert_eq!(std::mem::size_of::<DrawIndexedIndirectArgs>(), 20);
+        let a = DrawIndexedIndirectArgs {
+            index_count: 6,
+            instance_count: 1,
+            first_index: 12,
+            base_vertex: 4,
+            first_instance: 0,
+        };
+        let bytes: [u8; 20] = bytemuck::cast(a);
+        assert_eq!(&bytes[0..4], &6u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &1u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &12u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &(4i32).to_le_bytes());
+        assert_eq!(&bytes[16..20], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn batch_culls_outside_sections_and_preserves_ranges() {
+        let m = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        let planes = extract_frustum_planes(&m);
+
+        let mut sections: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>> =
+            std::collections::HashMap::new();
+        // Section containing the camera origin — visible, two meshes.
+        sections.insert((0, 0, 0), vec![
+            make_mesh(0, 0, 36),
+            make_mesh(36, 36, 72),
+        ]);
+        // Far outside the frustum — must be culled.
+        sections.insert((5000, 0, 0), vec![make_mesh(100, 100, 36)]);
+
+        let (draws, visible, culled) = collect_visible_draws(sections.iter(), &planes);
+        assert_eq!(visible, 1);
+        assert_eq!(culled, 1);
+        assert_eq!(draws.len(), 2);
+
+        assert_eq!(draws[0].index_count, 36);
+        assert_eq!(draws[0].first_index, 0);
+        assert_eq!(draws[0].base_vertex, 0);
+        assert_eq!(draws[1].index_count, 72);
+        assert_eq!(draws[1].first_index, 36);
+        assert_eq!(draws[1].base_vertex, 36);
+        for d in &draws {
+            assert_eq!(d.instance_count, 1);
+            assert_eq!(d.first_instance, 0);
+        }
+    }
+
+    #[test]
+    fn batch_zero_planes_include_every_section() {
+        // All-zero planes (IDENTITY camera) must never cull anything.
+        let planes = [[0.0f32; 4]; 6];
+        let mut sections: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>> =
+            std::collections::HashMap::new();
+        sections.insert((0, 0, 0), vec![make_mesh(0, 0, 6)]);
+        sections.insert((10000, 0, 0), vec![make_mesh(10, 10, 12)]);
+
+        let (draws, visible, culled) = collect_visible_draws(sections.iter(), &planes);
+        assert_eq!(visible, 2);
+        assert_eq!(culled, 0);
+        assert_eq!(draws.len(), 2);
+    }
+
+    #[test]
+    fn batch_empty_world_produces_no_draws() {
+        let planes = [[0.0f32; 4]; 6];
+        let sections: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>> =
+            std::collections::HashMap::new();
+        let (draws, visible, culled) = collect_visible_draws(sections.iter(), &planes);
+        assert!(draws.is_empty());
+        assert_eq!(visible, 0);
+        assert_eq!(culled, 0);
     }
 }
