@@ -87,7 +87,10 @@ Check "GL world render skipped (hand mixin injected)" "GL world render skipped" 
 # 9. Particle upload chain (Java ParticleGroup extraction + Rust billboard)
 Check "Particles uploaded (chain alive)" "Particles uploaded:" $true
 
-# 10. Renderer ready
+# 10. No wgpu Validation Error / fatal panic (256 MB buffer limit — 13.7)
+Check "No wgpu fatal error (Validation Error absent)" "Handling wgpu errors as fatal" $false
+
+# 11. Renderer ready
 Check "Renderer ready (Device created OK)" "Device created OK" $true
 
 Write-Host ""

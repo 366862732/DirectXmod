@@ -2235,6 +2235,21 @@ impl WmRenderer {
         // incrementally without re-concatenating every mesh every frame.
         let base_vertex = self.merged_verts.len() as u32;
         let index_offset = self.merged_indices.len() as u32;
+
+        // wgpu 23 D3D12 hard limit (268435456 bytes) pre-check BEFORE this
+        // mesh is recorded anywhere — appending to merged_verts/indices and
+        // then failing the GPU buffer create would leave the CPU caches
+        // inconsistent with the GPU buffers (draws would read garbage).
+        let new_vb_bytes = (base_vertex as u64 + vcount as u64)
+            * std::mem::size_of::<ChunkVertex>() as u64;
+        let new_ib_bytes = (index_offset as u64 + icount as u64)
+            * std::mem::size_of::<u32>() as u64;
+        if new_vb_bytes > Self::MAX_BUF_SIZE || new_ib_bytes > Self::MAX_BUF_SIZE {
+            log::error!("[dx12-wm] Chunk mesh REJECTED (section {},{},{}): merged VB {} B / IB {} B > wgpu max {} B",
+                section_x, section_y, section_z, new_vb_bytes, new_ib_bytes, Self::MAX_BUF_SIZE);
+            return;
+        }
+
         let mesh = ChunkMesh {
             vertices,
             indices,
@@ -2302,8 +2317,17 @@ impl WmRenderer {
     /// the GPU long enough for a TDR → DeviceLost → wgpu fatal panic → JVM
     /// crash (hs_err_pid23980, wgpu create_buffer → handle_error_inner →
     /// panic_unwind → EXCEPTION_UNCAUGHT_CXX_EXCEPTION).
+    ///
+    /// wgpu 23 D3D12 hard limit: max buffer size 268435456 (256 MB).
+    /// create_buffer with a larger size is a Validation Error that panics
+    /// inside wgpu (game log: "Buffer size 305925120 is greater than the
+    /// maximum buffer size (268435456)" — hit when the merged VB ×2 growth
+    /// jumped 146 MB → 292 MB). Growth is clamped to this limit and uploads
+    /// that alone exceed it are rejected BEFORE appending so the CPU caches
+    /// stay consistent with the GPU buffers.
     const CHUNK_VB_MIN_CAP: u64 = 4 * 1024 * 1024; // 4 MB
     const CHUNK_IB_MIN_CAP: u64 = 1 * 1024 * 1024; // 1 MB
+    const MAX_BUF_SIZE: u64 = 256 * 1024 * 1024;   // wgpu D3D12 hard limit (268435456)
 
     fn upload_chunk_slice(&mut self, verts_start: usize, idxs_start: usize) {
         if self.merged_verts.len() <= verts_start || self.merged_indices.len() <= idxs_start {
@@ -2320,9 +2344,19 @@ impl WmRenderer {
         // Vertex buffer: grow (async upload of ALL data) or append (write_buffer).
         let vb_grows = self.chunk_vb.as_ref().map_or(true, |b| b.size() < vb_bytes);
         if vb_grows {
-            let new_cap = (self.chunk_vb_capacity * 2)
+            if vb_bytes > Self::MAX_BUF_SIZE {
+                // Data alone exceeds the 256 MB hard limit; can never fit.
+                // (upload_chunk_mesh pre-checks too — this is belt & braces.)
+                log::error!("[dx12-wm] Chunk VB needs {} bytes > wgpu max {}; upload skipped",
+                    vb_bytes, Self::MAX_BUF_SIZE);
+                return;
+            }
+            let mut new_cap = (self.chunk_vb_capacity * 2)
                 .max(vb_bytes)
                 .max(Self::CHUNK_VB_MIN_CAP);
+            if new_cap > Self::MAX_BUF_SIZE {
+                new_cap = Self::MAX_BUF_SIZE;
+            }
             let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Chunk Merged VB"),
                 size: new_cap,
@@ -2345,9 +2379,17 @@ impl WmRenderer {
         // Index buffer: grow (async upload of ALL data) or append (write_buffer).
         let ib_grows = self.chunk_ib.as_ref().map_or(true, |b| b.size() < ib_bytes);
         if ib_grows {
-            let new_cap = (self.chunk_ib_capacity * 2)
+            if ib_bytes > Self::MAX_BUF_SIZE {
+                log::error!("[dx12-wm] Chunk IB needs {} bytes > wgpu max {}; upload skipped",
+                    ib_bytes, Self::MAX_BUF_SIZE);
+                return;
+            }
+            let mut new_cap = (self.chunk_ib_capacity * 2)
                 .max(ib_bytes)
                 .max(Self::CHUNK_IB_MIN_CAP);
+            if new_cap > Self::MAX_BUF_SIZE {
+                new_cap = Self::MAX_BUF_SIZE;
+            }
             let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Chunk Merged IB"),
                 size: new_cap,
@@ -2441,8 +2483,9 @@ impl WmRenderer {
             return;
         }
 
-        let vb_cap = (std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
-            .max(Self::CHUNK_VB_MIN_CAP as usize) as wgpu::BufferAddress;
+        let vb_cap = ((std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
+            .max(Self::CHUNK_VB_MIN_CAP as usize))
+            .min(Self::MAX_BUF_SIZE as usize) as wgpu::BufferAddress;
         let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Merged VB"),
             size: vb_cap,
@@ -2453,8 +2496,9 @@ impl WmRenderer {
         self.chunk_vb = Some(vb);
         self.chunk_vb_capacity = vb_cap;
 
-        let ib_cap = (std::mem::size_of::<u32>() * self.merged_indices.len())
-            .max(Self::CHUNK_IB_MIN_CAP as usize) as wgpu::BufferAddress;
+        let ib_cap = ((std::mem::size_of::<u32>() * self.merged_indices.len())
+            .max(Self::CHUNK_IB_MIN_CAP as usize))
+            .min(Self::MAX_BUF_SIZE as usize) as wgpu::BufferAddress;
         let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Merged IB"),
             size: ib_cap,
