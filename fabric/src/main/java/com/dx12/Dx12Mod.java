@@ -99,6 +99,7 @@ public class Dx12Mod implements ClientModInitializer {
     private static long lastRenderTime = 0;
     private static long renderStartTime = 0;
     private static int getSkyColorFailCount = 0;
+    private static long lastParticleLogMs = 0;
 
     // Lightmap update throttling
     private static int lightmapTickCount = 0;
@@ -394,16 +395,24 @@ public class Dx12Mod implements ClientModInitializer {
                         var particleEngine = mc.particleEngine;
                         if (particleEngine != null) {
                             var particleList = new java.util.ArrayList<net.minecraft.client.particle.Particle>();
+                            int particleTypes = 0;
                             try {
                                 // ParticleEngine.particles map via cached reflection
                                 initParticleReflection();
                                 if (PARTICLE_MAP_FIELD != null) {
                                     @SuppressWarnings("unchecked")
                                     var particleMap = (java.util.Map<?, ?>) PARTICLE_MAP_FIELD.get(particleEngine);
+                                    particleTypes = particleMap.size();
                                     for (var entry : particleMap.entrySet()) {
-                                        var set = (java.util.Set<?>) entry.getValue();
-                                        for (var p : set) {
-                                            particleList.add((net.minecraft.client.particle.Particle) p);
+                                        // MC 26.1.2: values are ParticleGroup<?> (NOT a Set).
+                                        // Casting to Set threw ClassCastException, which was
+                                        // silently swallowed → particles were never uploaded.
+                                        // ParticleGroup exposes getAll() → Queue<Particle>.
+                                        var group = entry.getValue();
+                                        if (group instanceof net.minecraft.client.particle.ParticleGroup<?> pg) {
+                                            for (var p : pg.getAll()) {
+                                                particleList.add((net.minecraft.client.particle.Particle) p);
+                                            }
                                         }
                                     }
                                 }
@@ -441,6 +450,11 @@ public class Dx12Mod implements ClientModInitializer {
                                     float[] trimmed = new float[idx * 8];
                                     System.arraycopy(particleData, 0, trimmed, 0, idx * 8);
                                     D3D12Bridge.setParticles(trimmed);
+                                    long nowMs = System.currentTimeMillis();
+                                    if (nowMs - lastParticleLogMs > 5000) {
+                                        lastParticleLogMs = nowMs;
+                                        LOGGER.info("[dx12-wm] Particles uploaded: {} ({} types)", idx, particleTypes);
+                                    }
                                 } else {
                                     D3D12Bridge.setParticles(new float[0]);
                                 }

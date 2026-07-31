@@ -89,7 +89,7 @@ public class GameRendererMixin {
      * overlay (they are 3D content, but the HUD pass composites them on top
      * of the D3D12 world, which matches their screen position).
      */
-    @WrapOperation(method = "renderLevel", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/LevelRenderer;renderLevel(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Lnet/minecraft/client/DeltaTracker;ZLnet/minecraft/client/renderer/state/level/CameraRenderState;Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lorg/joml/Vector4f;ZLnet/minecraft/client/renderer/state/level/LevelRenderState$ChunkSectionsToRender;)V"))
+    @WrapOperation(method = "renderLevel", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/LevelRenderer;renderLevel(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Lnet/minecraft/client/DeltaTracker;ZLnet/minecraft/client/renderer/state/level/CameraRenderState;Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lorg/joml/Vector4f;ZLnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;)V"))
     private void skipGlWorldRender(LevelRenderer instance, Object[] args, Operation<Void> original) {
         if (D3D12Bridge.hasSurface() && D3D12Bridge.hasChunkGeometry()) {
             if (!renderLevelCancelledLogged) {
