@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
 
 import org.lwjgl.BufferUtils;
 
@@ -91,6 +92,26 @@ public class D3D12Bridge {
     private static long cachedHwnd = 0;
     private static int lastWidth = -1;
     private static int lastHeight = -1;
+
+    // Phase 11g: entity/particle data is re-extracted every tick even when
+    // unchanged. Cache the last payload and skip the JNI call + GPU write
+    // when it is identical (mirrors the Phase 11d lightmap dedup).
+    private static float[] lastEntityData = null;
+    private static float[] lastParticleData = null;
+
+    public static void setEntities(float[] data) {
+        if (!initialized) return;
+        if (Arrays.equals(lastEntityData, data)) return;
+        lastEntityData = data;
+        nativeSetEntities(data);
+    }
+
+    public static void setParticles(float[] data) {
+        if (!initialized) return;
+        if (Arrays.equals(lastParticleData, data)) return;
+        lastParticleData = data;
+        nativeSetParticles(data);
+    }
 
     public static void init() {
         if (initialized) return;

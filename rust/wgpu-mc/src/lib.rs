@@ -881,10 +881,16 @@ pub struct WmRenderer {
     entity_count: u32,
     entity_pipeline: Option<wgpu::RenderPipeline>,
 
+    // Phase 11g: last-uploaded data for change detection (skip redundant uploads)
+    last_entity_data: Vec<f32>,
+    entity_uploads: u64,
+
     // Particle rendering (Phase 7 task 2: point sprites)
     particle_buffer: Option<wgpu::Buffer>,
     particle_count: u32,
     particle_pipeline: Option<wgpu::RenderPipeline>,
+    last_particle_data: Vec<f32>,
+    particle_uploads: u64,
 
     // Sky dome rendering
     sky_vb: Option<wgpu::Buffer>,
@@ -1428,6 +1434,10 @@ impl WmRenderer {
             particle_buffer: None,
             particle_count: 0,
             particle_pipeline: None,
+            last_entity_data: Vec::new(),
+            entity_uploads: 0,
+            last_particle_data: Vec::new(),
+            particle_uploads: 0,
 
             // Sky dome (created lazily)
             sky_vb: None,
@@ -2401,24 +2411,21 @@ impl WmRenderer {
         }
     }
 
-    /// Upload entity data and rebuild the entity vertex buffer.
-    /// data format: [x, y, z, w, h, d, r, g, b] per entity (9 floats).
-    /// Each entity is rendered as a colored box matching its bounding box dimensions.
-    pub fn set_entities(&mut self, data: &[f32]) {
-        let per_entity = 9;
-        let entity_count = data.len() / per_entity;
+    /// Pure builder: 9 floats/entity → 36 non-indexed box vertices
+    /// (6 faces × 2 triangles × 3 verts). Returns None when the entity count
+    /// is 0 or exceeds 256 (invalid upload).
+    fn build_entity_vertices(data: &[f32]) -> Option<Vec<Vertex>> {
+        const PER_ENTITY: usize = 9;
+        let entity_count = data.len() / PER_ENTITY;
         if entity_count == 0 || entity_count > 256 {
-            // 0 entities → clear; >256 is unreasonable, likely corrupted data
-            self.entity_count = 0;
-            return;
+            return None;
         }
 
         // Generate 36 vertices per entity (6 faces × 2 triangles × 3 verts, non-indexed)
-        let total_vertices = entity_count * 36;
-        let mut vertices: Vec<Vertex> = Vec::with_capacity(total_vertices);
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(entity_count * 36);
 
         for i in 0..entity_count {
-            let off = i * per_entity;
+            let off = i * PER_ENTITY;
             let cx = data[off];
             let cy = data[off + 1];
             let cz = data[off + 2];
@@ -2434,7 +2441,6 @@ impl WmRenderer {
             let (min_y, max_y) = (cy - sy, cy + sy);
             let (min_z, max_z) = (cz - sz, cz + sz);
 
-            // 6 faces, 2 triangles per face, 3 verts per triangle = 36 verts per entity
             // Helper: push 3 verts for a triangle
             let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
                 vertices.push(Vertex { position: a, color: col });
@@ -2460,9 +2466,29 @@ impl WmRenderer {
             tri([min_x, min_y, max_z], [min_x, max_y, min_z], [min_x, min_y, min_z]);
             tri([min_x, min_y, max_z], [min_x, max_y, max_z], [min_x, max_y, min_z]);
         }
+        Some(vertices)
+    }
+
+    /// Upload entity data and rebuild the entity vertex buffer.
+    /// data format: [x, y, z, w, h, d, r, g, b] per entity (9 floats).
+    /// Each entity is rendered as a colored box matching its bounding box dimensions.
+    pub fn set_entities(&mut self, data: &[f32]) {
+        // Phase 11g: skip redundant uploads when the data is unchanged
+        if self.last_entity_data == data {
+            return;
+        }
+        self.last_entity_data = data.to_vec();
+        self.entity_uploads += 1;
+
+        let Some(vertices) = Self::build_entity_vertices(data) else {
+            // 0 entities → clear; >256 is unreasonable, likely corrupted data
+            self.entity_count = 0;
+            return;
+        };
+        let total_vertices = vertices.len() as u32;
 
         // Recreate vertex buffer if needed
-        let vb_size = (total_vertices * size_of::<Vertex>()) as u64;
+        let vb_size = (total_vertices as usize * size_of::<Vertex>()) as u64;
         if self.entity_buffer.as_ref().map_or(true, |b| b.size() < vb_size) {
             self.entity_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Entity VB"),
@@ -2472,7 +2498,7 @@ impl WmRenderer {
             }));
         }
         self.queue.write_buffer(self.entity_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&vertices));
-        self.entity_count = total_vertices as u32;
+        self.entity_count = total_vertices;
 
         // Ensure entity pipeline exists
         self.ensure_entity_pipeline();
@@ -2491,19 +2517,18 @@ impl WmRenderer {
         rp.draw(0..self.entity_count, 0..1);
     }
 
-    /// Upload particle data and rebuild the particle point buffer.
-    /// data format: [x, y, z, size, r, g, b, a] per particle (8 floats).
-    pub fn set_particles(&mut self, data: &[f32]) {
-        let per_particle = 8;
-        let particle_count = data.len() / per_particle;
+    /// Pure builder: 8 floats/particle → point-sprite vertices.
+    /// Returns None when the particle count is 0 or exceeds 2048 (invalid upload).
+    fn build_particle_vertices(data: &[f32]) -> Option<Vec<ParticleVertex>> {
+        const PER_PARTICLE: usize = 8;
+        let particle_count = data.len() / PER_PARTICLE;
         if particle_count == 0 || particle_count > 2048 {
-            self.particle_count = 0;
-            return;
+            return None;
         }
 
         let mut particles: Vec<ParticleVertex> = Vec::with_capacity(particle_count);
         for i in 0..particle_count {
-            let off = i * per_particle;
+            let off = i * PER_PARTICLE;
             particles.push(ParticleVertex {
                 position: [data[off], data[off + 1], data[off + 2]],
                 color: [
@@ -2515,8 +2540,26 @@ impl WmRenderer {
                 size: data[off + 3].max(1.0),
             });
         }
+        Some(particles)
+    }
 
-        let vb_size = (particle_count * size_of::<ParticleVertex>()) as u64;
+    /// Upload particle data and rebuild the particle point buffer.
+    /// data format: [x, y, z, size, r, g, b, a] per particle (8 floats).
+    pub fn set_particles(&mut self, data: &[f32]) {
+        // Phase 11g: skip redundant uploads when the data is unchanged
+        if self.last_particle_data == data {
+            return;
+        }
+        self.last_particle_data = data.to_vec();
+        self.particle_uploads += 1;
+
+        let Some(particles) = Self::build_particle_vertices(data) else {
+            self.particle_count = 0;
+            return;
+        };
+        let particle_count = particles.len() as u32;
+
+        let vb_size = (particle_count as usize * size_of::<ParticleVertex>()) as u64;
         if self.particle_buffer.as_ref().map_or(true, |b| b.size() < vb_size) {
             self.particle_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Particle VB"),
@@ -2526,7 +2569,7 @@ impl WmRenderer {
             }));
         }
         self.queue.write_buffer(self.particle_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&particles));
-        self.particle_count = particle_count as u32;
+        self.particle_count = particle_count;
 
         // Ensure particle pipeline exists
         self.ensure_particle_pipeline();
@@ -3574,5 +3617,104 @@ mod batch_tests {
         assert!(draws.is_empty());
         assert_eq!(visible, 0);
         assert_eq!(culled, 0);
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    const EPS: f32 = 1e-6;
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < EPS
+    }
+
+    /// One entity: center (10,20,30), size w=2 h=4 d=6, color (1, 0.5, 0).
+    fn one_entity_data() -> [f32; 9] {
+        [10.0, 20.0, 30.0, 2.0, 4.0, 6.0, 1.0, 0.5, 0.0]
+    }
+
+    #[test]
+    fn entity_box_geometry_matches_bbox() {
+        let v = WmRenderer::build_entity_vertices(&one_entity_data()).expect("valid data");
+        // 6 faces × 2 tris × 3 verts = 36 non-indexed vertices.
+        assert_eq!(v.len(), 36);
+
+        // bbox half extents: sx=1, sy=2, sz=3.
+        // First vertex of the front face: (min_x, min_y, max_z).
+        assert!(near(v[0].position[0], 9.0) && near(v[0].position[1], 18.0) && near(v[0].position[2], 33.0));
+
+        // Every vertex must lie on the box surface (one axis at a bound) and
+        // carry the entity color.
+        for vert in &v {
+            assert!(near(vert.color[0], 1.0) && near(vert.color[1], 0.5) && near(vert.color[2], 0.0));
+            let px = vert.position[0];
+            let py = vert.position[1];
+            let pz = vert.position[2];
+            let on_surface = near(px, 9.0) || near(px, 11.0)
+                || near(py, 18.0) || near(py, 22.0)
+                || near(pz, 27.0) || near(pz, 33.0);
+            assert!(on_surface, "vertex {:?} not on box surface", vert.position);
+        }
+    }
+
+    #[test]
+    fn entity_builder_rejects_invalid_counts() {
+        assert!(WmRenderer::build_entity_vertices(&[]).is_none());
+
+        // 257 entities (> 256 cap) → rejected.
+        let mut big = Vec::with_capacity(257 * 9);
+        for _ in 0..257 {
+            big.extend_from_slice(&one_entity_data());
+        }
+        assert!(WmRenderer::build_entity_vertices(&big).is_none());
+
+        // Exactly 256 → accepted.
+        let mut maxed = Vec::with_capacity(256 * 9);
+        for _ in 0..256 {
+            maxed.extend_from_slice(&one_entity_data());
+        }
+        assert_eq!(WmRenderer::build_entity_vertices(&maxed).unwrap().len(), 256 * 36);
+    }
+
+    #[test]
+    fn entity_builder_clamps_colors_and_min_size() {
+        // Zero size → clamped to 0.01 half-extent; out-of-range color → clamped to [0,1].
+        let data = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, -1.0, 3.0];
+        let v = WmRenderer::build_entity_vertices(&data).expect("valid data");
+        assert_eq!(v.len(), 36);
+        assert!(near(v[0].position[0], -0.01) && near(v[0].position[1], -0.01) && near(v[0].position[2], 0.01));
+        assert!(near(v[0].color[0], 1.0) && near(v[0].color[1], 0.0) && near(v[0].color[2], 1.0));
+    }
+
+    #[test]
+    fn particle_builder_builds_points() {
+        let data = [1.0, 2.0, 3.0, 0.5, 1.0, 0.0, 0.0, 1.0];
+        let p = WmRenderer::build_particle_vertices(&data).expect("valid data");
+        assert_eq!(p.len(), 1);
+        assert!(near(p[0].position[0], 1.0) && near(p[0].position[1], 2.0) && near(p[0].position[2], 3.0));
+        // size < 1 → clamped to 1.0
+        assert!(near(p[0].size, 1.0));
+        assert!(near(p[0].color[0], 1.0) && near(p[0].color[1], 0.0) && near(p[0].color[2], 0.0) && near(p[0].color[3], 1.0));
+    }
+
+    #[test]
+    fn particle_builder_rejects_invalid_counts() {
+        assert!(WmRenderer::build_particle_vertices(&[]).is_none());
+
+        // 2049 particles (> 2048 cap) → rejected.
+        let mut big = Vec::with_capacity(2049 * 8);
+        for _ in 0..2049 {
+            big.extend_from_slice(&[1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        }
+        assert!(WmRenderer::build_particle_vertices(&big).is_none());
+
+        // Exactly 2048 → accepted.
+        let mut maxed = Vec::with_capacity(2048 * 8);
+        for _ in 0..2048 {
+            maxed.extend_from_slice(&[1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        }
+        assert_eq!(WmRenderer::build_particle_vertices(&maxed).unwrap().len(), 2048);
     }
 }

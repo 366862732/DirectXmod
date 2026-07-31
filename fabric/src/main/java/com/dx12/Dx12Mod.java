@@ -384,12 +384,12 @@ public class Dx12Mod implements ClientModInitializer {
                                 entityData[off + 7] = eg;
                                 entityData[off + 8] = eb;
                             }
-                            D3D12Bridge.nativeSetEntities(entityData);
+                            D3D12Bridge.setEntities(entityData);
                         } else {
-                            D3D12Bridge.nativeSetEntities(new float[0]);
+                            D3D12Bridge.setEntities(new float[0]);
                         }
                     } catch (Throwable entityEx) {
-                        D3D12Bridge.nativeSetEntities(new float[0]);
+                        D3D12Bridge.setEntities(new float[0]);
                     }
 
                     // ─── Particle extraction ────────────────────────
@@ -443,18 +443,18 @@ public class Dx12Mod implements ClientModInitializer {
                                 if (idx > 0) {
                                     float[] trimmed = new float[idx * 8];
                                     System.arraycopy(particleData, 0, trimmed, 0, idx * 8);
-                                    D3D12Bridge.nativeSetParticles(trimmed);
+                                    D3D12Bridge.setParticles(trimmed);
                                 } else {
-                                    D3D12Bridge.nativeSetParticles(new float[0]);
+                                    D3D12Bridge.setParticles(new float[0]);
                                 }
                             } else {
-                                D3D12Bridge.nativeSetParticles(new float[0]);
+                                D3D12Bridge.setParticles(new float[0]);
                             }
                         } else {
-                            D3D12Bridge.nativeSetParticles(new float[0]);
+                            D3D12Bridge.setParticles(new float[0]);
                         }
                     } catch (Throwable particleEx) {
-                        D3D12Bridge.nativeSetParticles(new float[0]);
+                        D3D12Bridge.setParticles(new float[0]);
                     }
                 }
             } catch (Throwable t) {
