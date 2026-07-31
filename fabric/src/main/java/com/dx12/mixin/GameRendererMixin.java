@@ -136,9 +136,35 @@ public class GameRendererMixin {
             }
             if (D3D12Bridge.hasSurface()) {
                 D3D12Bridge.renderFrame();
+                // Quantified evidence for deployment verification: log the actual
+                // D3D12 present rate every few seconds.
+                logPresentFps();
             }
         } finally {
             GLFW.glfwMakeContextCurrent(glfwWindow);
+        }
+    }
+
+    // ── Per-frame present FPS statistics ────────────────────────────────
+    private static long fpsWindowStart = 0;
+    private static long fpsFrameCount = 0;
+
+    private static void logPresentFps() {
+        long now = System.currentTimeMillis();
+        if (fpsWindowStart == 0) {
+            fpsWindowStart = now;
+            fpsFrameCount = 0;
+            return;
+        }
+        fpsFrameCount++;
+        long elapsed = now - fpsWindowStart;
+        if (elapsed >= 3000) {
+            double fps = fpsFrameCount * 1000.0 / elapsed;
+            Dx12Mod.LOGGER.info(
+                "[dx12-wm] D3D12 present FPS: {} ({} frames in {} ms)",
+                String.format("%.1f", fps), fpsFrameCount, elapsed);
+            fpsWindowStart = now;
+            fpsFrameCount = 0;
         }
     }
 
