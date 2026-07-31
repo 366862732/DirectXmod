@@ -20,9 +20,17 @@ import com.dx12.Dx12Mod;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
+import org.joml.Matrix4fc;
+import org.joml.Vector4f;
+
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
 
 /**
  * Plan C (HUD Overlay via GL → D3D12 composition):
@@ -90,7 +98,22 @@ public class GameRendererMixin {
      * of the D3D12 world, which matches their screen position).
      */
     @WrapOperation(method = "renderLevel", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/LevelRenderer;renderLevel(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Lnet/minecraft/client/DeltaTracker;ZLnet/minecraft/client/renderer/state/level/CameraRenderState;Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lorg/joml/Vector4f;ZLnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;)V"))
-    private void skipGlWorldRender(LevelRenderer instance, Object[] args, Operation<Void> original) {
+    private void skipGlWorldRender(
+        LevelRenderer instance,
+        GraphicsResourceAllocator allocator,
+        DeltaTracker deltaTracker,
+        boolean renderMainFbo,
+        CameraRenderState cameraRenderState,
+        Matrix4fc projectionMatrix,
+        GpuBufferSlice gpuBufferSlice,
+        Vector4f vector4f,
+        boolean bl2,
+        ChunkSectionsToRender chunkSectionsToRender,
+        Operation<Void> original) {
+        // NOTE: @WrapOperation handlers CANNOT use the Object[] folded argument
+        // form (unlike @Inject) — the parameter list must match the target
+        // method exactly or MixinExtras throws InvalidInjectionException at
+        // startup (crash: "Found unexpected argument type java.lang.Object[]").
         if (D3D12Bridge.hasSurface() && D3D12Bridge.hasChunkGeometry()) {
             if (!renderLevelCancelledLogged) {
                 renderLevelCancelledLogged = true;
@@ -99,7 +122,8 @@ public class GameRendererMixin {
             // no-op: keep fog setup + renderItemInHand + screen effects
             return;
         }
-        original.call(instance, args);
+        original.call(instance, allocator, deltaTracker, renderMainFbo, cameraRenderState,
+            projectionMatrix, gpuBufferSlice, vector4f, bl2, chunkSectionsToRender);
     }
 
     /**
