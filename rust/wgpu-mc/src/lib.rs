@@ -785,6 +785,65 @@ struct ChunkMesh {
     index_count: u32,
 }
 
+/// Phase 13.10: one mesh slot captured at the moment a progressive compaction
+/// starts, holding its (key, slot) identity plus the absolute offsets/lengths
+/// recorded then. A mesh whose current base_vertex/index_offset/lengths no
+/// longer match the captured values has been cleared and recompiled meanwhile,
+/// so the slot is skipped (left in place) instead of being moved.
+#[derive(Clone, Copy)]
+struct CompactionSlot {
+    key: (i32, i32, i32),
+    slot: usize,
+    base_vertex: u32,
+    index_offset: u32,
+    verts_len: usize,
+    indices_len: usize,
+}
+
+/// Phase 13.10: in-flight progressive tombstone compaction.
+///
+/// A tombstone clear used to force `rebuild_chunk_buffers()` — re-concatenating
+/// every mesh on the spot. At ~700 MB of merged geometry (4.8k meshes) that
+/// single-frame copy + full `write_buffer` costs ~50 ms and reads as a
+/// periodic stutter (FPS 270→225 every ~10 s). Instead we compact
+/// INCREMENTALLY:
+///
+/// - capture the mesh order (sorted by base_vertex) once;
+/// - each frame, move up to `COMPACTION_BUDGET` bytes of live mesh data from
+///   the mesh's authoritative per-mesh copy (`mesh.vertices` / `indices`) into
+///   the front of `merged_verts`/`merged_indices`, update that mesh's
+///   `base_vertex`/`index_offset`, and issue an async `queue.write_buffer` for
+///   exactly the moved ranges;
+/// - draws keep using the SAME GPU buffers, so tombstones and not-yet-moved
+///   meshes render unchanged. Indirect args are rebuilt from `chunk_meshes`
+///   every frame, so a mesh whose offset was updated this frame is drawn from
+///   its new location, and the `write_buffer` for that range was queued before
+///   the draw — same-frame consistency.
+///
+/// Safety against concurrent uploads/clears:
+/// - uploads append at the tail (`base_vertex >= merged_verts.len()` at
+///   capture); the compaction destination never reaches that far, so appends
+///   never collide with moved data;
+/// - a clear during compaction is forced onto the tombstone path (no
+///   truncation), keeping the flat caches intact; the cleared mesh's captured
+///   slot is skipped when the compaction reaches it;
+/// - a recompile of an already-captured section fails the identity check and
+///   is skipped; its (now dead or relocated) footprint is passed over.
+struct ChunkCompaction {
+    /// Captured mesh slots in merged order (sorted by base_vertex).
+    order: Vec<CompactionSlot>,
+    /// Next slot in `order` to move.
+    next: usize,
+    /// Running destination offsets inside the merged caches.
+    dest_vert: usize,
+    dest_index: usize,
+    /// merged_verts/merged_indices lengths when the compaction started —
+    /// used to detect tail appends so the final truncate never cuts live
+    /// uploads.
+    base_verts_len: usize,
+    base_indices_len: usize,
+}
+
 /// One entry of a draw-indexed-indirect argument buffer.
 /// Layout must exactly match D3D12_DRAW_INDEXED_ARGUMENTS (20 bytes,
 /// little-endian): IndexCountPerInstance, InstanceCount, StartIndexLocation,
@@ -917,6 +976,9 @@ pub struct WmRenderer {
     // dropped FPS to ~2 while moving at large render distance: ~446 MB VB).
     deleted_vb_bytes: u64,
     deleted_ib_bytes: u64,
+
+    // Phase 13.10: in-flight progressive compaction (None when idle).
+    compaction: Option<ChunkCompaction>,
 
     // Chunk textured pipeline + atlas
     chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
@@ -1481,6 +1543,7 @@ impl WmRenderer {
             chunk_need_full_rebuild: false,
             deleted_vb_bytes: 0,
             deleted_ib_bytes: 0,
+            compaction: None,
             chunk_shader: None,
             chunk_pipeline: None,
             chunk_pipeline_transparent: None,
@@ -2328,7 +2391,11 @@ impl WmRenderer {
             let removed_indices: usize = removed.iter().map(|m| m.index_count as usize).sum();
             let covers_tail = self.merged_verts.len() - cut_vertex == removed_verts
                 && self.merged_indices.len() - cut_index == removed_indices;
-            if covers_tail {
+            // Phase 13.10: while a progressive compaction is in flight, even a
+            // tail clear takes the tombstone path — truncating the flat caches
+            // would cut into the destination region the compaction is still
+            // writing (or into not-yet-moved sources), corrupting it.
+            if self.compaction.is_none() && covers_tail {
                 self.merged_verts.truncate(cut_vertex);
                 self.merged_indices.truncate(cut_index);
                 log::debug!("[dx12-wm] clear_chunk_section {:?} truncated {} verts / {} indices (incremental)",
@@ -2371,6 +2438,13 @@ impl WmRenderer {
     const CHUNK_VB_MIN_CAP: u64 = 4 * 1024 * 1024; // 4 MB
     const CHUNK_IB_MIN_CAP: u64 = 1 * 1024 * 1024; // 1 MB
     const MAX_BUF_SIZE: u64 = 1024 * 1024 * 1024;  // 1 GiB (matches required_limits.max_buffer_size)
+
+    /// Phase 13.10: bytes of live mesh data (verts + indices) moved per frame
+    /// during progressive compaction. 64 MB per frame costs well under a
+    /// millisecond of memcpy plus an async write_buffer enqueue — a far cry
+    /// from the ~50 ms single-frame full rebuild. A ~700 MB compaction then
+    /// spreads over ~11–14 frames (~0.2 s at 60 fps) with no frame stall.
+    const COMPACTION_BUDGET: u64 = 64 * 1024 * 1024; // 64 MB / frame
 
     fn upload_chunk_slice(&mut self, verts_start: usize, idxs_start: usize) {
         if self.merged_verts.len() <= verts_start || self.merged_indices.len() <= idxs_start {
@@ -2498,6 +2572,9 @@ impl WmRenderer {
         self.chunk_need_full_rebuild = false;
         self.deleted_vb_bytes = 0;
         self.deleted_ib_bytes = 0;
+        // Phase 13.10: a full rebuild supersedes any in-flight progressive
+        // compaction — abort it; every mesh gets fresh offsets below anyway.
+        self.compaction = None;
 
         // Rebuild the flat CPU caches from scratch (a clear/removal happened),
         // then re-upload everything into (possibly larger) GPU buffers.
@@ -2573,21 +2650,214 @@ impl WmRenderer {
             mesh_count, self.merged_verts.len(), self.merged_indices.len(), capacity);
     }
 
+    /// Phase 13.10: capture the current merged order and begin a progressive
+    /// compaction. Slots are snapshotted as (key, slot) pairs sorted by their
+    /// current base_vertex, which is also the order their data occupies in the
+    /// merged caches. The first budget slice is processed on the same frame.
+    fn start_chunk_compaction(&mut self) {
+        let mut order: Vec<CompactionSlot> = self
+            .chunk_meshes
+            .iter()
+            .flat_map(|(key, meshes)| {
+                meshes.iter().enumerate().map(move |(slot, m)| CompactionSlot {
+                    key: *key,
+                    slot,
+                    base_vertex: m.base_vertex,
+                    index_offset: m.index_offset,
+                    verts_len: m.vertices.len(),
+                    indices_len: m.indices.len(),
+                })
+            })
+            .collect();
+        order.sort_by_key(|s| (s.base_vertex, s.index_offset));
+        self.compaction = Some(ChunkCompaction {
+            order,
+            next: 0,
+            dest_vert: 0,
+            dest_index: 0,
+            base_verts_len: self.merged_verts.len(),
+            base_indices_len: self.merged_indices.len(),
+        });
+        log::info!("[dx12-wm] Chunk compaction started: {} meshes, {} MB tombstone",
+            self.compaction.as_ref().unwrap().order.len(),
+            (self.deleted_vb_bytes + self.deleted_ib_bytes) / (1024 * 1024));
+    }
+
+    /// Phase 13.10: move up to COMPACTION_BUDGET bytes of live meshes to the
+    /// front of the merged caches and re-upload exactly the moved ranges.
+    /// Returns true when every captured slot has been processed.
+    ///
+    /// Data is copied from each mesh's authoritative per-mesh copy rather than
+    /// from `merged_verts` positions, so the move is immune to overlaps. A
+    /// mesh's new destination is ≤ its old position (pure compaction), and
+    /// destinations are assigned contiguously, so a moved mesh never writes
+    /// over the source of a not-yet-moved mesh — either on the CPU cache or on
+    /// the GPU (the write_buffer of a moved range is queued before this
+    /// frame's draws, which reference the already-updated offsets).
+    fn step_chunk_compaction(&mut self) -> bool {
+        // Snapshot the compaction state so we can freely borrow `self` below.
+        let (order, mut next, mut dest_vert, mut dest_index) = match &self.compaction {
+            Some(c) => (c.order.clone(), c.next, c.dest_vert, c.dest_index),
+            None => return true,
+        };
+        let frame_start = next;
+        let mut budget = Self::COMPACTION_BUDGET as usize;
+
+        while next < order.len() {
+            let slot = order[next];
+            let vbytes = slot.verts_len * std::mem::size_of::<ChunkVertex>();
+            let ibytes = slot.indices_len * std::mem::size_of::<u32>();
+            // Always move at least one mesh per frame (a single oversized mesh
+            // must not stall compaction forever).
+            if budget < vbytes + ibytes && next > frame_start {
+                break;
+            }
+            // Identity check: only move the mesh if it is still the exact mesh
+            // captured at compaction start. A clear + recompile of the same
+            // section replaces the Vec<ChunkMesh>, so the (key, slot) would be
+            // stale — skip it and let the dead/relocated footprint pass.
+            let moved = self
+                .chunk_meshes
+                .get_mut(&slot.key)
+                .and_then(|ms| ms.get_mut(slot.slot))
+                .filter(|m| {
+                    m.base_vertex == slot.base_vertex
+                        && m.index_offset == slot.index_offset
+                        && m.vertices.len() == slot.verts_len
+                        && m.indices.len() == slot.indices_len
+                })
+                .is_some();
+            if moved {
+                let vd = dest_vert;
+                let id = dest_index;
+                if self.merged_verts.len() >= vd + slot.verts_len
+                    && self.merged_indices.len() >= id + slot.indices_len
+                {
+                    let m = self
+                        .chunk_meshes
+                        .get_mut(&slot.key)
+                        .and_then(|ms| ms.get_mut(slot.slot))
+                        .unwrap();
+                    self.merged_verts[vd..vd + slot.verts_len].copy_from_slice(&m.vertices);
+                    self.merged_indices[id..id + slot.indices_len].copy_from_slice(&m.indices);
+                    // Update absolute offsets; indirect args are rebuilt from
+                    // chunk_meshes every frame, so draws pick up the new
+                    // location the same frame the data lands on the GPU.
+                    m.base_vertex = vd as u32;
+                    m.index_offset = id as u32;
+                    if !m.vertices.is_empty() {
+                        if let Some(vb) = &self.chunk_vb {
+                            self.queue.write_buffer(
+                                vb,
+                                (vd as u64) * std::mem::size_of::<ChunkVertex>() as u64,
+                                bytemuck::cast_slice(&m.vertices),
+                            );
+                        }
+                    }
+                    if !m.indices.is_empty() {
+                        if let Some(ib) = &self.chunk_ib {
+                            self.queue.write_buffer(
+                                ib,
+                                (id as u64) * std::mem::size_of::<u32>() as u64,
+                                bytemuck::cast_slice(&m.indices),
+                            );
+                        }
+                    }
+                }
+                dest_vert += slot.verts_len;
+                dest_index += slot.indices_len;
+            } else {
+                // Cleared / recompiled since capture: pass over its footprint.
+                dest_vert += slot.verts_len;
+                dest_index += slot.indices_len;
+            }
+            budget = budget.saturating_sub(vbytes + ibytes);
+            next += 1;
+        }
+
+        let done = next >= order.len();
+        if let Some(c) = &mut self.compaction {
+            c.next = next;
+            c.dest_vert = dest_vert;
+            c.dest_index = dest_index;
+        }
+        done
+    }
+
+    /// Phase 13.10: finalize a completed progressive compaction — truncate the
+    /// flat caches to the compacted front (only when nothing appended to the
+    /// tail while compacting), reset the tombstone counters and drop the
+    /// in-flight state.
+    fn finish_chunk_compaction(&mut self) {
+        let (dest_vert, dest_index, base_verts_len, base_indices_len) = match &self.compaction {
+            Some(c) => (c.dest_vert, c.dest_index, c.base_verts_len, c.base_indices_len),
+            None => return,
+        };
+        // Tail appends during compaction (new section uploads) extend past the
+        // original length; truncating to dest_vert would cut them, so only
+        // truncate when nothing was appended meanwhile. Otherwise the gap
+        // between the compacted front and the appended tail stays as a (small)
+        // dead region — reclaimed by the next compaction.
+        if self.merged_verts.len() == base_verts_len {
+            self.merged_verts.truncate(dest_vert);
+        }
+        if self.merged_indices.len() == base_indices_len {
+            self.merged_indices.truncate(dest_index);
+        }
+        self.deleted_vb_bytes = 0;
+        self.deleted_ib_bytes = 0;
+        self.compaction = None;
+        if self.merged_verts.is_empty() {
+            self.chunk_vb = None;
+            self.chunk_ib = None;
+            self.chunk_indirect = None;
+            self.chunk_indirect_capacity = 0;
+            self.chunk_vb_capacity = 0;
+            self.chunk_ib_capacity = 0;
+            self.has_chunk_geometry = false;
+        }
+        log::info!("[dx12-wm] Chunk compaction finished: {} verts / {} indices (tombstone cleared)",
+            self.merged_verts.len(), self.merged_indices.len());
+    }
+
     /// Ensure the merged chunk buffers are up to date before issuing draws.
     /// Phase 11j: uploads are applied incrementally at upload time, so this
-    /// only performs a (rare) full rebuild after a section clear/removal.
+    /// only performs a (rare) rebuild/compaction after a section clear/removal.
     fn prepare_chunk_batch(&mut self) {
-        // Tombstone compaction (Phase 13.9): rebuild only when the accumulated
-        // deleted bytes are meaningful — at least 64 MB AND at least 1/3 of the
-        // live merged data (or a hard 256 MB cap as a backstop). A middle-
-        // section clear while moving would otherwise force a full rebuild of
-        // the merged VB/IB every frame (~446 MB upload at 3.5k meshes → 2 FPS).
+        // Tombstone compaction (Phase 13.9/13.10): rebuild only when the
+        // accumulated deleted bytes are meaningful — at least 128 MB AND at
+        // least 1/2 of the live merged data (or a hard 512 MB cap as a
+        // backstop). A middle-section clear while moving would otherwise force
+        // a full rebuild of the merged VB/IB every frame (~446 MB upload at
+        // 3.5k meshes → 2 FPS). The Phase 13.10 tuning raises the thresholds
+        // (64→128 MB, 1/3→1/2, 256→512 MB) to spread compactions ≥ 20 s apart
+        // so the occasional ~50 ms rebuild no longer reads as periodic stutter.
         let merged_vb_bytes = self.merged_verts.len() as u64 * std::mem::size_of::<ChunkVertex>() as u64;
-        let waste_exceeds = self.deleted_vb_bytes > 64 * 1024 * 1024
-            && self.deleted_vb_bytes * 2 > merged_vb_bytes;
-        let waste_hard_cap = self.deleted_vb_bytes > 256 * 1024 * 1024;
-        if self.chunk_need_full_rebuild || self.chunk_geometry_dirty || waste_exceeds || waste_hard_cap {
+        let waste_exceeds = self.deleted_vb_bytes > 128 * 1024 * 1024
+            && self.deleted_vb_bytes > merged_vb_bytes / 2;
+        let waste_hard_cap = self.deleted_vb_bytes > 512 * 1024 * 1024;
+
+        // Explicit full-rebuild requests (first geometry, flag-based edge
+        // cases) always take the synchronous path — they are one-off, not
+        // the periodic tombstone case.
+        if self.chunk_need_full_rebuild || self.chunk_geometry_dirty {
             self.rebuild_chunk_buffers();
+            return;
+        }
+
+        if self.compaction.is_some() {
+            // Phase 13.10: continue an in-flight progressive compaction — step
+            // one budget slice this frame (≤ ~64 MB moved, sub-ms memcpy +
+            // async uploads) instead of one ~50 ms full rebuild. When the last
+            // slice lands, finalize (truncate + reset tombstone counters).
+            if self.step_chunk_compaction() {
+                self.finish_chunk_compaction();
+            }
+        } else if waste_exceeds || waste_hard_cap {
+            self.start_chunk_compaction();
+            if self.step_chunk_compaction() {
+                self.finish_chunk_compaction();
+            }
         }
     }
 
