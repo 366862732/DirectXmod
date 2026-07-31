@@ -899,6 +899,11 @@ unsafe impl Send for WmRenderer {}
 
 impl WmRenderer {
     pub fn create(width: u32, height: u32) -> Result<Self, &'static str> {
+        // Print the build identity first: the JAR-internal DLL overwrites any
+        // external copy on every launch, so this hash is the only reliable way
+        // to confirm which wgpu_mc_jni.dll build is actually running.
+        let build_id = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+        eprintln!("[dx12-wm] wgpu-mc build {} (v{})", build_id, env!("CARGO_PKG_VERSION"));
         eprintln!("[dx12-wm] Creating WmRenderer {}x{} (triple-buffer + surface support)", width, height);
         log::info!("Creating WmRenderer {}x{}", width, height);
 
