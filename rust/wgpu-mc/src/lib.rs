@@ -436,6 +436,23 @@ fn write_camera_uniform(
 
 // ── Frustum culling helpers (Phase 11f) ──────────────────────────────
 
+/// Transpose a 4×4 matrix.
+///
+/// The JNI layer copies the JOML `Matrix4f.get()` output (column-major
+/// float[16]) straight into the row-major `[[f32; 4]; 4]` slots, so the
+/// in-memory matrix is the *transpose* of the intended world→clip matrix.
+/// The uniform upload path intentionally keeps that layout (WGSL
+/// `mat4x4<f32>` uniforms are column-major too), but plane extraction below
+/// expects row-major, so the camera matrix must be transposed back first.
+fn transpose4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    [
+        [m[0][0], m[1][0], m[2][0], m[3][0]],
+        [m[0][1], m[1][1], m[2][1], m[3][1]],
+        [m[0][2], m[1][2], m[2][2], m[3][2]],
+        [m[0][3], m[1][3], m[2][3], m[3][3]],
+    ]
+}
+
 /// Extract 6 frustum planes from a world→clip matrix (row-major storage,
 /// D3D-style z ∈ [0, w] as produced by JOML perspective(..., zZeroToOne=true)).
 /// Plane: a*x + b*y + c*z + d = 0 (normalized); a point is inside when dot > 0.
@@ -2341,7 +2358,12 @@ impl WmRenderer {
         // first camera update arrives.
         let cull_enabled = self.camera_mvp[3][2] != 0.0;
         let planes = if cull_enabled {
-            extract_frustum_planes(&self.camera_mvp)
+            // camera_mvp lives in column-major memory (JOML Matrix4f.get());
+            // the WGSL uniform consumes that layout as-is, but plane extraction
+            // expects row-major — transpose first. (Fix: looking up culled every
+            // section because planes were extracted from the transposed matrix.)
+            let mvp_row_major = transpose4(&self.camera_mvp);
+            extract_frustum_planes(&mvp_row_major)
         } else {
             [[0.0f32; 4]; 6] // all-zero planes pass every box
         };
@@ -3520,6 +3542,34 @@ mod frustum_tests {
         assert_eq!(id[3][2], 0.0);
         let proj = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
         assert_ne!(proj[3][2], 0.0);
+    }
+
+    #[test]
+    fn transpose_roundtrip_is_identity() {
+        let m = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        assert_eq!(transpose4(&transpose4(&m)), m);
+    }
+
+    #[test]
+    fn column_major_input_needs_transpose_for_planes() {
+        // JNI stores the JOML column-major float[16] as-is, so the in-memory
+        // [[f32; 4]; 4] is the transpose of the true world→clip matrix.
+        // Plane extraction must run on the transposed form.
+        let true_mvp = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        let stored = transpose4(&true_mvp); // what Rust sees at runtime
+
+        // Regression: before the fix, planes came from the transposed matrix
+        // and looking up culled every section (ground vanished).
+        let planes_bad = extract_frustum_planes(&stored);
+        let planes_ok = extract_frustum_planes(&transpose4(&stored));
+
+        assert_eq!(planes_ok, extract_frustum_planes(&true_mvp));
+        assert_ne!(planes_bad, planes_ok);
+
+        // Box directly ahead of the camera must stay visible…
+        assert!(aabb_in_frustum([-1.0, -1.0, 4.0], [1.0, 1.0, 6.0], &planes_ok));
+        // …and a box behind the camera must be culled.
+        assert!(!aabb_in_frustum([-1.0, -1.0, -20.0], [1.0, 1.0, -10.1], &planes_ok));
     }
 }
 
