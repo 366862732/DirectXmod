@@ -122,6 +122,9 @@ public class GameRendererMixin {
             presentLogOnce = true;
             Dx12Mod.LOGGER.info("[dx12-wm] D3D12 present moved to render TAIL (per-frame pacing)");
         }
+        // Phase 11i: update camera per rendered frame (was ~20 Hz on the tick
+        // path). Runs before detaching GL so the JNI call stays off the HWND path.
+        Dx12Mod.updateCameraFromRender();
         long glfwWindow = GLFW.glfwGetCurrentContext();
         if (glfwWindow == 0) return;
         long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);

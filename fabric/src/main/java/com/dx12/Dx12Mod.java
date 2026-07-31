@@ -252,37 +252,21 @@ public class Dx12Mod implements ClientModInitializer {
             try {
                 Minecraft mc = Minecraft.getInstance();
                 if (mc.player != null && mc.level != null) {
-                    inWorld = true; 
-                    var player = mc.player;
-                    var pos = player.getEyePosition();
-                    float pitch = player.getXRot();
-                    float yaw = player.getYRot();
+                    inWorld = true;
 
-                    Matrix4f view = new Matrix4f();
-                    view.rotateX((float) Math.toRadians(pitch));
-                    view.rotateY((float) Math.toRadians(yaw + 180.0));
-                    view.translate((float) -pos.x, (float) -pos.y, (float) -pos.z);
-
-                    float aspect = (float) width / (float) height;
-                    Matrix4f proj = new Matrix4f();
-                    proj.perspective((float) Math.toRadians(70.0), aspect, 0.05f, 1000.0f, true);
-
-                    Matrix4f mvp = new Matrix4f(proj);
-                    mvp.mul(view);
-
-                    float[] mvpArray = new float[16];
-                    mvp.get(mvpArray);
-                    D3D12Bridge.updateCamera(mvpArray);
-
-                    // Pass camera world position to offset test geometry near the player.
-                    D3D12Bridge.updateCameraPos(
-                        (float) pos.x, (float) pos.y, (float) pos.z);
+                    // Phase 11i: per-frame camera extraction moved to
+                    // updateCameraFromRender() (called from GameRendererMixin.render
+                    // TAIL at full frame rate). Camera here was 20 Hz (one per tick)
+                    // while D3D12 now presents every frame — the mismatch caused
+                    // visible stutter when moving.
 
                     // Extract fog color from the level for fog and sky rendering.
                     // MC 26.1.2 uses EnvironmentAttributes.SKY_COLOR (RGB 0xRRGGBB)
                     // via Level.environmentAttributes().getValue(attribute, pos).
                     // Older versions used Level.getSkyColor(Vec3, float) — kept as
                     // a reflective fallback for cross-version compatibility.
+                    var player = mc.player;
+                    Vec3 pos = player.getEyePosition();
                     Vec3 skyColor = null;
                     try {
                         // Direct call: compiled with official mappings and the runtime
@@ -671,6 +655,50 @@ public class Dx12Mod implements ClientModInitializer {
 
         } catch (Throwable t) {
             resetOverlayResources("GL draw failed: " + t.getMessage(), false);
+        }
+    }
+
+    /**
+     * Phase 11i: extract the camera view-projection matrix once per RENDERED
+     * frame (called from GameRendererMixin.render TAIL, full frame rate).
+     * Previously this ran inside the tick callback (~20 Hz), causing visible
+     * stutter now that D3D12 presents every frame. Sky/fog/lightmap updates
+     * stay on the tick path (they change slowly).
+     */
+    public static void updateCameraFromRender() {
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.player == null || mc.level == null) return;
+            var window = mc.getWindow();
+            int width = window.getWidth();
+            int height = window.getHeight();
+            if (width <= 0 || height <= 0) return;
+
+            var player = mc.player;
+            var pos = player.getEyePosition();
+            float pitch = player.getXRot();
+            float yaw = player.getYRot();
+
+            Matrix4f view = new Matrix4f();
+            view.rotateX((float) Math.toRadians(pitch));
+            view.rotateY((float) Math.toRadians(yaw + 180.0));
+            view.translate((float) -pos.x, (float) -pos.y, (float) -pos.z);
+
+            float aspect = (float) width / (float) height;
+            Matrix4f proj = new Matrix4f();
+            proj.perspective((float) Math.toRadians(70.0), aspect, 0.05f, 1000.0f, true);
+
+            Matrix4f mvp = new Matrix4f(proj);
+            mvp.mul(view);
+
+            float[] mvpArray = new float[16];
+            mvp.get(mvpArray);
+            D3D12Bridge.updateCamera(mvpArray);
+
+            // Pass camera world position to offset test geometry near the player.
+            D3D12Bridge.updateCameraPos((float) pos.x, (float) pos.y, (float) pos.z);
+        } catch (Throwable ignored) {
+            // Camera extraction is best-effort per frame; failures are not fatal.
         }
     }
 
