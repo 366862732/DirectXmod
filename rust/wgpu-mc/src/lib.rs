@@ -1000,7 +1000,13 @@ impl WmRenderer {
             &wgpu::DeviceDescriptor {
                 label: Some("wgpu-mc"),
                 required_features,
-                required_limits: wgpu::Limits::default(),
+                // Raise max_buffer_size above the wgpu default (256 MiB): the
+                // merged chunk VB reaches ≈268 MB at 6.7 M verts. D3D12
+                // supports i32::MAX here (wgpu-hal dx12 adapter.rs:510).
+                required_limits: wgpu::Limits {
+                    max_buffer_size: 1024 * 1024 * 1024, // 1 GiB
+                    ..wgpu::Limits::default()
+                },
                 memory_hints: Default::default(),
             },
             None,
@@ -2295,12 +2301,33 @@ impl WmRenderer {
     /// Called before recompiling a section to prevent stale mesh accumulation.
     pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
         let key = (section_x, section_y, section_z);
-        if self.chunk_meshes.remove(&key).is_some() {
-            // Phase 11j: removals shift every later mesh's base_vertex /
-            // index_offset, so they must trigger a full rebuild. This is far
-            // rarer than uploads (only on section recompile/unload), so the
-            // cost is acceptable — unlike the old per-upload full rebuild.
-            self.chunk_need_full_rebuild = true;
+        if let Some(removed) = self.chunk_meshes.remove(&key) {
+            // Fast path (Phase 11j+): if the removed meshes are exactly the
+            // tail of the merged caches, truncate them — no full rebuild, no
+            // GPU work (the stale tail is simply never drawn because the
+            // indirect args are rebuilt from chunk_meshes every frame).
+            // MC's section-recompile pattern is clear(section) → upload(section'),
+            // where the cleared mesh was appended last, so this is the common
+            // case during world load. Any other removal still needs a full
+            // rebuild because it shifts every later mesh's base_vertex.
+            let cut_vertex = removed.iter().map(|m| m.base_vertex as usize).min().unwrap_or(0);
+            let cut_index = removed.iter().map(|m| m.index_offset as usize).min().unwrap_or(0);
+            let removed_verts: usize = removed.iter().map(|m| m.vertices.len()).sum();
+            let removed_indices: usize = removed.iter().map(|m| m.index_count as usize).sum();
+            let covers_tail = self.merged_verts.len() - cut_vertex == removed_verts
+                && self.merged_indices.len() - cut_index == removed_indices;
+            if covers_tail {
+                self.merged_verts.truncate(cut_vertex);
+                self.merged_indices.truncate(cut_index);
+                log::debug!("[dx12-wm] clear_chunk_section {:?} truncated {} verts / {} indices (incremental)",
+                    key, removed_verts, removed_indices);
+            } else {
+                // Removals shift every later mesh's base_vertex /
+                // index_offset, so they must trigger a full rebuild. This is
+                // rarer than uploads (only on section recompile/unload), so
+                // the cost is acceptable — unlike the old per-upload rebuild.
+                self.chunk_need_full_rebuild = true;
+            }
         }
     }
 
@@ -2318,16 +2345,14 @@ impl WmRenderer {
     /// crash (hs_err_pid23980, wgpu create_buffer → handle_error_inner →
     /// panic_unwind → EXCEPTION_UNCAUGHT_CXX_EXCEPTION).
     ///
-    /// wgpu 23 D3D12 hard limit: max buffer size 268435456 (256 MB).
-    /// create_buffer with a larger size is a Validation Error that panics
-    /// inside wgpu (game log: "Buffer size 305925120 is greater than the
-    /// maximum buffer size (268435456)" — hit when the merged VB ×2 growth
-    /// jumped 146 MB → 292 MB). Growth is clamped to this limit and uploads
-    /// that alone exceed it are rejected BEFORE appending so the CPU caches
-    /// stay consistent with the GPU buffers.
+    /// wgpu 23 D3D12 hard limit raised via required_limits: the D3D12 adapter
+    /// supports i32::MAX (2 GiB - 1) but the wgpu default cap is 256 MiB.
+    /// Raising it lets the merged chunk VB keep growing (≈268 MB at 6.7 M
+    /// verts) instead of rejecting meshes after the old 256 MB wall
+    /// (game log 19:14:50+: "Chunk mesh REJECTED … > wgpu max 268435456 B").
     const CHUNK_VB_MIN_CAP: u64 = 4 * 1024 * 1024; // 4 MB
     const CHUNK_IB_MIN_CAP: u64 = 1 * 1024 * 1024; // 1 MB
-    const MAX_BUF_SIZE: u64 = 256 * 1024 * 1024;   // wgpu D3D12 hard limit (268435456)
+    const MAX_BUF_SIZE: u64 = 1024 * 1024 * 1024;  // 1 GiB (matches required_limits.max_buffer_size)
 
     fn upload_chunk_slice(&mut self, verts_start: usize, idxs_start: usize) {
         if self.merged_verts.len() <= verts_start || self.merged_indices.len() <= idxs_start {
