@@ -3251,3 +3251,113 @@ impl WmRenderer {
         pixels
     }
 }
+
+// ── Phase 11f: frustum culling unit tests ──────────────────────────────
+
+#[cfg(test)]
+mod frustum_tests {
+    use super::*;
+
+    /// Build a D3D-style perspective matrix (row-major storage, z ∈ [0, w]).
+    /// Matches JOML: perspective(fovy, aspect, zNear, zFar, zZeroToOne=true).
+    fn d3d_perspective(fovy_rad: f32, aspect: f32, zn: f32, zf: f32) -> [[f32; 4]; 4] {
+        let f = 1.0 / (fovy_rad / 2.0).tan();
+        let mut m = [[0.0f32; 4]; 4];
+        m[0][0] = f / aspect;
+        m[1][1] = f;
+        m[2][2] = zf / (zf - zn);
+        m[2][3] = -zf * zn / (zf - zn);
+        m[3][2] = 1.0; // clip.w = z
+        m
+    }
+
+    fn point_in_frustum(v: [f32; 3], planes: &[[f32; 4]; 6]) -> bool {
+        for p in planes {
+            let d = p[0] * v[0] + p[1] * v[1] + p[2] * v[2] + p[3];
+            if d < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn planes_are_normalized() {
+        let m = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        let planes = extract_frustum_planes(&m);
+        assert_eq!(planes.len(), 6);
+        for p in planes.iter() {
+            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!(
+                (len - 1.0).abs() < 1e-5,
+                "plane not normalized: {:?} len={}",
+                p,
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn interior_point_passes_all_planes() {
+        let m = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        let planes = extract_frustum_planes(&m);
+        // Dead center of the frustum, z=5
+        assert!(point_in_frustum([0.0, 0.0, 5.0], &planes));
+        // Corner-ish point still inside
+        assert!(point_in_frustum([1.0, -0.6, 5.0], &planes));
+        // Just past the near plane
+        assert!(point_in_frustum([0.0, 0.0, 0.1], &planes));
+    }
+
+    #[test]
+    fn outside_points_are_rejected() {
+        let m = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        let planes = extract_frustum_planes(&m);
+        // Beyond far plane
+        assert!(!point_in_frustum([0.0, 0.0, 2000.0], &planes));
+        // Behind the camera (z < zNear)
+        assert!(!point_in_frustum([0.0, 0.0, -1.0], &planes));
+        // Far right of the view cone
+        assert!(!point_in_frustum([500.0, 0.0, 5.0], &planes));
+        // Above the view cone
+        assert!(!point_in_frustum([0.0, 500.0, 5.0], &planes));
+        // Far left
+        assert!(!point_in_frustum([-500.0, 0.0, 5.0], &planes));
+    }
+
+    #[test]
+    fn aabb_inside_and_outside() {
+        let m = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        let planes = extract_frustum_planes(&m);
+
+        // Box fully inside the frustum (near the camera center)
+        assert!(aabb_in_frustum([-1.0, -1.0, 4.0], [1.0, 1.0, 6.0], &planes));
+        // Box straddling the camera (contains origin) — visible
+        assert!(aabb_in_frustum([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0], &planes));
+        // Box fully outside (far corner of the world)
+        assert!(!aabb_in_frustum([900.0, 900.0, 900.0], [910.0, 910.0, 910.0], &planes));
+        // Box entirely behind the camera
+        assert!(!aabb_in_frustum([-10.0, -10.0, -20.0], [10.0, 10.0, -10.1], &planes));
+        // Box far to the right
+        assert!(!aabb_in_frustum([500.0, -5.0, 4.0], [600.0, 5.0, 6.0], &planes));
+    }
+
+    #[test]
+    fn zero_planes_pass_every_box() {
+        // draw_chunks uses all-zero planes when the camera matrix is IDENTITY
+        // (cull_enabled = camera_mvp[3][2] != 0.0 is false) — nothing may be culled.
+        let planes = [[0.0f32; 4]; 6];
+        assert!(aabb_in_frustum([1000.0, 1000.0, 1000.0], [2000.0, 2000.0, 2000.0], &planes));
+        assert!(aabb_in_frustum([-9999.0, -9999.0, -9999.0], [-1.0, -1.0, -1.0], &planes));
+    }
+
+    #[test]
+    fn camera_matrix_validity_heuristic() {
+        // A real projection matrix has row 4 z-component = 1 (clip.w = z);
+        // the initial IDENTITY has 0, which disables culling.
+        let id = [[0.0f32; 4]; 4];
+        assert_eq!(id[3][2], 0.0);
+        let proj = d3d_perspective(70.0f32.to_radians(), 16.0 / 9.0, 0.05, 1000.0);
+        assert_ne!(proj[3][2], 0.0);
+    }
+}
