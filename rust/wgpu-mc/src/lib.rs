@@ -119,6 +119,25 @@ impl SkyVertex {
     }
 }
 
+/// Cloud plane vertex: local x/z offset from the camera (y is unused — the
+/// vertex shader places the plane at the uniform cloud height). 12 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct CloudVertex {
+    position: [f32; 3],
+}
+
+impl CloudVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct TexVertex {
@@ -334,6 +353,7 @@ struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     fog: vec4<f32>,
+    sky_color_top: vec3<f32>,
     viewport: vec2<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -380,21 +400,67 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Sky dome shader: renders a gradient hemisphere at the horizon.
-// Vertex color interpolated between deep blue (zenith) and fog color (horizon).
-// Uses position + normal per vertex (24 bytes), pos is on the hemisphere surface.
+// Sky dome shader: renders a gradient hemisphere plus vanilla-style
+// celestial bodies — sun disc, moon disc (with phase) and a star field.
+// The gradient is mixed from fog color (horizon) to sky_color_top (zenith),
+// matching the vanilla sky gradient. Celestial placement follows the
+// vanilla SkyRenderer conventions:
+//   sun_dir  = (-sin(sun_angle),  cos(sun_angle), 0)   (east/sunrise at -PI/2,
+//                                                        west/sunset at +PI/2)
+//   moon_dir = (-sin(moon_angle), cos(moon_angle), 0)
+//   star field is static on the celestial sphere, rotated by star_angle.
 const SKY_SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     fog: vec4<f32>,
     sky_color_top: vec3<f32>,
+    viewport: vec2<f32>,
+    sun_angle: f32,
+    moon_angle: f32,
+    star_angle: f32,
+    star_brightness: f32,
+    moon_phase: f32,
+    rain_brightness: f32,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
+    @location(1) dir: vec3<f32>,
+}
+
+// Deterministic 3D hash for the procedural star field.
+fn hash3(p: vec3<f32>) -> vec3<f32> {
+    let q = vec3<f32>(
+        dot(p, vec3<f32>(127.1, 311.7, 74.7)),
+        dot(p, vec3<f32>(269.5, 183.3, 246.1)),
+        dot(p, vec3<f32>(113.5, 271.9, 124.6)),
+    );
+    return fract(sin(q) * 43758.5453123);
+}
+
+fn rotate_x(a: f32, v: vec3<f32>) -> vec3<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return vec3<f32>(v.x, c * v.y - s * v.z, s * v.y + c * v.z);
+}
+
+// Scattered point stars on the unit sphere. Each cell of a direction-space
+// grid holds at most one star at a random offset, giving ~1500 stars over
+// the full sphere (matching vanilla's 1500-star buffer).
+fn star_field(dir: vec3<f32>) -> f32 {
+    let grid = 14.0;
+    let p = dir * grid;
+    let cell = floor(p);
+    let f = fract(p);
+    let h = hash3(cell);
+    let star = step(0.4, h.z);           // ~60% of cells hold a star
+    let offset = (h.xy - 0.5) * 0.8;     // random star position inside the cell
+    let d = distance(f.xy, offset);
+    let dot_size = 0.045;
+    return star * (1.0 - smoothstep(dot_size * 0.5, dot_size, d));
 }
 
 @vertex
@@ -403,17 +469,172 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>) -> Verte
     let world_pos = pos + camera.camera_pos;
     out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     // Sky gradient: zenith color at the top (t=1), fog color at the horizon (t=0).
-    // The zenith color comes from the uniform (MC sky color via updateSky),
-    // so the sky follows Minecraft's time-of-day / weather instead of a
-    // hardcoded palette.
     let t = max(0.0, normal.y);
     out.color = mix(camera.fog.rgb, camera.sky_color_top, t);
+    // World-space direction from the camera to the dome surface. The dome is
+    // centered on the camera, so pos == normal * RADIUS and normalize(pos)
+    // equals the interpolated normal.
+    out.dir = normal;
     return out;
 }
 
 @fragment
-fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
-    return vec4<f32>(color, 1.0);
+fn fs_main(@location(0) color: vec3<f32>, @location(1) dir: vec3<f32>) -> @location(0) vec4<f32> {
+    var col = color;
+    let vdir = normalize(dir);
+
+    // ── Sun disc (vanilla: sun texture disc ~20px of the 32px quad mapped to
+    // a 30x30 quad at 100 units → angular radius ~0.095 rad ≈ 10.9°)
+    let sun_dir = normalize(vec3<f32>(-sin(camera.sun_angle), cos(camera.sun_angle), 0.0));
+    let sun_ang = acos(clamp(dot(vdir, sun_dir), -1.0, 1.0));
+    let sun_radius = 0.095;
+    let sun_edge = 1.0 - smoothstep(sun_radius * 0.80, sun_radius, sun_ang);
+    // Fade with rain (vanilla passes rainBrightness as the sun quad alpha).
+    let sun_alpha = sun_edge * camera.rain_brightness;
+    col = mix(col, vec3<f32>(1.0, 0.98, 0.88), sun_alpha);
+
+    // ── Moon disc (vanilla: moon texture disc ~22px of the 32px quad mapped to
+    // a 20x20 quad at 100 units → angular radius ~0.07 rad ≈ 8°)
+    // The phase falls out of the sun-moon geometry: a point on the moon's
+    // near-side sphere is lit when its outward normal faces the sun.
+    let moon_dir = normalize(vec3<f32>(-sin(camera.moon_angle), cos(camera.moon_angle), 0.0));
+    let moon_ang = acos(clamp(dot(vdir, moon_dir), -1.0, 1.0));
+    let moon_radius = 0.07;
+    let moon_disc = 1.0 - smoothstep(moon_radius * 0.80, moon_radius, moon_ang);
+    if (moon_disc > 0.0) {
+        // Orthonormal tangent frame of the disc: t1/t2 in the disc plane,
+        // z axis toward the camera (-moon_dir). The sun direction expressed
+        // in this frame is the light direction for the moon sphere.
+        var t1 = cross(vec3<f32>(0.0, 1.0, 0.0), moon_dir);
+        if (length(t1) < 0.001) {
+            t1 = vec3<f32>(1.0, 0.0, 0.0); // moon at zenith → arbitrary tangent
+        }
+        t1 = normalize(t1);
+        let t2 = cross(-moon_dir, t1);
+        // Normalized 2D offset of this fragment on the moon disc.
+        let off = vdir - moon_dir * dot(vdir, moon_dir);
+        let dx = dot(off, t1) / moon_radius;
+        let dy = dot(off, t2) / moon_radius;
+        let r2 = clamp(dx * dx + dy * dy, 0.0, 1.0);
+        let n = vec3<f32>(dx, dy, sqrt(1.0 - r2)); // moon surface normal (near side)
+        let light = vec3<f32>(dot(sun_dir, t1), dot(sun_dir, t2), dot(sun_dir, -moon_dir));
+        // Soft terminator: full moon (sun opposite moon) lights the whole disc,
+        // new moon (sun behind the moon) leaves it dark.
+        let illum = smoothstep(0.0, 0.08, dot(n, light));
+        let moon_alpha = moon_disc * illum * camera.rain_brightness;
+        col = mix(col, vec3<f32>(0.92, 0.92, 0.95), moon_alpha);
+    }
+
+    // ── Stars (vanilla: 1500 quads at distance 100, brightness from the
+    // STAR_BRIGHTNESS attribute; the field rotates with star_angle).
+    if (camera.star_brightness > 0.001) {
+        let st_dir = rotate_x(-camera.star_angle, vdir);
+        let stars = star_field(st_dir) * camera.star_brightness;
+        col += vec3<f32>(0.85, 0.9, 1.0) * stars;
+    }
+
+    return vec4<f32>(col, 1.0);
+}
+"#;
+
+/// Cloud shader: renders the vanilla-style cloud layer as a procedural fbm
+/// noise plane at a fixed height (vanilla: y=192, 4 blocks thick). The grid
+/// is centered on the camera each frame via camera_pos, the wind scroll
+/// offset comes from cloud_params.y (blocks), and the tint from cloud_color
+/// (vanilla CLOUD_COLOR ARGB — white in clear weather, dimmed in rain).
+/// Blended with source-alpha over the sky; drawn before the chunk pass so
+/// terrain depth-tests in front of the layer.
+const CLOUD_SHADER_SRC: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog: vec4<f32>,
+    sky_color_top: vec3<f32>,
+    viewport: vec2<f32>,
+    sun_angle: f32,
+    moon_angle: f32,
+    star_angle: f32,
+    star_brightness: f32,
+    moon_phase: f32,
+    rain_brightness: f32,
+    cloud_color: vec4<f32>,
+    cloud_params: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_xz: vec2<f32>,
+    @location(1) view_side: f32,
+}
+
+fn hash2(p: vec2<f32>) -> vec2<f32> {
+    let q = vec2<f32>(
+        dot(p, vec2<f32>(127.1, 311.7)),
+        dot(p, vec2<f32>(269.5, 183.3)),
+    );
+    return fract(sin(q) * 43758.5453123);
+}
+
+fn noise2(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash2(i);
+    let b = hash2(i + vec2<f32>(1.0, 0.0));
+    let c = hash2(i + vec2<f32>(0.0, 1.0));
+    let d = hash2(i + vec2<f32>(1.0, 1.0));
+    return a.x + (b.x - a.x) * u.x + (c.x - a.x) * u.y + (a.x - b.x - c.x + d.x) * u.x * u.y;
+}
+
+fn fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var amp = 0.5;
+    var freq = 1.0;
+    for (var i = 0; i < 5; i = i + 1) {
+        v += amp * noise2(p * freq);
+        freq *= 2.02;
+        amp *= 0.52;
+    }
+    return v;
+}
+
+@vertex
+fn vs_main(@location(0) pos: vec3<f32>) -> VertexOutput {
+    var out: VertexOutput;
+    // Grid is camera-centered; the plane sits at the uniform cloud height.
+    let world = vec3<f32>(
+        pos.x + camera.camera_pos.x,
+        camera.cloud_params.x,
+        pos.z + camera.camera_pos.z,
+    );
+    out.position = camera.view_proj * vec4<f32>(world, 1.0);
+    out.world_xz = vec2<f32>(world.x, world.z);
+    // +1 → camera above the layer (see white tops), -1 → below (gray bottoms).
+    out.view_side = select(-1.0, 1.0, camera.camera_pos.y > camera.cloud_params.x);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // World-space noise sample scrolled by the wind (cloud_params.y in blocks).
+    // Subtracted so the pattern drifts in +X as the offset grows (vanilla wind).
+    let p = in.world_xz - vec2<f32>(camera.cloud_params.y, 0.0);
+    let n = fbm(p * 0.02);
+    // Puffy coverage threshold over the 0..1 fbm range.
+    var alpha = smoothstep(0.5, 0.62, n);
+    // Fade the finite grid edge so clouds melt into the sky at distance.
+    let dist = distance(in.world_xz, camera.camera_pos.xz);
+    alpha *= 1.0 - smoothstep(900.0, 1400.0, dist);
+    if (alpha <= 0.004) {
+        discard;
+    }
+    var col = camera.cloud_color.rgb;
+    // Vanilla darkens the cloud underside when viewed from below.
+    if (in.view_side < 0.0) {
+        col *= 0.62;
+    }
+    return vec4<f32>(col, alpha * camera.cloud_color.a);
 }
 "#;
 
@@ -430,15 +651,23 @@ fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
     result
 }
 
-/// Write camera MVP + camera_pos + fog + sky_color + viewport to the uniform
-/// buffer.
-/// Layout:
-///   mat4x4  view_proj      (64 bytes, offset 0)
-///   vec3    camera_pos     (12 bytes, offset 64, padded to 16)
-///   vec4    fog            (16 bytes, offset 80)  — fog.rgb = color, fog.a = density
-///   vec3    sky_color_top  (12 bytes, offset 96, padded to 16)
-///   vec2    viewport       (8 bytes,  offset 112, padded to 16)
-/// Total: 128 bytes.
+/// Write camera MVP + camera_pos + fog + sky + celestial + cloud params
+/// to the uniform buffer.
+/// Layout (matches WGSL uniform struct member placement, vec3 align=16):
+///   mat4x4     view_proj       (64 bytes, offset 0)
+///   vec3       camera_pos      (12 bytes, offset 64, padded to 16)
+///   vec4       fog             (16 bytes, offset 80)  — fog.rgb = color, fog.a = density
+///   vec3       sky_color_top   (12 bytes, offset 96, padded to 16)
+///   vec2       viewport        (8 bytes,  offset 112)
+///   f32        sun_angle       (offset 120)  — radians
+///   f32        moon_angle      (offset 124)  — radians
+///   f32        star_angle      (offset 128)  — radians
+///   f32        star_brightness (offset 132)
+///   f32        moon_phase      (offset 136)  — index 0..7
+///   f32        rain_brightness (offset 140)
+///   vec4       cloud_color     (16 bytes, offset 144)  — rgb + alpha
+///   vec4       cloud_params    (16 bytes, offset 160)  — x=height, y=wind offset
+/// Total: 176 bytes (buffer allocated at 192).
 fn write_camera_uniform(
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
@@ -447,13 +676,31 @@ fn write_camera_uniform(
     fog: &[f32; 4],
     sky_top: &[f32; 3],
     viewport: &[f32; 2],
+    sun_angle: f32,
+    moon_angle: f32,
+    star_angle: f32,
+    star_brightness: f32,
+    moon_phase: f32,
+    rain_brightness: f32,
+    cloud_color: &[f32; 4],
+    cloud_height: f32,
+    cloud_time: f32,
 ) {
-    let mut data = [0u8; 128];
+    let mut data = [0u8; 192];
     data[0..64].copy_from_slice(bytemuck::cast_slice(mvp));
     data[64..76].copy_from_slice(bytemuck::cast_slice(pos));
     data[80..96].copy_from_slice(bytemuck::cast_slice(&fog[..]));
     data[96..108].copy_from_slice(bytemuck::cast_slice(&sky_top[..]));
     data[112..120].copy_from_slice(bytemuck::cast_slice(viewport));
+    data[120..124].copy_from_slice(&sun_angle.to_le_bytes());
+    data[124..128].copy_from_slice(&moon_angle.to_le_bytes());
+    data[128..132].copy_from_slice(&star_angle.to_le_bytes());
+    data[132..136].copy_from_slice(&star_brightness.to_le_bytes());
+    data[136..140].copy_from_slice(&moon_phase.to_le_bytes());
+    data[140..144].copy_from_slice(&rain_brightness.to_le_bytes());
+    data[144..160].copy_from_slice(bytemuck::cast_slice(cloud_color));
+    data[160..164].copy_from_slice(&cloud_height.to_le_bytes());
+    data[164..168].copy_from_slice(&cloud_time.to_le_bytes());
     queue.write_buffer(buffer, 0, &data);
 }
 
@@ -643,6 +890,40 @@ fn create_sky_dome_mesh() -> (Vec<SkyVertex>, Vec<u16>) {
         }
     }
 
+    (verts, idxs)
+}
+
+/// Generate the cloud plane grid (local x/z offsets centered on the camera).
+/// 128×128 cells of 32 blocks → a ±2048-block plane the shader places at the
+/// uniform cloud height. Noise is evaluated per-fragment, so the geometry only
+/// needs to be dense enough to follow the perspective projection smoothly.
+/// Returns (vertices, indices); indices fit in u16 (129×129 = 16641 verts).
+fn create_cloud_plane_mesh() -> (Vec<CloudVertex>, Vec<u16>) {
+    const CELLS: u32 = 128;
+    const CELL_SIZE: f32 = 32.0;
+    let verts_per_side = CELLS + 1;
+    let mut verts = Vec::with_capacity((verts_per_side * verts_per_side) as usize);
+    let half = CELLS as f32 * CELL_SIZE * 0.5;
+    for z in 0..verts_per_side {
+        for x in 0..verts_per_side {
+            verts.push(CloudVertex {
+                position: [
+                    x as f32 * CELL_SIZE - half,
+                    0.0,
+                    z as f32 * CELL_SIZE - half,
+                ],
+            });
+        }
+    }
+    let mut idxs = Vec::with_capacity((CELLS * CELLS * 6) as usize);
+    for z in 0..CELLS {
+        for x in 0..CELLS {
+            let a = z * verts_per_side + x;
+            let b = a + verts_per_side;
+            idxs.extend_from_slice(&[a as u16, b as u16, (a + 1) as u16]);
+            idxs.extend_from_slice(&[b as u16, (b + 1) as u16, (a + 1) as u16]);
+        }
+    }
     (verts, idxs)
 }
 
@@ -899,6 +1180,19 @@ pub struct WmRenderer {
     camera_pos: [f32; 3],
     fog_color: [f32; 4], // rgb + density
     sky_color: [f32; 3], // zenith sky color for sky dome
+    // P1a celestial state (drives sun disc / moon disc + phases / stars).
+    // The horizon color is the fog color (fog_color.rgb) — Dx12Mod passes the
+    // same values to both updateFog and updateSky.
+    sky_sun_angle: f32,      // radians
+    sky_moon_angle: f32,     // radians
+    sky_star_angle: f32,     // radians
+    sky_star_brightness: f32,
+    sky_moon_phase: f32,     // MoonPhase index 0..7
+    sky_rain_brightness: f32,
+    // P1b cloud state (procedural fbm cloud plane).
+    cloud_color: [f32; 4],   // rgb + alpha (alpha 0 → invisible, mirrors vanilla ARGB gate)
+    cloud_height: f32,       // vanilla: 192.0
+    cloud_time: f32,         // wind scroll offset in blocks
 
     // Immutable GPU resources
     pipeline: wgpu::RenderPipeline,
@@ -1020,6 +1314,11 @@ pub struct WmRenderer {
     sky_ib: Option<wgpu::Buffer>,
     sky_index_count: u32,
     sky_pipeline: Option<wgpu::RenderPipeline>,
+    // P1b cloud plane (camera-centered grid, created lazily).
+    cloud_vb: Option<wgpu::Buffer>,
+    cloud_ib: Option<wgpu::Buffer>,
+    cloud_index_count: u32,
+    cloud_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 // SAFETY: WmRenderer is only accessed from the JNI thread (Minecraft render thread).
@@ -1093,7 +1392,7 @@ impl WmRenderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniform"),
-            size: 128, // mat4x4 (64) + camera_pos (16) + fog (16) + sky_top (16)
+            size: 192, // view_proj(64) + camera_pos(16) + fog(16) + sky_top(16) + viewport(16) + celestial(24)
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1496,6 +1795,15 @@ impl WmRenderer {
             camera_pos: [0.0; 3],
             fog_color: [1.0, 0.0, 0.0, 0.001], // DIAG: bright red fog to verify shader mixing
             sky_color: [0.4, 0.6, 0.9], // default sky blue zenith
+            sky_sun_angle: 0.0,     // noon sun (visible by default)
+            sky_moon_angle: std::f32::consts::PI,
+            sky_star_angle: 0.0,
+            sky_star_brightness: 0.0, // stars off until MC provides night brightness
+            sky_moon_phase: 0.0,      // FULL_MOON index
+            sky_rain_brightness: 1.0, // clear weather
+            cloud_color: [1.0, 1.0, 1.0, 1.0], // white clouds, opaque
+            cloud_height: 192.0,      // vanilla cloud bottom
+            cloud_time: 0.0,
             pipeline,
             bind_group,
             uniform_buffer,
@@ -1581,6 +1889,12 @@ impl WmRenderer {
             sky_ib: None,
             sky_index_count: 0,
             sky_pipeline: None,
+
+            // Cloud plane (created lazily)
+            cloud_vb: None,
+            cloud_ib: None,
+            cloud_index_count: 0,
+            cloud_pipeline: None,
         })
     }
 
@@ -2366,10 +2680,37 @@ impl WmRenderer {
         self.fog_color = [fog_color_rgb[0], fog_color_rgb[1], fog_color_rgb[2], fog_density];
     }
 
-    /// Set sky dome zenith color (used for sky gradient top color).
-    /// Typically from MC's sky color, brightened for the top of the dome.
-    pub fn set_sky_color(&mut self, rgb: &[f32; 3]) {
-        self.sky_color = [rgb[0], rgb[1], rgb[2]];
+    /// Set full sky state: zenith color, horizon color and celestial parameters
+    /// (sun/moon/star angles in radians, star brightness 0..1, moon phase
+    /// index 0..7, rain brightness 0..1). Consumed by the sky dome shader.
+    pub fn set_sky_state(
+        &mut self,
+        top_rgb: &[f32; 3],
+        horizon_rgb: &[f32; 3],
+        sun_angle: f32,
+        moon_angle: f32,
+        star_angle: f32,
+        star_brightness: f32,
+        moon_phase: f32,
+        rain_brightness: f32,
+    ) {
+        let _ = horizon_rgb; // horizon == fog color, already tracked separately
+        self.sky_color = [top_rgb[0], top_rgb[1], top_rgb[2]];
+        self.sky_sun_angle = sun_angle;
+        self.sky_moon_angle = moon_angle;
+        self.sky_star_angle = star_angle;
+        self.sky_star_brightness = star_brightness;
+        self.sky_moon_phase = moon_phase;
+        self.sky_rain_brightness = rain_brightness;
+    }
+
+    /// Set the procedural cloud layer state: ARGB-style tint (rgb + alpha),
+    /// plane height (vanilla 192.0) and the wind scroll offset in blocks.
+    /// Consumed by the cloud shader (CLOUD_SHADER_SRC).
+    pub fn set_cloud_state(&mut self, color_rgba: &[f32; 4], height: f32, time: f32) {
+        self.cloud_color = [color_rgba[0], color_rgba[1], color_rgba[2], color_rgba[3]];
+        self.cloud_height = height.max(1.0);
+        self.cloud_time = time;
     }
 
     /// Remove all chunk meshes for a given section.
@@ -3461,6 +3802,105 @@ impl WmRenderer {
         log::info!("[dx12-wm] Sky dome pipeline created with format={:?}", self.surface_format);
     }
 
+    // ── Cloud plane (procedural fbm cloud layer) ───────────────
+
+    /// Create or recreate the cloud plane pipeline.
+    /// The camera-centered grid mesh is allocated once; the pipeline is
+    /// rebuilt on surface format change.
+    fn ensure_cloud_pipeline(&mut self) {
+        // Allocate the cloud grid mesh on first call
+        if self.cloud_vb.is_none() {
+            let (verts, idxs) = create_cloud_plane_mesh();
+            self.cloud_index_count = idxs.len() as u32;
+            let vb_size = (verts.len() * std::mem::size_of::<CloudVertex>()) as u64;
+            self.cloud_vb = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Cloud VB"),
+                size: vb_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.queue.write_buffer(self.cloud_vb.as_ref().unwrap(), 0, bytemuck::cast_slice(&verts));
+            let ib_size = (idxs.len() * 2) as u64;
+            self.cloud_ib = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Cloud IB"),
+                size: ib_size,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.queue.write_buffer(self.cloud_ib.as_ref().unwrap(), 0, bytemuck::cast_slice(&idxs));
+            log::info!("[dx12-wm] Cloud plane mesh created: {} verts, {} indices", verts.len(), idxs.len());
+        }
+        if self.cloud_pipeline.is_some() { return; }
+
+        let Some(bgl) = &self.chunk_bind_group_layout else { return; };
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Cloud Shader"),
+            source: wgpu::ShaderSource::Wgsl(CLOUD_SHADER_SRC.into()),
+        });
+        let pl = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Cloud PL"),
+            bind_group_layouts: &[bgl],
+            push_constant_ranges: &[],
+        });
+
+        self.cloud_pipeline = Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Cloud Pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[CloudVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                // Both sides visible — from below you see the gray underside,
+                // from above the white tops (shaded in the fragment shader).
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                // No depth write (semi-transparent layer) but depth-tested so
+                // terrain in front of the layer occludes it and gaps show
+                // terrain behind it. Drawn after the depth clear in Pass 1.
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        }));
+        log::info!("[dx12-wm] Cloud pipeline created with format={:?}", self.surface_format);
+    }
+
+    /// Render the cloud layer in the current render pass (sky already drawn).
+    fn draw_clouds<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
+        if self.cloud_color[3] <= 0.001 { return; } // vanilla: ARGB alpha gate
+        let Some(pipeline) = &self.cloud_pipeline else { return; };
+        let Some(vb) = &self.cloud_vb else { return; };
+        let Some(ib) = &self.cloud_ib else { return; };
+        let Some(bind_group) = &self.chunk_bind_group else { return; };
+        if self.cloud_index_count == 0 { return; }
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, bind_group, &[]);
+        rp.set_vertex_buffer(0, vb.slice(..));
+        rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint16);
+        rp.draw_indexed(0..self.cloud_index_count, 0, 0..1);
+    }
+
     // ── HUD overlay pipeline (alpha-blended fullscreen quad) ────
 
     /// Create or recreate the HUD compositing pipeline with the current surface format.
@@ -3699,7 +4139,7 @@ impl WmRenderer {
                 // Phase 7: Render native MC chunk geometry with D3D12
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32]);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time);
 
                 let depth_view = self.surface_depth
                     .as_ref()
@@ -3708,6 +4148,7 @@ impl WmRenderer {
 
                 // Ensure sky pipeline exists for this surface format
                 self.ensure_sky_pipeline();
+                self.ensure_cloud_pipeline();
 
                 // Pass 0: Sky dome (gradient hemisphere, no depth)
                 {
@@ -3758,6 +4199,7 @@ impl WmRenderer {
                         occlusion_query_set: None,
                     });
 
+                    self.draw_clouds(&mut rp);
                     self.draw_chunks(&mut rp);
                     self.draw_entities(&mut rp);
                     self.draw_particles(&mut rp);
@@ -3809,7 +4251,7 @@ impl WmRenderer {
                 // Fallback: 3D test scene (plane + cubes)
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32]);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time);
 
                 {
                     let depth_view = self.surface_depth
@@ -3882,7 +4324,7 @@ impl WmRenderer {
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[w as f32, h as f32]);
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[w as f32, h as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time);
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);

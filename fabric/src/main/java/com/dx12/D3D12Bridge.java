@@ -68,7 +68,12 @@ public class D3D12Bridge {
     public static native void nativeUpdateFog(float r, float g, float b, float density);
     public static native void nativeSetAaMode(int mode);
     public static native void nativeUpdateSky(float topR, float topG, float topB,
-        float horizonR, float horizonG, float horizonB, float sunAngle);
+        float horizonR, float horizonG, float horizonB, float sunAngle,
+        float moonAngle, float starAngle, float starBrightness,
+        float moonPhase, float rainBrightness);
+    /** Update the procedural cloud layer (ARGB tint, height, wind offset). */
+    public static native void nativeUpdateCloud(float r, float g, float b, float a,
+        float height, float time);
 
     // ─── Entities & Particles ──────────────────────────────────
 
@@ -245,12 +250,29 @@ public class D3D12Bridge {
         }
     }
 
-    /** Update D3D12 sky rendering parameters from MC sky data. */
+    /** Update D3D12 sky rendering parameters from MC sky data.
+     *  Angles are in radians; moonPhase is the MoonPhase.index() 0..7;
+     *  rainBrightness is 1 - rainLevel. */
     public static void updateSky(float topR, float topG, float topB,
-            float horizonR, float horizonG, float horizonB, float sunAngle) {
+            float horizonR, float horizonG, float horizonB, float sunAngle,
+            float moonAngle, float starAngle, float starBrightness,
+            float moonPhase, float rainBrightness) {
         if (!initialized) return;
         try {
-            nativeUpdateSky(topR, topG, topB, horizonR, horizonG, horizonB, sunAngle);
+            nativeUpdateSky(topR, topG, topB, horizonR, horizonG, horizonB,
+                sunAngle, moonAngle, starAngle, starBrightness,
+                moonPhase, rainBrightness);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    /** Update the procedural cloud layer: ARGB tint, height, wind offset (blocks). */
+    public static void updateCloud(float r, float g, float b, float a,
+            float height, float time) {
+        if (!initialized) return;
+        try {
+            nativeUpdateCloud(r, g, b, a, height, time);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore
         }

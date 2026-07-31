@@ -205,9 +205,10 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetAaMode(
     // Keep the JNI entry point as a no-op for backward compatibility.
 }
 
-/// Update sky gradient colors and sun angle for dynamic sky rendering.
-/// Colors are RGBA float values, sun_angle is in radians.
-/// sun_angle < 0 or >= 2PI disables the sun disk.
+/// Update sky gradient colors and celestial parameters for dynamic sky
+/// rendering (sun disc / moon disc + phases / stars).
+/// Angles are in radians; moon_phase is the MoonPhase index 0..7;
+/// rain_brightness is 1 - rainLevel (0..1); star_brightness is 0..1.
 ///
 /// # Safety
 /// This function is called from Java via JNI.
@@ -215,16 +216,51 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetAaMode(
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateSky(
     _env: JNIEnv,
     _class: JClass,
-    _top_r: f32, _top_g: f32, _top_b: f32,
-    _horizon_r: f32, _horizon_g: f32, _horizon_b: f32,
-    _sun_angle: f32,
+    top_r: f32, top_g: f32, top_b: f32,
+    horizon_r: f32, horizon_g: f32, horizon_b: f32,
+    sun_angle: f32,
+    moon_angle: f32,
+    star_angle: f32,
+    star_brightness: f32,
+    moon_phase: f32,
+    rain_brightness: f32,
 ) {
-    // Sky rendering is handled internally by the sky dome shader.
-    // The gradient is computed from the fog color (set via nativeUpdateFog).
-    // Keeping the JNI entry point as a no-op for backward compatibility.
     let mut guard = lock_or_poisoned();
     if let Some(Ok(ref mut renderer)) = guard.as_mut() {
-        renderer.set_sky_color(&[_top_r.clamp(0.0, 1.0), _top_g.clamp(0.0, 1.0), _top_b.clamp(0.0, 1.0)]);
+        renderer.set_sky_state(
+            &[top_r.clamp(0.0, 1.0), top_g.clamp(0.0, 1.0), top_b.clamp(0.0, 1.0)],
+            &[horizon_r.clamp(0.0, 1.0), horizon_g.clamp(0.0, 1.0), horizon_b.clamp(0.0, 1.0)],
+            sun_angle,
+            moon_angle,
+            star_angle,
+            star_brightness.clamp(0.0, 1.0),
+            moon_phase,
+            rain_brightness.clamp(0.0, 1.0),
+        );
+    }
+}
+
+/// Update the procedural cloud layer: ARGB-style tint (r/g/b/a, vanilla
+/// CLOUD_COLOR), plane height (vanilla 192.0) and the wind scroll offset
+/// in blocks ((gameTime % 102400 + partialTicks) * 0.03).
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCloud(
+    _env: JNIEnv,
+    _class: JClass,
+    r: f32, g: f32, b: f32, a: f32,
+    height: f32,
+    time: f32,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_cloud_state(
+            &[r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), a.clamp(0.0, 1.0)],
+            height.max(1.0),
+            time,
+        );
     }
 }
 

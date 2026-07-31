@@ -321,8 +321,70 @@ public class Dx12Mod implements ClientModInitializer {
                         float tr = Math.min(fr * 1.15f + 0.05f, 1.0f);
                         float tg = Math.min(fg * 1.15f + 0.05f, 1.0f);
                         float tb = Math.min(fb * 1.25f + 0.08f, 1.0f);
-                        float sunAngle = 0.0f; // gradient dome ignores angle
-                        D3D12Bridge.updateSky(tr, tg, tb, fr, fg, fb, sunAngle);
+                        // P1a: real celestial data from MC's environment attribute
+                        // system (same source vanilla SkyRenderer uses). Angles are
+                        // in degrees; the Rust sky shader expects radians.
+                        float sunAngle = 0.0f, moonAngle = (float) Math.PI;
+                        float starAngle = 0.0f, starBrightness = 0.0f;
+                        float moonPhase = 0.0f, rainBrightness = 1.0f;
+                        try {
+                            var env = mc.level.environmentAttributes();
+                            Float sunDeg = env.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.SUN_ANGLE, pos);
+                            Float moonDeg = env.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.MOON_ANGLE, pos);
+                            Float starDeg = env.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.STAR_ANGLE, pos);
+                            Float stars = env.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.STAR_BRIGHTNESS, pos);
+                            var phase = env.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.MOON_PHASE, pos);
+                            if (sunDeg != null) sunAngle = (float) Math.toRadians(sunDeg);
+                            if (moonDeg != null) moonAngle = (float) Math.toRadians(moonDeg);
+                            if (starDeg != null) starAngle = (float) Math.toRadians(starDeg);
+                            if (stars != null) starBrightness = Math.max(stars, 0.0f);
+                            if (phase != null) moonPhase = phase.index();
+                            rainBrightness = 1.0f - mc.level.getRainLevel(1.0f);
+                        } catch (Exception | LinkageError celestialEx) {
+                            // API mismatch → keep defaults (noon sun, no stars)
+                        }
+                        D3D12Bridge.updateSky(tr, tg, tb, fr, fg, fb,
+                            sunAngle, moonAngle, starAngle, starBrightness,
+                            moonPhase, rainBrightness);
+                    }
+
+                    // ─── Cloud layer update (P1b) ───────────────────
+                    // Vanilla CloudRenderer: cloud color from CLOUD_COLOR (ARGB —
+                    // alpha 0 disables the layer), height from CLOUD_HEIGHT, and
+                    // the wind scroll offset = (gameTime % 102400 + partialTicks)
+                    // * 0.03 blocks (256px texture * 12 blocks/cell * 400 ticks,
+                    // 0.6 blocks/second wind).
+                    {
+                        float cloudR = 1.0f, cloudG = 1.0f, cloudB = 1.0f, cloudA = 1.0f;
+                        float cloudHeight = 192.0f;
+                        float cloudTime = 0.0f;
+                        try {
+                            var envC = mc.level.environmentAttributes();
+                            Integer cloudArgb = envC.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.CLOUD_COLOR, pos);
+                            Float cHeight = envC.getValue(
+                                net.minecraft.world.attribute.EnvironmentAttributes.CLOUD_HEIGHT, pos);
+                            if (cloudArgb != null) {
+                                cloudA = ((cloudArgb >> 24) & 0xFF) / 255.0f;
+                                cloudR = ((cloudArgb >> 16) & 0xFF) / 255.0f;
+                                cloudG = ((cloudArgb >> 8) & 0xFF) / 255.0f;
+                                cloudB = (cloudArgb & 0xFF) / 255.0f;
+                            }
+                            if (cHeight != null) cloudHeight = cHeight;
+                            long gameTime = mc.level.getGameTime();
+                            float partialTicks =
+                                mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+                            cloudTime = (float) ((gameTime % 102400L) + partialTicks) * 0.03f;
+                        } catch (Exception | LinkageError cloudEx) {
+                            // API mismatch → default white clouds at y=192, no scroll
+                        }
+                        D3D12Bridge.updateCloud(cloudR, cloudG, cloudB, cloudA,
+                            cloudHeight, cloudTime);
                     }
 
                     // ─── Lightmap update ──────────────────────────
