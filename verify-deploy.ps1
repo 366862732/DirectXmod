@@ -75,10 +75,19 @@ Check "Sky color fix (no getSkyColor fallback)" "getSkyColor fallback" $false
 # 5. Chunk batching (Phase 11e)
 Check "Chunk batching (Chunk batch rebuilt)" "Chunk batch rebuilt" $true
 
-# 6. Batching enabled flag
+# 6. Incremental chunk merge (Phase 11j — stutter fix code path)
+Check "Incremental chunk upload (incremental)" "\(incremental\)" $true
+
+# 7. Batching enabled flag
 Check "Batching enabled (batching=true)" "batching=true" $true
 
-# 7. Renderer ready
+# 8. Hand/held item visible (GL renderLevel skipped, renderItemInHand kept)
+Check "GL world render skipped (hand mixin injected)" "GL world render skipped" $true
+
+# 9. Particle upload chain (Java ParticleGroup extraction + Rust billboard)
+Check "Particles uploaded (chain alive)" "Particles uploaded:" $true
+
+# 10. Renderer ready
 Check "Renderer ready (Device created OK)" "Device created OK" $true
 
 Write-Host ""
