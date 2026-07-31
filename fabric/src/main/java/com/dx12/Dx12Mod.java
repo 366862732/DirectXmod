@@ -2,8 +2,13 @@ package com.dx12;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Arrays;
 
 import org.joml.Matrix4f;
+import org.joml.Vector3f;
+import org.joml.Vector3fc;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
@@ -94,6 +99,59 @@ public class Dx12Mod implements ClientModInitializer {
     private static long lastRenderTime = 0;
     private static long renderStartTime = 0;
     private static int getSkyColorFailCount = 0;
+
+    // Lightmap update throttling
+    private static int lightmapTickCount = 0;
+    private static final int LIGHTMAP_UPDATE_INTERVAL_TICKS = 5;
+
+    // Phase 11d: cache last uploaded lightmap pixels.
+    // Skip the JNI upload + GPU write_texture when content is unchanged.
+    private static byte[] lastLightmapPixels = null;
+
+    // Phase 11c: cached reflection handles for entity/particle extraction.
+    // getDeclaredMethod/Field scans the class method table every call, which is
+    // slow in a per-tick loop — resolve once and reuse.
+    private static Method GET_ENTITIES_METHOD = null;
+    private static Method GET_ALL_METHOD = null;
+    private static Field PARTICLE_MAP_FIELD = null;
+    private static Field PARTICLE_X_FIELD = null;
+    private static Field PARTICLE_Y_FIELD = null;
+    private static Field PARTICLE_Z_FIELD = null;
+    private static boolean entityReflectionInit = false;
+    private static boolean particleReflectionInit = false;
+
+    /** Resolve Level.getEntities() + LevelEntityGetter.getAll(List) once. */
+    private static void initEntityReflection() {
+        if (entityReflectionInit) return;
+        entityReflectionInit = true;
+        try {
+            GET_ENTITIES_METHOD = net.minecraft.world.level.Level.class.getDeclaredMethod("getEntities");
+            GET_ENTITIES_METHOD.setAccessible(true);
+        } catch (Throwable ignored) {
+            GET_ENTITIES_METHOD = null;
+        }
+    }
+
+    /** Resolve ParticleEngine.particles + Particle.x/y/z fields once. */
+    private static void initParticleReflection() {
+        if (particleReflectionInit) return;
+        particleReflectionInit = true;
+        try {
+            PARTICLE_MAP_FIELD = net.minecraft.client.particle.ParticleEngine.class.getDeclaredField("particles");
+            PARTICLE_MAP_FIELD.setAccessible(true);
+            PARTICLE_X_FIELD = net.minecraft.client.particle.Particle.class.getDeclaredField("x");
+            PARTICLE_X_FIELD.setAccessible(true);
+            PARTICLE_Y_FIELD = net.minecraft.client.particle.Particle.class.getDeclaredField("y");
+            PARTICLE_Y_FIELD.setAccessible(true);
+            PARTICLE_Z_FIELD = net.minecraft.client.particle.Particle.class.getDeclaredField("z");
+            PARTICLE_Z_FIELD.setAccessible(true);
+        } catch (Throwable ignored) {
+            PARTICLE_MAP_FIELD = null;
+            PARTICLE_X_FIELD = null;
+            PARTICLE_Y_FIELD = null;
+            PARTICLE_Z_FIELD = null;
+        }
+    }
 
     // Unified overlay GL resources (texture, PBO, mesh, shader)
     private static GlOverlayResources overlayResources = new GlOverlayResources();
@@ -221,21 +279,41 @@ public class Dx12Mod implements ClientModInitializer {
                         (float) pos.x, (float) pos.y, (float) pos.z);
 
                     // Extract fog color from the level for fog and sky rendering.
-                    // In MC 26.1.2, Level.getSkyColor may not be publicly accessible
-                    // and setAccessible can be blocked by Java module system.
-                    // Use throttled fallback to avoid log spam.
+                    // MC 26.1.2 uses the EnvironmentAttributes system (SKY_COLOR)
+                    // instead of the removed Level.getSkyColor(Vec3, float).
+                    // Both paths are attempted reflectively for cross-version compatibility.
                     Vec3 skyColor = null;
                     try {
-                        var method = net.minecraft.world.level.Level.class
-                            .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
-                        method.setAccessible(true);
-                        skyColor = (Vec3) method.invoke(mc.level, pos, 1.0f);
-                    } catch (Exception e) {
-                        if (getSkyColorFailCount % 60 == 0) {
-                            LOGGER.info("getSkyColor fallback ({}): {}",
-                                getSkyColorFailCount, e.getMessage());
+                        // MC 26.1.2+: Level.environmentAttributes().getValue(EnvironmentAttributes.SKY_COLOR, pos)
+                        Class<?> envAttrClass = Class.forName("net.minecraft.world.attribute.EnvironmentAttribute");
+                        Class<?> readerClass = Class.forName("net.minecraft.world.attribute.EnvironmentAttributeReader");
+                        var envAttrsClass = Class.forName("net.minecraft.world.attribute.EnvironmentAttributes");
+                        Object skyColorAttr = envAttrsClass.getField("SKY_COLOR").get(null);
+                        var envSystemMethod = net.minecraft.world.level.Level.class.getMethod("environmentAttributes");
+                        Object envSystem = envSystemMethod.invoke(mc.level);
+                        var getValueMethod = readerClass.getMethod("getValue", envAttrClass, net.minecraft.world.phys.Vec3.class);
+                        Object colorObj = getValueMethod.invoke(envSystem, skyColorAttr, pos);
+                        if (colorObj instanceof Integer argb) {
+                            // SKY_COLOR is RGB (0xRRGGBB, no alpha)
+                            skyColor = new Vec3(
+                                ((argb >> 16) & 0xFF) / 255.0,
+                                ((argb >> 8) & 0xFF) / 255.0,
+                                (argb & 0xFF) / 255.0);
                         }
-                        getSkyColorFailCount++;
+                    } catch (Exception e) {
+                        // Older versions: Level.getSkyColor(Vec3, float)
+                        try {
+                            var method = net.minecraft.world.level.Level.class
+                                .getDeclaredMethod("getSkyColor", net.minecraft.world.phys.Vec3.class, float.class);
+                            method.setAccessible(true);
+                            skyColor = (Vec3) method.invoke(mc.level, pos, 1.0f);
+                        } catch (Exception e2) {
+                            if (getSkyColorFailCount % 60 == 0) {
+                                LOGGER.info("getSkyColor fallback ({}): {}",
+                                    getSkyColorFailCount, e2.getMessage());
+                            }
+                            getSkyColorFailCount++;
+                        }
                     }
                     if (skyColor == null) {
                         skyColor = new Vec3(0.53, 0.81, 0.92);
@@ -250,18 +328,35 @@ public class Dx12Mod implements ClientModInitializer {
                         D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
                     }
 
+                    // ─── Lightmap update ──────────────────────────
+                    // Compute 16x16 lightmap from MC render state and upload to Rust.
+                    // Throttled to every 5 ticks to reduce CPU/JNI overhead.
+                    if (lightmapTickCount++ % LIGHTMAP_UPDATE_INTERVAL_TICKS == 0) {
+                        try {
+                            updateLightmap(mc);
+                        } catch (Exception lmEx) {
+                            if (lightmapTickCount % 60 == 0) {
+                                LOGGER.warn("[dx12-wm] Lightmap update failed: {}", lmEx.getMessage());
+                            }
+                        }
+                    }
+
                     // ─── Entity extraction ──────────────────────────
                     try {
                         // Use reflection to access entities (API differs across MC versions)
                         var entityList = new java.util.ArrayList<net.minecraft.world.entity.Entity>();
                         try {
-                            // Try Level.getEntities() + LevelEntityGetter via reflection
-                            var getEntitiesMethod = net.minecraft.world.level.Level.class
-                                .getDeclaredMethod("getEntities");
-                            getEntitiesMethod.setAccessible(true);
-                            var entityGetter = getEntitiesMethod.invoke(mc.level);
-                            var getAllMethod = entityGetter.getClass().getMethod("getAll", java.util.List.class);
-                            getAllMethod.invoke(entityGetter, entityList);
+                            // Level.getEntities() + LevelEntityGetter.getAll(List) via cached reflection
+                            initEntityReflection();
+                            if (GET_ENTITIES_METHOD != null) {
+                                var entityGetter = GET_ENTITIES_METHOD.invoke(mc.level);
+                                if (GET_ALL_METHOD == null && entityGetter != null) {
+                                    GET_ALL_METHOD = entityGetter.getClass().getMethod("getAll", java.util.List.class);
+                                }
+                                if (GET_ALL_METHOD != null) {
+                                    GET_ALL_METHOD.invoke(entityGetter, entityList);
+                                }
+                            }
                         } catch (Exception ignore) {
                             // Entity iteration failed, skip
                         }
@@ -304,15 +399,16 @@ public class Dx12Mod implements ClientModInitializer {
                         if (particleEngine != null) {
                             var particleList = new java.util.ArrayList<net.minecraft.client.particle.Particle>();
                             try {
-                                var particlesField = net.minecraft.client.particle.ParticleEngine.class
-                                    .getDeclaredField("particles");
-                                particlesField.setAccessible(true);
-                                @SuppressWarnings("unchecked")
-                                var particleMap = (java.util.Map<?, ?>) particlesField.get(particleEngine);
-                                for (var entry : particleMap.entrySet()) {
-                                    var set = (java.util.Set<?>) entry.getValue();
-                                    for (var p : set) {
-                                        particleList.add((net.minecraft.client.particle.Particle) p);
+                                // ParticleEngine.particles map via cached reflection
+                                initParticleReflection();
+                                if (PARTICLE_MAP_FIELD != null) {
+                                    @SuppressWarnings("unchecked")
+                                    var particleMap = (java.util.Map<?, ?>) PARTICLE_MAP_FIELD.get(particleEngine);
+                                    for (var entry : particleMap.entrySet()) {
+                                        var set = (java.util.Set<?>) entry.getValue();
+                                        for (var p : set) {
+                                            particleList.add((net.minecraft.client.particle.Particle) p);
+                                        }
                                     }
                                 }
                             } catch (Exception ignored) {
@@ -322,22 +418,15 @@ public class Dx12Mod implements ClientModInitializer {
                                 float[] particleData = new float[particleList.size() * 8];
                                 int idx = 0;
                                 for (var p : particleList) {
-                                    // Read particle fields via reflection (protected in MC 26.1.2)
+                                    // Read particle fields via cached reflection (protected in MC 26.1.2)
                                     float px = 0f, py = 0f, pz = 0f;
-                                    try {
-                                        var xField = net.minecraft.client.particle.Particle.class
-                                            .getDeclaredField("x");
-                                        xField.setAccessible(true);
-                                        px = xField.getFloat(p);
-                                        var yField = net.minecraft.client.particle.Particle.class
-                                            .getDeclaredField("y");
-                                        yField.setAccessible(true);
-                                        py = yField.getFloat(p);
-                                        var zField = net.minecraft.client.particle.Particle.class
-                                            .getDeclaredField("z");
-                                        zField.setAccessible(true);
-                                        pz = zField.getFloat(p);
-                                    } catch (Exception ignored) {
+                                    if (PARTICLE_X_FIELD != null) {
+                                        try {
+                                            px = PARTICLE_X_FIELD.getFloat(p);
+                                            py = PARTICLE_Y_FIELD.getFloat(p);
+                                            pz = PARTICLE_Z_FIELD.getFloat(p);
+                                        } catch (Exception ignored) {
+                                        }
                                     }
                                     float size = 4.0f;
                                     float pr = 1.0f, pg = 1.0f, pb = 1.0f, pa = 0.8f;
@@ -411,6 +500,129 @@ public class Dx12Mod implements ClientModInitializer {
             }
         });
         LOGGER.info("GL4DX12 Mod initialized!");
+    }
+
+    // ─── Lightmap computation (replicates MC 26.1.2 core/lightmap.fsh on CPU) ───
+
+    /// Compute 16x16 lightmap texture from MC's LightmapRenderState and upload to Rust.
+    /// Uses the same algorithm as the core/lightmap.fsh shader.
+    private static void updateLightmap(Minecraft mc) {
+        // Access LightmapRenderState from GameRenderer's GameRenderState
+        var gameState = mc.gameRenderer.getGameRenderState();
+        var rs = gameState.lightmapRenderState;
+
+        // Detect first-frame: render state fields are null before extract() runs.
+        // blockLightTint is set by LightmapRenderStateExtractor.extract() during render.
+        // Before that, all Vector3fc fields are null and float fields are 0.
+        boolean firstFrame = rs.blockLightTint == null;
+        float skyFactor = firstFrame ? 1.0f : rs.skyFactor;
+        float blockFactor = firstFrame ? 1.4f : rs.blockFactor;
+        Vector3fc blockLightTint = firstFrame ? new Vector3f(1.0f, 0.8f, 0.5f) : rs.blockLightTint;
+        Vector3fc skyLightColor = firstFrame ? new Vector3f(1.0f, 1.0f, 1.0f) : rs.skyLightColor;
+        Vector3fc ambientColor = firstFrame ? new Vector3f(0.0f, 0.0f, 0.0f) : rs.ambientColor;
+        Vector3fc nightVisionColor = firstFrame ? new Vector3f(0.0f, 0.0f, 0.0f) : rs.nightVisionColor;
+
+        float nightVisionFactor = rs.nightVisionEffectIntensity;
+        float darknessScale = rs.darknessEffectScale;
+        float bossOverlay = rs.bossOverlayWorldDarkening;
+        float brightness = rs.brightness;
+
+        // Build the 16x16 lightmap (RGBA8)
+        byte[] pixels = new byte[16 * 16 * 4];
+        for (int blockLight = 0; blockLight < 16; blockLight++) {
+            for (int skyLight = 0; skyLight < 16; skyLight++) {
+                float blockLevel = (float)blockLight / 15.0f;
+                float skyLevel = (float)skyLight / 15.0f;
+
+                float blockBright = getBrightness(blockLevel) * blockFactor;
+                float skyBright = getBrightness(skyLevel) * skyFactor;
+
+                // Ambient base (max of ambient color and night vision)
+                float r = Math.max(ambientColor.x(), nightVisionColor.x() * nightVisionFactor);
+                float g = Math.max(ambientColor.y(), nightVisionColor.y() * nightVisionFactor);
+                float b = Math.max(ambientColor.z(), nightVisionColor.z() * nightVisionFactor);
+
+                // Sky light contribution
+                r += skyLightColor.x() * skyBright;
+                g += skyLightColor.y() * skyBright;
+                b += skyLightColor.z() * skyBright;
+
+                // Block light with parabolic color mix
+                // See lightmap.fsh: vec3 BlockLightColor = mix(BlockLightTint, vec3(1.0), 0.9 * parabolicMixFactor(block_level));
+                float parabolicMix = (2.0f * blockLevel - 1.0f) * (2.0f * blockLevel - 1.0f);
+                float blockTintR = blockLightTint.x() + (1.0f - blockLightTint.x()) * 0.9f * parabolicMix;
+                float blockTintG = blockLightTint.y() + (1.0f - blockLightTint.y()) * 0.9f * parabolicMix;
+                float blockTintB = blockLightTint.z() + (1.0f - blockLightTint.z()) * 0.9f * parabolicMix;
+
+                r += blockTintR * blockBright;
+                g += blockTintG * blockBright;
+                b += blockTintB * blockBright;
+
+                // Boss overlay darkening
+                // color = mix(color, color * vec3(0.7, 0.6, 0.6), bossOverlay)
+                if (bossOverlay > 0.0f) {
+                    float darkR = r * 0.7f;
+                    float darkG = g * 0.6f;
+                    float darkB = b * 0.6f;
+                    r = r + (darkR - r) * bossOverlay;
+                    g = g + (darkG - g) * bossOverlay;
+                    b = b + (darkB - b) * bossOverlay;
+                }
+
+                // Darkness effect scale (subtractive)
+                r = Math.max(0.0f, r - darknessScale);
+                g = Math.max(0.0f, g - darknessScale);
+                b = Math.max(0.0f, b - darknessScale);
+
+                // Clamp to [0, 1]
+                r = Math.min(1.0f, r);
+                g = Math.min(1.0f, g);
+                b = Math.min(1.0f, b);
+
+                // Brightness / notGamma adjustment
+                // See lightmap.fsh: notGamma(vec3 color) — intensity-preserving gamma correction
+                float maxComponent = Math.max(Math.max(r, g), b);
+                if (maxComponent > 0.001f) {
+                    float maxInverted = 1.0f - maxComponent;
+                    float maxScaled = 1.0f - maxInverted * maxInverted * maxInverted * maxInverted;
+                    float brightR = r * (maxScaled / maxComponent);
+                    float brightG = g * (maxScaled / maxComponent);
+                    float brightB = b * (maxScaled / maxComponent);
+                    r = r + (brightR - r) * brightness;
+                    g = g + (brightG - g) * brightness;
+                    b = b + (brightB - b) * brightness;
+                }
+
+                // Store RGBA pixel (row-major: skyLight rows, blockLight columns)
+                int idx = (skyLight * 16 + blockLight) * 4;
+                pixels[idx]     = (byte)(Math.round(r * 255.0f) & 0xFF);
+                pixels[idx + 1] = (byte)(Math.round(g * 255.0f) & 0xFF);
+                pixels[idx + 2] = (byte)(Math.round(b * 255.0f) & 0xFF);
+                pixels[idx + 3] = (byte)255;
+            }
+        }
+
+        // Phase 11d: skip upload when the lightmap content is unchanged.
+        // This avoids a JNI call + GPU write_texture every 5 ticks for
+        // static lighting (e.g. a torch-lit area with constant sky).
+        if (Arrays.equals(lastLightmapPixels, pixels)) {
+            return;
+        }
+        lastLightmapPixels = pixels.clone();
+
+        // Upload to Rust via JNI
+        ByteBuffer buffer = ByteBuffer.allocateDirect(16 * 16 * 4);
+        buffer.put(pixels);
+        buffer.flip();
+        D3D12Bridge.uploadLightmap(buffer, 16, 16);
+    }
+
+    /// Replicate MC lightmap.fsh get_brightness function.
+    /// Brightness curve: level / (4 - 3 * level)
+    /// Maps 0→0 and 1→1 with a non-linear curve in between.
+    private static float getBrightness(float level) {
+        if (level <= 0.0f) return 0.0f;
+        return level / (4.0f - 3.0f * level);
     }
 
     // GL drawing: called by GameRendererMixin at TAIL of render() (offscreen mode only).

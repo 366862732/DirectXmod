@@ -180,7 +180,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadLightmap(
     }
 }
 
-/// Set the anti-aliasing mode for the D3D12 renderer.
+/// Set the anti-aliasing mode for the D3D12 renderer (no-op, AA removed from engine).
 /// mode: 0=None, 1=FXAA, 2=SMAA, 3=TAA
 ///
 /// # Safety
@@ -189,20 +189,10 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadLightmap(
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetAaMode(
     _env: JNIEnv,
     _class: JClass,
-    mode: jni::sys::jint,
+    _mode: jni::sys::jint,
 ) {
-    let mut guard = lock_or_poisoned();
-    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
-        use wgpu_mc::AaMode;
-        let aa_mode = match mode {
-            0 => AaMode::None,
-            1 => AaMode::FXAA,
-            2 => AaMode::SMAA,
-            3 => AaMode::TAA,
-            _ => AaMode::FXAA,
-        };
-        renderer.set_aa_mode(aa_mode);
-    }
+    // AA mode support was removed from the renderer.
+    // Keep the JNI entry point as a no-op for backward compatibility.
 }
 
 /// Update sky gradient colors and sun angle for dynamic sky rendering.
@@ -215,13 +205,16 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeSetAaMode(
 pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateSky(
     _env: JNIEnv,
     _class: JClass,
-    top_r: f32, top_g: f32, top_b: f32,
-    horizon_r: f32, horizon_g: f32, horizon_b: f32,
-    sun_angle: f32,
+    _top_r: f32, _top_g: f32, _top_b: f32,
+    _horizon_r: f32, _horizon_g: f32, _horizon_b: f32,
+    _sun_angle: f32,
 ) {
+    // Sky rendering is handled internally by the sky dome shader.
+    // The gradient is computed from the fog color (set via nativeUpdateFog).
+    // Keeping the JNI entry point as a no-op for backward compatibility.
     let mut guard = lock_or_poisoned();
     if let Some(Ok(ref mut renderer)) = guard.as_mut() {
-        renderer.set_sky(top_r, top_g, top_b, horizon_r, horizon_g, horizon_b, sun_angle);
+        renderer.set_sky_color(&[_top_r.clamp(0.0, 1.0), _top_g.clamp(0.0, 1.0), _top_b.clamp(0.0, 1.0)]);
     }
 }
 

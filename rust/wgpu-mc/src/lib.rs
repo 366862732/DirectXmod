@@ -38,21 +38,24 @@ impl Vertex {
     }
 }
 
-/// Chunk vertex with UV for texture atlas sampling.
-/// 32 bytes: position(12) + color(12) + uv(8).
+/// Chunk vertex with UV for texture atlas and lightmap sampling.
+/// 40 bytes: position(12) + color(12) + uv(8) + light_uv(8).
+/// light_uv is the lightmap texture coordinate for dynamic block/sky lighting.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct ChunkVertex {
     position: [f32; 3],
     color: [f32; 3],
     uv: [f32; 2],
+    light_uv: [f32; 2],
 }
 
 impl ChunkVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x2,
+        3 => Float32x2,
     ];
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -163,7 +166,8 @@ fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Chunk shader: samples atlas texture, multiplies by vertex color as lighting tint.
+// Chunk shader: samples atlas texture and lightmap for dynamic block/sky lighting.
+// Lightmap bindings: @binding(3) = lightmap texture, @binding(4) = lightmap sampler.
 const CHUNK_SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -173,12 +177,15 @@ struct CameraUniform {
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+@group(0) @binding(3) var lightmap: texture_2d<f32>;
+@group(0) @binding(4) var lightmap_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tint: vec3<f32>,
     @location(2) linear_depth: f32,
+    @location(3) light_uv: vec2<f32>,
 }
 
 @vertex
@@ -186,6 +193,7 @@ fn vs_main(
     @location(0) pos: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) light_uv: vec2<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     // Positions are in world space (section origin + local offset).
@@ -195,6 +203,7 @@ fn vs_main(
     out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = uv;
     out.tint = color;
+    out.light_uv = light_uv;
     // clip_w = view-space distance (positive for in-front geometry).
     // Store the reciprocal so the fragment shader can compute distance = 1/linear_depth.
     out.linear_depth = out.position.w;
@@ -222,7 +231,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if tex_color.a < threshold {
         discard;
     }
-    let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    // Sample lightmap for dynamic block/sky lighting.
+    let light_color = textureSample(lightmap, lightmap_sampler, in.light_uv);
+    let lit = vec4<f32>(tex_color.rgb * in.tint * light_color.rgb, tex_color.a);
     return apply_fog(lit, in.linear_depth);
 }
 
@@ -238,7 +249,9 @@ fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
     if tex_color.a < threshold_low || tex_color.a > threshold_high {
         discard;
     }
-    let lit = vec4<f32>(tex_color.rgb * in.tint, tex_color.a);
+    // Sample lightmap for dynamic block/sky lighting of transparent fragments.
+    let light_color = textureSample(lightmap, lightmap_sampler, in.light_uv);
+    let lit = vec4<f32>(tex_color.rgb * in.tint * light_color.rgb, tex_color.a);
     return apply_fog(lit, in.linear_depth);
 }
 "#;
@@ -419,6 +432,61 @@ fn write_camera_uniform(
     data[80..96].copy_from_slice(bytemuck::cast_slice(&fog[..]));
     data[96..108].copy_from_slice(bytemuck::cast_slice(&sky_top[..]));
     queue.write_buffer(buffer, 0, &data);
+}
+
+// ── Frustum culling helpers (Phase 11f) ──────────────────────────────
+
+/// Extract 6 frustum planes from a world→clip matrix (row-major storage,
+/// D3D-style z ∈ [0, w] as produced by JOML perspective(..., zZeroToOne=true)).
+/// Plane: a*x + b*y + c*z + d = 0 (normalized); a point is inside when dot > 0.
+/// Order: left, right, bottom, top, near, far.
+fn extract_frustum_planes(m: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
+    let r1 = m[0];
+    let r2 = m[1];
+    let r3 = m[2];
+    let r4 = m[3];
+    let mut planes = [[0.0f32; 4]; 6];
+    planes[0] = plane_combine(r4, r1, 1.0);  // left:   clip.x >= -clip.w
+    planes[1] = plane_combine(r4, r1, -1.0); // right:  clip.x <=  clip.w
+    planes[2] = plane_combine(r4, r2, 1.0);  // bottom: clip.y >= -clip.w
+    planes[3] = plane_combine(r4, r2, -1.0); // top:    clip.y <=  clip.w
+    planes[4] = plane_normalize(r3);         // near:   clip.z >= 0 (D3D z)
+    planes[5] = plane_combine(r4, r3, -1.0); // far:    clip.z <=  clip.w
+    planes
+}
+
+/// p = normalize(a + sign * b)
+fn plane_combine(a: [f32; 4], b: [f32; 4], sign: f32) -> [f32; 4] {
+    let mut p = [0.0f32; 4];
+    for i in 0..4 {
+        p[i] = a[i] + sign * b[i];
+    }
+    plane_normalize(p)
+}
+
+fn plane_normalize(p: [f32; 4]) -> [f32; 4] {
+    let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+    if len > 1e-8 {
+        [p[0] / len, p[1] / len, p[2] / len, p[3] / len]
+    } else {
+        p
+    }
+}
+
+/// Conservative AABB (world-space min/max) vs frustum test.
+/// Returns true when the box is fully or partially inside the frustum.
+fn aabb_in_frustum(min: [f32; 3], max: [f32; 3], planes: &[[f32; 4]; 6]) -> bool {
+    for p in planes {
+        // p-vertex: the corner farthest along the plane normal
+        let px = if p[0] >= 0.0 { max[0] } else { min[0] };
+        let py = if p[1] >= 0.0 { max[1] } else { min[1] };
+        let pz = if p[2] >= 0.0 { max[2] } else { min[2] };
+        let d = p[0] * px + p[1] * py + p[2] * pz + p[3];
+        if d < 0.0 {
+            return false; // entire box outside this plane
+        }
+    }
+    true
 }
 
 fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -736,6 +804,12 @@ pub struct WmRenderer {
     /// Raw atlas pixels stored for diagnostics
     atlas_pixels: Option<Vec<u8>>,
 
+    // Lightmap texture (dynamic block/sky lighting)
+    lightmap_texture: Option<wgpu::Texture>,
+    lightmap_sampler: wgpu::Sampler,
+    lightmap_width: u32,
+    lightmap_height: u32,
+
     // Entity rendering (Phase 7 task 1: colored boxes at entity positions)
     entity_buffer: Option<wgpu::Buffer>,
     entity_count: u32,
@@ -1028,7 +1102,45 @@ impl WmRenderer {
             ..Default::default()
         });
 
-        // Chunk bind group layout: camera uniform + atlas texture + sampler
+        // Create a 1x1 white texture as default lightmap (mid-level light).
+        let default_lightmap = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Default Lightmap (1x1 white)"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &default_lightmap,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8, 255, 255, 255], // white = full brightness
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let default_lightmap_view = default_lightmap.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let lightmap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Lightmap Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Chunk bind group layout: camera uniform + atlas texture + atlas sampler + lightmap texture + lightmap sampler
         let chunk_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Chunk BGL"),
             entries: &[
@@ -1058,6 +1170,85 @@ impl WmRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Create a default chunk bind group with the 1x1 white lightmap.
+        // This is replaced when upload_terrain_atlas() is called with the real atlas.
+        // The default bind group uses the uniform buffer + dummy atlas/uniform for completeness,
+        // but will be replaced once the real atlas is uploaded.
+        // For now, only lightmap is set up correctly; chunks won't render until atlas arrives.
+        // We need a temporary bind group so that entity/particle/sky setups that share the
+        // chunk BGL can work even before atlas upload.
+        //
+        // Create a 1x1 fallback atlas texture for the bind group (gray pixel).
+        let fallback_atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fallback Atlas (1x1 gray)"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &fallback_atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[128u8, 128, 128, 255], // gray
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let fallback_atlas_view = fallback_atlas.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let default_chunk_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Default Chunk Bind Group (fallback)"),
+            layout: &chunk_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&fallback_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&default_lightmap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
+                },
             ],
         });
 
@@ -1067,7 +1258,7 @@ impl WmRenderer {
             push_constant_ranges: &[],
         });
 
-        eprintln!("[dx12-wm] Chunk pipeline layout created (texture atlas support ready)");
+        eprintln!("[dx12-wm] Chunk pipeline layout created (texture atlas + lightmap support ready)");
 
         Ok(Self {
             instance,
@@ -1119,13 +1310,22 @@ impl WmRenderer {
             chunk_shader: None,
             chunk_pipeline: None,
             chunk_pipeline_transparent: None,
-            chunk_bind_group: None,
+            chunk_bind_group: Some(default_chunk_bg),
             chunk_bind_group_layout: Some(chunk_bgl),
-            atlas_texture: None,
+            // Store fallback atlas here initially — the default chunk bind group
+            // references this texture's view, so it must outlive the bind group.
+            // Replaced by upload_terrain_atlas() once the real atlas arrives.
+            atlas_texture: Some(fallback_atlas),
             atlas_sampler,
             atlas_width: 0,
             atlas_height: 0,
             atlas_pixels: None,
+
+            // Lightmap: starts with a 1x1 white fallback texture
+            lightmap_texture: Some(default_lightmap),
+            lightmap_sampler,
+            lightmap_width: 1,
+            lightmap_height: 1,
 
             // Entity + particle rendering (created lazily)
             entity_buffer: None,
@@ -1337,10 +1537,13 @@ impl WmRenderer {
             eprintln!("[dx12-wm] Atlas saved to atlas_debug.png ({}x{})", width, height);
         }
 
-        // Create the chunk bind group
+        // Create the chunk bind group (now includes lightmap)
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
 
         let chunk_bgl = self.chunk_bind_group_layout.as_ref().unwrap();
+        let lightmap_view = self.lightmap_texture.as_ref()
+            .unwrap()
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let chunk_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Chunk Bind Group"),
             layout: chunk_bgl,
@@ -1357,6 +1560,14 @@ impl WmRenderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.lightmap_sampler),
+                },
             ],
         });
 
@@ -1371,6 +1582,93 @@ impl WmRenderer {
             source: wgpu::ShaderSource::Wgsl(CHUNK_SHADER_SRC.into()),
         }));
         self.ensure_chunk_pipeline();
+    }
+
+    /// Upload the MC lightmap texture for dynamic block/sky lighting.
+    /// `pixels` is RGBA8 data (typically 16x16 = 256 texels for vanilla MC).
+    /// Called from Java when the lightmap texture is updated (day/night cycle, torch placement, etc.).
+    pub fn upload_lightmap(&mut self, pixels: &[u8], width: u32, height: u32) {
+        if pixels.len() < (width * height * 4) as usize { return; }
+
+        // Recreate texture if dimensions changed
+        let need_new = self.lightmap_texture.as_ref().map_or(true, |t| {
+            t.size().width != width || t.size().height != height
+        });
+
+        if need_new {
+            log::info!("[dx12-wm] Creating lightmap texture: {}x{}", width, height);
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Lightmap Texture"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.lightmap_texture = Some(tex);
+            self.lightmap_width = width;
+            self.lightmap_height = height;
+
+            // Rebuild the chunk bind group with the new lightmap texture
+            if let (Some(atlas), Some(bgl)) = (&self.atlas_texture, &self.chunk_bind_group_layout) {
+                let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+                let lightmap_view = self.lightmap_texture.as_ref()
+                    .unwrap()
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Chunk Bind Group"),
+                    layout: bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&atlas_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&lightmap_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&self.lightmap_sampler),
+                        },
+                    ],
+                });
+                self.chunk_bind_group = Some(bg);
+            }
+
+            eprintln!("[dx12-wm] Lightmap texture created: {}x{}", width, height);
+        }
+
+        // Upload pixel data to the (possibly new) lightmap texture
+        if let Some(ref tex) = self.lightmap_texture {
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels[..(width * height * 4) as usize],
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+
+        log::info!("[dx12-wm] Lightmap uploaded: {}x{} ({} bytes)", width, height, pixels.len());
     }
 
     pub fn set_camera(&mut self, mvp: [[f32; 4]; 4]) {
@@ -1552,8 +1850,9 @@ impl WmRenderer {
         let world_oy = (section_y as f32) * 16.0;
         let world_oz = (section_z as f32) * 16.0;
 
-        // Convert MC vertex data to ChunkVertex (position + color + uv) and build index buffer.
+        // Convert MC vertex data to ChunkVertex (position + color + uv + light_uv) and build index buffer.
         // MC 26.1.2 BLOCK format (28 bytes): Pos(12) + Color(4) + UV0(8) + UV2(4)
+        // UV2 at offset 24: 2 u16 values (block_light, sky_light), range 0-240 (each light value * 16).
         let mut vertices: Vec<ChunkVertex> = Vec::with_capacity(vertex_count as usize);
         let max_index = vertex_count;
 
@@ -1562,8 +1861,8 @@ impl WmRenderer {
 
         for v in 0..vertex_count {
             let base = (v as usize) * stride;
-            // Need at least 24 bytes: Pos(12) + Color(4) + UV(8)
-            if base + 24 > data.len() { break; }
+            // Need at least 28 bytes: Pos(12) + Color(4) + UV(8) + UV2(4)
+            if base + 28 > data.len() { break; }
 
             // Position: 3 f32 at offset 0 (section-relative, 0..16)
             let px = f32::from_le_bytes([data[base], data[base+1], data[base+2], data[base+3]]);
@@ -1584,6 +1883,15 @@ impl WmRenderer {
             let u_corrected = u.clamp(0.0, 1.0);
             let v_corrected = v_uv.clamp(0.0, 1.0);
 
+            // UV2: 2 u16 at offset 24 (block_light, sky_light).
+            // MC stores light levels as u16 (0, 16, 32, ..., 240).
+            // Convert to lightmap UV coordinates: center of each 1/16 tile.
+            let block_light = u16::from_le_bytes([data[base + 24], data[base + 25]]);
+            let sky_light = u16::from_le_bytes([data[base + 26], data[base + 27]]);
+            // Center of texel: (value + 0.5) / 16.0, equivalent to (value + 8) / 256.0
+            let light_u = ((block_light as f32) + 8.0) / 256.0;
+            let light_v = ((sky_light as f32) + 8.0) / 256.0;
+
             // World position (section origin + local pos).
             // Store directly in world space so the shader MVP transform is consistent
             // regardless of when the chunk was uploaded.
@@ -1595,6 +1903,7 @@ impl WmRenderer {
                 position: [wx, wy, wz],
                 color: [cr, cg, cb],
                 uv: [u_corrected, v_corrected],
+                light_uv: [light_u, light_v],
             });
         }
 
@@ -1896,7 +2205,23 @@ impl WmRenderer {
         let Some(pipeline_transparent) = &self.chunk_pipeline_transparent else { return; };
         let Some(bind_group) = &self.chunk_bind_group else { return; };
 
+        // Phase 11f: frustum culling — skip chunk sections outside the view.
+        // Section AABBs are in world space; camera_mvp maps world → clip
+        // (JOML perspective with zZeroToOne=true, D3D-style depth).
+        // A real projection matrix has row 4 = [0, 0, 1, 0]; the initial
+        // IDENTITY value has z=0 there, so culling is skipped until the
+        // first camera update arrives.
+        let cull_enabled = self.camera_mvp[3][2] != 0.0;
+        let planes = if cull_enabled {
+            extract_frustum_planes(&self.camera_mvp)
+        } else {
+            [[0.0f32; 4]; 6] // all-zero planes pass every box
+        };
+
         static mut CHUNK_DRAW_FIRST: bool = true;
+        static mut CHUNK_FRAME_COUNT: u32 = 0;
+        static mut CHUNK_CULLED_TOTAL: u32 = 0;
+        static mut CHUNK_VISIBLE_TOTAL: u32 = 0;
         if unsafe { CHUNK_DRAW_FIRST } {
             unsafe { CHUNK_DRAW_FIRST = false; }
             let total_meshes: usize = self.chunk_meshes.values().map(|v| v.len()).sum();
@@ -1909,7 +2234,14 @@ impl WmRenderer {
         // ════════════════════════════════════════════════
         rp.set_pipeline(pipeline);
         rp.set_bind_group(0, bind_group, &[]);
-        for (_key, meshes) in &self.chunk_meshes {
+        for (key, meshes) in &self.chunk_meshes {
+            let min = [key.0 as f32 * 16.0, key.1 as f32 * 16.0, key.2 as f32 * 16.0];
+            let max = [min[0] + 16.0, min[1] + 16.0, min[2] + 16.0];
+            if !aabb_in_frustum(min, max, &planes) {
+                unsafe { CHUNK_CULLED_TOTAL += 1; }
+                continue;
+            }
+            unsafe { CHUNK_VISIBLE_TOTAL += 1; }
             for mesh in meshes {
                 rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 let index_format = if mesh.index_is_u32 {
@@ -1927,7 +2259,12 @@ impl WmRenderer {
         // ════════════════════════════════════════════════
         rp.set_pipeline(pipeline_transparent);
         rp.set_bind_group(0, bind_group, &[]);
-        for (_key, meshes) in &self.chunk_meshes {
+        for (key, meshes) in &self.chunk_meshes {
+            let min = [key.0 as f32 * 16.0, key.1 as f32 * 16.0, key.2 as f32 * 16.0];
+            let max = [min[0] + 16.0, min[1] + 16.0, min[2] + 16.0];
+            if !aabb_in_frustum(min, max, &planes) {
+                continue;
+            }
             for mesh in meshes {
                 rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 let index_format = if mesh.index_is_u32 {
@@ -1937,6 +2274,19 @@ impl WmRenderer {
                 };
                 rp.set_index_buffer(mesh.index_buffer.slice(..), index_format);
                 rp.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+
+        // Throttled culling stats (every 600 frames ≈ 10 s)
+        unsafe {
+            CHUNK_FRAME_COUNT += 1;
+            if CHUNK_FRAME_COUNT % 600 == 0 {
+                let visible = CHUNK_VISIBLE_TOTAL;
+                let culled = CHUNK_CULLED_TOTAL;
+                eprintln!("[dx12-wm] frustum: {} visible / {} culled (sections this frame)",
+                    visible, culled);
+                CHUNK_VISIBLE_TOTAL = 0;
+                CHUNK_CULLED_TOTAL = 0;
             }
         }
     }
