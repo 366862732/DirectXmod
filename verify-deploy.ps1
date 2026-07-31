@@ -61,7 +61,7 @@ function Check {
 }
 
 # 1. DLL build identity (git commit hash injected by build.rs)
-Check "DLL version (wgpu-mc build 08cd11c)" "wgpu-mc build 08cd11c" $true
+Check "DLL version (wgpu-mc build 51e8a3a)" "wgpu-mc build 51e8a3a" $true
 
 # 2. Frame-rate unlock (Phase 11h)
 Check "Per-frame present (present moved to render TAIL)" "present moved to render TAIL" $true
