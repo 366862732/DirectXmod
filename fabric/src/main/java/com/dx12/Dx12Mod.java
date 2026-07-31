@@ -301,14 +301,27 @@ public class Dx12Mod implements ClientModInitializer {
                     if (skyColor == null) {
                         skyColor = new Vec3(0.53, 0.81, 0.92);
                     }
+                    float fr, fg, fb;
                     {
-                        float fr = Math.max((float) skyColor.x, 0.20f);
-                        float fg = Math.max((float) skyColor.y, 0.25f);
-                        float fb = Math.max((float) skyColor.z, 0.35f);
+                        fr = Math.max((float) skyColor.x, 0.20f);
+                        fg = Math.max((float) skyColor.y, 0.25f);
+                        fb = Math.max((float) skyColor.z, 0.35f);
                         float fogDensity = 0.001f;
                         if (mc.level.isRaining()) fogDensity = 0.003f;
                         if (mc.level.isThundering()) fogDensity = 0.006f;
                         D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
+                    }
+                    // ─── Sky dome update ────────────────────────────
+                    // Push the MC-derived sky color to the Rust sky dome so the
+                    // sky gradient follows the world (time of day / weather).
+                    // Zenith is brightened from the fog color; horizon matches
+                    // the fog color exactly (same as vanilla gradient).
+                    {
+                        float tr = Math.min(fr * 1.15f + 0.05f, 1.0f);
+                        float tg = Math.min(fg * 1.15f + 0.05f, 1.0f);
+                        float tb = Math.min(fb * 1.25f + 0.08f, 1.0f);
+                        float sunAngle = 0.0f; // gradient dome ignores angle
+                        D3D12Bridge.updateSky(tr, tg, tb, fr, fg, fb, sunAngle);
                     }
 
                     // ─── Lightmap update ──────────────────────────

@@ -67,20 +67,25 @@ impl ChunkVertex {
 }
 
 /// Particle vertex for point sprite rendering.
-/// 32 bytes: position(12) + color(16) + size(4).
+/// Particle billboard vertex: position + color + size(px) + corner offset.
+/// 40 bytes. Rendered as a screen-space quad (6 verts per particle) because
+/// D3D12 ignores `@builtin(point_size)` — point sprites are 1px there.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct ParticleVertex {
     position: [f32; 3],
     color: [f32; 4],
     size: f32,
+    /// Corner offset in [-0.5, 0.5]² relative to the particle center.
+    corner: [f32; 2],
 }
 
 impl ParticleVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x4,
         2 => Float32,
+        3 => Float32x2,
     ];
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -320,20 +325,23 @@ fn fs_main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Particle shader: renders point sprites with alpha blending.
-/// Uses same camera uniform. Point size is controlled by vertex attribute.
+/// Particle shader: renders screen-space billboards (quads) with alpha
+/// blending. D3D12 cannot size point sprites (`@builtin(point_size)` is a
+/// no-op there), so each particle is expanded to a 2-triangle quad in NDC
+/// space — the quad always faces the camera by construction.
 const PARTICLE_SHADER_SRC: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     fog: vec4<f32>,
+    viewport: vec2<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @builtin(point_size) point_size: f32,
+    @location(1) uv: vec2<f32>,
 }
 
 @vertex
@@ -341,24 +349,33 @@ fn vs_main(
     @location(0) pos: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) size: f32,
+    @location(3) corner: vec2<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.position = camera.view_proj * vec4<f32>(pos, 1.0);
+    let clip = camera.view_proj * vec4<f32>(pos, 1.0);
+    // size is in screen pixels; convert to NDC units (NDC spans 2.0 across
+    // the whole viewport) and scale by clip.w so the offset survives the
+    // perspective divide. Depth stays at the particle's true depth.
+    let ndc = vec2<f32>(size / camera.viewport.x, size / camera.viewport.y) * 2.0;
+    out.position = vec4<f32>(
+        clip.x + corner.x * ndc.x * clip.w,
+        clip.y + corner.y * ndc.y * clip.w,
+        clip.z,
+        clip.w,
+    );
     out.color = color;
-    out.point_size = size;
+    out.uv = corner + 0.5; // [0,1]² across the quad
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Soft circle point sprite: discard pixels outside the inner circle.
-    let coord = 2.0 * vec2<f32>(in.position.x % in.point_size, in.position.y % in.point_size) / in.point_size - 1.0;
-    let dist = length(coord);
-    if dist > 1.0 {
+    // Soft circle sprite: discard outside the radius, feather the edge.
+    let d = distance(in.uv, vec2<f32>(0.5));
+    if d > 0.5 {
         discard;
     }
-    // Soft edge: alpha = 1 - smoothstep(0.8, 1.0, dist)
-    let alpha = 1.0 - smoothstep(0.7, 1.0, dist);
+    let alpha = 1.0 - smoothstep(0.35, 0.5, d);
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
 "#;
@@ -371,6 +388,7 @@ struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     fog: vec4<f32>,
+    sky_color_top: vec3<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
@@ -384,11 +402,12 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>) -> Verte
     var out: VertexOutput;
     let world_pos = pos + camera.camera_pos;
     out.position = camera.view_proj * vec4<f32>(world_pos, 1.0);
-    // Sky gradient: deep blue at zenith (t=1), fog color at horizon (t=0).
-    // Use a natural sky palette: richer blue at top, lighter/foggier at horizon.
+    // Sky gradient: zenith color at the top (t=1), fog color at the horizon (t=0).
+    // The zenith color comes from the uniform (MC sky color via updateSky),
+    // so the sky follows Minecraft's time-of-day / weather instead of a
+    // hardcoded palette.
     let t = max(0.0, normal.y);
-    let zenith = vec3<f32>(0.08, 0.20, 0.55);
-    out.color = mix(camera.fog.rgb, zenith, t);
+    out.color = mix(camera.fog.rgb, camera.sky_color_top, t);
     return out;
 }
 
@@ -411,13 +430,15 @@ fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
     result
 }
 
-/// Write camera MVP + camera_pos + fog + sky_color to the uniform buffer.
+/// Write camera MVP + camera_pos + fog + sky_color + viewport to the uniform
+/// buffer.
 /// Layout:
 ///   mat4x4  view_proj      (64 bytes, offset 0)
 ///   vec3    camera_pos     (12 bytes, offset 64, padded to 16)
 ///   vec4    fog            (16 bytes, offset 80)  — fog.rgb = color, fog.a = density
 ///   vec3    sky_color_top  (12 bytes, offset 96, padded to 16)
-/// Total: 112 bytes (allocated 128 for safety).
+///   vec2    viewport       (8 bytes,  offset 112, padded to 16)
+/// Total: 128 bytes.
 fn write_camera_uniform(
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
@@ -425,12 +446,14 @@ fn write_camera_uniform(
     pos: &[f32; 3],
     fog: &[f32; 4],
     sky_top: &[f32; 3],
+    viewport: &[f32; 2],
 ) {
     let mut data = [0u8; 128];
     data[0..64].copy_from_slice(bytemuck::cast_slice(mvp));
     data[64..76].copy_from_slice(bytemuck::cast_slice(pos));
     data[80..96].copy_from_slice(bytemuck::cast_slice(&fog[..]));
     data[96..108].copy_from_slice(bytemuck::cast_slice(&sky_top[..]));
+    data[112..120].copy_from_slice(bytemuck::cast_slice(viewport));
     queue.write_buffer(buffer, 0, &data);
 }
 
@@ -873,6 +896,17 @@ pub struct WmRenderer {
     chunk_indirect_capacity: u32,         // entries the indirect buffer can hold
     chunk_geometry_dirty: bool,           // merged buffers need rebuilding
     chunk_batch_enabled: bool,            // false → per-mesh draw_indexed fallback
+
+    // Phase 11j: incremental chunk merging — CPU-side flat copies of the
+    // merged VB/IB data plus the capacity each GPU buffer was allocated for.
+    // New section uploads append into these (O(1) per mesh, no full rebuild);
+    // a full rebuild only happens when a section is cleared (recompile/unload),
+    // which is far rarer than the per-frame upload storm during world loading.
+    merged_verts: Vec<ChunkVertex>,
+    merged_indices: Vec<u32>,
+    chunk_vb_capacity: u64, // allocated vertex bytes in chunk_vb
+    chunk_ib_capacity: u64, // allocated index bytes in chunk_ib
+    chunk_need_full_rebuild: bool, // true → rebuild_chunk_buffers() required
 
     // Chunk textured pipeline + atlas
     chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
@@ -1424,6 +1458,11 @@ impl WmRenderer {
             chunk_indirect_capacity: 0,
             chunk_geometry_dirty: false,
             chunk_batch_enabled: chunk_batch_enabled,
+            merged_verts: Vec::new(),
+            merged_indices: Vec::new(),
+            chunk_vb_capacity: 0,
+            chunk_ib_capacity: 0,
+            chunk_need_full_rebuild: false,
             chunk_shader: None,
             chunk_pipeline: None,
             chunk_pipeline_transparent: None,
@@ -2191,20 +2230,36 @@ impl WmRenderer {
         let vcount = vertices.len() as u32;
         let icount = indices.len() as u32;
 
+        // Phase 11j: assign merge offsets NOW (append position in the flat
+        // caches), not during a later full rebuild. This lets uploads append
+        // incrementally without re-concatenating every mesh every frame.
+        let base_vertex = self.merged_verts.len() as u32;
+        let index_offset = self.merged_indices.len() as u32;
         let mesh = ChunkMesh {
             vertices,
             indices,
-            base_vertex: 0,   // assigned during rebuild_chunk_buffers()
-            index_offset: 0,
-            index_count: 0,
+            base_vertex,   // assigned at upload time (Phase 11j incremental merge)
+            index_offset,
+            index_count: icount,
         };
 
         let key = (section_x, section_y, section_z);
         self.chunk_meshes.entry(key).or_insert_with(Vec::new).push(mesh);
         self.has_chunk_geometry = true;
-        self.chunk_geometry_dirty = true;
 
-        log::info!("[dx12-wm] Chunk mesh uploaded: section=({},{},{}) {} verts, {} indices (batch rebuild pending)",
+        // Phase 11j: append-only merge. Extend the CPU flat caches and upload
+        // just the new mesh slice to the GPU, growing the GPU buffers on
+        // demand. No full rebuild — previously every upload flagged
+        // chunk_geometry_dirty, so prepare_chunk_batch() re-concatenated ALL
+        // meshes and recreated both GPU buffers every frame while loading
+        // (log evidence: 4000+ meshes / 5.2M verts rebuilt repeatedly → 6 FPS).
+        let verts_start = base_vertex as usize;
+        let idxs_start = index_offset as usize;
+        self.merged_verts.extend_from_slice(&self.chunk_meshes[&key].last().unwrap().vertices);
+        self.merged_indices.extend_from_slice(&self.chunk_meshes[&key].last().unwrap().indices);
+        self.upload_chunk_slice(verts_start, idxs_start);
+
+        log::info!("[dx12-wm] Chunk mesh uploaded: section=({},{},{}) {} verts, {} indices (incremental)",
             section_x, section_y, section_z, vcount, icount);
     }
 
@@ -2226,7 +2281,91 @@ impl WmRenderer {
     pub fn clear_chunk_section(&mut self, section_x: i32, section_y: i32, section_z: i32) {
         let key = (section_x, section_y, section_z);
         if self.chunk_meshes.remove(&key).is_some() {
-            self.chunk_geometry_dirty = true;
+            // Phase 11j: removals shift every later mesh's base_vertex /
+            // index_offset, so they must trigger a full rebuild. This is far
+            // rarer than uploads (only on section recompile/unload), so the
+            // cost is acceptable — unlike the old per-upload full rebuild.
+            self.chunk_need_full_rebuild = true;
+        }
+    }
+
+    /// Phase 11j: append the mesh slice at `verts_start`/`idxs_start` in the
+    /// flat caches into the merged GPU buffers. Grows `chunk_vb`/`chunk_ib`
+    /// when the append exceeds their current allocation (copying existing data
+    /// into the bigger buffer), otherwise issues a plain `queue.write_buffer`
+    /// for just the new range.
+    fn upload_chunk_slice(&mut self, verts_start: usize, idxs_start: usize) {
+        if self.merged_verts.len() <= verts_start || self.merged_indices.len() <= idxs_start {
+            return;
+        }
+        let verts = &self.merged_verts[verts_start..];
+        let idxs = &self.merged_indices[idxs_start..];
+
+        let vb_bytes = (verts_start as u64 + verts.len() as u64)
+            * std::mem::size_of::<ChunkVertex>() as u64;
+        let ib_bytes = (idxs_start as u64 + idxs.len() as u64)
+            * std::mem::size_of::<u32>() as u64;
+
+        // Vertex buffer: grow (full copy of ALL data) or append (write_buffer).
+        let vb_grows = self.chunk_vb.as_ref().map_or(true, |b| b.size() < vb_bytes);
+        if vb_grows {
+            let new_cap = (self.chunk_vb_capacity * 2).max(vb_bytes).max(64 * 1024);
+            let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk Merged VB"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            // Resize path: copy the ENTIRE merged cache (old data + new slice)
+            // into the larger buffer, not just the newly appended range.
+            vb.slice(..).get_mapped_range_mut()[..vb_bytes as usize]
+                .copy_from_slice(bytemuck::cast_slice(&self.merged_verts));
+            vb.unmap();
+            self.chunk_vb = Some(vb);
+            self.chunk_vb_capacity = new_cap;
+        } else if let Some(vb) = &self.chunk_vb {
+            let start_bytes = (verts_start as u64) * std::mem::size_of::<ChunkVertex>() as u64;
+            self.queue.write_buffer(vb, start_bytes, bytemuck::cast_slice(verts));
+        }
+
+        // Index buffer: grow (full copy of ALL data) or append (write_buffer).
+        let ib_grows = self.chunk_ib.as_ref().map_or(true, |b| b.size() < ib_bytes);
+        if ib_grows {
+            let new_cap = (self.chunk_ib_capacity * 2).max(ib_bytes).max(64 * 1024);
+            let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk Merged IB"),
+                size: new_cap,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            ib.slice(..).get_mapped_range_mut()[..ib_bytes as usize]
+                .copy_from_slice(bytemuck::cast_slice(&self.merged_indices));
+            ib.unmap();
+            self.chunk_ib = Some(ib);
+            self.chunk_ib_capacity = new_cap;
+        } else if let Some(ib) = &self.chunk_ib {
+            let start_bytes = (idxs_start as u64) * std::mem::size_of::<u32>() as u64;
+            self.queue.write_buffer(ib, start_bytes, bytemuck::cast_slice(idxs));
+        }
+
+        // Indirect args buffer holds the *visible* draw list, rewritten every
+        // frame in draw_chunks() — it only needs growing when the total mesh
+        // count (an upper bound on visible draws) outgrows the current
+        // capacity. next_power_of_two keeps the growth logarithmic.
+        let total_meshes: u32 = self.chunk_meshes.values().map(|v| v.len() as u32).sum();
+        if self.chunk_indirect.as_ref().map_or(true, |_| {
+            total_meshes > self.chunk_indirect_capacity
+        }) {
+            let capacity = total_meshes.max(1024).next_power_of_two();
+            let indirect = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Chunk Indirect Args"),
+                size: (std::mem::size_of::<DrawIndexedIndirectArgs>() * capacity as usize)
+                    as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.chunk_indirect = Some(indirect);
+            self.chunk_indirect_capacity = capacity;
         }
     }
 
@@ -2250,12 +2389,15 @@ impl WmRenderer {
     }
 
     /// Phase 11e: rebuild the merged vertex/index/indirect buffers from the
-    /// CPU-side mesh storage. Called lazily (at most once per frame) when any
-    /// section was uploaded or cleared since the last rebuild.
+    /// CPU-side mesh storage. Phase 11j: called only when a section was
+    /// cleared (removals shift offsets) — plain uploads now append
+    /// incrementally in `upload_chunk_slice` and skip this path entirely.
     fn rebuild_chunk_buffers(&mut self) {
         self.chunk_geometry_dirty = false;
+        self.chunk_need_full_rebuild = false;
 
-        // Assign ranges and concatenate all meshes into flat CPU arrays.
+        // Rebuild the flat CPU caches from scratch (a clear/removal happened),
+        // then re-upload everything into (possibly larger) GPU buffers.
         let mut all_verts: Vec<ChunkVertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
         let mut mesh_count: u32 = 0;
@@ -2269,35 +2411,45 @@ impl WmRenderer {
                 mesh_count += 1;
             }
         }
+        self.merged_verts = all_verts;
+        self.merged_indices = all_indices;
 
-        if all_verts.is_empty() {
+        if self.merged_verts.is_empty() {
             self.chunk_vb = None;
             self.chunk_ib = None;
             self.chunk_indirect = None;
             self.chunk_indirect_capacity = 0;
+            self.chunk_vb_capacity = 0;
+            self.chunk_ib_capacity = 0;
             self.has_chunk_geometry = false;
             return;
         }
 
         let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Merged VB"),
-            size: (std::mem::size_of::<ChunkVertex>() * all_verts.len()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX,
+            size: (std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
         vb.slice(..).get_mapped_range_mut()[..]
-            .copy_from_slice(bytemuck::cast_slice(&all_verts));
+            .copy_from_slice(bytemuck::cast_slice(&self.merged_verts));
         vb.unmap();
+        self.chunk_vb = Some(vb);
+        self.chunk_vb_capacity = (std::mem::size_of::<ChunkVertex>() * self.merged_verts.len())
+            as u64;
 
         let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Merged IB"),
-            size: (std::mem::size_of::<u32>() * all_indices.len()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::INDEX,
+            size: (std::mem::size_of::<u32>() * self.merged_indices.len()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
         ib.slice(..).get_mapped_range_mut()[..]
-            .copy_from_slice(bytemuck::cast_slice(&all_indices));
+            .copy_from_slice(bytemuck::cast_slice(&self.merged_indices));
         ib.unmap();
+        self.chunk_ib = Some(ib);
+        self.chunk_ib_capacity = (std::mem::size_of::<u32>() * self.merged_indices.len()) as u64;
 
         // Indirect args buffer: one 16-byte entry per mesh. Needs INDIRECT
         // for multi_draw_indexed_indirect and COPY_DST for queue.write_buffer.
@@ -2310,19 +2462,19 @@ impl WmRenderer {
             mapped_at_creation: false,
         });
 
-        self.chunk_vb = Some(vb);
-        self.chunk_ib = Some(ib);
         self.chunk_indirect = Some(indirect);
         self.chunk_indirect_capacity = capacity;
         self.has_chunk_geometry = true;
 
         eprintln!("[dx12-wm] Chunk batch rebuilt: {} meshes, {} verts, {} indices (indirect capacity {})",
-            mesh_count, all_verts.len(), all_indices.len(), capacity);
+            mesh_count, self.merged_verts.len(), self.merged_indices.len(), capacity);
     }
 
     /// Ensure the merged chunk buffers are up to date before issuing draws.
+    /// Phase 11j: uploads are applied incrementally at upload time, so this
+    /// only performs a (rare) full rebuild after a section clear/removal.
     fn prepare_chunk_batch(&mut self) {
-        if self.chunk_geometry_dirty {
+        if self.chunk_need_full_rebuild || self.chunk_geometry_dirty {
             self.rebuild_chunk_buffers();
         }
     }
@@ -2539,7 +2691,8 @@ impl WmRenderer {
         rp.draw(0..self.entity_count, 0..1);
     }
 
-    /// Pure builder: 8 floats/particle → point-sprite vertices.
+    /// Pure builder: 8 floats/particle → 6 billboard vertices each (two
+    /// triangles forming a screen-space quad).
     /// Returns None when the particle count is 0 or exceeds 2048 (invalid upload).
     fn build_particle_vertices(data: &[f32]) -> Option<Vec<ParticleVertex>> {
         const PER_PARTICLE: usize = 8;
@@ -2548,21 +2701,37 @@ impl WmRenderer {
             return None;
         }
 
-        let mut particles: Vec<ParticleVertex> = Vec::with_capacity(particle_count);
+        // 6 vertices per particle: (-,-) (+,-) (+,+) (-,-) (+,+) (-,+)
+        const QUAD: [[f32; 2]; 6] = [
+            [-0.5, -0.5],
+            [0.5, -0.5],
+            [0.5, 0.5],
+            [-0.5, -0.5],
+            [0.5, 0.5],
+            [-0.5, 0.5],
+        ];
+
+        let mut vertices: Vec<ParticleVertex> = Vec::with_capacity(particle_count * 6);
         for i in 0..particle_count {
             let off = i * PER_PARTICLE;
-            particles.push(ParticleVertex {
-                position: [data[off], data[off + 1], data[off + 2]],
-                color: [
-                    data[off + 4].clamp(0.0, 1.0),
-                    data[off + 5].clamp(0.0, 1.0),
-                    data[off + 6].clamp(0.0, 1.0),
-                    data[off + 7].clamp(0.0, 1.0),
-                ],
-                size: data[off + 3].max(1.0),
-            });
+            let center = [data[off], data[off + 1], data[off + 2]];
+            let color = [
+                data[off + 4].clamp(0.0, 1.0),
+                data[off + 5].clamp(0.0, 1.0),
+                data[off + 6].clamp(0.0, 1.0),
+                data[off + 7].clamp(0.0, 1.0),
+            ];
+            let size = data[off + 3].max(1.0);
+            for corner in QUAD {
+                vertices.push(ParticleVertex {
+                    position: center,
+                    color,
+                    size,
+                    corner,
+                });
+            }
         }
-        Some(particles)
+        Some(vertices)
     }
 
     /// Upload particle data and rebuild the particle point buffer.
@@ -3148,7 +3317,7 @@ impl WmRenderer {
                 // Phase 7: Render native MC chunk geometry with D3D12
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32]);
 
                 let depth_view = self.surface_depth
                     .as_ref()
@@ -3160,6 +3329,10 @@ impl WmRenderer {
 
                 // Pass 0: Sky dome (gradient hemisphere, no depth)
                 {
+                    // Clear with the dynamic MC sky color so any pixels the
+                    // dome doesn't cover (e.g. below the horizon line) still
+                    // match Minecraft's sky instead of a hardcoded blue.
+                    let sky = self.sky_color;
                     let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sky Dome Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3167,7 +3340,7 @@ impl WmRenderer {
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                                    r: sky[0] as f64, g: sky[1] as f64, b: sky[2] as f64, a: 1.0,
                                 }),
                                 store: wgpu::StoreOp::Store,
                             },
@@ -3254,7 +3427,7 @@ impl WmRenderer {
                 // Fallback: 3D test scene (plane + cubes)
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32]);
 
                 {
                     let depth_view = self.surface_depth
@@ -3327,7 +3500,7 @@ impl WmRenderer {
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color);
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[w as f32, h as f32]);
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);
@@ -3742,11 +3915,16 @@ mod upload_tests {
     fn particle_builder_builds_points() {
         let data = [1.0, 2.0, 3.0, 0.5, 1.0, 0.0, 0.0, 1.0];
         let p = WmRenderer::build_particle_vertices(&data).expect("valid data");
-        assert_eq!(p.len(), 1);
+        // One particle → 6 quad vertices (2 triangles).
+        assert_eq!(p.len(), 6);
         assert!(near(p[0].position[0], 1.0) && near(p[0].position[1], 2.0) && near(p[0].position[2], 3.0));
         // size < 1 → clamped to 1.0
         assert!(near(p[0].size, 1.0));
         assert!(near(p[0].color[0], 1.0) && near(p[0].color[1], 0.0) && near(p[0].color[2], 0.0) && near(p[0].color[3], 1.0));
+        // Corners cover the full quad in [-0.5, 0.5]².
+        let min_x = p.iter().map(|v| v.corner[0]).fold(f32::INFINITY, f32::min);
+        let max_x = p.iter().map(|v| v.corner[0]).fold(f32::NEG_INFINITY, f32::max);
+        assert!(near(min_x, -0.5) && near(max_x, 0.5));
     }
 
     #[test]
@@ -3760,11 +3938,11 @@ mod upload_tests {
         }
         assert!(WmRenderer::build_particle_vertices(&big).is_none());
 
-        // Exactly 2048 → accepted.
+        // Exactly 2048 → accepted, 2048*6 quad vertices.
         let mut maxed = Vec::with_capacity(2048 * 8);
         for _ in 0..2048 {
             maxed.extend_from_slice(&[1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
         }
-        assert_eq!(WmRenderer::build_particle_vertices(&maxed).unwrap().len(), 2048);
+        assert_eq!(WmRenderer::build_particle_vertices(&maxed).unwrap().len(), 2048 * 6);
     }
 }

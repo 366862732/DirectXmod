@@ -17,8 +17,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import com.dx12.D3D12Bridge;
 import com.dx12.Dx12Mod;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
+import net.minecraft.client.renderer.LevelRenderer;
 
 /**
  * Plan C (HUD Overlay via GL → D3D12 composition):
@@ -72,19 +76,30 @@ public class GameRendererMixin {
     }
 
     /**
-     * Cancel renderLevel at HEAD when D3D12 has chunks + surface.
-     * This prevents GL world rendering. The framebuffer retains MC's
-     * initial clear color + any subsequent HUD/GUI rendering.
+     * Skip the GL world render when D3D12 renders the chunks.
+     *
+     * We cannot cancel `renderLevel` at HEAD anymore: in MC 26.1.2 the first
+     * person hand (`renderItemInHand`) and screen effects (fire/nausea) render
+     * INSIDE `renderLevel`, AFTER `levelRenderer.renderLevel(...)`. Cancelling
+     * the whole method removed the hand/effects along with the world.
+     *
+     * Instead we wrap only the `LevelRenderer.renderLevel(...)` call with a
+     * no-op. The world stays D3D12-only, while the hand + effects still
+     * render to the GL framebuffer and get captured as part of the HUD
+     * overlay (they are 3D content, but the HUD pass composites them on top
+     * of the D3D12 world, which matches their screen position).
      */
-    @Inject(method = "renderLevel", at = @At("HEAD"), cancellable = true)
-    private void onRenderLevelHead(CallbackInfo ci) {
+    @WrapOperation(method = "renderLevel", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/LevelRenderer;renderLevel(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Lnet/minecraft/client/DeltaTracker;ZLnet/minecraft/client/renderer/state/level/CameraRenderState;Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lorg/joml/Vector4f;ZLnet/minecraft/client/renderer/state/level/LevelRenderState$ChunkSectionsToRender;)V"))
+    private void skipGlWorldRender(LevelRenderer instance, Object[] args, Operation<Void> original) {
         if (D3D12Bridge.hasSurface() && D3D12Bridge.hasChunkGeometry()) {
             if (!renderLevelCancelledLogged) {
                 renderLevelCancelledLogged = true;
-                com.dx12.Dx12Mod.LOGGER.info("[dx12-wm] renderLevel HEAD cancelled");
+                Dx12Mod.LOGGER.info("[dx12-wm] GL world render skipped (D3D12 renders chunks)");
             }
-            ci.cancel();
+            // no-op: keep fog setup + renderItemInHand + screen effects
+            return;
         }
+        original.call(instance, args);
     }
 
     /**
