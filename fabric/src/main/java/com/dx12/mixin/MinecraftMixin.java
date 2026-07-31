@@ -12,16 +12,18 @@ import com.dx12.D3D12Bridge;
 import net.minecraft.client.Minecraft;
 
 /**
- * Surface mode: D3D12 Present() at TAIL of Minecraft.runTick().
+ * Surface mode: D3D12 surface initialization at TAIL of Minecraft.runTick().
  *
- * MC 26.1.2 removed Window.updateDisplay(). D3D12 renders + presents
- * AFTER the entire game tick (post GL swap) via the MinecraftMixin TAIL.
+ * MC 26.1.2 removed Window.updateDisplay(). The D3D12 swapchain surface is
+ * (re)created here after a game tick, while the GL context is temporarily
+ * detached — GL context detach/reattach keeps DXGI and WGL from contending
+ * on the same HWND, eliminating the WDDM driver-level TDR (Timeout Detection
+ * & Recovery) conflict.
  *
- * To prevent GPU driver TDR (Timeout Detection & Recovery) from D3D12 and
- * OpenGL contending on the same HWND, the GL context is temporarily
- * detached (glfwMakeContextCurrent(0)) before calling D3D12 renderFrame(),
- * and reattached after. This ensures only one API accesses the HWND at
- * any time, eliminating the WDDM driver-level conflict.
+ * Per-frame D3D12 rendering + Present() happens in GameRendererMixin.render
+ * TAIL (vsync-driven, once per rendered frame). runTick fires only ~20 Hz
+ * (one per game tick), so Present was moved there in Phase 11h to unlock
+ * full frame-rate.
  */
 @Mixin(Minecraft.class)
 public class MinecraftMixin {
@@ -52,12 +54,10 @@ public class MinecraftMixin {
                     D3D12Bridge.setWindow(hwnd);
                 }
 
-                // Render frame via D3D12 swapchain (only if surface is active)
-                if (D3D12Bridge.hasSurface()) {
-                    // Camera was updated in ClientTickEvents.END_CLIENT_TICK.
-                    // renderFrame() dispatches to render_surface() → get_current_texture() → render → Present()
-                    D3D12Bridge.renderFrame();
-                }
+                // Phase 11h: D3D12 Present moved to GameRendererMixin.render TAIL
+                // (per-frame, vsync-driven). runTick fires ~20 Hz (one per game
+                // tick), which used to cap D3D12 output at 20 FPS. Only surface
+                // init stays here since it must run without a GL context bound.
             } finally {
                 // Reattach GL context for the next tick's operations.
                 GLFW.glfwMakeContextCurrent(glfwWindow);

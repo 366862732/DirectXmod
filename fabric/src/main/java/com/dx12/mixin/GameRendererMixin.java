@@ -3,6 +3,8 @@ package com.dx12.mixin;
 import java.nio.ByteBuffer;
 
 import org.lwjgl.BufferUtils;
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWNativeWin32;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL21;
@@ -90,6 +92,10 @@ public class GameRendererMixin {
      * - Surface + chunks: capture HUD-only framebuffer → D3D12 overlay
      * - Surface (no chunks): capture full GL framebuffer → D3D12 texture
      * - Offscreen mode: upload D3D12-rendered pixels as GL quad overlay
+     *
+     * Phase 11h (Frame Pacing): D3D12 Present now runs HERE, once per rendered
+     * frame (vsync-driven). Previously it ran at Minecraft.runTick() TAIL which
+     * fires only on game ticks (~20 Hz), capping D3D12 output at 20 FPS.
      */
     @Inject(method = "render", at = @At("TAIL"))
     private void onRenderTail(CallbackInfo ci) {
@@ -99,8 +105,37 @@ public class GameRendererMixin {
             } else {
                 captureFramebufferForD3D12();
             }
+            presentD3D12Frame();
         } else {
             Dx12Mod.onPostRender();
+        }
+    }
+
+    /**
+     * Present one D3D12 frame from the render-thread tail (per frame, vsync).
+     * The GL context is temporarily detached before Present() and reattached
+     * afterwards so DXGI and WGL never touch the HWND simultaneously (the same
+     * TDR-avoidance pattern the runTick hook used).
+     */
+    private void presentD3D12Frame() {
+        if (!presentLogOnce) {
+            presentLogOnce = true;
+            Dx12Mod.LOGGER.info("[dx12-wm] D3D12 present moved to render TAIL (per-frame pacing)");
+        }
+        long glfwWindow = GLFW.glfwGetCurrentContext();
+        if (glfwWindow == 0) return;
+        long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
+
+        GLFW.glfwMakeContextCurrent(0);
+        try {
+            if (hwnd != 0) {
+                D3D12Bridge.setWindow(hwnd);
+            }
+            if (D3D12Bridge.hasSurface()) {
+                D3D12Bridge.renderFrame();
+            }
+        } finally {
+            GLFW.glfwMakeContextCurrent(glfwWindow);
         }
     }
 
@@ -391,4 +426,5 @@ public class GameRendererMixin {
     private static boolean firstCaptureLogged = false;
     private static boolean firstHudCaptureLogged = false;
     private static boolean renderLevelCancelledLogged = false;
+    private static boolean presentLogOnce = false;
 }
