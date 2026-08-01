@@ -88,6 +88,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadChunkMesh(
     section_x: jni::sys::jint,
     section_y: jni::sys::jint,
     section_z: jni::sys::jint,
+    layer: jni::sys::jint,
     buffer: jni::objects::JObject,
     vertex_count: jni::sys::jint,
     vertex_stride: jni::sys::jint,
@@ -117,6 +118,7 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUploadChunkMesh(
                 slice,
                 vertex_count as u32,
                 vertex_stride as u32,
+                layer.clamp(0, 2) as u8,
             );
         }
     }));

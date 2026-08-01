@@ -64,7 +64,9 @@ public class SectionCompilerMixin {
                 Dx12Mod.LOGGER.debug("[dx12-wm] Uploading chunk mesh: section=({},{},{}) layer={} vcount={} stride={}",
                     sx, sy, sz, entry.getKey(), vertexCount, vertexStride);
 
-                D3D12Bridge.uploadChunkMesh(sx, sy, sz, vertexBuffer, vertexCount, vertexStride);
+                // ChunkSectionLayer order: SOLID=0, CUTOUT=1, TRANSLUCENT=2
+                D3D12Bridge.uploadChunkMesh(sx, sy, sz, entry.getKey().ordinal(),
+                    vertexBuffer, vertexCount, vertexStride);
                 // Upload ALL layers, not just the first one
             }
         } catch (Exception e) {

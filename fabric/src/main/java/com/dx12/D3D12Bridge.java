@@ -83,7 +83,7 @@ public class D3D12Bridge {
     public static native void nativeSetParticles(float[] data);
     public static native void nativeSetFramePixels(java.nio.ByteBuffer buffer, int width, int height);
     public static native void nativeUploadChunkMesh(int sectionX, int sectionY, int sectionZ,
-        java.nio.ByteBuffer buffer, int vertexCount, int vertexStride);
+        int layer, java.nio.ByteBuffer buffer, int vertexCount, int vertexStride);
     public static native int nativeIsReady();
     public static native String nativeGetStatus();
     public static native boolean nativeHasSurface();
@@ -320,12 +320,13 @@ public class D3D12Bridge {
         }
     }
 
-    /** Upload MC chunk section mesh to D3D12 for native rendering. */
+    /** Upload MC chunk section mesh to D3D12 for native rendering.
+     *  @param layer MC chunk render layer: 0=SOLID, 1=CUTOUT, 2=TRANSLUCENT */
     public static void uploadChunkMesh(int sectionX, int sectionY, int sectionZ,
-            java.nio.ByteBuffer buffer, int vertexCount, int vertexStride) {
+            int layer, java.nio.ByteBuffer buffer, int vertexCount, int vertexStride) {
         if (!initialized) return;
         try {
-            nativeUploadChunkMesh(sectionX, sectionY, sectionZ, buffer, vertexCount, vertexStride);
+            nativeUploadChunkMesh(sectionX, sectionY, sectionZ, layer, buffer, vertexCount, vertexStride);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore
         }

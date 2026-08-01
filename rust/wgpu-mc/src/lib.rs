@@ -780,12 +780,16 @@ fn aabb_in_frustum(min: [f32; 3], max: [f32; 3], planes: &[[f32; 4]; 6]) -> bool
 /// skipping sections outside the view frustum (Phase 11f). Every visible
 /// mesh yields one [`DrawIndexedIndirectArgs`] referencing the merged
 /// vertex/index buffers.
-/// Returns (draws, visible_sections, culled_sections).
+/// Collect frustum-culled draw args, split by chunk render layer (P1c):
+/// `opaque` holds SOLID/CUTOUT meshes (layer < 2) for the depth-writing
+/// pass; `transparent` holds TRANSLUCENT meshes (layer == 2) for the
+/// alpha-blended pass. Returns (opaque, transparent, visible, culled).
 fn collect_visible_draws<'m>(
     sections: impl Iterator<Item = (&'m (i32, i32, i32), &'m Vec<ChunkMesh>)>,
     planes: &[[f32; 4]; 6],
-) -> (Vec<DrawIndexedIndirectArgs>, u32, u32) {
-    let mut draws: Vec<DrawIndexedIndirectArgs> = Vec::new();
+) -> (Vec<DrawIndexedIndirectArgs>, Vec<DrawIndexedIndirectArgs>, u32, u32) {
+    let mut opaque: Vec<DrawIndexedIndirectArgs> = Vec::new();
+    let mut transparent: Vec<DrawIndexedIndirectArgs> = Vec::new();
     let mut visible: u32 = 0;
     let mut culled: u32 = 0;
     for (key, meshes) in sections {
@@ -797,16 +801,21 @@ fn collect_visible_draws<'m>(
         }
         visible += 1;
         for m in meshes {
-            draws.push(DrawIndexedIndirectArgs {
+            let args = DrawIndexedIndirectArgs {
                 index_count: m.index_count,
                 instance_count: 1,
                 first_index: m.index_offset,
                 base_vertex: m.base_vertex as i32,
                 first_instance: 0,
-            });
+            };
+            if m.layer < 2 {
+                opaque.push(args);
+            } else {
+                transparent.push(args);
+            }
         }
     }
-    (draws, visible, culled)
+    (opaque, transparent, visible, culled)
 }
 
 fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -1064,6 +1073,11 @@ struct ChunkMesh {
     index_offset: u32,
     /// Number of indices (6 per quad).
     index_count: u32,
+    /// MC chunk render layer (P1c): 0=SOLID, 1=CUTOUT, 2=TRANSLUCENT.
+    /// The opaque pass submits only layer < 2; the transparent pass only
+    /// layer == 2 — eliminating the duplicate submission of opaque meshes
+    /// in the transparent pass.
+    layer: u8,
 }
 
 /// Phase 13.10: one mesh slot captured at the moment a progressive compaction
@@ -2387,6 +2401,7 @@ impl WmRenderer {
         data: &[u8],
         vertex_count: u32,
         vertex_stride: u32,
+        layer: u8,
     ) {
         let stride = vertex_stride as usize;
         let expected_size = (vertex_count as usize) * stride;
@@ -2651,6 +2666,7 @@ impl WmRenderer {
             base_vertex,   // assigned at upload time (Phase 11j incremental merge)
             index_offset,
             index_count: icount,
+            layer: layer.min(2), // 0=SOLID, 1=CUTOUT, 2=TRANSLUCENT
         };
 
         let key = (section_x, section_y, section_z);
@@ -2779,6 +2795,17 @@ impl WmRenderer {
     const CHUNK_VB_MIN_CAP: u64 = 4 * 1024 * 1024; // 4 MB
     const CHUNK_IB_MIN_CAP: u64 = 1 * 1024 * 1024; // 1 MB
     const MAX_BUF_SIZE: u64 = 1024 * 1024 * 1024;  // 1 GiB (matches required_limits.max_buffer_size)
+
+    /// P1c-era live-dataset budget (P1c fix #2): MC recompiles sections
+    /// in-place (clear→upload) but NEVER evicts them on chunk unload, so the
+    /// live vertex set only grows. During fast travel (elytra flight) it blows
+    /// past the 1 GiB wgpu hard cap and every new upload is REJECTED —
+    /// observed 8752 "Chunk mesh REJECTED" in one session → missing chunks.
+    /// Once the live VB passes LIVE_VB_HARD, the farthest sections are evicted
+    /// (tombstoned for the next compaction) down to LIVE_VB_BUDGET, keeping
+    /// uploads working and distant terrain present while bounding GPU memory.
+    const LIVE_VB_BUDGET: u64 = 700 * 1024 * 1024; // evict down to 700 MB
+    const LIVE_VB_HARD: u64 = 850 * 1024 * 1024;   // start evicting at 850 MB
 
     /// Phase 13.10: bytes of live mesh data (verts + indices) moved per frame
     /// during progressive compaction. 64 MB per frame costs well under a
@@ -3173,9 +3200,20 @@ impl WmRenderer {
         // 3.5k meshes → 2 FPS). The Phase 13.10 tuning raises the thresholds
         // (64→128 MB, 1/3→1/2, 256→512 MB) to spread compactions ≥ 20 s apart
         // so the occasional ~50 ms rebuild no longer reads as periodic stutter.
+        //
+        // P1c-era fix: with a huge live dataset (long runs, heavy chunk
+        // recompiles) deleted bytes rarely exceed 1/2 of the live data, so the
+        // 1/2 ratio never trips and merged_verts grows unbounded until it hits
+        // the wgpu 1 GiB hard cap — after which EVERY new upload is REJECTED
+        // (observed: 728 "Chunk mesh REJECTED" in one session, missing distant
+        // terrain). When the merged buffer is already near the hard cap, start
+        // a compaction as soon as ≥ 64 MB of tombstones exist to reclaim space
+        // before uploads get rejected.
         let merged_vb_bytes = self.merged_verts.len() as u64 * std::mem::size_of::<ChunkVertex>() as u64;
+        let near_hard_cap = merged_vb_bytes > Self::MAX_BUF_SIZE * 3 / 4;
         let waste_exceeds = self.deleted_vb_bytes > 128 * 1024 * 1024
             && self.deleted_vb_bytes > merged_vb_bytes / 2;
+        let waste_near_cap = near_hard_cap && self.deleted_vb_bytes > 64 * 1024 * 1024;
         let waste_hard_cap = self.deleted_vb_bytes > 512 * 1024 * 1024;
 
         // Explicit full-rebuild requests (first geometry, flag-based edge
@@ -3194,10 +3232,64 @@ impl WmRenderer {
             if self.step_chunk_compaction() {
                 self.finish_chunk_compaction();
             }
-        } else if waste_exceeds || waste_hard_cap {
+        } else if waste_exceeds || waste_near_cap || waste_hard_cap {
             self.start_chunk_compaction();
             if self.step_chunk_compaction() {
                 self.finish_chunk_compaction();
+            }
+        }
+
+        // ── P1c fix #2: bound the live dataset (fast-travel eviction) ──
+        // MC never evicts compiled sections on chunk unload, so long elytra
+        // flights accumulate far sections until the merged VB hits the 1 GiB
+        // wgpu hard cap and every new upload is REJECTED (missing chunks).
+        // Once the live data exceeds LIVE_VB_HARD, evict the farthest sections
+        // down to LIVE_VB_BUDGET. Evictions become tombstones that the
+        // compaction paths above reclaim over the next frames.
+        let live_vb_bytes: u64 = self
+            .chunk_meshes
+            .values()
+            .flat_map(|ms| ms.iter())
+            .map(|m| m.vertices.len() as u64)
+            .sum::<u64>()
+            * std::mem::size_of::<ChunkVertex>() as u64;
+        if live_vb_bytes > Self::LIVE_VB_HARD {
+            let (cx, cy, cz) = (self.camera_pos[0], self.camera_pos[1], self.camera_pos[2]);
+            let mut far: Vec<((i32, i32, i32), f32)> = self
+                .chunk_meshes
+                .keys()
+                .map(|k| {
+                    let dx = (k.0 as f32 * 16.0 + 8.0) - cx;
+                    let dy = (k.1 as f32 * 16.0 + 8.0) - cy;
+                    let dz = (k.2 as f32 * 16.0 + 8.0) - cz;
+                    (*k, dx * dx + dy * dy + dz * dz)
+                })
+                .collect();
+            far.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut live_vb_bytes = live_vb_bytes;
+            let mut evicted = 0usize;
+            for (key, _dist2) in far {
+                if live_vb_bytes <= Self::LIVE_VB_BUDGET {
+                    break;
+                }
+                let removed: u64 = self
+                    .chunk_meshes
+                    .get(&key)
+                    .map(|ms| ms.iter().map(|m| m.vertices.len() as u64).sum())
+                    .unwrap_or(0);
+                if removed == 0 {
+                    continue;
+                }
+                self.clear_chunk_section(key.0, key.1, key.2);
+                live_vb_bytes = live_vb_bytes.saturating_sub(removed);
+                evicted += 1;
+            }
+            if evicted > 0 {
+                log::info!(
+                    "[dx12-wm] Fast-travel eviction: removed {} far sections, live VB now {:.0} MB",
+                    evicted,
+                    live_vb_bytes as f64 / (1024.0 * 1024.0)
+                );
             }
         }
     }
@@ -3254,39 +3346,48 @@ impl WmRenderer {
                 self.chunk_meshes.len(), total_meshes, self.chunk_batch_enabled);
         }
 
-        // Phase 11e: one AABB-culled draw list shared by both passes.
-        let (draws, visible_sections, culled_sections) =
+        // Phase 11e: one AABB-culled draw list per layer group (P1c) — the
+        // opaque pass submits SOLID/CUTOUT only, the transparent pass only
+        // TRANSLUCENT, instead of resubmitting every mesh in both passes.
+        let (opaque_draws, transparent_draws, visible_sections, culled_sections) =
             collect_visible_draws(self.chunk_meshes.iter(), &planes);
 
-        if !draws.is_empty() && (draws.len() as u32) <= self.chunk_indirect_capacity {
+        let total_draws = opaque_draws.len() + transparent_draws.len();
+        if total_draws > 0 && (total_draws as u32) <= self.chunk_indirect_capacity {
             // Per-frame upload of the visible draw list (a few KB). The merged
             // VB/IB are static; only the args change with the camera.
-            self.queue.write_buffer(indirect, 0, bytemuck::cast_slice(&draws));
+            // Opaque args go first, transparent args follow contiguously so a
+            // single write_buffer + two indirect ranges serve both passes.
+            let mut all_draws = opaque_draws.clone();
+            all_draws.extend_from_slice(&transparent_draws);
+            self.queue.write_buffer(indirect, 0, bytemuck::cast_slice(&all_draws));
 
             // ════════════════════════════════════════════════
-            // Pass 1: Opaque — writes depth, no blending
+            // Pass 1: Opaque (SOLID + CUTOUT) — writes depth, no blending
             // ════════════════════════════════════════════════
             rp.set_pipeline(pipeline);
             rp.set_bind_group(0, bind_group, &[]);
             rp.set_vertex_buffer(0, vb.slice(..));
             rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             if self.chunk_batch_enabled {
-                rp.multi_draw_indexed_indirect(indirect, 0, draws.len() as u32);
+                rp.multi_draw_indexed_indirect(indirect, 0, opaque_draws.len() as u32);
             } else {
-                for d in &draws {
+                for d in &opaque_draws {
                     rp.draw_indexed(d.first_index..d.first_index + d.index_count, d.base_vertex, 0..1);
                 }
             }
 
             // ════════════════════════════════════════════════
-            // Pass 2: Transparent — no depth write, alpha blending
+            // Pass 2: Transparent (TRANSLUCENT only) — no depth write, alpha blend
             // ════════════════════════════════════════════════
             rp.set_pipeline(pipeline_transparent);
             rp.set_bind_group(0, bind_group, &[]);
+            let transparent_offset =
+                (std::mem::size_of::<DrawIndexedIndirectArgs>() * opaque_draws.len()) as u64;
             if self.chunk_batch_enabled {
-                rp.multi_draw_indexed_indirect(indirect, 0, draws.len() as u32);
+                rp.multi_draw_indexed_indirect(indirect, transparent_offset, transparent_draws.len() as u32);
             } else {
-                for d in &draws {
+                for d in &transparent_draws {
                     rp.draw_indexed(d.first_index..d.first_index + d.index_count, d.base_vertex, 0..1);
                 }
             }
@@ -4199,10 +4300,18 @@ impl WmRenderer {
                         occlusion_query_set: None,
                     });
 
-                    self.draw_clouds(&mut rp);
                     self.draw_chunks(&mut rp);
                     self.draw_entities(&mut rp);
                     self.draw_particles(&mut rp);
+                    // Clouds render LAST within the world pass, mirroring
+                    // vanilla (the clouds pass runs after the main terrain/
+                    // entity/particle pass on the same color+depth targets).
+                    // Terrain depth is already written by draw_chunks, so:
+                    //   - from above: the layer is nearer than the ground,
+                    //     passes depth-test and correctly covers terrain;
+                    //     discarded gaps show the ground through cloud holes
+                    //   - from below: nearer terrain occludes the layer
+                    self.draw_clouds(&mut rp);
                 }
                 // Pass 2: HUD overlay (load world output, no depth, alpha blending)
                 if has_hud {
@@ -4584,6 +4693,7 @@ mod batch_tests {
             base_vertex,
             index_offset,
             index_count,
+            layer: 0, // SOLID
         }
     }
 
@@ -4623,18 +4733,20 @@ mod batch_tests {
         // Far outside the frustum — must be culled.
         sections.insert((5000, 0, 0), vec![make_mesh(100, 100, 36)]);
 
-        let (draws, visible, culled) = collect_visible_draws(sections.iter(), &planes);
+        let (opaque_draws, transparent_draws, visible, culled) =
+            collect_visible_draws(sections.iter(), &planes);
         assert_eq!(visible, 1);
         assert_eq!(culled, 1);
-        assert_eq!(draws.len(), 2);
+        assert_eq!(opaque_draws.len(), 2);
+        assert!(transparent_draws.is_empty());
 
-        assert_eq!(draws[0].index_count, 36);
-        assert_eq!(draws[0].first_index, 0);
-        assert_eq!(draws[0].base_vertex, 0);
-        assert_eq!(draws[1].index_count, 72);
-        assert_eq!(draws[1].first_index, 36);
-        assert_eq!(draws[1].base_vertex, 36);
-        for d in &draws {
+        assert_eq!(opaque_draws[0].index_count, 36);
+        assert_eq!(opaque_draws[0].first_index, 0);
+        assert_eq!(opaque_draws[0].base_vertex, 0);
+        assert_eq!(opaque_draws[1].index_count, 72);
+        assert_eq!(opaque_draws[1].first_index, 36);
+        assert_eq!(opaque_draws[1].base_vertex, 36);
+        for d in &opaque_draws {
             assert_eq!(d.instance_count, 1);
             assert_eq!(d.first_instance, 0);
         }
@@ -4649,10 +4761,12 @@ mod batch_tests {
         sections.insert((0, 0, 0), vec![make_mesh(0, 0, 6)]);
         sections.insert((10000, 0, 0), vec![make_mesh(10, 10, 12)]);
 
-        let (draws, visible, culled) = collect_visible_draws(sections.iter(), &planes);
+        let (opaque_draws, transparent_draws, visible, culled) =
+            collect_visible_draws(sections.iter(), &planes);
         assert_eq!(visible, 2);
         assert_eq!(culled, 0);
-        assert_eq!(draws.len(), 2);
+        assert_eq!(opaque_draws.len(), 2);
+        assert!(transparent_draws.is_empty());
     }
 
     #[test]
@@ -4660,8 +4774,10 @@ mod batch_tests {
         let planes = [[0.0f32; 4]; 6];
         let sections: std::collections::HashMap<(i32, i32, i32), Vec<ChunkMesh>> =
             std::collections::HashMap::new();
-        let (draws, visible, culled) = collect_visible_draws(sections.iter(), &planes);
-        assert!(draws.is_empty());
+        let (opaque_draws, transparent_draws, visible, culled) =
+            collect_visible_draws(sections.iter(), &planes);
+        assert!(opaque_draws.is_empty());
+        assert!(transparent_draws.is_empty());
         assert_eq!(visible, 0);
         assert_eq!(culled, 0);
     }
