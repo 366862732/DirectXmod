@@ -266,6 +266,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateCloud(
     }
 }
 
+/// Set whether the camera is under water. While submerged the sky dome
+/// collapses to the water fog color and the cloud layer disappears
+/// (vanilla water fog behavior).
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateUnderwater(
+    _env: JNIEnv,
+    _class: JClass,
+    underwater: jni::sys::jboolean,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_underwater(underwater != 0);
+    }
+}
+
 /// Check if the wgpu renderer is ready for rendering.
 /// Returns 1 if ready, 0 if still initializing, -1 if failed.
 ///

@@ -76,6 +76,8 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.phys.Vec3;
 
 /**
@@ -307,10 +309,28 @@ public class Dx12Mod implements ClientModInitializer {
                         fr = Math.max((float) skyColor.x, 0.20f);
                         fg = Math.max((float) skyColor.y, 0.25f);
                         fb = Math.max((float) skyColor.z, 0.35f);
+                        // P1d: detect the camera being underwater. Vanilla applies
+                        // a dense blue water fog (#3F76E4) that fully obscures the
+                        // sky dome and cloud layer from below the surface.
+                        boolean underwater = false;
+                        try {
+                            underwater = mc.level.getBlockState(BlockPos.containing(pos))
+                                .getFluidState().is(FluidTags.WATER);
+                        } catch (Exception | LinkageError e) {
+                            // Missing mappings — stay above water
+                        }
                         float fogDensity = 0.001f;
-                        if (mc.level.isRaining()) fogDensity = 0.003f;
-                        if (mc.level.isThundering()) fogDensity = 0.006f;
+                        if (underwater) {
+                            fr = 0.247f;
+                            fg = 0.463f;
+                            fb = 0.894f;
+                            fogDensity = 0.1f;
+                        } else {
+                            if (mc.level.isRaining()) fogDensity = 0.003f;
+                            if (mc.level.isThundering()) fogDensity = 0.006f;
+                        }
                         D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
+                        D3D12Bridge.updateUnderwater(underwater);
                     }
                     // ─── Sky dome update ────────────────────────────
                     // Push the MC-derived sky color to the Rust sky dome so the

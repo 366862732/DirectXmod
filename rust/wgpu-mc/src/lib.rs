@@ -422,6 +422,12 @@ struct CameraUniform {
     star_brightness: f32,
     moon_phase: f32,
     rain_brightness: f32,
+    // Layout MUST match write_camera_uniform: cloud fields live at
+    // offsets 144-168, underwater at offset 176. These placeholders keep
+    // the sky dome reading the same uniform offsets as the chunk shader.
+    cloud_color: vec4<f32>,
+    cloud_params: vec4<f32>,
+    underwater: f32,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
@@ -533,6 +539,12 @@ fn fs_main(@location(0) color: vec3<f32>, @location(1) dir: vec3<f32>) -> @locat
         col += vec3<f32>(0.85, 0.9, 1.0) * stars;
     }
 
+    // Underwater: the sky dome collapses to the water fog color (vanilla
+    // water fog fully obscures sky/sun/moon/stars from below the surface).
+    if (camera.underwater > 0.5) {
+        col = camera.fog.rgb;
+    }
+
     return vec4<f32>(col, 1.0);
 }
 "#;
@@ -559,6 +571,9 @@ struct CameraUniform {
     rain_brightness: f32,
     cloud_color: vec4<f32>,
     cloud_params: vec4<f32>,
+    // underwater sits at offset 176 (after cloud_params), matching
+    // write_camera_uniform's layout.
+    underwater: f32,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
@@ -634,6 +649,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (in.view_side < 0.0) {
         col *= 0.62;
     }
+    // Underwater: clouds melt into the water fog (vanilla shows no clouds
+    // through the surface — the water fog fully absorbs the layer).
+    if (camera.underwater > 0.5) {
+        col = camera.fog.rgb;
+        alpha = 0.0;
+    }
     return vec4<f32>(col, alpha * camera.cloud_color.a);
 }
 "#;
@@ -667,7 +688,8 @@ fn mat4_lerp(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4], t: f32) -> [[f32; 4]; 4] {
 ///   f32        rain_brightness (offset 140)
 ///   vec4       cloud_color     (16 bytes, offset 144)  — rgb + alpha
 ///   vec4       cloud_params    (16 bytes, offset 160)  — x=height, y=wind offset
-/// Total: 176 bytes (buffer allocated at 192).
+///   f32        underwater      (offset 176)  — 1 when the camera is submerged
+/// Total: 180 bytes (buffer allocated at 192).
 fn write_camera_uniform(
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
@@ -685,6 +707,7 @@ fn write_camera_uniform(
     cloud_color: &[f32; 4],
     cloud_height: f32,
     cloud_time: f32,
+    underwater: f32,
 ) {
     let mut data = [0u8; 192];
     data[0..64].copy_from_slice(bytemuck::cast_slice(mvp));
@@ -701,6 +724,7 @@ fn write_camera_uniform(
     data[144..160].copy_from_slice(bytemuck::cast_slice(cloud_color));
     data[160..164].copy_from_slice(&cloud_height.to_le_bytes());
     data[164..168].copy_from_slice(&cloud_time.to_le_bytes());
+    data[176..180].copy_from_slice(&underwater.to_le_bytes());
     queue.write_buffer(buffer, 0, &data);
 }
 
@@ -1207,6 +1231,8 @@ pub struct WmRenderer {
     cloud_color: [f32; 4],   // rgb + alpha (alpha 0 → invisible, mirrors vanilla ARGB gate)
     cloud_height: f32,       // vanilla: 192.0
     cloud_time: f32,         // wind scroll offset in blocks
+    // P1d underwater state: camera submerged → water fog color + vanishing sky/clouds.
+    underwater: bool,
 
     // Immutable GPU resources
     pipeline: wgpu::RenderPipeline,
@@ -1818,6 +1844,7 @@ impl WmRenderer {
             cloud_color: [1.0, 1.0, 1.0, 1.0], // white clouds, opaque
             cloud_height: 192.0,      // vanilla cloud bottom
             cloud_time: 0.0,
+            underwater: false,
             pipeline,
             bind_group,
             uniform_buffer,
@@ -2696,6 +2723,13 @@ impl WmRenderer {
         self.fog_color = [fog_color_rgb[0], fog_color_rgb[1], fog_color_rgb[2], fog_density];
     }
 
+    /// Set whether the camera is submerged. While under water the sky dome
+    /// collapses to the water fog color and the cloud layer disappears
+    /// (vanilla water fog behavior).
+    pub fn set_underwater(&mut self, underwater: bool) {
+        self.underwater = underwater;
+    }
+
     /// Set full sky state: zenith color, horizon color and celestial parameters
     /// (sun/moon/star angles in radians, star brightness 0..1, moon phase
     /// index 0..7, rain brightness 0..1). Consumed by the sky dome shader.
@@ -3268,13 +3302,21 @@ impl WmRenderer {
             far.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let mut live_vb_bytes = live_vb_bytes;
             let mut evicted = 0usize;
-            for (key, _dist2) in far {
+            // Two-phase eviction. Phase 1 only evicts sections beyond the keep
+            // radius (~18 chunks) so the view-distance ring the player is
+            // flying toward is never stripped — otherwise fast travel leaves a
+            // hole ahead that only fills after MC recompiles those sections.
+            const KEEP_RADIUS2: f32 = 288.0 * 288.0;
+            for (key, dist2) in &far {
                 if live_vb_bytes <= Self::LIVE_VB_BUDGET {
                     break;
                 }
+                if *dist2 < KEEP_RADIUS2 {
+                    continue; // keep the near ring; phase 2 is the fallback
+                }
                 let removed: u64 = self
                     .chunk_meshes
-                    .get(&key)
+                    .get(key)
                     .map(|ms| ms.iter().map(|m| m.vertices.len() as u64).sum())
                     .unwrap_or(0);
                 if removed == 0 {
@@ -3283,6 +3325,26 @@ impl WmRenderer {
                 self.clear_chunk_section(key.0, key.1, key.2);
                 live_vb_bytes = live_vb_bytes.saturating_sub(removed);
                 evicted += 1;
+            }
+            // Phase 2: the near ring alone still exceeds the budget (e.g. an
+            // extreme render distance) — evict farthest sections inside it too.
+            if live_vb_bytes > Self::LIVE_VB_BUDGET {
+                for (key, _dist2) in &far {
+                    if live_vb_bytes <= Self::LIVE_VB_BUDGET {
+                        break;
+                    }
+                    let removed: u64 = self
+                        .chunk_meshes
+                        .get(key)
+                        .map(|ms| ms.iter().map(|m| m.vertices.len() as u64).sum())
+                        .unwrap_or(0);
+                    if removed == 0 {
+                        continue;
+                    }
+                    self.clear_chunk_section(key.0, key.1, key.2);
+                    live_vb_bytes = live_vb_bytes.saturating_sub(removed);
+                    evicted += 1;
+                }
             }
             if evicted > 0 {
                 log::info!(
@@ -4240,7 +4302,7 @@ impl WmRenderer {
                 // Phase 7: Render native MC chunk geometry with D3D12
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time, if self.underwater { 1.0 } else { 0.0 });
 
                 let depth_view = self.surface_depth
                     .as_ref()
@@ -4360,7 +4422,7 @@ impl WmRenderer {
                 // Fallback: 3D test scene (plane + cubes)
                 self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
                 self.camera_prev = self.camera_mvp;
-                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time);
+                write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[self.width as f32, self.height as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time, if self.underwater { 1.0 } else { 0.0 });
 
                 {
                     let depth_view = self.surface_depth
@@ -4433,7 +4495,7 @@ impl WmRenderer {
         self.camera_mvp = mat4_lerp(&self.camera_prev, &self.camera_target, LERP_FACTOR);
         self.camera_prev = self.camera_mvp;
 
-        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[w as f32, h as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time);
+        write_camera_uniform(&self.queue, &self.uniform_buffer, &self.camera_mvp, &self.camera_pos, &self.fog_color, &self.sky_color, &[w as f32, h as f32], self.sky_sun_angle, self.sky_moon_angle, self.sky_star_angle, self.sky_star_brightness, self.sky_moon_phase, self.sky_rain_brightness, &self.cloud_color, self.cloud_height, self.cloud_time, if self.underwater { 1.0 } else { 0.0 });
 
         let slot = &self.slots[self.idx];
         let row_aligned = aligned_row(w);

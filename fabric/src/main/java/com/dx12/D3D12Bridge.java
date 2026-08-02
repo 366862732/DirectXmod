@@ -74,6 +74,8 @@ public class D3D12Bridge {
     /** Update the procedural cloud layer (ARGB tint, height, wind offset). */
     public static native void nativeUpdateCloud(float r, float g, float b, float a,
         float height, float time);
+    /** Set whether the camera is submerged (water fog over sky/clouds). */
+    public static native void nativeUpdateUnderwater(boolean underwater);
 
     // ─── Entities & Particles ──────────────────────────────────
 
@@ -273,6 +275,16 @@ public class D3D12Bridge {
         if (!initialized) return;
         try {
             nativeUpdateCloud(r, g, b, a, height, time);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    /** Set whether the camera is submerged (applies water fog to sky/clouds). */
+    public static void updateUnderwater(boolean underwater) {
+        if (!initialized) return;
+        try {
+            nativeUpdateUnderwater(underwater);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore
         }
