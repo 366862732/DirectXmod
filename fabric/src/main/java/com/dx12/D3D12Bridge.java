@@ -76,6 +76,8 @@ public class D3D12Bridge {
         float height, float time);
     /** Set whether the camera is submerged (water fog over sky/clouds). */
     public static native void nativeUpdateUnderwater(boolean underwater);
+    /** Set the fast-travel eviction keep radius in blocks (render distance × 16 + margin). */
+    public static native void nativeUpdateKeepRadius(float blocks);
 
     // ─── Entities & Particles ──────────────────────────────────
 
@@ -285,6 +287,16 @@ public class D3D12Bridge {
         if (!initialized) return;
         try {
             nativeUpdateUnderwater(underwater);
+        } catch (UnsatisfiedLinkError e) {
+            // Silently ignore
+        }
+    }
+
+    /** Set the fast-travel eviction keep radius in blocks (usually effective render distance × 16 + margin). */
+    public static void updateKeepRadius(float blocks) {
+        if (!initialized) return;
+        try {
+            nativeUpdateKeepRadius(blocks);
         } catch (UnsatisfiedLinkError e) {
             // Silently ignore
         }

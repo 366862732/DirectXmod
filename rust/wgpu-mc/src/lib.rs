@@ -1314,6 +1314,14 @@ pub struct WmRenderer {
     // Phase 13.10: in-flight progressive compaction (None when idle).
     compaction: Option<ChunkCompaction>,
 
+    // P1c fix #3: squared keep radius (blocks) for fast-travel eviction.
+    // Sections within this distance of the camera are never evicted. Updated
+    // from the Java side with the effective render distance so the eviction
+    // ring always covers the full view-distance circle (the old fixed 288 m
+    // ring was smaller than a 32-chunk view distance and stripped visible
+    // horizon terrain).
+    keep_radius_sq: f32,
+
     // Chunk textured pipeline + atlas
     chunk_shader: Option<wgpu::ShaderModule>,  // stored for lazy pipeline creation
     chunk_pipeline: Option<wgpu::RenderPipeline>,
@@ -1893,6 +1901,7 @@ impl WmRenderer {
             deleted_vb_bytes: 0,
             deleted_ib_bytes: 0,
             compaction: None,
+            keep_radius_sq: 288.0 * 288.0, // default: 18 chunks (matches LIVE_VB era)
             chunk_shader: None,
             chunk_pipeline: None,
             chunk_pipeline_transparent: None,
@@ -2274,6 +2283,13 @@ impl WmRenderer {
     /// Set the camera world position (used to offset geometry near the camera).
     pub fn set_camera_pos(&mut self, x: f32, y: f32, z: f32) {
         self.camera_pos = [x, y, z];
+    }
+
+    /// Set the eviction keep radius in blocks (usually the effective render
+    /// distance × 16 + a margin). Sections closer than this to the camera are
+    /// never evicted by the fast-travel defense.
+    pub fn set_keep_radius(&mut self, blocks: f32) {
+        self.keep_radius_sq = blocks.max(0.0).powi(2);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -2667,6 +2683,49 @@ impl WmRenderer {
         let vcount = vertices.len() as u32;
         let icount = indices.len() as u32;
 
+        // ── P1c fix #3: upload-time reclamation (defense-in-depth) ──
+        // The render-thread eviction (prepare_chunk_batch) cannot run while
+        // the render loop stalls during a view-distance-32 chunk-compile
+        // storm; the merged VB then pins at the 1 GiB wgpu hard cap and every
+        // new upload is REJECTED (observed: 5838 REJECTED after one 8→32
+        // view-distance switch → missing terrain). Reclaim space HERE, on the
+        // compile thread, before this append is recorded:
+        //   1. evict the farthest sections beyond the view-distance keep radius
+        //      (they are never visible anyway — MC will recompile them if the
+        //      player returns),
+        //   2. run a synchronous rebuild so the tombstoned bytes actually
+        //      shrink merged_verts/indices (progressive compaction cannot
+        //      catch up while uploads keep appending to the tail).
+        // Only triggers when the merged buffer is within RECLAIM_MARGIN of the
+        // cap, so the ~50 ms rebuild cost is spread over hundreds of uploads.
+        let new_vb_bytes = (self.merged_verts.len() as u64 + vcount as u64)
+            * std::mem::size_of::<ChunkVertex>() as u64;
+        let new_ib_bytes = (self.merged_indices.len() as u64 + icount as u64)
+            * std::mem::size_of::<u32>() as u64;
+        let reclaim_needed = new_vb_bytes > Self::MAX_BUF_SIZE - Self::RECLAIM_MARGIN
+            || new_ib_bytes > Self::MAX_BUF_SIZE - Self::RECLAIM_MARGIN;
+        if reclaim_needed {
+            let live_vb_bytes: u64 = self
+                .chunk_meshes
+                .values()
+                .flat_map(|ms| ms.iter())
+                .map(|m| m.vertices.len() as u64)
+                .sum::<u64>()
+                * std::mem::size_of::<ChunkVertex>() as u64;
+            let live_after = self.evict_far_sections(live_vb_bytes);
+            if live_after < live_vb_bytes {
+                eprintln!("[dx12-wm] Upload-time eviction: freed {} MB of live sections (live VB {:.0} MB → {:.0} MB)",
+                    (live_vb_bytes - live_after) as f64 / (1024.0 * 1024.0),
+                    live_vb_bytes as f64 / (1024.0 * 1024.0),
+                    live_after as f64 / (1024.0 * 1024.0));
+            }
+            // Synchronous rebuild reclaims ALL tombstones + dead gaps so the
+            // merged cache returns to the live size before this append.
+            if self.deleted_vb_bytes > 0 || self.deleted_ib_bytes > 0 || live_after < live_vb_bytes {
+                self.rebuild_chunk_buffers();
+            }
+        }
+
         // Phase 11j: assign merge offsets NOW (append position in the flat
         // caches), not during a later full rebuild. This lets uploads append
         // incrementally without re-concatenating every mesh every frame.
@@ -2838,8 +2897,14 @@ impl WmRenderer {
     /// Once the live VB passes LIVE_VB_HARD, the farthest sections are evicted
     /// (tombstoned for the next compaction) down to LIVE_VB_BUDGET, keeping
     /// uploads working and distant terrain present while bounding GPU memory.
-    const LIVE_VB_BUDGET: u64 = 700 * 1024 * 1024; // evict down to 700 MB
-    const LIVE_VB_HARD: u64 = 850 * 1024 * 1024;   // start evicting at 850 MB
+    const LIVE_VB_BUDGET: u64 = 900 * 1024 * 1024; // evict down to 900 MB
+    const LIVE_VB_HARD: u64 = 930 * 1024 * 1024;   // start evicting at 930 MB
+
+    /// P1c fix #3: upload-time reclamation margin. When a new section upload
+    /// would bring the merged VB/IB within this many bytes of the 1 GiB hard
+    /// cap, reclaim space synchronously on the upload path (evict + rebuild)
+    /// before the append is REJECTED.
+    const RECLAIM_MARGIN: u64 = 48 * 1024 * 1024; // 48 MB headroom
 
     /// Phase 13.10: bytes of live mesh data (verts + indices) moved per frame
     /// during progressive compaction. 64 MB per frame costs well under a
@@ -3288,72 +3353,145 @@ impl WmRenderer {
             .sum::<u64>()
             * std::mem::size_of::<ChunkVertex>() as u64;
         if live_vb_bytes > Self::LIVE_VB_HARD {
-            let (cx, cy, cz) = (self.camera_pos[0], self.camera_pos[1], self.camera_pos[2]);
-            let mut far: Vec<((i32, i32, i32), f32)> = self
-                .chunk_meshes
-                .keys()
-                .map(|k| {
-                    let dx = (k.0 as f32 * 16.0 + 8.0) - cx;
-                    let dy = (k.1 as f32 * 16.0 + 8.0) - cy;
-                    let dz = (k.2 as f32 * 16.0 + 8.0) - cz;
-                    (*k, dx * dx + dy * dy + dz * dz)
-                })
-                .collect();
-            far.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let mut live_vb_bytes = live_vb_bytes;
-            let mut evicted = 0usize;
-            // Two-phase eviction. Phase 1 only evicts sections beyond the keep
-            // radius (~18 chunks) so the view-distance ring the player is
-            // flying toward is never stripped — otherwise fast travel leaves a
-            // hole ahead that only fills after MC recompiles those sections.
-            const KEEP_RADIUS2: f32 = 288.0 * 288.0;
-            for (key, dist2) in &far {
+            let live_after = self.evict_far_sections(live_vb_bytes);
+            if live_after < live_vb_bytes {
+                log::info!(
+                    "[dx12-wm] Fast-travel eviction: live VB now {:.0} MB (was {:.0} MB)",
+                    live_after as f64 / (1024.0 * 1024.0),
+                    live_vb_bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
+    }
+
+    /// P1c fix #3: evict the farthest chunk sections (beyond the view-distance
+    /// keep radius) until the live vertex bytes drop to LIVE_VB_BUDGET, or the
+    /// whole dataset is inside the keep radius. Returns the remaining live
+    /// bytes. Evictions go through `clear_chunk_section` — tail removals free
+    /// merged cache space immediately, middle removals become tombstones for
+    /// the next compaction/rebuild.
+    ///
+    /// P1c fix #4: view-frustum protection. Sections inside the current view
+    /// frustum are never evicted in phase 1, even when they sit beyond the
+    /// keep radius — a stale/misconfigured keep radius must not strip terrain
+    /// the player can actually see (last line of defense behind the Java
+    /// render-distance sync).
+    ///
+    /// P1c fix #5 (why the phases order like this): at 32-chunk render distance
+    /// the in-view dataset alone reaches ~850 MB live (frustum reports ~3.6k
+    /// live sections/frame), so the old 850 MB hard / 700 MB budget forced
+    /// eviction INSIDE the keep radius — stripping terrain the player could
+    /// still see ("most chunks vanish during elytra flight", game log
+    /// 15:49:54 with keep_radius=544 and evicted samples at ~543 blocks).
+    /// The budgets are now close to the 1 GiB wgpu hard cap so the legitimate
+    /// view-distance ring always fits; eviction trims only the far ring,
+    /// which MC has already unloaded (keep radius = view distance + 32 blocks,
+    /// so dist >= keep radius is beyond MC's load radius and never visible).
+    ///
+    /// Three phases. Phase 1 evicts sections beyond the keep radius AND outside
+    /// the view frustum (normal fast-travel cleanup — off-screen and already
+    /// unloaded by MC). Phase 2 evicts ALL sections beyond the keep radius,
+    /// in-frustum or not — they are past MC's load radius, so the player can
+    /// never see them and freeing them is always safe. Phase 3 is the absolute
+    /// last resort (still over budget with the whole far ring freed — extreme
+    /// render distance): evict the farthest in-ring sections, frustum or not —
+    /// better than the 1 GiB cap REJECTING every upload, which blanks the
+    /// whole world.
+    fn evict_far_sections(&mut self, live_vb_bytes: u64) -> u64 {
+        let (cx, cy, cz) = (self.camera_pos[0], self.camera_pos[1], self.camera_pos[2]);
+        // Frustum planes, same derivation as draw_chunks. camera_mvp starts at
+        // IDENTITY where row 4 z = 0 → culling disabled → every section counts
+        // as frustum-protected until the first real camera update arrives.
+        let cull_enabled = self.camera_mvp[3][2] != 0.0;
+        let planes = if cull_enabled {
+            let mvp_row_major = transpose4(&self.camera_mvp);
+            extract_frustum_planes(&mvp_row_major)
+        } else {
+            [[0.0f32; 4]; 6]
+        };
+        let mut far: Vec<((i32, i32, i32), f32, bool)> = self
+            .chunk_meshes
+            .keys()
+            .map(|k| {
+                let dx = (k.0 as f32 * 16.0 + 8.0) - cx;
+                let dy = (k.1 as f32 * 16.0 + 8.0) - cy;
+                let dz = (k.2 as f32 * 16.0 + 8.0) - cz;
+                let min = [k.0 as f32 * 16.0, k.1 as f32 * 16.0, k.2 as f32 * 16.0];
+                let max = [min[0] + 16.0, min[1] + 16.0, min[2] + 16.0];
+                let in_view = cull_enabled && aabb_in_frustum(min, max, &planes);
+                (*k, dx * dx + dy * dy + dz * dz, in_view)
+            })
+            .collect();
+        far.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut live_vb_bytes = live_vb_bytes;
+        let mut evicted = 0usize;
+        let mut evicted_coords: Vec<String> = Vec::new(); // sample for diagnostics
+        let keep_radius2 = self.keep_radius_sq;
+
+        // Inline eviction helper (macro so it can share the mutable borrow
+        // without fighting the borrow checker). `phase` gates which safety
+        // checks apply: 1 = keep radius + frustum, 2 = keep radius only,
+        // 3 = nothing (absolute last resort).
+        macro_rules! try_evict {
+            ($key:expr, $dist2:expr, $in_view:expr, $phase:expr) => {{
                 if live_vb_bytes <= Self::LIVE_VB_BUDGET {
                     break;
                 }
-                if *dist2 < KEEP_RADIUS2 {
-                    continue; // keep the near ring; phase 2 is the fallback
+                if *$in_view && $phase == 1 {
+                    continue; // phase 1: never strip terrain on screen
+                }
+                if *$dist2 < keep_radius2 && $phase < 3 {
+                    continue; // phases 1-2: keep the in-view-distance ring
                 }
                 let removed: u64 = self
                     .chunk_meshes
-                    .get(key)
+                    .get($key)
                     .map(|ms| ms.iter().map(|m| m.vertices.len() as u64).sum())
                     .unwrap_or(0);
                 if removed == 0 {
                     continue;
                 }
-                self.clear_chunk_section(key.0, key.1, key.2);
+                self.clear_chunk_section($key.0, $key.1, $key.2);
                 live_vb_bytes = live_vb_bytes.saturating_sub(removed);
                 evicted += 1;
-            }
-            // Phase 2: the near ring alone still exceeds the budget (e.g. an
-            // extreme render distance) — evict farthest sections inside it too.
-            if live_vb_bytes > Self::LIVE_VB_BUDGET {
-                for (key, _dist2) in &far {
-                    if live_vb_bytes <= Self::LIVE_VB_BUDGET {
-                        break;
-                    }
-                    let removed: u64 = self
-                        .chunk_meshes
-                        .get(key)
-                        .map(|ms| ms.iter().map(|m| m.vertices.len() as u64).sum())
-                        .unwrap_or(0);
-                    if removed == 0 {
-                        continue;
-                    }
-                    self.clear_chunk_section(key.0, key.1, key.2);
-                    live_vb_bytes = live_vb_bytes.saturating_sub(removed);
-                    evicted += 1;
+                if evicted_coords.len() < 8 {
+                    evicted_coords.push(format!("({},{},{})", $key.0, $key.1, $key.2));
                 }
-            }
-            if evicted > 0 {
-                log::info!(
-                    "[dx12-wm] Fast-travel eviction: removed {} far sections, live VB now {:.0} MB",
-                    evicted,
-                    live_vb_bytes as f64 / (1024.0 * 1024.0)
-                );
+            }};
+        }
+
+        // Phase 1: beyond the keep radius AND outside the view frustum.
+        for (key, dist2, in_view) in &far {
+            try_evict!(key, dist2, in_view, 1);
+        }
+        // Phase 2: the whole far ring (dist >= keep radius), in-frustum or not —
+        // those sections are past MC's load radius so the player never sees them.
+        if live_vb_bytes > Self::LIVE_VB_BUDGET {
+            for (key, dist2, in_view) in &far {
+                try_evict!(key, dist2, in_view, 2);
             }
         }
+        // Phase 3: everything beyond the keep radius freed and still over
+        // budget — the farthest in-ring sections beat the whole world REJECTED.
+        if live_vb_bytes > Self::LIVE_VB_BUDGET {
+            for (key, dist2, in_view) in &far {
+                try_evict!(key, dist2, in_view, 3);
+            }
+        }
+        if evicted > 0 {
+            eprintln!(
+                "[dx12-wm] Fast-travel eviction: removed {} sections, live VB now {:.0} MB (budget {:.0} MB, keep_radius={:.0} blocks, camera=({:.0},{:.0},{:.0}), e.g. {})",
+                evicted,
+                live_vb_bytes as f64 / (1024.0 * 1024.0),
+                Self::LIVE_VB_BUDGET as f64 / (1024.0 * 1024.0),
+                keep_radius2.sqrt(),
+                cx,
+                cy,
+                cz,
+                evicted_coords.join(" ")
+            );
+        }
+        live_vb_bytes
     }
 
     /// Render all stored MC chunk meshes using two-pass rendering.

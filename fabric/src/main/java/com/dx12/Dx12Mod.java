@@ -103,6 +103,118 @@ public class Dx12Mod implements ClientModInitializer {
     private static int getSkyColorFailCount = 0;
     private static long lastParticleLogMs = 0;
 
+    // P1c fix #3: last keep radius (blocks) sent to the Rust renderer.
+    private static float lastKeepRadiusBlocks = 288.0f;
+
+    // P1c fix #4: cached render-distance resolution. getRenderDistanceBlocks()
+    // is called every tick; reflection field/method scans are slow, so the
+    // result is cached for 10 s (view distance can change at runtime).
+    private static boolean renderDistanceResolved = false;
+    private static float resolvedRenderDistanceBlocks = 288.0f;
+    private static long lastRenderDistanceResolveMs = 0;
+
+    /**
+     * Effective render distance in blocks, resolved fully reflectively so the
+     * mod compiles against any MC mapping layout. The Minecraft.options field
+     * is looked up with getDeclaredField + setAccessible (getField only finds
+     * public fields and silently fails on private layouts, which made the
+     * keep radius fall back to 288 blocks — smaller than a 32-chunk view
+     * distance and the renderer then evicted the visible horizon). Tries, in
+     * order:
+     *   Options.getEffectiveRenderDistance()        (1.20.x+)
+     *   Options.renderDistance()                    (OptionInstance<Integer>, 1.20.5+)
+     *   Minecraft.getEffectiveRenderDistance()      (older)
+     * Failures are logged once so a wrong radius is diagnosable instead of
+     * silently defaulting.
+     */
+    private static float getRenderDistanceBlocks(Minecraft mc) {
+        long now = System.currentTimeMillis();
+        if (renderDistanceResolved && now - lastRenderDistanceResolveMs < 10_000) {
+            return resolvedRenderDistanceBlocks;
+        }
+        float blocks = resolveRenderDistanceBlocks(mc);
+        renderDistanceResolved = true;
+        lastRenderDistanceResolveMs = now;
+        resolvedRenderDistanceBlocks = blocks;
+        return blocks;
+    }
+
+    private static float resolveRenderDistanceBlocks(Minecraft mc) {
+        Object options = findOptionsField(mc);
+        if (options != null) {
+            // 1) Options.getEffectiveRenderDistance() → int chunks (1.20.x+)
+            Float rd = invokeNumberMethod(options, "getEffectiveRenderDistance");
+            if (rd != null) {
+                LOGGER.info("[dx12-wm] Render distance (Options.getEffectiveRenderDistance): {} chunks", rd.intValue());
+                return rd * 16.0f + 32.0f;
+            }
+            // 2) Options.renderDistance() → OptionInstance<Integer> (a Supplier)
+            Object rdObj = invokeMethod(options, "renderDistance");
+            if (rdObj != null) {
+                if (rdObj instanceof Number n) {
+                    LOGGER.info("[dx12-wm] Render distance (Options.renderDistance number): {} chunks", n.intValue());
+                    return n.intValue() * 16.0f + 32.0f;
+                }
+                if (rdObj instanceof java.util.function.Supplier<?> s) {
+                    Object val = s.get();
+                    if (val instanceof Number n) {
+                        LOGGER.info("[dx12-wm] Render distance (Options.renderDistance supplier): {} chunks", n.intValue());
+                        return n.intValue() * 16.0f + 32.0f;
+                    }
+                }
+            }
+        }
+        // 3) Minecraft.getEffectiveRenderDistance() → int chunks (older)
+        Float rd = invokeNumberMethod(mc, "getEffectiveRenderDistance");
+        if (rd != null) {
+            LOGGER.info("[dx12-wm] Render distance (Minecraft.getEffectiveRenderDistance): {} chunks", rd.intValue());
+            return rd * 16.0f + 32.0f;
+        }
+        LOGGER.warn("[dx12-wm] Render distance resolution failed; keep radius defaults to 288 blocks");
+        return 288.0f;
+    }
+
+    /** Resolve the Minecraft.options slot (public or private, any layout). */
+    private static Object findOptionsField(Minecraft mc) {
+        try {
+            Field f = Minecraft.class.getDeclaredField("options");
+            f.setAccessible(true);
+            return f.get(mc);
+        } catch (Exception | LinkageError e) {
+            LOGGER.warn("[dx12-wm] options field lookup failed: {}", e.toString());
+        }
+        // Fallback: scan declared fields for a net.minecraft.client.Options slot
+        // (works even when the field is renamed in the runtime mapping).
+        try {
+            for (Field f : Minecraft.class.getDeclaredFields()) {
+                if (f.getType().getName().endsWith("client.Options")) {
+                    f.setAccessible(true);
+                    return f.get(mc);
+                }
+            }
+        } catch (Exception | LinkageError e) {
+            LOGGER.warn("[dx12-wm] options field scan failed: {}", e.toString());
+        }
+        return null;
+    }
+
+    /** Invoke a no-arg method returning a Number (e.g. getEffectiveRenderDistance). */
+    private static Float invokeNumberMethod(Object target, String name) {
+        Object val = invokeMethod(target, name);
+        if (val instanceof Number n) return (float) n.intValue();
+        return null;
+    }
+
+    /** Invoke a no-arg method and return its raw result (null on failure). */
+    private static Object invokeMethod(Object target, String name) {
+        try {
+            Method m = target.getClass().getMethod(name);
+            return m.invoke(target);
+        } catch (Exception | LinkageError ignored) {
+            return null;
+        }
+    }
+
     // Lightmap update throttling
     private static int lightmapTickCount = 0;
     private static final int LIGHTMAP_UPDATE_INTERVAL_TICKS = 5;
@@ -331,6 +443,18 @@ public class Dx12Mod implements ClientModInitializer {
                         }
                         D3D12Bridge.nativeUpdateFog(fr, fg, fb, fogDensity);
                         D3D12Bridge.updateUnderwater(underwater);
+                    }
+                    // P1c fix #3: sync the fast-travel eviction keep radius to
+                    // the effective render distance so the renderer never evicts
+                    // terrain that is actually in view (the old fixed 288-block
+                    // ring was smaller than a 32-chunk view distance and
+                    // stripped the visible horizon).
+                    {
+                        float rdBlocks = getRenderDistanceBlocks(mc);
+                        if (Math.abs(rdBlocks - lastKeepRadiusBlocks) > 0.5f) {
+                            lastKeepRadiusBlocks = rdBlocks;
+                            D3D12Bridge.updateKeepRadius(rdBlocks);
+                        }
                     }
                     // ─── Sky dome update ────────────────────────────
                     // Push the MC-derived sky color to the Rust sky dome so the

@@ -284,6 +284,24 @@ pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateUnderwater(
     }
 }
 
+/// Set the fast-travel eviction keep radius in blocks (effective render
+/// distance × 16 + margin). Sections closer than this to the camera are
+/// never evicted when the live vertex set is trimmed.
+///
+/// # Safety
+/// This function is called from Java via JNI.
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_dx12_D3D12Bridge_nativeUpdateKeepRadius(
+    _env: JNIEnv,
+    _class: JClass,
+    blocks: f32,
+) {
+    let mut guard = lock_or_poisoned();
+    if let Some(Ok(ref mut renderer)) = guard.as_mut() {
+        renderer.set_keep_radius(blocks);
+    }
+}
+
 /// Check if the wgpu renderer is ready for rendering.
 /// Returns 1 if ready, 0 if still initializing, -1 if failed.
 ///
