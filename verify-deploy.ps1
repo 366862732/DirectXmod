@@ -61,7 +61,7 @@ function Check {
 }
 
 # 1. DLL build identity (git commit hash injected by build.rs)
-Check "DLL version (wgpu-mc build cb40852)" "wgpu-mc build cb40852" $true
+Check "DLL version (wgpu-mc build 4ccfc75)" "wgpu-mc build 4ccfc75" $true
 
 # 2. Frame-rate unlock (Phase 11h)
 Check "Per-frame present (present moved to render TAIL)" "present moved to render TAIL" $true
@@ -90,8 +90,8 @@ Check "Particles uploaded (chain alive)" "Particles uploaded:" $true
 # 10. No wgpu Validation Error / fatal panic (256 MB buffer limit — 13.7)
 Check "No wgpu fatal error (Validation Error absent)" "Handling wgpu errors as fatal" $false
 
-# 11. No rejected chunk meshes (max_buffer_size raised to 1 GiB — 13.8)
-Check "No rejected chunk meshes (1 GiB limit)" "Chunk mesh REJECTED" $false
+# 11. No rejected chunk meshes (max_buffer_size raised to 1.5 GiB — 13.12)
+Check "No rejected chunk meshes (1.5 GiB limit)" "Chunk mesh REJECTED" $false
 
 # 12. Renderer ready
 Check "Renderer ready (Device created OK)" "Device created OK" $true

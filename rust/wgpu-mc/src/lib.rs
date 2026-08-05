@@ -1422,8 +1422,12 @@ impl WmRenderer {
                 // Raise max_buffer_size above the wgpu default (256 MiB): the
                 // merged chunk VB reaches ≈268 MB at 6.7 M verts. D3D12
                 // supports i32::MAX here (wgpu-hal dx12 adapter.rs:510).
+                // P1c fix #6: 1 GiB → 1.5 GiB — a 32-chunk view distance needs
+                // ~850–950 MB live + recompile tombstones; the old 1 GiB cap
+                // forced full rebuilds/eviction during normal play (freeze +
+                // chunk loss, game log 16:04).
                 required_limits: wgpu::Limits {
-                    max_buffer_size: 1024 * 1024 * 1024, // 1 GiB
+                    max_buffer_size: 1536 * 1024 * 1024, // 1.5 GiB
                     ..wgpu::Limits::default()
                 },
                 memory_hints: Default::default(),
@@ -2887,24 +2891,35 @@ impl WmRenderer {
     /// (game log 19:14:50+: "Chunk mesh REJECTED … > wgpu max 268435456 B").
     const CHUNK_VB_MIN_CAP: u64 = 4 * 1024 * 1024; // 4 MB
     const CHUNK_IB_MIN_CAP: u64 = 1 * 1024 * 1024; // 1 MB
-    const MAX_BUF_SIZE: u64 = 1024 * 1024 * 1024;  // 1 GiB (matches required_limits.max_buffer_size)
+    const MAX_BUF_SIZE: u64 = 1536 * 1024 * 1024;  // 1.5 GiB (matches required_limits.max_buffer_size)
 
     /// P1c-era live-dataset budget (P1c fix #2): MC recompiles sections
     /// in-place (clear→upload) but NEVER evicts them on chunk unload, so the
     /// live vertex set only grows. During fast travel (elytra flight) it blows
-    /// past the 1 GiB wgpu hard cap and every new upload is REJECTED —
+    /// past the wgpu hard cap and every new upload is REJECTED —
     /// observed 8752 "Chunk mesh REJECTED" in one session → missing chunks.
     /// Once the live VB passes LIVE_VB_HARD, the farthest sections are evicted
     /// (tombstoned for the next compaction) down to LIVE_VB_BUDGET, keeping
     /// uploads working and distant terrain present while bounding GPU memory.
-    const LIVE_VB_BUDGET: u64 = 900 * 1024 * 1024; // evict down to 900 MB
-    const LIVE_VB_HARD: u64 = 930 * 1024 * 1024;   // start evicting at 930 MB
+    ///
+    /// P1c fix #6 (budgets raised for 32-chunk view distance): the legitimate
+    /// in-ring dataset at 32 chunks is ~850–950 MB live (frustum reports ~3.6k
+    /// sections/frame), so the old 900/930 MB budget sat AT the ring size —
+    /// eviction then ran during normal play and phase 3 stripped in-ring
+    /// sections the player could still see ("0 visible / 2198400 culled",
+    /// game log 16:04:31–16:05:19). The cap is also raised 1 GiB → 1.5 GiB
+    /// (D3D12 supports i32::MAX, wgpu-hal dx12 adapter.rs:510) so the merged
+    /// buffer has headroom for the ring + recompile tombstones without a
+    /// synchronous full rebuild. Budgets now sit ~500 MB above the ring, so
+    /// eviction only trims flight accumulation beyond the keep radius.
+    const LIVE_VB_BUDGET: u64 = 1400 * 1024 * 1024; // evict down to 1400 MB
+    const LIVE_VB_HARD: u64 = 1450 * 1024 * 1024;   // start evicting at 1450 MB
 
     /// P1c fix #3: upload-time reclamation margin. When a new section upload
-    /// would bring the merged VB/IB within this many bytes of the 1 GiB hard
-    /// cap, reclaim space synchronously on the upload path (evict + rebuild)
+    /// would bring the merged VB/IB within this many bytes of the hard cap,
+    /// reclaim space synchronously on the upload path (evict + rebuild)
     /// before the append is REJECTED.
-    const RECLAIM_MARGIN: u64 = 48 * 1024 * 1024; // 48 MB headroom
+    const RECLAIM_MARGIN: u64 = 64 * 1024 * 1024; // 64 MB headroom
 
     /// Phase 13.10: bytes of live mesh data (verts + indices) moved per frame
     /// during progressive compaction. 64 MB per frame costs well under a
@@ -3383,10 +3398,11 @@ impl WmRenderer {
     /// eviction INSIDE the keep radius — stripping terrain the player could
     /// still see ("most chunks vanish during elytra flight", game log
     /// 15:49:54 with keep_radius=544 and evicted samples at ~543 blocks).
-    /// The budgets are now close to the 1 GiB wgpu hard cap so the legitimate
-    /// view-distance ring always fits; eviction trims only the far ring,
-    /// which MC has already unloaded (keep radius = view distance + 32 blocks,
-    /// so dist >= keep radius is beyond MC's load radius and never visible).
+    /// P1c fix #6: with the budgets raised to 1400/1450 MB and the cap to
+    /// 1.5 GiB, the legitimate view-distance ring always fits well below the
+    /// hard cap; eviction trims only the far ring, which MC has already
+    /// unloaded (keep radius = view distance + 32 blocks, so dist >= keep
+    /// radius is beyond MC's load radius and never visible).
     ///
     /// Three phases. Phase 1 evicts sections beyond the keep radius AND outside
     /// the view frustum (normal fast-travel cleanup — off-screen and already
