@@ -3,12 +3,7 @@
     "package": "com.dx12.mixin",
     "compatibilityLevel": "JAVA_25",
     "client": [
-        "GameRendererMixin",
-        "GlDeviceMixin",
-        "MinecraftMixin",
-        "PreferredGraphicsApiMixin",
-        "SectionCompilerMixin",
-        "TextureAtlasMixin"
+        "PreferredGraphicsApiMixin"
     ],
     "injectors": {
         "defaultRequire": 1

@@ -9,13 +9,14 @@
 use jni::objects::JClass;
 use jni::sys::jstring;
 use jni::JNIEnv;
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
     D3D_FEATURE_LEVEL_12_1,
 };
 use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice, DXGI_ADAPTER_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4, DXGI_ADAPTER_DESC,
+};
 
 /// Java: `com.dx12.dx12.Dx12Native.dx12CreateDevice() -> String`
 ///
@@ -24,7 +25,7 @@ use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice, DXGI_ADAPTER_DES
 /// 失败时返回以 `ERROR:` 开头的错误信息。
 #[no_mangle]
 pub extern "system" fn Java_com_dx12_dx12_Dx12Native_dx12CreateDevice(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let msg = match dx12_create_device() {
@@ -68,15 +69,20 @@ fn create_device_at(level: D3D_FEATURE_LEVEL) -> Result<ID3D12Device, String> {
     }
 }
 
-/// 通过 IDXGIDevice → IDXGIAdapter → GetDesc 取设备名。
+/// 通过 device 的 LUID 在 DXGI 中枚举对应适配器取设备名。
+///
+/// 不用 `device.cast::<IDXGIDevice>()`：D3D12 设备的 QueryInterface(IDXGIDevice)
+/// 在部分驱动上返回 E_NOINTERFACE（实测 0x80004002）。用
+/// `ID3D12Device::GetAdapterLuid` + `IDXGIFactory4::EnumAdapterByLuid` 更稳，
+/// 且按 LUID 匹配能正确选中实际创建 device 的适配器（含多 GPU 环境）。
 fn adapter_name(device: &ID3D12Device) -> Result<String, String> {
     unsafe {
-        let dxgi: IDXGIDevice = device
-            .cast()
-            .map_err(|e| format!("query IDXGIDevice: {e:?}"))?;
-        let adapter: IDXGIAdapter = dxgi
-            .GetAdapter()
-            .map_err(|e| format!("GetAdapter: {e:?}"))?;
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e:?}"))?;
+        let adapter: IDXGIAdapter = factory
+            .EnumAdapterByLuid(luid)
+            .map_err(|e| format!("EnumAdapterByLuid: {e:?}"))?;
         let desc: DXGI_ADAPTER_DESC =
             adapter.GetDesc().map_err(|e| format!("GetDesc: {e:?}"))?;
         let name = String::from_utf16_lossy(&desc.Description);
