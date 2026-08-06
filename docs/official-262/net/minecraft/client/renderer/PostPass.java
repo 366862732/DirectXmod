@@ -1,0 +1,192 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  net.fabricmc.api.EnvType
+ *  net.fabricmc.api.Environment
+ *  org.lwjgl.system.MemoryStack
+ */
+package net.minecraft.client.renderer;
+
+import com.mojang.blaze3d.ProjectionType;
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.buffers.Std140Builder;
+import com.mojang.blaze3d.buffers.Std140SizeCalculator;
+import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
+import com.mojang.blaze3d.framegraph.FramePass;
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.resource.ResourceHandle;
+import com.mojang.blaze3d.systems.CommandEncoder;
+import com.mojang.blaze3d.systems.RenderPass;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.systems.SamplerCache;
+import com.mojang.blaze3d.textures.FilterMode;
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.renderer.MappableRingBuffer;
+import net.minecraft.client.renderer.UniformValue;
+import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.resources.Identifier;
+import org.lwjgl.system.MemoryStack;
+
+@Environment(value=EnvType.CLIENT)
+public class PostPass
+implements AutoCloseable {
+    private static final int UBO_SIZE_PER_SAMPLER = new Std140SizeCalculator().putVec2().get();
+    private final String name;
+    private final RenderPipeline pipeline;
+    private final Identifier outputTargetId;
+    private final Map<String, GpuBuffer> customUniforms = new HashMap<String, GpuBuffer>();
+    private final MappableRingBuffer infoUbo;
+    private final List<Input> inputs;
+
+    public PostPass(RenderPipeline pipeline, Identifier outputTargetId, Map<String, List<UniformValue>> uniformGroups, List<Input> inputs) {
+        this.pipeline = pipeline;
+        this.name = pipeline.getLocation().toString();
+        this.outputTargetId = outputTargetId;
+        this.inputs = inputs;
+        for (Map.Entry<String, List<UniformValue>> uniformGroup : uniformGroups.entrySet()) {
+            List<UniformValue> uniforms = uniformGroup.getValue();
+            if (uniforms.isEmpty()) continue;
+            Std140SizeCalculator calculator = new Std140SizeCalculator();
+            for (UniformValue uniform : uniforms) {
+                uniform.addSize(calculator);
+            }
+            int size = calculator.get();
+            MemoryStack stack = MemoryStack.stackPush();
+            try {
+                Std140Builder builder = Std140Builder.onStack(stack, size);
+                for (UniformValue uniform : uniforms) {
+                    uniform.writeTo(builder);
+                }
+                this.customUniforms.put(uniformGroup.getKey(), RenderSystem.getDevice().createBuffer(() -> this.name + " / " + (String)uniformGroup.getKey(), 128, builder.get()));
+            }
+            finally {
+                if (stack == null) continue;
+                stack.close();
+            }
+        }
+        this.infoUbo = new MappableRingBuffer(() -> this.name + " SamplerInfo", 130, (inputs.size() + 1) * UBO_SIZE_PER_SAMPLER);
+    }
+
+    public void addToFrame(FrameGraphBuilder frame, Map<Identifier, ResourceHandle<RenderTarget>> targets, GpuBufferSlice shaderOrthoMatrix) {
+        FramePass pass = frame.addPass(this.name);
+        for (Input input : this.inputs) {
+            input.addToPass(pass, targets);
+        }
+        ResourceHandle outputHandle = targets.computeIfPresent(this.outputTargetId, (id, handle) -> pass.readsAndWrites(handle));
+        if (outputHandle == null) {
+            throw new IllegalStateException("Missing handle for target " + String.valueOf(this.outputTargetId));
+        }
+        pass.executes(() -> {
+            RenderTarget outputTarget = (RenderTarget)outputHandle.get();
+            RenderSystem.backupProjectionMatrix();
+            RenderSystem.setProjectionMatrix(shaderOrthoMatrix, ProjectionType.ORTHOGRAPHIC);
+            CommandEncoder commandEncoder = RenderSystem.getDevice().createCommandEncoder();
+            SamplerCache samplerCache = RenderSystem.getSamplerCache();
+            List<InputTexture> inputTextures = this.inputs.stream().map(i -> new InputTexture(i.samplerName(), i.texture(targets), samplerCache.getClampToEdge(i.bilinear() ? FilterMode.LINEAR : FilterMode.NEAREST))).toList();
+            try (GpuBufferSlice.MappedView view = this.infoUbo.currentBuffer().map(false, true);){
+                Std140Builder builder = Std140Builder.intoBuffer(view.data());
+                builder.putVec2(outputTarget.width, outputTarget.height);
+                for (InputTexture input : inputTextures) {
+                    builder.putVec2(input.view.getWidth(0), input.view.getHeight(0));
+                }
+            }
+            try (RenderPass renderPass = commandEncoder.createRenderPass(() -> "Post pass " + this.name, outputTarget.getColorTextureView(), Optional.empty(), outputTarget.useDepth ? outputTarget.getDepthTextureView() : null, OptionalDouble.empty());){
+                renderPass.setPipeline(this.pipeline);
+                RenderSystem.bindDefaultUniforms(renderPass);
+                renderPass.setUniform("SamplerInfo", this.infoUbo.currentBuffer());
+                for (Map.Entry<String, GpuBuffer> entry : this.customUniforms.entrySet()) {
+                    renderPass.setUniform(entry.getKey(), entry.getValue());
+                }
+                for (InputTexture input : inputTextures) {
+                    renderPass.bindTexture(input.samplerName() + "Sampler", input.view(), input.sampler());
+                }
+                renderPass.draw(3, 1, 0, 0);
+            }
+            this.infoUbo.rotate();
+            RenderSystem.restoreProjectionMatrix();
+            for (Input input : this.inputs) {
+                input.cleanup(targets);
+            }
+        });
+    }
+
+    @Override
+    public void close() {
+        for (GpuBuffer buffer : this.customUniforms.values()) {
+            buffer.close();
+        }
+        this.infoUbo.close();
+    }
+
+    @Environment(value=EnvType.CLIENT)
+    public static interface Input {
+        public void addToPass(FramePass var1, Map<Identifier, ResourceHandle<RenderTarget>> var2);
+
+        default public void cleanup(Map<Identifier, ResourceHandle<RenderTarget>> targets) {
+        }
+
+        public GpuTextureView texture(Map<Identifier, ResourceHandle<RenderTarget>> var1);
+
+        public String samplerName();
+
+        public boolean bilinear();
+    }
+
+    @Environment(value=EnvType.CLIENT)
+    private record InputTexture(String samplerName, GpuTextureView view, GpuSampler sampler) {
+    }
+
+    @Environment(value=EnvType.CLIENT)
+    public record TargetInput(String samplerName, Identifier targetId, boolean depthBuffer, boolean bilinear) implements Input
+    {
+        private ResourceHandle<RenderTarget> getHandle(Map<Identifier, ResourceHandle<RenderTarget>> targets) {
+            ResourceHandle<RenderTarget> handle = targets.get(this.targetId);
+            if (handle == null) {
+                throw new IllegalStateException("Missing handle for target " + String.valueOf(this.targetId));
+            }
+            return handle;
+        }
+
+        @Override
+        public void addToPass(FramePass pass, Map<Identifier, ResourceHandle<RenderTarget>> targets) {
+            pass.reads(this.getHandle(targets));
+        }
+
+        @Override
+        public GpuTextureView texture(Map<Identifier, ResourceHandle<RenderTarget>> targets) {
+            GpuTextureView textureView;
+            ResourceHandle<RenderTarget> handle = this.getHandle(targets);
+            RenderTarget target = handle.get();
+            GpuTextureView gpuTextureView = textureView = this.depthBuffer ? target.getDepthTextureView() : target.getColorTextureView();
+            if (textureView == null) {
+                throw new IllegalStateException("Missing " + (this.depthBuffer ? "depth" : "color") + "texture for target " + String.valueOf(this.targetId));
+            }
+            return textureView;
+        }
+    }
+
+    @Environment(value=EnvType.CLIENT)
+    public record TextureInput(String samplerName, AbstractTexture texture, int width, int height, boolean bilinear) implements Input
+    {
+        @Override
+        public void addToPass(FramePass pass, Map<Identifier, ResourceHandle<RenderTarget>> targets) {
+        }
+
+        @Override
+        public GpuTextureView texture(Map<Identifier, ResourceHandle<RenderTarget>> targets) {
+            return this.texture.getTextureView();
+        }
+    }
+}
+

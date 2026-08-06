@@ -1,0 +1,151 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  org.jspecify.annotations.Nullable
+ */
+package net.minecraft.world.item;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Holder;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BiomeTags;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.util.ParticleUtils;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.context.UseOnContext;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.block.BaseCoralWallFanBlock;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.BonemealableBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.gameevent.GameEvent;
+import org.jspecify.annotations.Nullable;
+
+public class BoneMealItem
+extends Item {
+    public static final int GRASS_SPREAD_WIDTH = 3;
+    public static final int GRASS_SPREAD_HEIGHT = 1;
+    public static final int GRASS_COUNT_MULTIPLIER = 3;
+
+    public BoneMealItem(Item.Properties properties) {
+        super(properties);
+    }
+
+    @Override
+    public InteractionResult useOn(UseOnContext context) {
+        Level level = context.getLevel();
+        BlockPos pos = context.getClickedPos();
+        BlockPos relative = pos.relative(context.getClickedFace());
+        ItemStack boneMealStack = context.getItemInHand();
+        if (BoneMealItem.growCrop(boneMealStack, level, pos)) {
+            if (!level.isClientSide()) {
+                boneMealStack.causeUseVibration(context.getPlayer(), GameEvent.ITEM_INTERACT_FINISH);
+                level.levelEvent(1505, pos, 15);
+                return InteractionResult.SUCCESS_SERVER;
+            }
+            return InteractionResult.SUCCESS;
+        }
+        BlockState clickedState = level.getBlockState(pos);
+        boolean solidBlockFace = clickedState.isFaceSturdy(level, pos, context.getClickedFace());
+        if (solidBlockFace && BoneMealItem.growWaterPlant(boneMealStack, level, relative, context.getClickedFace())) {
+            if (!level.isClientSide()) {
+                boneMealStack.causeUseVibration(context.getPlayer(), GameEvent.ITEM_INTERACT_FINISH);
+                level.levelEvent(1505, relative, 15);
+            }
+            return InteractionResult.SUCCESS;
+        }
+        return InteractionResult.PASS;
+    }
+
+    public static boolean growCrop(ItemStack itemStack, Level level, BlockPos pos) {
+        BonemealableBlock block;
+        BlockState state = level.getBlockState(pos);
+        Block block2 = state.getBlock();
+        if (block2 instanceof BonemealableBlock && (block = (BonemealableBlock)((Object)block2)).isValidBonemealTarget(level, pos, state)) {
+            if (level instanceof ServerLevel) {
+                ServerLevel serverLevel = (ServerLevel)level;
+                if (block.isBonemealSuccess(level, level.getRandom(), pos, state)) {
+                    block.performBonemeal(serverLevel, level.getRandom(), pos, state);
+                }
+                itemStack.shrink(1);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    public static boolean growWaterPlant(ItemStack itemStack, Level level, BlockPos pos, @Nullable Direction clickedFace) {
+        if (!level.getBlockState(pos).is(Blocks.WATER) || !level.getFluidState(pos).isFull()) {
+            return false;
+        }
+        if (!(level instanceof ServerLevel)) {
+            return true;
+        }
+        ServerLevel serverLevel = (ServerLevel)level;
+        RandomSource random = level.getRandom();
+        block0: for (int j = 0; j < 128; ++j) {
+            BlockPos testPos = pos;
+            BlockState stateToGrow = Blocks.SEAGRASS.defaultBlockState();
+            for (int i = 0; i < j / 16; ++i) {
+                if (level.getBlockState(testPos = testPos.offset(random.nextInt(3) - 1, (random.nextInt(3) - 1) * random.nextInt(3) / 2, random.nextInt(3) - 1)).isCollisionShapeFullBlock(level, testPos)) continue block0;
+            }
+            Holder<Biome> testBiome = level.getBiome(testPos);
+            if (testBiome.is(BiomeTags.PRODUCES_CORALS_FROM_BONEMEAL)) {
+                if (j == 0 && clickedFace != null && clickedFace.getAxis().isHorizontal()) {
+                    stateToGrow = BuiltInRegistries.BLOCK.getRandomElementOf(BlockTags.WALL_CORALS, level.getRandom()).map(h -> ((Block)h.value()).defaultBlockState()).orElse(stateToGrow);
+                    if (stateToGrow.hasProperty(BaseCoralWallFanBlock.FACING)) {
+                        stateToGrow = (BlockState)stateToGrow.setValue(BaseCoralWallFanBlock.FACING, clickedFace);
+                    }
+                } else if (random.nextInt(4) == 0) {
+                    stateToGrow = BuiltInRegistries.BLOCK.getRandomElementOf(BlockTags.UNDERWATER_BONEMEALS, level.getRandom()).map(h -> ((Block)h.value()).defaultBlockState()).orElse(stateToGrow);
+                }
+            }
+            if (stateToGrow.is(BlockTags.WALL_CORALS, s -> s.hasProperty(BaseCoralWallFanBlock.FACING))) {
+                for (int d = 0; !stateToGrow.canSurvive(level, testPos) && d < 4; ++d) {
+                    stateToGrow = (BlockState)stateToGrow.setValue(BaseCoralWallFanBlock.FACING, Direction.Plane.HORIZONTAL.getRandomDirection(random));
+                }
+            }
+            if (!stateToGrow.canSurvive(level, testPos)) continue;
+            BlockState testState = level.getBlockState(testPos);
+            if (testState.is(Blocks.WATER) && level.getFluidState(testPos).isFull()) {
+                level.setBlock(testPos, stateToGrow, 3);
+                continue;
+            }
+            if (!testState.is(Blocks.SEAGRASS) || !((BonemealableBlock)((Object)Blocks.SEAGRASS)).isValidBonemealTarget(level, testPos, testState) || random.nextInt(10) != 0) continue;
+            ((BonemealableBlock)((Object)Blocks.SEAGRASS)).performBonemeal(serverLevel, random, testPos, testState);
+        }
+        itemStack.shrink(1);
+        return true;
+    }
+
+    public static void addGrowthParticles(LevelAccessor level, BlockPos pos, int count) {
+        BlockState blockState = level.getBlockState(pos);
+        Block block = blockState.getBlock();
+        if (block instanceof BonemealableBlock) {
+            BonemealableBlock bonemealableBlock = (BonemealableBlock)((Object)block);
+            BlockPos particlePos = bonemealableBlock.getParticlePos(pos);
+            switch (bonemealableBlock.getType()) {
+                case NEIGHBOR_SPREADER: {
+                    ParticleUtils.spawnParticles(level, particlePos, count * 3, 3.0, 1.0, false, ParticleTypes.HAPPY_VILLAGER);
+                    break;
+                }
+                case GROWER: {
+                    ParticleUtils.spawnParticleInBlock(level, particlePos, count, ParticleTypes.HAPPY_VILLAGER);
+                }
+            }
+        } else if (blockState.is(Blocks.WATER)) {
+            ParticleUtils.spawnParticles(level, pos, count * 3, 3.0, 1.0, false, ParticleTypes.HAPPY_VILLAGER);
+        }
+    }
+}
+

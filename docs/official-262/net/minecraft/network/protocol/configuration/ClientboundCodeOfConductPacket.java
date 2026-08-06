@@ -1,0 +1,31 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  io.netty.buffer.ByteBuf
+ */
+package net.minecraft.network.protocol.configuration;
+
+import io.netty.buffer.ByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.PacketType;
+import net.minecraft.network.protocol.configuration.ClientConfigurationPacketListener;
+import net.minecraft.network.protocol.configuration.ConfigurationPacketTypes;
+
+public record ClientboundCodeOfConductPacket(String codeOfConduct) implements Packet<ClientConfigurationPacketListener>
+{
+    public static final StreamCodec<ByteBuf, ClientboundCodeOfConductPacket> STREAM_CODEC = StreamCodec.composite(ByteBufCodecs.STRING_UTF8, ClientboundCodeOfConductPacket::codeOfConduct, ClientboundCodeOfConductPacket::new);
+
+    @Override
+    public PacketType<ClientboundCodeOfConductPacket> type() {
+        return ConfigurationPacketTypes.CLIENTBOUND_CODE_OF_CONDUCT;
+    }
+
+    @Override
+    public void handle(ClientConfigurationPacketListener listener) {
+        listener.handleCodeOfConduct(this);
+    }
+}
+

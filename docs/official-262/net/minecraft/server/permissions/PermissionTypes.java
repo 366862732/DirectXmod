@@ -1,0 +1,20 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  com.mojang.serialization.MapCodec
+ */
+package net.minecraft.server.permissions;
+
+import com.mojang.serialization.MapCodec;
+import net.minecraft.core.Registry;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.permissions.Permission;
+
+public class PermissionTypes {
+    public static MapCodec<? extends Permission> bootstrap(Registry<MapCodec<? extends Permission>> registry) {
+        Registry.register(registry, Identifier.withDefaultNamespace("atom"), Permission.Atom.MAP_CODEC);
+        return Registry.register(registry, Identifier.withDefaultNamespace("command_level"), Permission.HasCommandLevel.MAP_CODEC);
+    }
+}
+

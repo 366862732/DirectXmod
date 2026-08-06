@@ -1,0 +1,63 @@
+/*
+ * Decompiled with CFR 0.152.
+ */
+package net.minecraft.util.debug;
+
+import java.util.List;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.Unit;
+import net.minecraft.util.debug.DebugBeeInfo;
+import net.minecraft.util.debug.DebugBrainDump;
+import net.minecraft.util.debug.DebugBreezeInfo;
+import net.minecraft.util.debug.DebugEntityBlockIntersection;
+import net.minecraft.util.debug.DebugGameEventInfo;
+import net.minecraft.util.debug.DebugGameEventListenerInfo;
+import net.minecraft.util.debug.DebugGoalInfo;
+import net.minecraft.util.debug.DebugHiveInfo;
+import net.minecraft.util.debug.DebugPathInfo;
+import net.minecraft.util.debug.DebugPoiInfo;
+import net.minecraft.util.debug.DebugStructureInfo;
+import net.minecraft.util.debug.DebugSubscription;
+import net.minecraft.world.level.redstone.Orientation;
+
+public class DebugSubscriptions<T> {
+    public static final DebugSubscription<?> DEDICATED_SERVER_TICK_TIME = DebugSubscriptions.registerSimple("dedicated_server_tick_time");
+    public static final DebugSubscription<DebugBeeInfo> BEES = DebugSubscriptions.registerWithValue("bees", DebugBeeInfo.STREAM_CODEC);
+    public static final DebugSubscription<DebugBrainDump> BRAINS = DebugSubscriptions.registerWithValue("brains", DebugBrainDump.STREAM_CODEC);
+    public static final DebugSubscription<DebugBreezeInfo> BREEZES = DebugSubscriptions.registerWithValue("breezes", DebugBreezeInfo.STREAM_CODEC);
+    public static final DebugSubscription<DebugGoalInfo> GOAL_SELECTORS = DebugSubscriptions.registerWithValue("goal_selectors", DebugGoalInfo.STREAM_CODEC);
+    public static final DebugSubscription<DebugPathInfo> ENTITY_PATHS = DebugSubscriptions.registerWithValue("entity_paths", DebugPathInfo.STREAM_CODEC);
+    public static final DebugSubscription<DebugEntityBlockIntersection> ENTITY_BLOCK_INTERSECTIONS = DebugSubscriptions.registerTemporaryValue("entity_block_intersections", DebugEntityBlockIntersection.STREAM_CODEC, 100);
+    public static final DebugSubscription<DebugHiveInfo> BEE_HIVES = DebugSubscriptions.registerWithValue("bee_hives", DebugHiveInfo.STREAM_CODEC);
+    public static final DebugSubscription<DebugPoiInfo> POIS = DebugSubscriptions.registerWithValue("pois", DebugPoiInfo.STREAM_CODEC);
+    public static final DebugSubscription<Orientation> REDSTONE_WIRE_ORIENTATIONS = DebugSubscriptions.registerTemporaryValue("redstone_wire_orientations", Orientation.STREAM_CODEC, 200);
+    public static final DebugSubscription<Unit> VILLAGE_SECTIONS = DebugSubscriptions.registerWithValue("village_sections", Unit.STREAM_CODEC);
+    public static final DebugSubscription<List<BlockPos>> RAIDS = DebugSubscriptions.registerWithValue("raids", BlockPos.STREAM_CODEC.apply(ByteBufCodecs.list()));
+    public static final DebugSubscription<List<DebugStructureInfo>> STRUCTURES = DebugSubscriptions.registerWithValue("structures", DebugStructureInfo.STREAM_CODEC.apply(ByteBufCodecs.list()));
+    public static final DebugSubscription<DebugGameEventListenerInfo> GAME_EVENT_LISTENERS = DebugSubscriptions.registerWithValue("game_event_listeners", DebugGameEventListenerInfo.STREAM_CODEC);
+    public static final DebugSubscription<BlockPos> NEIGHBOR_UPDATES = DebugSubscriptions.registerTemporaryValue("neighbor_updates", BlockPos.STREAM_CODEC, 200);
+    public static final DebugSubscription<DebugGameEventInfo> GAME_EVENTS = DebugSubscriptions.registerTemporaryValue("game_events", DebugGameEventInfo.STREAM_CODEC, 60);
+
+    public static DebugSubscription<?> bootstrap(Registry<DebugSubscription<?>> registry) {
+        return DEDICATED_SERVER_TICK_TIME;
+    }
+
+    private static DebugSubscription<?> registerSimple(String id) {
+        return Registry.register(BuiltInRegistries.DEBUG_SUBSCRIPTION, Identifier.withDefaultNamespace(id), new DebugSubscription(null));
+    }
+
+    private static <T> DebugSubscription<T> registerWithValue(String id, StreamCodec<? super RegistryFriendlyByteBuf, T> valueStreamCodec) {
+        return Registry.register(BuiltInRegistries.DEBUG_SUBSCRIPTION, Identifier.withDefaultNamespace(id), new DebugSubscription<T>(valueStreamCodec));
+    }
+
+    private static <T> DebugSubscription<T> registerTemporaryValue(String id, StreamCodec<? super RegistryFriendlyByteBuf, T> valueStreamCodec, int expireAfterTicks) {
+        return Registry.register(BuiltInRegistries.DEBUG_SUBSCRIPTION, Identifier.withDefaultNamespace(id), new DebugSubscription<T>(valueStreamCodec, expireAfterTicks));
+    }
+}
+

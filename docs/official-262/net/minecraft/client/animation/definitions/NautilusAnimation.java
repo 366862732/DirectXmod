@@ -1,0 +1,23 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  net.fabricmc.api.EnvType
+ *  net.fabricmc.api.Environment
+ *  org.joml.Vector3fc
+ */
+package net.minecraft.client.animation.definitions;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.animation.AnimationChannel;
+import net.minecraft.client.animation.AnimationDefinition;
+import net.minecraft.client.animation.Keyframe;
+import net.minecraft.client.animation.KeyframeAnimations;
+import org.joml.Vector3fc;
+
+@Environment(value=EnvType.CLIENT)
+public class NautilusAnimation {
+    public static final AnimationDefinition SWIMMING = AnimationDefinition.Builder.withLength(1.0f).looping().addAnimation("body", new AnimationChannel(AnimationChannel.Targets.SCALE, new Keyframe(0.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.5f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.2f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.75f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 0.9f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.875f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(1.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR))).addAnimation("upper_mouth", new AnimationChannel(AnimationChannel.Targets.ROTATION, new Keyframe(0.0f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.5f, (Vector3fc)KeyframeAnimations.degreeVec(30.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.75f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.875f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(1.0f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR))).addAnimation("upper_mouth", new AnimationChannel(AnimationChannel.Targets.SCALE, new Keyframe(0.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.5f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.4f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.75f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 0.9f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.875f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(1.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR))).addAnimation("inner_mouth", new AnimationChannel(AnimationChannel.Targets.SCALE, new Keyframe(0.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.5f, (Vector3fc)KeyframeAnimations.scaleVec(0.8f, 0.8f, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.75f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 0.9f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.875f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(1.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR))).addAnimation("lower_mouth", new AnimationChannel(AnimationChannel.Targets.ROTATION, new Keyframe(0.0f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.5f, (Vector3fc)KeyframeAnimations.degreeVec(-30.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.75f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.875f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR), new Keyframe(1.0f, (Vector3fc)KeyframeAnimations.degreeVec(0.0f, 0.0f, 0.0f), AnimationChannel.Interpolations.LINEAR))).addAnimation("lower_mouth", new AnimationChannel(AnimationChannel.Targets.SCALE, new Keyframe(0.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.5f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.4f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.75f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 0.9f), AnimationChannel.Interpolations.LINEAR), new Keyframe(0.875f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR), new Keyframe(1.0f, (Vector3fc)KeyframeAnimations.scaleVec(1.0, 1.0, 1.0), AnimationChannel.Interpolations.LINEAR))).build();
+}
+

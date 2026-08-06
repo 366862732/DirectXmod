@@ -1,0 +1,96 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  com.google.common.collect.ImmutableMap
+ *  com.google.common.collect.ImmutableMap$Builder
+ *  com.mojang.serialization.Dynamic
+ *  com.mojang.serialization.DynamicOps
+ */
+package net.minecraft.world.level.levelgen.structure.pools;
+
+import com.google.common.collect.ImmutableMap;
+import com.mojang.serialization.Dynamic;
+import com.mojang.serialization.DynamicOps;
+import java.util.Map;
+import net.minecraft.world.level.levelgen.structure.pools.StructureTemplatePool;
+
+public class JigsawJunction {
+    private final int sourceX;
+    private final int sourceGroundY;
+    private final int sourceZ;
+    private final int deltaY;
+    private final StructureTemplatePool.Projection destProjection;
+
+    public JigsawJunction(int sourceX, int sourceGroundY, int sourceZ, int deltaY, StructureTemplatePool.Projection destProjection) {
+        this.sourceX = sourceX;
+        this.sourceGroundY = sourceGroundY;
+        this.sourceZ = sourceZ;
+        this.deltaY = deltaY;
+        this.destProjection = destProjection;
+    }
+
+    public int getSourceX() {
+        return this.sourceX;
+    }
+
+    public int getSourceGroundY() {
+        return this.sourceGroundY;
+    }
+
+    public int getSourceZ() {
+        return this.sourceZ;
+    }
+
+    public int getDeltaY() {
+        return this.deltaY;
+    }
+
+    public StructureTemplatePool.Projection getDestProjection() {
+        return this.destProjection;
+    }
+
+    public <T> Dynamic<T> serialize(DynamicOps<T> ops) {
+        ImmutableMap.Builder builder = ImmutableMap.builder();
+        builder.put(ops.createString("source_x"), ops.createInt(this.sourceX)).put(ops.createString("source_ground_y"), ops.createInt(this.sourceGroundY)).put(ops.createString("source_z"), ops.createInt(this.sourceZ)).put(ops.createString("delta_y"), ops.createInt(this.deltaY)).put(ops.createString("dest_proj"), ops.createString(this.destProjection.getName()));
+        return new Dynamic(ops, ops.createMap((Map)builder.build()));
+    }
+
+    public static <T> JigsawJunction deserialize(Dynamic<T> input) {
+        return new JigsawJunction(input.get("source_x").asInt(0), input.get("source_ground_y").asInt(0), input.get("source_z").asInt(0), input.get("delta_y").asInt(0), StructureTemplatePool.Projection.byName(input.get("dest_proj").asString("")));
+    }
+
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || this.getClass() != o.getClass()) {
+            return false;
+        }
+        JigsawJunction that = (JigsawJunction)o;
+        if (this.sourceX != that.sourceX) {
+            return false;
+        }
+        if (this.sourceZ != that.sourceZ) {
+            return false;
+        }
+        if (this.deltaY != that.deltaY) {
+            return false;
+        }
+        return this.destProjection == that.destProjection;
+    }
+
+    public int hashCode() {
+        int result = this.sourceX;
+        result = 31 * result + this.sourceGroundY;
+        result = 31 * result + this.sourceZ;
+        result = 31 * result + this.deltaY;
+        result = 31 * result + this.destProjection.hashCode();
+        return result;
+    }
+
+    public String toString() {
+        return "JigsawJunction{sourceX=" + this.sourceX + ", sourceGroundY=" + this.sourceGroundY + ", sourceZ=" + this.sourceZ + ", deltaY=" + this.deltaY + ", destProjection=" + String.valueOf(this.destProjection) + "}";
+    }
+}
+

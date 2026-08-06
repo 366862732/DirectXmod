@@ -1,0 +1,121 @@
+Summary for C:\Users\xiaozi\.gradle\caches\fabric-loom\minecraftMaven\net\minecraft\minecraft-merged-deobf\26.2\minecraft-merged-deobf-26.2.jar
+Decompiled with CFR 0.152
+
+
+net.minecraft.advancements.predicates.entity.EntityFlagsPredicate
+----------------------------
+
+matches(net.minecraft.world.entity.Entity )
+  Unable to fully structure code
+
+
+net.minecraft.client.gui.screens.achievement.StatsScreen
+----------------------------
+
+setTabActiveStateAndTooltip(int )
+  Unable to fully structure code
+
+
+net.minecraft.client.gui.screens.Screen
+----------------------------
+
+defaultHandleClickEvent(net.minecraft.network.chat.ClickEvent net.minecraft.client.Minecraft net.minecraft.client.gui.screens.Screen )
+  Loose catch block
+
+
+net.minecraft.client.gui.screens.worldselection.CreateWorldScreen
+----------------------------
+
+createNewWorldDirectory(net.minecraft.client.Minecraft java.lang.String java.nio.file.Path )
+  WARNING - bad return control flow
+
+
+net.minecraft.nbt.ListTag
+----------------------------
+
+parseList(java.io.DataInput net.minecraft.nbt.StreamTagVisitor net.minecraft.nbt.NbtAccounter )
+  Exception : org.benf.cfr.reader.util.ConfusedCFRException: Tried to end blocks [8[CASE], 4[SWITCH]], but top level block is 9[SWITCH]
+
+
+net.minecraft.server.commands.ExecuteCommand
+----------------------------
+
+scheduleFunctionConditionsAndTest(T java.util.List<T> java.util.function.Function<T, T> java.util.function.IntPredicate com.mojang.brigadier.context.ContextChain<T> net.minecraft.nbt.CompoundTag net.minecraft.commands.execution.ExecutionControl<T> net.minecraft.server.commands.InCommandFunction<com.mojang.brigadier.context.CommandContext<T>, java.util.Collection<net.minecraft.commands.functions.CommandFunction<T>>> net.minecraft.commands.execution.ChainModifiers )
+  Exception : org.benf.cfr.reader.util.ConfusedCFRException: Started 2 blocks at once
+
+
+net.minecraft.server.commands.data.DataCommands
+----------------------------
+
+getData(net.minecraft.commands.CommandSourceStack net.minecraft.server.commands.data.DataAccessor net.minecraft.commands.arguments.NbtPathArgument$NbtPath )
+  Loose catch block
+
+
+net.minecraft.server.network.PlayerChunkSender
+----------------------------
+
+collectChunksToSend(net.minecraft.server.level.ChunkMap net.minecraft.world.level.ChunkPos )
+  Unable to fully structure code
+
+
+net.minecraft.util.HttpUtil
+----------------------------
+
+downloadFile(java.nio.file.Path java.net.URL java.util.Map<java.lang.String, java.lang.String> com.google.common.hash.HashFunction com.google.common.hash.HashCode int java.net.Proxy net.minecraft.util.HttpUtil$DownloadProgressListener )
+  Loose catch block
+
+
+net.minecraft.world.entity.LivingEntity
+----------------------------
+
+aiStep()
+  Unable to fully structure code
+
+
+net.minecraft.world.entity.animal.rabbit.Rabbit
+----------------------------
+
+getBreedOffspring(net.minecraft.server.level.ServerLevel net.minecraft.world.entity.AgeableMob )
+  Unable to fully structure code
+
+
+net.minecraft.world.entity.projectile.throwableitemprojectile.ThrownEnderpearl
+----------------------------
+
+tick()
+  Unable to fully structure code
+
+
+net.minecraft.world.entity.vehicle.VehicleEntity
+----------------------------
+
+hurtServer(net.minecraft.server.level.ServerLevel net.minecraft.world.damagesource.DamageSource float )
+  Unable to fully structure code
+
+
+net.minecraft.world.item.MaceItem
+----------------------------
+
+lambda$knockbackPredicate$0(net.minecraft.world.entity.Entity net.minecraft.world.entity.Entity net.minecraft.world.entity.LivingEntity )
+  Unable to fully structure code
+
+
+net.minecraft.world.item.component.TypedEntityData
+----------------------------
+
+loadInto(net.minecraft.world.level.block.entity.BlockEntity net.minecraft.core.HolderLookup$Provider )
+  Exception : org.benf.cfr.reader.util.ConfusedCFRException: Tried to end blocks [5[CATCHBLOCK]], but top level block is 2[TRYBLOCK]
+
+
+net.minecraft.world.level.block.BeehiveBlock
+----------------------------
+
+useItemOn(net.minecraft.world.item.ItemStack net.minecraft.world.level.block.state.BlockState net.minecraft.world.level.Level net.minecraft.core.BlockPos net.minecraft.world.entity.player.Player net.minecraft.world.InteractionHand net.minecraft.world.phys.BlockHitResult )
+  Unable to fully structure code
+
+
+net.minecraft.world.level.levelgen.feature.TreeFeature
+----------------------------
+
+updateLeaves(net.minecraft.world.level.LevelAccessor net.minecraft.world.level.levelgen.structure.BoundingBox java.util.Set<net.minecraft.core.BlockPos> java.util.Set<net.minecraft.core.BlockPos> java.util.Set<net.minecraft.core.BlockPos> )
+  Unable to fully structure code

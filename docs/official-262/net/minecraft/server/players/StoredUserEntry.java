@@ -1,0 +1,30 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  com.google.gson.JsonObject
+ *  org.jspecify.annotations.Nullable
+ */
+package net.minecraft.server.players;
+
+import com.google.gson.JsonObject;
+import org.jspecify.annotations.Nullable;
+
+public abstract class StoredUserEntry<T> {
+    private final @Nullable T user;
+
+    public StoredUserEntry(@Nullable T user) {
+        this.user = user;
+    }
+
+    public @Nullable T getUser() {
+        return this.user;
+    }
+
+    public boolean hasExpired() {
+        return false;
+    }
+
+    protected abstract void serialize(JsonObject var1);
+}
+

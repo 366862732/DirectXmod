@@ -1,0 +1,90 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  net.fabricmc.api.EnvType
+ *  net.fabricmc.api.Environment
+ *  org.jspecify.annotations.Nullable
+ */
+package net.minecraft.client.data.models.model;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import org.jspecify.annotations.Nullable;
+
+@Environment(value=EnvType.CLIENT)
+public final class TextureSlot {
+    public static final TextureSlot ALL = TextureSlot.create("all");
+    public static final TextureSlot TEXTURE = TextureSlot.create("texture", ALL);
+    public static final TextureSlot PARTICLE = TextureSlot.create("particle", TEXTURE);
+    public static final TextureSlot END = TextureSlot.create("end", ALL);
+    public static final TextureSlot BOTTOM = TextureSlot.create("bottom", END);
+    public static final TextureSlot TOP = TextureSlot.create("top", END);
+    public static final TextureSlot FRONT = TextureSlot.create("front", ALL);
+    public static final TextureSlot BACK = TextureSlot.create("back", ALL);
+    public static final TextureSlot SIDE = TextureSlot.create("side", ALL);
+    public static final TextureSlot NORTH = TextureSlot.create("north", SIDE);
+    public static final TextureSlot SOUTH = TextureSlot.create("south", SIDE);
+    public static final TextureSlot EAST = TextureSlot.create("east", SIDE);
+    public static final TextureSlot WEST = TextureSlot.create("west", SIDE);
+    public static final TextureSlot UP = TextureSlot.create("up");
+    public static final TextureSlot DOWN = TextureSlot.create("down");
+    public static final TextureSlot CROSS = TextureSlot.create("cross");
+    public static final TextureSlot CROSS_EMISSIVE = TextureSlot.create("cross_emissive");
+    public static final TextureSlot PLANT = TextureSlot.create("plant");
+    public static final TextureSlot WALL = TextureSlot.create("wall", ALL);
+    public static final TextureSlot RAIL = TextureSlot.create("rail");
+    public static final TextureSlot WOOL = TextureSlot.create("wool");
+    public static final TextureSlot PATTERN = TextureSlot.create("pattern");
+    public static final TextureSlot PANE = TextureSlot.create("pane");
+    public static final TextureSlot EDGE = TextureSlot.create("edge");
+    public static final TextureSlot FAN = TextureSlot.create("fan");
+    public static final TextureSlot STEM = TextureSlot.create("stem");
+    public static final TextureSlot UPPER_STEM = TextureSlot.create("upperstem");
+    public static final TextureSlot CROP = TextureSlot.create("crop");
+    public static final TextureSlot DIRT = TextureSlot.create("dirt");
+    public static final TextureSlot FIRE = TextureSlot.create("fire");
+    public static final TextureSlot LANTERN = TextureSlot.create("lantern");
+    public static final TextureSlot PLATFORM = TextureSlot.create("platform");
+    public static final TextureSlot UNSTICKY = TextureSlot.create("unsticky");
+    public static final TextureSlot TORCH = TextureSlot.create("torch");
+    public static final TextureSlot LAYER0 = TextureSlot.create("layer0");
+    public static final TextureSlot LAYER1 = TextureSlot.create("layer1");
+    public static final TextureSlot LAYER2 = TextureSlot.create("layer2");
+    public static final TextureSlot LIT_LOG = TextureSlot.create("lit_log");
+    public static final TextureSlot CANDLE = TextureSlot.create("candle");
+    public static final TextureSlot INSIDE = TextureSlot.create("inside");
+    public static final TextureSlot CONTENT = TextureSlot.create("content");
+    public static final TextureSlot INNER_TOP = TextureSlot.create("inner_top");
+    public static final TextureSlot FLOWERBED = TextureSlot.create("flowerbed");
+    public static final TextureSlot TENTACLES = TextureSlot.create("tentacles");
+    public static final TextureSlot BARS = TextureSlot.create("bars");
+    private final String id;
+    private final @Nullable TextureSlot parent;
+
+    private static TextureSlot create(String id) {
+        return new TextureSlot(id, null);
+    }
+
+    private static TextureSlot create(String id, TextureSlot parent) {
+        return new TextureSlot(id, parent);
+    }
+
+    private TextureSlot(String id, @Nullable TextureSlot parent) {
+        this.id = id;
+        this.parent = parent;
+    }
+
+    public String getId() {
+        return this.id;
+    }
+
+    public @Nullable TextureSlot getParent() {
+        return this.parent;
+    }
+
+    public String toString() {
+        return "#" + this.id;
+    }
+}
+

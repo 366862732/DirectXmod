@@ -1,0 +1,24 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  net.fabricmc.api.EnvType
+ *  net.fabricmc.api.Environment
+ */
+package net.minecraft.client.renderer.feature;
+
+import com.mojang.blaze3d.textures.GpuTextureView;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.color.block.BlockColors;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.renderer.StagedVertexBuffer;
+import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.state.OptionsRenderState;
+import net.minecraft.client.renderer.texture.TextureManager;
+import net.minecraft.client.resources.model.sprite.AtlasManager;
+
+@Environment(value=EnvType.CLIENT)
+public record FeatureFrameContext(OptionsRenderState options, Font font, BlockStateModelSet blockStateModelSet, BlockColors blockColors, TextureManager textureManager, AtlasManager atlasManager, GpuTextureView lightmap, StagedVertexBuffer stagedVertexBuffer) {
+}
+
