@@ -2,5 +2,6 @@
 members = [
     "wgpu-mc",
     "wgpu-mc-jni",
+    "dx12-mc",
 ]
 resolver = "2"
