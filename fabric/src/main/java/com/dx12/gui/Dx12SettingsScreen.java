@@ -1,6 +1,5 @@
 package com.dx12.gui;
 
-import com.dx12.D3D12Bridge;
 import com.dx12.config.Dx12Config;
 
 import net.minecraft.client.gui.components.Button;
@@ -9,7 +8,9 @@ import net.minecraft.network.chat.Component;
 
 /**
  * GL4DX12 Mod Settings Screen.
- * Allows configuring anti-aliasing mode and other D3D12 rendering options.
+ *
+ * The anti-aliasing preference is persisted to config only. It will be wired
+ * to the native DX12 backend once the backend implements AA.
  */
 public class Dx12SettingsScreen extends Screen {
     private static final Component TITLE = Component.literal("D3D12 Mod Settings");
@@ -43,7 +44,6 @@ public class Dx12SettingsScreen extends Screen {
             (btn) -> {
                 int next = (Dx12Config.getInstance().getAaMode() + 1) % 4;
                 Dx12Config.getInstance().setAaMode(next);
-                D3D12Bridge.setAaMode(next);
                 btn.setMessage(Component.literal("Anti-Aliasing: ").append(AA_VALUES[next]));
             }
         ).bounds(centerX - btnWidth / 2, y, btnWidth, 20).build();
