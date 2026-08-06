@@ -59,6 +59,7 @@ public class Dx12SettingsScreen extends Screen {
 
     @Override
     public void onClose() {
-        this.minecraft.setScreen(parent);
+        // MC 26.2 renamed Minecraft.setScreen → setScreenAndShow
+        this.minecraft.setScreenAndShow(parent);
     }
 }

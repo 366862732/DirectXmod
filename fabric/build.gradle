@@ -40,7 +40,7 @@ dependencies {
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-    implementation files('libs/modmenu-18.0.0.jar')
+    implementation files('libs/modmenu-20.0.1.jar')
 }
 
 processResources {

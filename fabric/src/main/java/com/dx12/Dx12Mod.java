@@ -229,6 +229,7 @@ public class Dx12Mod implements ClientModInitializer {
     private static Method GET_ENTITIES_METHOD = null;
     private static Method GET_ALL_METHOD = null;
     private static Field PARTICLE_MAP_FIELD = null;
+    private static Field PARTICLE_GROUP_QUEUE_FIELD = null;
     private static Field PARTICLE_X_FIELD = null;
     private static Field PARTICLE_Y_FIELD = null;
     private static Field PARTICLE_Z_FIELD = null;
@@ -254,6 +255,10 @@ public class Dx12Mod implements ClientModInitializer {
         try {
             PARTICLE_MAP_FIELD = net.minecraft.client.particle.ParticleEngine.class.getDeclaredField("particles");
             PARTICLE_MAP_FIELD.setAccessible(true);
+            // MC 26.2: ParticleGroup exposes no getAll(); iterate the protected
+            // `particles` queue via reflection instead.
+            PARTICLE_GROUP_QUEUE_FIELD = net.minecraft.client.particle.ParticleGroup.class.getDeclaredField("particles");
+            PARTICLE_GROUP_QUEUE_FIELD.setAccessible(true);
             PARTICLE_X_FIELD = net.minecraft.client.particle.Particle.class.getDeclaredField("x");
             PARTICLE_X_FIELD.setAccessible(true);
             PARTICLE_Y_FIELD = net.minecraft.client.particle.Particle.class.getDeclaredField("y");
@@ -262,6 +267,7 @@ public class Dx12Mod implements ClientModInitializer {
             PARTICLE_Z_FIELD.setAccessible(true);
         } catch (Throwable ignored) {
             PARTICLE_MAP_FIELD = null;
+            PARTICLE_GROUP_QUEUE_FIELD = null;
             PARTICLE_X_FIELD = null;
             PARTICLE_Y_FIELD = null;
             PARTICLE_Z_FIELD = null;
@@ -613,11 +619,21 @@ public class Dx12Mod implements ClientModInitializer {
                                         // MC 26.1.2: values are ParticleGroup<?> (NOT a Set).
                                         // Casting to Set threw ClassCastException, which was
                                         // silently swallowed → particles were never uploaded.
-                                        // ParticleGroup exposes getAll() → Queue<Particle>.
+                                        // MC 26.2: ParticleGroup has no getAll(); the protected
+                                        // `particles` queue is read via PARTICLE_GROUP_QUEUE_FIELD.
                                         var group = entry.getValue();
                                         if (group instanceof net.minecraft.client.particle.ParticleGroup<?> pg) {
-                                            for (var p : pg.getAll()) {
-                                                particleList.add((net.minecraft.client.particle.Particle) p);
+                                            java.util.Queue<?> queue = null;
+                                            if (PARTICLE_GROUP_QUEUE_FIELD != null) {
+                                                try {
+                                                    queue = (java.util.Queue<?>) PARTICLE_GROUP_QUEUE_FIELD.get(pg);
+                                                } catch (Exception ignored) {
+                                                }
+                                            }
+                                            if (queue != null) {
+                                                for (var p : queue) {
+                                                    particleList.add((net.minecraft.client.particle.Particle) p);
+                                                }
                                             }
                                         }
                                     }
@@ -724,7 +740,7 @@ public class Dx12Mod implements ClientModInitializer {
     /// Uses the same algorithm as the core/lightmap.fsh shader.
     private static void updateLightmap(Minecraft mc) {
         // Access LightmapRenderState from GameRenderer's GameRenderState
-        var gameState = mc.gameRenderer.getGameRenderState();
+        var gameState = mc.gameRenderer.gameRenderState();
         var rs = gameState.lightmapRenderState;
 
         // Detect first-frame: render state fields are null before extract() runs.
@@ -847,7 +863,8 @@ public class Dx12Mod implements ClientModInitializer {
     // glPushAttrib/glPopAttrib removed — they are deprecated and crash on core profile.
     public static void onPostRender() {
         Minecraft mc = Minecraft.getInstance();
-        if (mc == null || mc.screen != null) return;  // skip menus
+        // MC 26.2 removed Minecraft.screen; skip menus via level/pause state.
+        if (mc == null || mc.level == null || mc.isPaused()) return;  // skip menus
 
         if (pendingPixels == null || !pendingPixels.hasRemaining()) return;
 
