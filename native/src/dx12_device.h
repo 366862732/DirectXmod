@@ -57,6 +57,9 @@ struct Dx12Object {
 bool ensureDevice(std::string& errorOut);
 void destroyDevice();
 
+// JNI 层访问设备上下文（读 adapterName/featureLevel）。
+DeviceContext& deviceContextForJni();
+
 // ---------------------------------------------------------------------------
 // 资源创建（返回 new 的 Dx12Object*，句柄 = 指针；失败返回 nullptr + err）
 // ---------------------------------------------------------------------------
