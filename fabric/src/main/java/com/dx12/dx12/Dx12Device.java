@@ -44,11 +44,16 @@ public class Dx12Device implements GpuDeviceBackend {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12");
 
     private final DeviceInfo deviceInfo;
+    private long timestampCtx;
 
     public Dx12Device() {
         String probe = Dx12Native.dx12CreateDevice();
         LOGGER.info("[dx12] Device probe + resource self-test: {}", probe);
-        this.deviceInfo = buildDeviceInfo(parseAdapterName(probe));
+        long frequency = Dx12Native.dx12GetTimestampFrequency();
+        if (frequency == 0) {
+            LOGGER.warn("[dx12] GetTimestampFrequency returned 0; timestampPeriod=1.0");
+        }
+        this.deviceInfo = buildDeviceInfo(parseAdapterName(probe), frequency);
     }
 
     // -----------------------------------------------------------------------
@@ -94,14 +99,14 @@ public class Dx12Device implements GpuDeviceBackend {
     public GpuBuffer createBuffer(@Nullable Supplier<String> label, @GpuBuffer.Usage int usage,
         ByteBuffer data) {
         // Mirror of the official VulkanDevice.createBuffer(data): allocate a buffer
-        // with COPY_DST and upload the data immediately. No command encoder yet in
-        // P2, so upload through a persistent map (UPLOAD heap via MAP_WRITE).
+        // with COPY_DST and upload the data through the command encoder.
         GpuBuffer buffer = this.createBuffer(label, usage | GpuBuffer.USAGE_COPY_DST, data.remaining());
-        GpuBufferSlice.MappedView view = buffer.map(0, data.remaining(), false, true);
+        Dx12CommandEncoderBackend encoder = new Dx12CommandEncoderBackend();
         try {
-            view.data().put(data.duplicate());
+            encoder.writeToBuffer(buffer.slice(), data);
+            encoder.submit();
         } finally {
-            view.close();
+            encoder.close();
         }
         return buffer;
     }
@@ -117,7 +122,7 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public CommandEncoderBackend createCommandEncoder() {
-        throw new UnsupportedOperationException("P3: command encoder not yet implemented");
+        return new Dx12CommandEncoderBackend();
     }
 
     @Override
@@ -133,12 +138,19 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public GpuQueryPool createTimestampQueryPool(int size) {
-        throw new UnsupportedOperationException("P3: timestamp query pool not yet implemented");
+        return new Dx12GpuQueryPool(size);
     }
 
     @Override
     public long getTimestampNow() {
-        return 0L;
+        // The native call needs a command context; keep one lazily for timestamps.
+        if (this.timestampCtx == 0) {
+            this.timestampCtx = Dx12Native.dx12CreateCommandEncoder();
+            if (this.timestampCtx == 0) {
+                throw new IllegalStateException("dx12CreateCommandEncoder returned a null handle");
+            }
+        }
+        return Dx12Native.dx12GetTimestampNow(this.timestampCtx);
     }
 
     @Override
@@ -173,19 +185,20 @@ public class Dx12Device implements GpuDeviceBackend {
         return sep < 0 ? probe : probe.substring(0, sep);
     }
 
-    private static DeviceInfo buildDeviceInfo(String adapterName) {
+    private static DeviceInfo buildDeviceInfo(String adapterName, long timestampFrequency) {
+        float timestampPeriod = timestampFrequency > 0 ? 1.0f / (float) timestampFrequency : 1.0f;
         return new DeviceInfo(
             adapterName,  // name
             "D3D12",      // vendorName
             "D3D12 driver",  // driverInfo
             true,         // isZZeroToOne: D3D12 NDC depth is 0..1
             "DX12",       // backendName
-            1.0f,         // timestampPeriod (P3: read from GetTimestampFrequency)
+            timestampPeriod,
             new DeviceLimits(16, 256, 16384, Long.MAX_VALUE, 4096, 8),
             new DeviceFeatures(true, true, true, true, true, true, true),
             Set.of(),
             new HintsAndWorkarounds(false, false),
-            DeviceType.DISCRETE  // heuristic; refine in P3 via DXGI adapter info
+            DeviceType.DISCRETE  // heuristic; refine via DXGI adapter info
         );
     }
 }

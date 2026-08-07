@@ -169,6 +169,9 @@ bool copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* d
     int mip, int layer, int srcX, int srcY, int dstX, int dstY, int w, int h,
     std::string& err);
 
+// 设备 timestamp 频率（GetTimestampFrequency；0 = 未知/未初始化）。
+unsigned long long getTimestampFrequency();
+
 // 渲染 pass 生命周期（P3：OMSetRenderTargets + viewport/scissor + clear；
 // draw 命令录制依赖 P4 pipeline）。
 //   colorViews      ：颜色纹理数组（允许空指针占位，对应 withUnusedColorAttachment）

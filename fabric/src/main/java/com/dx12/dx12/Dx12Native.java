@@ -88,6 +88,9 @@ public final class Dx12Native {
     // P3: command layer
     // -----------------------------------------------------------------------
 
+    /** Query the GPU timestamp frequency (ticks per second; 0 if unknown). */
+    public static native long dx12GetTimestampFrequency();
+
     /** Create a command context (CommandContext*); returns the native handle. */
     public static native long dx12CreateCommandEncoder();
 

@@ -30,6 +30,11 @@ extern "C" {
 // P3 命令层：CommandEncoder（对应官方 VulkanCommandEncoder）
 // ===========================================================================
 
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampFrequency(
+    JNIEnv*, jclass) {
+    return (jlong)dx12mc::getTimestampFrequency();
+}
+
 JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateCommandEncoder(
     JNIEnv* env, jclass) {
     std::string err;

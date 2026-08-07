@@ -1070,4 +1070,8 @@ bool readQueryValues(QueryPool* pool, int start, int count, long long* out,
     return resolveQuery(pool, start, count, out, err);
 }
 
+unsigned long long getTimestampFrequency() {
+    return gCtx.timestampFrequency;
+}
+
 }  // namespace dx12mc
