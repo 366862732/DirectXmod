@@ -1,20 +1,20 @@
 package com.dx12.dx12;
 
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 
 /**
- * JNI bridge for the dx12-mc Rust library.
+ * JNI bridge for the dx12-mc C++ native library.
  *
- * The native symbol exported by dx12-mc is
- * {@code Java_com_dx12_dx12_Dx12Native_dx12CreateDevice}, so the class MUST be
- * {@code com.dx12.dx12.Dx12Native} with a {@code dx12CreateDevice()} method.
+ * The native symbols exported by dx12_mc.dll are named
+ * {@code Java_com_dx12_dx12_Dx12Native_<method>}, so this class MUST be
+ * {@code com.dx12.dx12.Dx12Native} and method names MUST match exactly.
  *
  * The DLL is extracted from the mod JAR into {@code <user.dir>/dx12mod/}
- * (same pattern as D3D12Bridge) so the launcher's working directory always
- * holds a copy that matches the JAR.
+ * so the launcher's working directory always holds a copy that matches the JAR.
  */
 public final class Dx12Native {
     private static boolean loaded = false;
@@ -50,13 +50,39 @@ public final class Dx12Native {
     }
 
     /**
-     * Probe D3D12 device creation on the native side.
+     * Probe D3D12 device creation + run the native resource self-test.
      *
-     * @return adapter name + feature level (e.g. "NVIDIA GeForce RTX 4090
-     *         (D3D_FEATURE_LEVEL 12_1)"), or a string starting with "ERROR: "
-     *         if device creation failed.
+     * @return adapter name + feature level + self-test result
+     *         (e.g. "NVIDIA GeForce RTX 4090 (D3D_FEATURE_LEVEL 12_1); SELF-TEST OK (...)")
      */
     public static native String dx12CreateDevice();
+
+    /** Create a texture; returns a native handle (long = Dx12Object*). */
+    public static native long dx12CreateTexture(int usage, int format, int width,
+        int height, int depthOrLayers, int mipLevels);
+
+    /** Create a buffer; returns a native handle (long = Dx12Object*). */
+    public static native long dx12CreateBuffer(int usage, long size);
+
+    /** Create a sampler; returns a native handle (long = Dx12Object*). */
+    public static native long dx12CreateSampler(int addressU, int addressV, int minFilter,
+        int magFilter, int maxAnisotropy, float maxLod);
+
+    /** Create a texture view; returns a native handle (long = Dx12Object*). */
+    public static native long dx12CreateTextureView(long textureHandle, int baseMipLevel, int mipLevels);
+
+    /** Destroy a native resource created by one of the dx12Create* methods. */
+    public static native void dx12DestroyResource(long handle);
+
+    /**
+     * Map a buffer region; returns a direct ByteBuffer over the mapped memory.
+     * Must be paired with {@link #dx12UnmapBuffer}.
+     */
+    public static native ByteBuffer dx12MapBuffer(long bufferHandle, long offset, long length,
+        boolean read, boolean write);
+
+    /** Unmap a previously mapped buffer. */
+    public static native void dx12UnmapBuffer(long bufferHandle);
 
     private Dx12Native() {
     }

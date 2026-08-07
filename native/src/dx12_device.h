@@ -1,5 +1,11 @@
 #pragma once
 
+// 禁用 Windows min/max 宏，避免与 std::max/std::min 冲突（须在任何
+// windows.h/d3d12.h 之前定义）。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 // dx12-mc 原生 D3D12 层（C++）
 // P2 目标：D3D12 设备上下文 + 资源创建（texture/buffer/sampler/view）+ 自检。
 // 设计参考：官方 com.mojang.blaze3d.vulkan.VulkanDevice / VulkanGpuTexture /

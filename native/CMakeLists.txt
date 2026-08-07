@@ -24,7 +24,7 @@ add_library(dx12_mc SHARED
 
 target_link_libraries(dx12_mc PRIVATE d3d12 dxgi)
 
-# 警告级别
+# 警告级别 + 强制源文件按 UTF-8 解析（源码含中文注释，避免 GBK 代码页误读）
 if(MSVC)
-    target_compile_options(dx12_mc PRIVATE /W3)
+    target_compile_options(dx12_mc PRIVATE /W3 /utf-8)
 endif()

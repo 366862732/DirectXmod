@@ -344,11 +344,11 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
     if (texture->usage & 16) {  // CUBEMAP_COMPATIBLE
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         srv.TextureCube.MipLevels = (UINT)std::max(1, mipLevels);
-        srv.TextureCube.BaseMipLevel = (UINT)std::max(0, baseMipLevel);
+        srv.TextureCube.MostDetailedMip = (UINT)std::max(0, baseMipLevel);
     } else {
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Texture2D.MipLevels = (UINT)std::max(1, mipLevels);
-        srv.Texture2D.BaseMipLevel = (UINT)std::max(0, baseMipLevel);
+        srv.Texture2D.MostDetailedMip = (UINT)std::max(0, baseMipLevel);
     }
     gCtx.device->CreateShaderResourceView(texture->resource.Get(), &srv, cpu);
 
