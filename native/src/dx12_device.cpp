@@ -1587,7 +1587,14 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     if (!pipeline) { err = "setPipeline: null pipeline"; return false; }
     ID3D12PipelineState* pso = hasDepth ? pipeline->withDepth.Get() : pipeline->withoutDepth.Get();
     if (!pso) pso = pipeline->withDepth.Get();  // 无深度渲染但管线未建 withoutDepth 时回退
+    if (!pipeline->rootSignature) { err = "setPipeline: null root signature"; return false; }
+    // P6 崩溃修复（第 5 轮）：D3D12 规定使用任何 root 参数（SetGraphicsRootDescriptorTable
+    // 等）前必须先 SetGraphicsRootSignature。此前缺失 → UMD 首次真实 draw 时对 NULL root
+    // signature 解引用崩溃（hs_err：NVIDIA UMD 内读 NULL+0x2b88，AV，PC 0x7ffcd70e8fa3）。
+    ctx->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
     ctx->commandList->SetPipelineState(pso);
+    std::fprintf(stdout, "[dx12] setPipeline rootSig=%p pso=%p hasDepth=%d\n",
+        (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth);
     return true;
 }
 
