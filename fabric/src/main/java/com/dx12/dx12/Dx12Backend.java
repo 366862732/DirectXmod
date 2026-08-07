@@ -5,8 +5,10 @@ import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.buffers.GpuFence;
+import com.mojang.blaze3d.pipeline.CompiledRenderPipeline;
 import com.mojang.blaze3d.shaders.GpuDebugOptions;
 import com.mojang.blaze3d.shaders.ShaderSource;
+import com.mojang.blaze3d.shaders.ShaderType;
 import com.mojang.blaze3d.systems.BackendCreationException;
 import com.mojang.blaze3d.systems.GpuBackend;
 import com.mojang.blaze3d.systems.GpuDevice;
@@ -19,6 +21,8 @@ import java.util.Locale;
 import java.util.OptionalDouble;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -65,22 +69,30 @@ public class Dx12Backend implements GpuBackend {
     @Override
     public GpuDevice createDevice(long window, ShaderSource defaultShaderSource,
         GpuDebugOptions debugOptions, Runnable criticalShaderLoader) throws BackendCreationException {
-        // P2: prove the whole Java -> JNI -> C++ D3D12 resource chain works by
-        // creating + destroying real textures/buffers/samplers/views through a
-        // Dx12Device. The render layer (P3+) is not implemented yet, so we still
-        // fail with a clean BackendCreationException and let the game fall back
-        // to GL/Vulkan (same safety net as P1).
+        // P2/P3: prove the whole Java -> JNI -> C++ D3D12 resource + command
+        // chain works by creating/destroying real resources and submitting a
+        // command list with readback. P4: compile two real vanilla pipelines
+        // (core/gui + core/position_tex_color) end-to-end: GLSL -> shaderc
+        // SPIR-V -> spvc reflection/rebind -> HLSL -> d3dcompiler DXBC ->
+        // root signature + PSO. The render layer (P5+) is not implemented yet,
+        // so we still fail with a clean BackendCreationException and let the
+        // game fall back to GL/Vulkan.
         try {
             Dx12Device device = new Dx12Device();
-            selfTestJavaResources(device);
-            selfTestCommandLayer(device);
+            try {
+                selfTestJavaResources(device);
+                selfTestCommandLayer(device);
+                selfTestPipelines(device);
+            } finally {
+                device.close();
+            }
         } catch (Throwable t) {
-            LOGGER.error("[dx12] D3D12 resource self-test failed: {}", t.toString());
+            LOGGER.error("[dx12] D3D12 self-test failed: {}", t.toString());
             throw new BackendCreationException(
-                "DX12 resource self-test failed: " + t, BackendCreationException.Reason.OTHER);
+                "DX12 self-test failed: " + t, BackendCreationException.Reason.OTHER);
         }
         throw new BackendCreationException(
-            "DX12 command layer verified; render layer (P4) not yet implemented",
+            "DX12 device + pipeline verified; render layer (P5) not yet implemented",
             BackendCreationException.Reason.OTHER);
     }
 
@@ -164,8 +176,9 @@ public class Dx12Backend implements GpuBackend {
                 }
             }
 
-            // Texture readback: D3D12 readback rows are 256-byte aligned.
-            int rowPitch = 256;
+            // Texture readback: native writes tightly-packed rows (rowBytes per
+            // row), matching what the caller allocated.
+            int rowPitch = texSize * 4;
             try (GpuBufferSlice.MappedView view = texDst.map(0, texDst.size(), true, false)) {
                 ByteBuffer read = view.data();
                 for (int row = 0; row < texSize; ++row) {
@@ -186,5 +199,154 @@ public class Dx12Backend implements GpuBackend {
             src.close();
         }
         LOGGER.info("[dx12] Command layer self-test OK (submit/fence/copy/readback via JNI)");
+    }
+
+    // -----------------------------------------------------------------------
+    // P4: pipeline self-test — 内嵌官方启动期 critical shader 的 GLSL 原文
+    // （提取自 assets/minecraft/shaders/core/），编译官方真实 RenderPipeline
+    // 全链路：GLSL -> shaderc SPIR-V -> spvc 反射/rebind -> HLSL SM5.1 ->
+    // d3dcompiler DXBC -> root signature + 双 PSO。
+    // -----------------------------------------------------------------------
+
+    private static final String CORE_GUI_VSH = """
+        #version 330
+
+        // Can't moj_import in things used during startup, when resource packs don't exist.
+        // This is a copy of dynamicimports.glsl and projection.glsl
+        layout(std140) uniform DynamicTransforms {
+            mat4 ModelViewMat;
+            vec4 ColorModulator;
+            vec3 ModelOffset;
+            mat4 TextureMat;
+        };
+        layout(std140) uniform Projection {
+            mat4 ProjMat;
+        };
+
+        in vec3 Position;
+        in vec4 Color;
+
+        out vec4 vertexColor;
+
+        void main() {
+            gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+
+            vertexColor = Color;
+        }
+        """;
+
+    private static final String CORE_GUI_FSH = """
+        #version 330
+
+        // Can't moj_import in things used during startup, when resource packs don't exist.
+        // This is a copy of dynamicimports.glsl
+        layout(std140) uniform DynamicTransforms {
+            mat4 ModelViewMat;
+            vec4 ColorModulator;
+            vec3 ModelOffset;
+            mat4 TextureMat;
+        };
+
+        in vec4 vertexColor;
+
+        out vec4 fragColor;
+
+        void main() {
+            vec4 color = vertexColor;
+            if (color.a == 0.0) {
+                discard;
+            }
+            fragColor = color * ColorModulator;
+        }
+        """;
+
+    private static final String CORE_POSITION_TEX_COLOR_VSH = """
+        #version 330
+
+        // Can't moj_import in things used during startup, when resource packs don't exist.
+        // This is a copy of dynamicimports.glsl and projection.glsl
+        layout(std140) uniform DynamicTransforms {
+            mat4 ModelViewMat;
+            vec4 ColorModulator;
+            vec3 ModelOffset;
+            mat4 TextureMat;
+        };
+        layout(std140) uniform Projection {
+            mat4 ProjMat;
+        };
+
+        in vec3 Position;
+        in vec2 UV0;
+        in vec4 Color;
+
+        out vec2 texCoord0;
+        out vec4 vertexColor;
+
+        void main() {
+            gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+
+            texCoord0 = UV0;
+            vertexColor = Color;
+        }
+        """;
+
+    private static final String CORE_POSITION_TEX_COLOR_FSH = """
+        #version 330
+
+        // Can't moj_import in things used during startup, when resource packs don't exist.
+        // This is a copy of dynamicimports.glsl
+        layout(std140) uniform DynamicTransforms {
+            mat4 ModelViewMat;
+            vec4 ColorModulator;
+            vec3 ModelOffset;
+            mat4 TextureMat;
+        };
+
+        uniform sampler2D Sampler0;
+
+        in vec2 texCoord0;
+        in vec4 vertexColor;
+
+        out vec4 fragColor;
+
+        void main() {
+            vec4 color = texture(Sampler0, texCoord0) * vertexColor;
+            if (color.a == 0.0) {
+                discard;
+            }
+            fragColor = color * ColorModulator;
+        }
+        """;
+
+    /** 自检 shader 源：createDevice 时资源包未加载，用内嵌 GLSL 顶替真实 ShaderSource。 */
+    private static final ShaderSource EMBEDDED_SHADER_SOURCE = (id, type) -> {
+        if (!id.getPath().startsWith("core/")) {
+            return null;
+        }
+        return switch (id.getPath()) {
+            case "core/gui" -> type == ShaderType.VERTEX ? CORE_GUI_VSH : CORE_GUI_FSH;
+            case "core/position_tex_color" -> type == ShaderType.VERTEX
+                ? CORE_POSITION_TEX_COLOR_VSH : CORE_POSITION_TEX_COLOR_FSH;
+            default -> null;
+        };
+    };
+
+    /**
+     * 用两条官方真实管线（GUI、GUI_TEXTURED）验证 P4 编译全链路。每条管线
+     * 编译出的原生 Dx12Pipeline* 必须 handle != 0（isValid()==true）。编译失败
+     * 时 compilePipeline 返回无效管线并记 error，这里再抛异常终止自检。
+     */
+    private static void selfTestPipelines(Dx12Device device) {
+        String[] names = { "pipeline/gui", "pipeline/gui_textured" };
+        for (String name : names) {
+            CompiledRenderPipeline pipeline = switch (name) {
+                case "pipeline/gui" -> device.precompilePipeline(RenderPipelines.GUI, EMBEDDED_SHADER_SOURCE);
+                default -> device.precompilePipeline(RenderPipelines.GUI_TEXTURED, EMBEDDED_SHADER_SOURCE);
+            };
+            if (!pipeline.isValid()) {
+                throw new IllegalStateException("native pipeline compile failed for " + name);
+            }
+        }
+        LOGGER.info("[dx12] Pipeline self-test OK (GLSL->SPIR-V->HLSL->DXBC->PSO for core/gui + core/position_tex_color)");
     }
 }

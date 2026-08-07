@@ -3,9 +3,14 @@ package com.dx12.dx12;
 import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.pipeline.BlendFunction;
+import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.CompiledRenderPipeline;
+import com.mojang.blaze3d.pipeline.DepthStencilState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.preprocessor.GlslPreprocessor;
 import com.mojang.blaze3d.shaders.ShaderSource;
+import com.mojang.blaze3d.shaders.ShaderType;
 import com.mojang.blaze3d.systems.CommandEncoderBackend;
 import com.mojang.blaze3d.systems.DeviceFeatures;
 import com.mojang.blaze3d.systems.DeviceInfo;
@@ -20,13 +25,23 @@ import com.mojang.blaze3d.textures.FilterMode;
 import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
+import com.mojang.blaze3d.vulkan.glsl.ShaderCompileException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.OptionalDouble;
 import java.util.Set;
 import java.util.function.Supplier;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
+import net.minecraft.client.renderer.ShaderDefines;
+import net.minecraft.resources.Identifier;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +60,14 @@ public class Dx12Device implements GpuDeviceBackend {
 
     private final DeviceInfo deviceInfo;
     private long timestampCtx;
+
+    // P4: pipeline + shader caches（镜像官方 VulkanDevice）
+    private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
+    private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
+    @Nullable
+    private Dx12ShaderCompiler glslCompiler;
+    /** 默认 ShaderSource：P4 阶段 createDevice 早于资源加载，保持 null（precompile 时无源则管线无效）。 */
+    private ShaderSource defaultShaderSource;
 
     public Dx12Device() {
         String probe = Dx12Native.dx12CreateDevice();
@@ -128,12 +151,16 @@ public class Dx12Device implements GpuDeviceBackend {
     @Override
     public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource) {
-        throw new UnsupportedOperationException("P4: pipeline compilation not yet implemented");
+        ShaderSource source = shaderSource == null ? this.defaultShaderSource : shaderSource;
+        return this.pipelineCache.computeIfAbsent(pipeline, ignored -> this.compilePipeline(pipeline, source));
     }
 
     @Override
     public void clearPipelineCache() {
-        // No pipeline cache in P2.
+        this.pipelineCache.values().forEach(Dx12CompiledRenderPipeline::close);
+        this.pipelineCache.clear();
+        this.shaderCache.values().forEach(Dx12IntermediaryShaderModule::close);
+        this.shaderCache.clear();
     }
 
     @Override
@@ -170,7 +197,235 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public void close() {
-        // Resources are closed individually; the native device context is process-lifetime.
+        this.clearPipelineCache();
+        Dx12ShaderCompiler compiler = this.glslCompiler;
+        if (compiler != null) {
+            compiler.close();
+            this.glslCompiler = null;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P4: pipeline + shader compilation（镜像官方 VulkanDevice）
+    // -----------------------------------------------------------------------
+
+    /**
+     * 编译一条管线：取顶点/片元 shader（缓存）-> GLSL 编译 -> HLSL -> 打包
+     * desc -> 原生层 D3DCompile + root signature + 双 PSO。任何失败都返回
+     * handle=0 的无效管线（isValid()==false），镜像官方 compilePipeline。
+     */
+    private Dx12CompiledRenderPipeline compilePipeline(RenderPipeline pipeline,
+        @Nullable ShaderSource shaderSource) {
+        Dx12IntermediaryShaderModule vertexShader = this.getOrCompileShader(
+            pipeline.getVertexShader(), ShaderType.VERTEX, pipeline.getShaderDefines(), shaderSource);
+        Dx12IntermediaryShaderModule fragmentShader = this.getOrCompileShader(
+            pipeline.getFragmentShader(), ShaderType.FRAGMENT, pipeline.getShaderDefines(), shaderSource);
+        if (vertexShader == Dx12IntermediaryShaderModule.INVALID) {
+            LOGGER.error("Couldn't compile pipeline {}: vertex shader {} was invalid",
+                pipeline.getLocation(), pipeline.getVertexShader());
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+        }
+        if (fragmentShader == Dx12IntermediaryShaderModule.INVALID) {
+            LOGGER.error("Couldn't compile pipeline {}: fragment shader {} was invalid",
+                pipeline.getLocation(), pipeline.getFragmentShader());
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+        }
+        try {
+            Dx12CompiledShader compiled = this.getOrCreateCompiler()
+                .compile(pipeline, vertexShader, fragmentShader);
+            ByteBuffer desc = buildNativeDesc(compiled, pipeline);
+            long handle = Dx12Native.dx12CreateGraphicsPipeline(desc);
+            if (handle == 0) {
+                LOGGER.error("Couldn't create native pipeline {}", pipeline.getLocation());
+                return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+            }
+            return new Dx12CompiledRenderPipeline(pipeline, handle,
+                compiled.vertexHlsl(), compiled.fragmentHlsl());
+        } catch (ShaderCompileException e) {
+            LOGGER.error("Couldn't compile pipeline {}: {}", pipeline.getLocation(), e.getMessage());
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+        }
+    }
+
+    private Dx12IntermediaryShaderModule getOrCompileShader(Identifier id, ShaderType type,
+        ShaderDefines defines, @Nullable ShaderSource shaderSource) {
+        ShaderCompilationKey key = new ShaderCompilationKey(id, type, defines);
+        return this.shaderCache.computeIfAbsent(key, ignored -> this.compileShader(key, shaderSource));
+    }
+
+    private Dx12IntermediaryShaderModule compileShader(ShaderCompilationKey key,
+        @Nullable ShaderSource shaderSource) {
+        if (shaderSource == null) {
+            LOGGER.error("Couldn't find source for {} shader ({})", key.type(), key.id());
+            return Dx12IntermediaryShaderModule.INVALID;
+        }
+        String source = shaderSource.get(key.id(), key.type());
+        if (source == null) {
+            LOGGER.error("Couldn't find source for {} shader ({})", key.type(), key.id());
+            return Dx12IntermediaryShaderModule.INVALID;
+        }
+        String sourceWithDefines = GlslPreprocessor.injectDefines(source, key.defines());
+        try {
+            return this.getOrCreateCompiler().createIntermediary(
+                key.id().toDebugFileName(), sourceWithDefines, key.type());
+        } catch (ShaderCompileException e) {
+            LOGGER.error("Couldn't compile {} shader {}: {}", key.type(), key.id(), e.getMessage());
+            return Dx12IntermediaryShaderModule.INVALID;
+        }
+    }
+
+    private Dx12ShaderCompiler getOrCreateCompiler() {
+        Dx12ShaderCompiler compiler = this.glslCompiler;
+        if (compiler == null) {
+            compiler = new Dx12ShaderCompiler();
+            this.glslCompiler = compiler;
+        }
+        return compiler;
+    }
+
+    /**
+     * 生成 D3D12 输入布局元素：仅包含顶点着色器实际声明的输入（与
+     * {@link Dx12IntermediaryShaderModule#rebind} 的 attribLocation 分配
+     * 完全一致），每元素 {location, binding, formatOrdinal, offset, stride, stepRate}。
+     */
+    private static List<int[]> buildVertexInputElements(RenderPipeline pipeline,
+        List<String> vertexShaderInputs) {
+        List<int[]> elements = new ArrayList<>();
+        int attribLocation = 0;
+        VertexFormat[] bindings = pipeline.getVertexFormatBindings();
+        for (int i = 0; i < bindings.length; i++) {
+            VertexFormat format = bindings[i];
+            if (format == null) continue;
+            int stride = format.getVertexSize();
+            int stepRate = format.getStepRate();
+            for (VertexFormatElement element : format.getElements()) {
+                if (!vertexShaderInputs.contains(element.name())) continue;
+                elements.add(new int[] {
+                    attribLocation, i, element.format().ordinal(),
+                    element.offset(), stride, stepRate
+                });
+                attribLocation++;
+            }
+        }
+        return elements;
+    }
+
+    /**
+     * 打包原生层 {@code dx12CreateGraphicsPipeline} 的 desc（little-endian）。
+     * 布局见 {@link Dx12Native#dx12CreateGraphicsPipeline} Javadoc。
+     */
+    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled, RenderPipeline pipeline) {
+        byte[] vsBytes = compiled.vertexHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] psBytes = compiled.fragmentHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ColorTargetState[] colorTargets = pipeline.getColorTargetStates();
+        int colorCount = colorTargets == null ? 0 : colorTargets.length;
+        boolean hasDepth = pipeline.getDepthStencilState() != null;
+        List<int[]> inputElements = buildVertexInputElements(pipeline, compiled.vertexShaderInputs());
+        List<Dx12BindGroupEntry> entries = compiled.entries();
+
+        int size = 4 + vsBytes.length + 4 + psBytes.length;   // vsLen+vs + psLen+ps
+        size += 4 + colorCount * 10;                          // colorCount + per color
+        size += 1 + (hasDepth ? (4 + 2) : 0);                 // hasDepth + depth state
+        size += 4 + 1 + 4;                                    // topology + cullEnabled + polygonMode
+        size += 4 + inputElements.size() * (4 * 6);           // inputElementCount + per element
+        size += 4 + entries.size() * 2;                       // entryCount + per entry (type, register)
+
+        ByteBuffer desc = ByteBuffer.allocateDirect(size).order(ByteOrder.LITTLE_ENDIAN);
+        desc.putInt(vsBytes.length);
+        desc.put(vsBytes);
+        desc.putInt(psBytes.length);
+        desc.put(psBytes);
+
+        desc.putInt(colorCount);
+        for (int i = 0; i < colorCount; i++) {
+            writeColorTarget(desc, colorTargets[i]);
+        }
+
+        desc.put((byte) (hasDepth ? 1 : 0));
+        if (hasDepth) {
+            writeDepthState(desc, pipeline.getDepthStencilState());
+        }
+
+        desc.putInt(pipeline.getPrimitiveTopology().ordinal());
+        desc.put((byte) (pipeline.isCull() ? 1 : 0));
+        desc.putInt(pipeline.getPolygonMode().ordinal());
+
+        desc.putInt(inputElements.size());
+        for (int[] element : inputElements) {
+            desc.putInt(element[0]);  // location
+            desc.putInt(element[1]);  // binding
+            desc.putInt(element[2]);  // format ordinal
+            desc.putInt(element[3]);  // offset
+            desc.putInt(element[4]);  // stride
+            desc.putInt(element[5]);  // stepRate
+        }
+
+        desc.putInt(entries.size());
+        for (int i = 0; i < entries.size(); i++) {
+            desc.put((byte) switch (entries.get(i).type()) {
+                case UNIFORM_BUFFER -> 0;   // CBV b{i}
+                case SAMPLED_IMAGE -> 1;    // SRV t{i} + static sampler s{i}
+                case TEXEL_BUFFER -> 2;     // SRV t{i}
+            });
+            desc.put((byte) i);
+        }
+        desc.flip();
+        return desc;
+    }
+
+    /**
+     * 写入一个颜色目标（10 字节）。{@code null}（withUnusedColorTargetState）
+     * 表示该槽位未使用：format=-1（DXGI_FORMAT_UNKNOWN）、无混合、无写入。
+     * 混合枚举序数即官方枚举 ordinal（见各枚举声明顺序）。
+     */
+    private static void writeColorTarget(ByteBuffer desc, @Nullable ColorTargetState state) {
+        if (state == null) {
+            desc.putInt(-1);
+            desc.put((byte) 0);  // writeMask
+            desc.put((byte) 0);  // blendEnabled
+            desc.put((byte) 0);  // srcColor
+            desc.put((byte) 0);  // dstColor
+            desc.put((byte) 0);  // colorOp
+            desc.put((byte) 0);  // srcAlpha
+            desc.put((byte) 0);  // dstAlpha
+            desc.put((byte) 0);  // alphaOp
+            return;
+        }
+        desc.putInt(state.format().ordinal());
+        desc.put((byte) state.writeMask());
+        desc.put((byte) (state.blendFunction().isPresent() ? 1 : 0));
+        if (state.blendFunction().isPresent()) {
+            BlendFunction blend = state.blendFunction().get();
+            desc.put((byte) blend.color().sourceFactor().ordinal());
+            desc.put((byte) blend.color().destFactor().ordinal());
+            desc.put((byte) blend.color().op().ordinal());
+            desc.put((byte) blend.alpha().sourceFactor().ordinal());
+            desc.put((byte) blend.alpha().destFactor().ordinal());
+            desc.put((byte) blend.alpha().op().ordinal());
+        } else {
+            desc.put((byte) 0);
+            desc.put((byte) 0);
+            desc.put((byte) 0);
+            desc.put((byte) 0);
+            desc.put((byte) 0);
+            desc.put((byte) 0);
+        }
+    }
+
+    /** 写入深度模板状态：depthFormat + depthWrite + depthCompareOp（深度格式固定 D32_FLOAT）。 */
+    private static void writeDepthState(ByteBuffer desc, DepthStencilState state) {
+        desc.putInt(GpuFormat.D32_FLOAT.ordinal());
+        desc.put((byte) (state.writeDepth() ? 1 : 0));
+        desc.put((byte) state.depthTest().ordinal());
+    }
+
+    /** 着色器编译缓存键：id + 阶段 + defines（镜像官方 VulkanDevice.ShaderCompilationKey）。 */
+    private record ShaderCompilationKey(Identifier id, ShaderType type, ShaderDefines defines) {
+        @Override
+        public String toString() {
+            String s = this.id + " (" + this.type + ")";
+            return this.defines.isEmpty() ? s : s + " with " + this.defines;
+        }
     }
 
     // -----------------------------------------------------------------------

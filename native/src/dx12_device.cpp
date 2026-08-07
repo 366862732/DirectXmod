@@ -189,6 +189,18 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
     }
 }
 
+// 顶点输入布局格式：RGB32_* 用精确三分量格式（DXGI 仅对 32 位三分量提供
+// R32G32B32_* 输入格式；纹理用途的 toDxgiFormat 会把 RGB32 加宽成 RGBA32，
+// 但输入布局加宽会导致与 shader 语义分量数不匹配，PSO 创建失败）。
+DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
+    switch (gpuFormat) {
+        case 36: return DXGI_FORMAT_R32G32B32_UINT;   // RGB32_UINT
+        case 37: return DXGI_FORMAT_R32G32B32_SINT;   // RGB32_SINT
+        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;  // RGB32_FLOAT
+        default: return toDxgiFormat(gpuFormat);
+    }
+}
+
 namespace {
 
 // 是否有 depth 面（官方 GpuFormat.hasDepthAspect）
@@ -906,28 +918,51 @@ bool copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, int mip, int l
     transitionBufferOnce(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
 
     UINT subresource = (UINT)(mip + layer * srcTex->resource->GetDesc().MipLevels);
-    // 读回行距 256 对齐（D3D12 硬性要求）；客户端按 rowPitch 逐行访问。
+    // 客户端（Minecraft）按紧凑行距访问读回数据，且读回 buffer 只分配了
+    // 紧凑大小（rowBytes*h）。D3D12 要求 footprint RowPitch 为 256 的倍数，
+    // 因此行距未对齐时逐行紧凑拷贝（每行 Height=1）。
     constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    UINT rowPitch = (rowBytes + kPitchAlign - 1) / kPitchAlign * kPitchAlign;
-    if (dstOffset + (UINT64)rowPitch * h > (UINT64)dstBuf->size) {
-        err = "copyTextureToBuffer: destination buffer too small (need aligned rowPitch)";
+    bool aligned = (rowBytes % kPitchAlign) == 0;
+    if (dstOffset + (UINT64)rowBytes * h > (UINT64)dstBuf->size) {
+        err = "copyTextureToBuffer: destination buffer too small";
         return false;
     }
+    transitionTextureOnce(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionBufferOnce(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
+
     D3D12_TEXTURE_COPY_LOCATION src{};
     src.pResource = srcTex->resource.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = subresource;
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = dstBuf->resource.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Offset = (UINT64)dstOffset;
-    dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
-    dst.PlacedFootprint.Footprint.Width = (UINT)w;
-    dst.PlacedFootprint.Footprint.Height = (UINT)h;
-    dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = rowPitch;
-    D3D12_BOX srcBox{ (UINT)srcX, (UINT)srcY, 0, (UINT)(srcX + w), (UINT)(srcY + h), 1 };
-    ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+    if (aligned) {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = dstBuf->resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = (UINT64)dstOffset;
+        dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
+        dst.PlacedFootprint.Footprint.Width = (UINT)w;
+        dst.PlacedFootprint.Footprint.Height = (UINT)h;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = rowBytes;
+        D3D12_BOX srcBox{ (UINT)srcX, (UINT)srcY, 0, (UINT)(srcX + w), (UINT)(srcY + h), 1 };
+        ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+    } else {
+        // 逐行拷贝：目标 buffer 紧凑布局，RowPitch=rowBytes（每行 1 像素高）。
+        for (int row = 0; row < h; ++row) {
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = dstBuf->resource.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = (UINT64)dstOffset + (UINT64)row * rowBytes;
+            dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
+            dst.PlacedFootprint.Footprint.Width = (UINT)w;
+            dst.PlacedFootprint.Footprint.Height = 1;
+            dst.PlacedFootprint.Footprint.Depth = 1;
+            dst.PlacedFootprint.Footprint.RowPitch = rowBytes;
+            D3D12_BOX srcBox{ (UINT)srcX, (UINT)(srcY + row), 0,
+                (UINT)(srcX + w), (UINT)(srcY + row + 1), 1 };
+            ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+        }
+    }
     return true;
 }
 
@@ -1072,6 +1107,284 @@ bool readQueryValues(QueryPool* pool, int start, int count, long long* out,
 
 unsigned long long getTimestampFrequency() {
     return gCtx.timestampFrequency;
+}
+
+// ---------------------------------------------------------------------------
+// P4: 图形管线（D3DCompile + root signature + 双 PSO）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// MC BlendFactor ordinal -> D3D12_BLEND（枚举声明顺序）
+D3D12_BLEND toD3d12BlendFactor(uint8_t f) {
+    switch (f) {
+        case 0: return D3D12_BLEND_BLEND_FACTOR;      // CONSTANT_ALPHA
+        case 1: return D3D12_BLEND_BLEND_FACTOR;      // CONSTANT_COLOR
+        case 2: return D3D12_BLEND_DEST_ALPHA;        // DST_ALPHA
+        case 3: return D3D12_BLEND_DEST_COLOR;        // DST_COLOR
+        case 4: return D3D12_BLEND_ONE;               // ONE
+        case 5: return D3D12_BLEND_INV_BLEND_FACTOR;  // ONE_MINUS_CONSTANT_ALPHA
+        case 6: return D3D12_BLEND_INV_BLEND_FACTOR;  // ONE_MINUS_CONSTANT_COLOR
+        case 7: return D3D12_BLEND_INV_DEST_ALPHA;    // ONE_MINUS_DST_ALPHA
+        case 8: return D3D12_BLEND_INV_DEST_COLOR;    // ONE_MINUS_DST_COLOR
+        case 9: return D3D12_BLEND_INV_SRC_ALPHA;     // ONE_MINUS_SRC_ALPHA
+        case 10: return D3D12_BLEND_INV_SRC_COLOR;    // ONE_MINUS_SRC_COLOR
+        case 11: return D3D12_BLEND_SRC_ALPHA;        // SRC_ALPHA
+        case 12: return D3D12_BLEND_SRC_ALPHA_SAT;    // SRC_ALPHA_SATURATE
+        case 13: return D3D12_BLEND_SRC_COLOR;        // SRC_COLOR
+        case 14: return D3D12_BLEND_ZERO;             // ZERO
+        default: return D3D12_BLEND_ONE;
+    }
+}
+
+// MC BlendOp ordinal -> D3D12_BLEND_OP
+D3D12_BLEND_OP toD3d12BlendOp(uint8_t op) {
+    switch (op) {
+        case 0: return D3D12_BLEND_OP_ADD;            // ADD
+        case 1: return D3D12_BLEND_OP_SUBTRACT;       // SUBTRACT
+        case 2: return D3D12_BLEND_OP_REV_SUBTRACT;   // REVERSE_SUBTRACT
+        case 3: return D3D12_BLEND_OP_MIN;            // MIN
+        case 4: return D3D12_BLEND_OP_MAX;            // MAX
+        default: return D3D12_BLEND_OP_ADD;
+    }
+}
+
+// MC CompareOp ordinal -> D3D12_COMPARISON_FUNC
+D3D12_COMPARISON_FUNC toD3d12Compare(uint8_t c) {
+    switch (c) {
+        case 0: return D3D12_COMPARISON_FUNC_ALWAYS;         // ALWAYS_PASS
+        case 1: return D3D12_COMPARISON_FUNC_LESS;           // LESS_THAN
+        case 2: return D3D12_COMPARISON_FUNC_LESS_EQUAL;     // LESS_THAN_OR_EQUAL
+        case 3: return D3D12_COMPARISON_FUNC_EQUAL;          // EQUAL
+        case 4: return D3D12_COMPARISON_FUNC_NOT_EQUAL;      // NOT_EQUAL
+        case 5: return D3D12_COMPARISON_FUNC_GREATER_EQUAL;  // GREATER_THAN_OR_EQUAL
+        case 6: return D3D12_COMPARISON_FUNC_GREATER;        // GREATER_THAN
+        case 7: return D3D12_COMPARISON_FUNC_NEVER;          // NEVER_PASS
+        default: return D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+}
+
+// MC PrimitiveTopology ordinal -> D3D12_PRIMITIVE_TOPOLOGY_TYPE
+D3D12_PRIMITIVE_TOPOLOGY_TYPE toTopologyType(int t) {
+    switch (t) {
+        case 0: case 1: case 2: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;   // LINES/DEBUG_LINES/DEBUG_LINE_STRIP
+        case 3: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;                  // POINTS
+        default: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;              // TRIANGLES/STRIP/FAN/QUADS
+    }
+}
+
+bool compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageName,
+    const char* target, ComPtr<ID3DBlob>& out, std::string& err) {
+    ComPtr<ID3DBlob> errBlob;
+    HRESULT hr = D3DCompile(src.data(), src.size(), stageName, nullptr, nullptr,
+        "main", target, 0, 0, &out, &errBlob);
+    if (FAILED(hr)) {
+        std::string msg;
+        if (errBlob && errBlob->GetBufferSize() > 0) {
+            const char* m = static_cast<const char*>(errBlob->GetBufferPointer());
+            msg.assign(m, errBlob->GetBufferSize());
+        }
+        err = std::string("D3DCompile(") + target + ") hr=0x" + hrText(hr)
+            + (msg.empty() ? "" : "\n" + msg);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err) {
+    if (!ensureDevice(err)) return nullptr;
+
+    // 1) HLSL -> DXBC（vs_5_1 / ps_5_1，入口 main）
+    ComPtr<ID3DBlob> vsBlob, psBlob;
+    if (!compileShaderBytecode(desc.vsBytes, "vertex", "vs_5_1", vsBlob, err)) return nullptr;
+    if (!compileShaderBytecode(desc.psBytes, "fragment", "ps_5_1", psBlob, err)) return nullptr;
+
+    // 2) root signature：单 descriptor table（CBV/SRV 混合，register=条目序号）
+    //    + static sampler（仅 SAMPLED_IMAGE 条目，register=同一序号）
+    std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
+    std::vector<D3D12_STATIC_SAMPLER_DESC> staticSamplers;
+    ranges.reserve(desc.bindings.size());
+    for (const PipelineDesc::Binding& b : desc.bindings) {
+        D3D12_DESCRIPTOR_RANGE r{};
+        r.NumDescriptors = 1;
+        r.RegisterSpace = 0;
+        r.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        r.BaseShaderRegister = b.reg;
+        r.RangeType = (b.type == 0) ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+                                    : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges.push_back(r);
+        if (b.type == 1) {
+            D3D12_STATIC_SAMPLER_DESC s{};
+            s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            s.MipLODBias = 0.0f;
+            s.MaxAnisotropy = 1;
+            s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            s.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+            s.MinLOD = 0.0f;
+            s.MaxLOD = D3D12_FLOAT32_MAX;
+            s.ShaderRegister = b.reg;
+            s.RegisterSpace = 0;
+            s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            staticSamplers.push_back(s);
+        }
+    }
+    D3D12_ROOT_DESCRIPTOR_TABLE table{};
+    table.NumDescriptorRanges = (UINT)ranges.size();
+    table.pDescriptorRanges = ranges.empty() ? nullptr : ranges.data();
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable = table;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 1;
+    rsDesc.pParameters = &param;
+    rsDesc.NumStaticSamplers = (UINT)staticSamplers.size();
+    rsDesc.pStaticSamplers = staticSamplers.empty() ? nullptr : staticSamplers.data();
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+        &rsBlob, &rsErr);
+    if (FAILED(hr)) {
+        err = "createGraphicsPipeline: D3D12SerializeRootSignature hr=0x" + hrText(hr);
+        return nullptr;
+    }
+    ComPtr<ID3D12RootSignature> rootSig;
+    hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+        rsBlob->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+    if (FAILED(hr)) {
+        err = "createGraphicsPipeline: CreateRootSignature hr=0x" + hrText(hr);
+        return nullptr;
+    }
+
+    // 3) 输入布局：语义 = TEXCOORD<location>（spvc 对顶点输入按 location 生成）
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    inputLayout.reserve(desc.inputElements.size());
+    for (const PipelineDesc::InputElement& el : desc.inputElements) {
+        D3D12_INPUT_ELEMENT_DESC ie{};
+        ie.SemanticName = "TEXCOORD";
+        ie.SemanticIndex = (UINT)el.location;
+        ie.Format = toDxgiVertexFormat(el.format);
+        ie.InputSlot = (UINT)el.binding;
+        ie.AlignedByteOffset = (UINT)el.offset;
+        if (el.stepRate > 0) {
+            ie.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+            ie.InstanceDataStepRate = (UINT)el.stepRate;
+        } else {
+            ie.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+            ie.InstanceDataStepRate = 0;
+        }
+        inputLayout.push_back(ie);
+    }
+
+    // 4) PSO 共享状态：混合 + 光栅化
+    D3D12_BLEND_DESC blend{};
+    blend.AlphaToCoverageEnable = FALSE;
+    blend.IndependentBlendEnable = TRUE;
+    int numRT = 0;
+    for (int i = 0; i < desc.colorCount; ++i) {
+        const PipelineDesc::ColorTarget& ct = desc.colorTargets[i];
+        if (ct.format < 0) continue;  // 未使用槽位
+        numRT = i + 1;
+        D3D12_RENDER_TARGET_BLEND_DESC& rt = blend.RenderTarget[i];
+        rt.BlendEnable = ct.blendEnabled;
+        rt.LogicOpEnable = FALSE;
+        rt.SrcBlend = toD3d12BlendFactor(ct.srcColor);
+        rt.DestBlend = toD3d12BlendFactor(ct.dstColor);
+        rt.BlendOp = toD3d12BlendOp(ct.colorOp);
+        rt.SrcBlendAlpha = toD3d12BlendFactor(ct.srcAlpha);
+        rt.DestBlendAlpha = toD3d12BlendFactor(ct.dstAlpha);
+        rt.BlendOpAlpha = toD3d12BlendOp(ct.alphaOp);
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = ct.writeMask;  // MC 掩码位序与 D3D12 一致（R=1,G=2,B=4,A=8）
+    }
+
+    D3D12_RASTERIZER_DESC rs{};
+    rs.FillMode = (desc.polygonMode == 1) ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+    rs.CullMode = desc.cullEnabled ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+    // MC 前端为逆时针（官方 Vulkan frontFace=CCW），D3D12 默认按顺时针判定，需翻转。
+    rs.FrontCounterClockwise = TRUE;
+    rs.DepthBias = 0;                    // P6 细化 depthBiasConstant/ScaleFactor
+    rs.DepthBiasClamp = 0.0f;
+    rs.SlopeScaledDepthBias = 0.0f;
+    rs.DepthClipEnable = TRUE;
+    rs.MultisampleEnable = FALSE;
+    rs.AntialiasedLineEnable = FALSE;
+    rs.ForcedSampleCount = 0;
+    rs.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    // 5) 双 PSO：withDepth 总是创建（DSV=D32_FLOAT，镜像官方 depthAttachmentFormat=126）；
+    //    仅当管线无深度状态时再创建 withoutDepth（DSV=UNKNOWN，无深度附件）。
+    auto pipeline = std::make_unique<Dx12Pipeline>();
+    pipeline->rootSignature = rootSig;
+
+    auto buildPso = [&](DXGI_FORMAT dsvFormat, bool depthEnable,
+        D3D12_DEPTH_WRITE_MASK depthWrite, D3D12_COMPARISON_FUNC depthFunc,
+        ComPtr<ID3D12PipelineState>& out, std::string& e) -> bool {
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable = depthEnable;
+        ds.DepthWriteMask = depthWrite;
+        ds.DepthFunc = depthFunc;
+        ds.StencilEnable = FALSE;
+        ds.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+        ds.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+        pso.pRootSignature = rootSig.Get();
+        pso.VS.pShaderBytecode = vsBlob->GetBufferPointer();
+        pso.VS.BytecodeLength = vsBlob->GetBufferSize();
+        pso.PS.pShaderBytecode = psBlob->GetBufferPointer();
+        pso.PS.BytecodeLength = psBlob->GetBufferSize();
+        pso.InputLayout.NumElements = (UINT)inputLayout.size();
+        pso.InputLayout.pInputElementDescs =
+            inputLayout.empty() ? nullptr : inputLayout.data();
+        pso.BlendState = blend;
+        pso.RasterizerState = rs;
+        pso.DepthStencilState = ds;
+        pso.PrimitiveTopologyType = toTopologyType(desc.topology);
+        pso.NumRenderTargets = (UINT)numRT;
+        for (int i = 0; i < desc.colorCount; ++i) {
+            const PipelineDesc::ColorTarget& ct = desc.colorTargets[i];
+            pso.RTVFormats[i] = ct.format < 0 ? DXGI_FORMAT_UNKNOWN
+                                              : toDxgiFormat(ct.format);
+        }
+        pso.DSVFormat = dsvFormat;
+        pso.SampleDesc.Count = 1;
+        pso.SampleDesc.Quality = 0;
+        pso.SampleMask = UINT_MAX;
+        HRESULT h = gCtx.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&out));
+        if (FAILED(h)) {
+            e = "createGraphicsPipeline: CreateGraphicsPipelineState hr=0x" + hrText(h);
+            return false;
+        }
+        return true;
+    };
+
+    D3D12_DEPTH_WRITE_MASK depthWrite = (desc.hasDepth && desc.depthWrite)
+        ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    D3D12_COMPARISON_FUNC depthFunc = desc.hasDepth
+        ? toD3d12Compare((uint8_t)desc.depthCompareOp) : D3D12_COMPARISON_FUNC_ALWAYS;
+
+    if (!buildPso(DXGI_FORMAT_D32_FLOAT, desc.hasDepth, depthWrite, depthFunc,
+        pipeline->withDepth, err)) {
+        return nullptr;
+    }
+    if (!desc.hasDepth) {
+        if (!buildPso(DXGI_FORMAT_UNKNOWN, FALSE, D3D12_DEPTH_WRITE_MASK_ZERO,
+            D3D12_COMPARISON_FUNC_ALWAYS, pipeline->withoutDepth, err)) {
+            return nullptr;
+        }
+    }
+    return pipeline.release();
+}
+
+void destroyPipeline(Dx12Pipeline* pipeline) {
+    delete pipeline;
 }
 
 }  // namespace dx12mc

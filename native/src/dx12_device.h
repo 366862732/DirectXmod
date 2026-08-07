@@ -15,11 +15,13 @@
 // VulkanCommandEncoder / VulkanRenderPass。
 
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dx12mc {
 
@@ -209,6 +211,55 @@ bool readQueryValues(QueryPool* pool, int start, int count, long long* out,
 // 格式映射（官方 GpuFormat 枚举值 -> DXGI_FORMAT）
 // ---------------------------------------------------------------------------
 DXGI_FORMAT toDxgiFormat(int gpuFormat);
+// 顶点输入布局专用：RGB32_* 用精确的三分量格式（R32G32B32_*，DXGI 合法
+// 输入格式；纹理用的 toDxgiFormat 会把 RGB32 加宽成 RGBA32，输入布局不能加宽）。
+DXGI_FORMAT toDxgiVertexFormat(int gpuFormat);
+
+// ---------------------------------------------------------------------------
+// 图形管线（P4）：D3DCompile(vs_5_1/ps_5_1) + root signature + 双 PSO
+// ---------------------------------------------------------------------------
+struct Dx12Pipeline {
+    ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12PipelineState> withDepth;     // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
+    ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
+};
+
+// Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
+struct PipelineDesc {
+    struct ColorTarget {
+        int format = 0;            // GpuFormat ordinal；-1 = 未使用槽位
+        uint8_t writeMask = 0;
+        bool blendEnabled = false;
+        uint8_t srcColor = 0, dstColor = 0, colorOp = 0;
+        uint8_t srcAlpha = 0, dstAlpha = 0, alphaOp = 0;
+    };
+    struct InputElement {
+        int location = 0, binding = 0, format = 0;
+        int offset = 0, stride = 0, stepRate = 0;
+    };
+    struct Binding {
+        uint8_t type = 0;  // 0=CBV，1=SRV+static sampler，2=SRV
+        uint8_t reg = 0;
+    };
+
+    std::vector<uint8_t> vsBytes;  // HLSL 源码（vs_5_1 编译）
+    std::vector<uint8_t> psBytes;  // HLSL 源码（ps_5_1 编译）
+    int colorCount = 0;
+    std::vector<ColorTarget> colorTargets;
+    bool hasDepth = false;
+    int depthFormat = 0;
+    bool depthWrite = false;
+    int depthCompareOp = 0;
+    int topology = 0;       // PrimitiveTopology ordinal
+    bool cullEnabled = false;
+    int polygonMode = 0;    // PolygonMode ordinal（0=FILL, 1=WIREFRAME）
+    std::vector<InputElement> inputElements;
+    std::vector<Binding> bindings;  // 按 shader 声明顺序（register = 序号）
+};
+
+// 创建管线（D3DCompile + root signature + 双 PSO）；失败返回 nullptr + err。
+Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err);
+void destroyPipeline(Dx12Pipeline* pipeline);
 
 // 自检：创建 texture/buffer/sampler/view 各一，验证资源层可用后销毁。
 // 返回描述字符串（成功/失败明细）。

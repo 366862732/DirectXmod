@@ -21,9 +21,11 @@ add_library(dx12_mc SHARED
     src/dx12_device.cpp
     src/jni_bridge.cpp
     src/jni_bridge_p3.cpp
+    src/jni_bridge_p4.cpp
 )
 
-target_link_libraries(dx12_mc PRIVATE d3d12 dxgi)
+# d3dcompiler：D3DCompile 把 HLSL 编译为 DXBC（vs_5_1/ps_5_1）
+target_link_libraries(dx12_mc PRIVATE d3d12 dxgi d3dcompiler)
 
 # 警告级别 + 强制源文件按 UTF-8 解析（源码含中文注释，避免 GBK 代码页误读）
 if(MSVC)

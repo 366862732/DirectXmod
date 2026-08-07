@@ -183,6 +183,46 @@ public final class Dx12Native {
     /** Blocking read of {@code count} timestamps starting at {@code start}. */
     public static native void dx12ReadQueryValues(long pool, int start, int count, long[] out);
 
+    // -----------------------------------------------------------------------
+    // P4: graphics pipeline
+    // -----------------------------------------------------------------------
+
+    /**
+     * Compile an HLSL pair (vs_5_1/ps_5_1) and create a Dx12Pipeline*
+     * (root signature + PSOs) from a packed little-endian descriptor buffer.
+     *
+     * <p>Layout (little-endian):
+     * <pre>
+     * int vsLen; byte[vsLen]; int psLen; byte[psLen];
+     * int colorCount;
+     *   per color: int format; byte writeMask; byte blendEnabled;
+     *              byte srcColor; byte dstColor; byte colorOp;
+     *              byte srcAlpha; byte dstAlpha; byte alphaOp;
+     *              (format = -1 => unused slot, DXGI_FORMAT_UNKNOWN)
+     * byte hasDepth; if(hasDepth): int depthFormat; byte depthWrite; byte depthCompareOp;
+     * int topology; byte cullEnabled; int polygonMode;
+     * int inputElementCount;
+     *   per element: int location; int binding; int format; int offset;
+     *                int stride; int stepRate;
+     * int entryCount;
+     *   per entry: byte type (0=CBV, 1=SRV+static sampler, 2=SRV); byte register;
+     * </pre>
+     *
+     * <p>枚举序数为官方 MC 枚举 ordinal：topology = {@code PrimitiveTopology.ordinal()}
+     * （LINES=0, DEBUG_LINES=1, DEBUG_LINE_STRIP=2, POINTS=3, TRIANGLES=4,
+     * TRIANGLE_STRIP=5, TRIANGLE_FAN=6, QUADS=7）；blend factor/op 与
+     * depth compare op 均为 {@code BlendFactor}/{@code BlendOp}/{@code CompareOp}
+     * 的 ordinal；polygonMode = {@code PolygonMode.ordinal()}（FILL=0, WIREFRAME=1）。
+     * format = {@code GpuFormat.ordinal()}。
+     *
+     * @param desc direct ByteBuffer (LITTLE_ENDIAN), flipped before passing
+     * @return native Dx12Pipeline* handle; 0 on failure (error logged natively)
+     */
+    public static native long dx12CreateGraphicsPipeline(ByteBuffer desc);
+
+    /** Destroy a pipeline created by {@link #dx12CreateGraphicsPipeline}. */
+    public static native void dx12DestroyPipeline(long pipeline);
+
     private Dx12Native() {
     }
 }
