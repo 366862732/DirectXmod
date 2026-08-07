@@ -35,17 +35,28 @@ import org.jspecify.annotations.Nullable;
 @Environment(EnvType.CLIENT)
 public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private final long ctx;
+    private final @Nullable Dx12Device device;
     private final Dx12TransientMemory transientMemory;
     private final List<Runnable> pendingCallbacks = new ArrayList<>();
     private @Nullable Dx12RenderPassBackend currentRenderPass;
 
     public Dx12CommandEncoderBackend() {
+        this(null);
+    }
+
+    public Dx12CommandEncoderBackend(@Nullable Dx12Device device) {
+        this.device = device;
         this.ctx = Dx12Native.dx12CreateCommandEncoder();
         if (this.ctx == 0) {
             throw new IllegalStateException("dx12CreateCommandEncoder returned a null handle");
         }
         this.transientMemory = new Dx12TransientMemory(this.ctx);
         Dx12Native.dx12BeginCommandList(this.ctx);
+    }
+
+    /** Native CommandContext* handle (used by surface blit + render pass). */
+    long nativeHandle() {
+        return this.ctx;
     }
 
     private static long textureHandle(GpuTexture texture) {
@@ -125,7 +136,9 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
         Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorClearFlags, clearColors,
             depthTexture, depthClearFlag, depthClearValue, x, y, w, h);
-        Dx12RenderPassBackend pass = new Dx12RenderPassBackend(this.ctx);
+        boolean hasDepth = depthTexture != 0L;
+        Dx12RenderPassBackend pass = new Dx12RenderPassBackend(this.device, this.ctx,
+            area, w, h, hasDepth);
         this.currentRenderPass = pass;
         return pass;
     }
@@ -287,7 +300,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             this.currentRenderPass = null;
         }
         Dx12Native.dx12EndCommandList(this.ctx);
-        this.transientMemory.close();
+        // 必须先销毁命令上下文（其内部等待本 ctx 所有已提交命令完成）再关闭瞬时缓冲：
+        // createBuffer(data) 等一次性 encoder 在 submit 后立即 close，若先释放
+        // staging/gpu buffer，GPU 可能仍在使用它们（资源飞行中释放）→ 驱动延迟错误
+        // DXGI_ERROR_DEVICE_REMOVED（下一处 CreateCommittedResource 爆发）或调试层
+        // 致命异常。等待后再释放则安全。
         Dx12Native.dx12DestroyCommandEncoder(this.ctx);
+        this.transientMemory.close();
     }
 }

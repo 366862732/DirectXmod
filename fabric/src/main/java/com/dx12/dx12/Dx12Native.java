@@ -223,6 +223,107 @@ public final class Dx12Native {
     /** Destroy a pipeline created by {@link #dx12CreateGraphicsPipeline}. */
     public static native void dx12DestroyPipeline(long pipeline);
 
+    // -----------------------------------------------------------------------
+    // P5: surface (DXGI swapchain)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Create a DXGI swapchain for the given native window handle (HWND).
+     *
+     * @param hwnd native HWND (e.g. from {@code GLFWNativeWin32.glfwGetWin32Window})
+     * @return native Dx12Surface* handle; 0 on failure
+     */
+    public static native long dx12CreateSurface(long hwnd);
+
+    /**
+     * Present modes this implementation supports, as {@code GpuSurface.PresentMode}
+     * ordinals (IMMEDIATE=0, MAILBOX=1, FIFO=2, FIFO_RELAXED=3). DXGI FLIP
+     * supports {IMMEDIATE, FIFO, FIFO_RELAXED}.
+     */
+    public static native int[] dx12SurfacePresentModes();
+
+    /**
+     * ResizeBuffers to {@code width x height} with the given present mode.
+     *
+     * @return true on success
+     */
+    public static native boolean dx12ConfigureSurface(long surface, int width,
+        int height, int presentMode);
+
+    /** Acquire the next back buffer. @return true on success */
+    public static native boolean dx12AcquireSurface(long surface);
+
+    /**
+     * Record a copy of {@code texture} into the current back buffer on the
+     * given command context's open command list. Source and back buffer must
+     * have compatible (same-family) formats.
+     */
+    public static native void dx12BlitSurface(long ctx, long surface, long texture);
+
+    /** Present the current back buffer (vsync follows the configured mode). */
+    public static native void dx12PresentSurface(long surface);
+
+    /** Whether the last present reported a suboptimal status. */
+    public static native boolean dx12IsSurfaceSuboptimal(long surface);
+
+    /** Destroy a surface created by {@link #dx12CreateSurface}. */
+    public static native void dx12DestroySurface(long surface);
+
+    // -----------------------------------------------------------------------
+    // P6: render pass 内 draw 命令录制
+    // -----------------------------------------------------------------------
+
+    /**
+     * Bind a graphics pipeline (PSO). {@code hasDepth} selects the with-depth
+     * or without-depth PSO variant (mirror of the Vulkan withDepth/withoutDepth
+     * pipeline pair).
+     *
+     * @return true on success
+     */
+    public static native boolean dx12SetPipeline(long ctx, long pipeline, boolean hasDepth);
+
+    /** Set the scissor rect (x, y, width, height) on the open render pass. */
+    public static native boolean dx12SetScissor(long ctx, int x, int y, int width, int height);
+
+    /**
+     * Bind a vertex buffer to {@code slot} (0..15). {@code stride} is the
+     * per-vertex byte size from the pipeline's vertex format binding.
+     */
+    public static native boolean dx12SetVertexBuffer(long ctx, int slot, long buffer,
+        long offset, int stride);
+
+    /** Bind an index buffer; {@code indexType} 0=SHORT(R16_UINT), 1=INT(R32_UINT). */
+    public static native boolean dx12SetIndexBuffer(long ctx, long buffer, int indexType);
+
+    /**
+     * Push the draw's descriptors into the transient per-frame heap and bind
+     * root descriptor table 0 (mirror of the Vulkan push descriptors).
+     * Parallel arrays, one entry per pipeline binding in declaration order:
+     * types 0=CBV / 1=SRV(texture view) / 2=SRV(texel buffer); for CBV the
+     * matching buffer/offset/length; for texel buffers buffer/texelFormat;
+     * for texture views the Dx12GpuTextureView handle.
+     *
+     * @return true on success
+     */
+    public static native boolean dx12PushDescriptors(long ctx, int[] types,
+        long[] buffers, long[] offsets, long[] lengths, int[] texelFormats, long[] views);
+
+    /** DrawIndexedInstanced on the open render pass. */
+    public static native boolean dx12DrawIndexed(long ctx, int indexCount,
+        int instanceCount, int firstIndex, int baseVertex, int firstInstance);
+
+    /** DrawInstanced on the open render pass. */
+    public static native boolean dx12Draw(long ctx, int vertexCount, int instanceCount,
+        int firstVertex, int firstInstance);
+
+    /** ExecuteIndirect (DrawIndexedInstanced) with the given command buffer. */
+    public static native boolean dx12DrawIndexedIndirect(long ctx, long commands,
+        long offset, int drawCount);
+
+    /** ExecuteIndirect (DrawInstanced) with the given command buffer. */
+    public static native boolean dx12DrawIndirect(long ctx, long commands,
+        long offset, int drawCount);
+
     private Dx12Native() {
     }
 }

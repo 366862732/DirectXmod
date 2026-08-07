@@ -25,6 +25,10 @@ constexpr UINT kRtvHeapSize = 512;
 constexpr UINT kDsvHeapSize = 64;
 constexpr UINT kSamplerHeapSize = 256;
 
+// P6：瞬时描述符堆（drawHeap）每帧半区容量 + 总数（ring x2，配合双 allocator）
+constexpr UINT kDrawHeapPerFrame = 32768;
+constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * 2;
+
 bool createHeap(ID3D12Device* dev, D3D12_DESCRIPTOR_HEAP_TYPE type,
     UINT count, D3D12_DESCRIPTOR_HEAP_FLAGS flags, ComPtr<ID3D12DescriptorHeap>& out) {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
@@ -58,6 +62,30 @@ std::string queryAdapterName(ID3D12Device* dev) {
     }
 }
 
+// 设备移除诊断：GetDeviceRemovedReason + 调试层最近消息（定位 0x887A0005 根因）。
+std::string deviceStatusText() {
+    std::string s;
+    if (!gCtx.device) return s;
+    HRESULT reason = gCtx.device->GetDeviceRemovedReason();
+    s += "GetDeviceRemovedReason=" + hrText(reason);
+    if (gCtx.infoQueue) {
+        UINT64 count = gCtx.infoQueue->GetNumStoredMessages();
+        UINT64 start = count > 24 ? count - 24 : 0;
+        for (UINT64 i = start; i < count; ++i) {
+            SIZE_T len = 0;
+            if (FAILED(gCtx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+            std::vector<char> buf(len > 0 ? len : 1);
+            D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+            if (SUCCEEDED(gCtx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+                s += " | msg[" + std::to_string((long long)i) + "](";
+                s += msg->pDescription ? msg->pDescription : "";
+                s += ")";
+            }
+        }
+    }
+    return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -66,6 +94,17 @@ std::string queryAdapterName(ID3D12Device* dev) {
 
 bool ensureDevice(std::string& errorOut) {
     if (gCtx.device) return true;
+
+    // 诊断：先启用 D3D12 调试层（Win10/11 自带；失败则无调试层继续）。
+    // 启用后非法 API 调用 / 描述符越界等会写入 InfoQueue，设备移除时可读回定位。
+    bool debugEnabled = false;
+    {
+        ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            debug->EnableDebugLayer();
+            debugEnabled = true;
+        }
+    }
 
     const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
@@ -78,12 +117,28 @@ bool ensureDevice(std::string& errorOut) {
             break;
         }
     }
+    if (!device && debugEnabled) {
+        // 部分系统缺少 SDK 调试层：D3D12CreateDevice 会失败，回退到无调试层重试。
+        debugEnabled = false;
+        for (auto level : levels) {
+            if (SUCCEEDED(D3D12CreateDevice(nullptr, level, IID_PPV_ARGS(&device)))) {
+                gCtx.featureLevel = level;
+                break;
+            }
+        }
+    }
     if (!device) {
         errorOut = "D3D12CreateDevice failed at all feature levels";
         return false;
     }
     gCtx.device = device;
     gCtx.adapterName = queryAdapterName(device.Get());
+    // 取 InfoQueue（调试层启用后可用）用于设备移除时回读验证消息。
+    if (debugEnabled) {
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&gCtx.infoQueue)))) {
+            gCtx.infoQueue = nullptr;
+        }
+    }
 
     // 命令队列（P3 提交用）
     D3D12_COMMAND_QUEUE_DESC qd{};
@@ -103,7 +158,10 @@ bool ensureDevice(std::string& errorOut) {
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
             kDsvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.dsvHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-            kSamplerHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.samplerHeap)) {
+            kSamplerHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.samplerHeap) ||
+        // P6：瞬时 draw 描述符堆（ring x2，两帧在飞行时安全交替）
+        !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            kDrawHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.drawHeap)) {
         errorOut = "CreateDescriptorHeap failed";
         return false;
     }
@@ -111,6 +169,27 @@ bool ensureDevice(std::string& errorOut) {
     gCtx.rtvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     gCtx.dsvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     gCtx.samplerInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    gCtx.drawInc = gCtx.srvInc;  // 同属 CBV_SRV_UAV 类型，增量相同
+
+    // P6：ExecuteIndirect 用 command signature
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{};
+        arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+        D3D12_COMMAND_SIGNATURE_DESC cs{};
+        cs.NumArgumentDescs = 1;
+        cs.pArgumentDescs = &arg;
+        cs.ByteStride = 20;  // indexCount, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation
+        if (FAILED(device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&gCtx.cmdSigIndexed)))) {
+            errorOut = "CreateCommandSignature(indexed) failed";
+            return false;
+        }
+        arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        cs.ByteStride = 16;  // vertexCount, instanceCount, startVertexLocation, startInstanceLocation
+        if (FAILED(device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&gCtx.cmdSigNonIndexed)))) {
+            errorOut = "CreateCommandSignature(non-indexed) failed";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -120,6 +199,17 @@ void destroyDevice() {
 
 DeviceContext& deviceContextForJni() {
     return gCtx;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err) {
+    if (gNextRtv >= kRtvHeapSize) {
+        err = "RTV descriptor heap exhausted";
+        return D3D12_CPU_DESCRIPTOR_HANDLE{};
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h = gCtx.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)gNextRtv * gCtx.rtvInc;
+    ++gNextRtv;
+    return h;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +354,14 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
     HRESULT hr = gCtx.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
         nullptr, IID_PPV_ARGS(&obj->resource));
-    if (FAILED(hr)) { err = "CreateCommittedResource(texture): " + hrText(hr); return nullptr; }
+    if (FAILED(hr)) {
+        err = "CreateCommittedResource(texture): " + hrText(hr);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+            hr == DXGI_ERROR_DEVICE_HUNG) {
+            err += " — " + deviceStatusText();
+        }
+        return nullptr;
+    }
     return obj.release();
 }
 
@@ -279,7 +376,9 @@ Dx12Object* createBuffer(int usage, long long size, std::string& err) {
 
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = (UINT64)size;
+    // P6：统一 256 对齐分配（D3D12 资源分配粒度本就 64KB，无额外浪费），
+    // 保证任意 uniform 切片的 CBV（SizeInBytes 向上取整 256）不越界。
+    desc.Width = ((UINT64)size + 255) & ~255ULL;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -294,7 +393,14 @@ Dx12Object* createBuffer(int usage, long long size, std::string& err) {
     HRESULT hr = gCtx.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &desc, initialStateFor(heapType),
         nullptr, IID_PPV_ARGS(&obj->resource));
-    if (FAILED(hr)) { err = "CreateCommittedResource(buffer): " + hrText(hr); return nullptr; }
+    if (FAILED(hr)) {
+        err = "CreateCommittedResource(buffer): " + hrText(hr);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+            hr == DXGI_ERROR_DEVICE_HUNG) {
+            err += " — " + deviceStatusText();
+        }
+        return nullptr;
+    }
     return obj.release();
 }
 
@@ -354,7 +460,19 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
     gNextSrv++;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = texture->resource->GetDesc().Format;
+    // 深度格式（D32_FLOAT/D16_UNORM/D32_FLOAT_S8X24_UINT/D24_UNORM_S8_UINT）
+    // 不能直接作为 SRV 格式（调试层：'The format cannot be used with a
+    // ShaderResource view'）——需换成同格式族内的只读视图格式（读深度为
+    // float/uint），纹理本体仍保持深度格式用于 DSV。
+    DXGI_FORMAT viewFormat = texture->resource->GetDesc().Format;
+    switch (viewFormat) {
+        case DXGI_FORMAT_D32_FLOAT:            viewFormat = DXGI_FORMAT_R32_FLOAT; break;
+        case DXGI_FORMAT_D16_UNORM:            viewFormat = DXGI_FORMAT_R16_UNORM; break;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: viewFormat = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:    viewFormat = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+        default: break;
+    }
+    srv.Format = viewFormat;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     if (texture->usage & 16) {  // CUBEMAP_COMPATIBLE
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
@@ -486,24 +604,6 @@ void resourceBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
     list->ResourceBarrier(1, &b);
 }
 
-// buffer 按需 transition：进入 to，随后立刻回到初始状态（以初始状态为锚点）。
-void transitionBufferOnce(CommandContext* ctx, Dx12Object* buf,
-    D3D12_RESOURCE_STATES to) {
-    D3D12_RESOURCE_STATES from = initialStateFor(buf->heapType);
-    if (!needTransition(from, to)) return;
-    resourceBarrier(ctx->commandList.Get(), buf->resource.Get(), from, to);
-    resourceBarrier(ctx->commandList.Get(), buf->resource.Get(), to, from);
-}
-
-// texture 以 COMMON 为锚点：COMMON -> to，随后回 COMMON。
-void transitionTextureOnce(CommandContext* ctx, Dx12Object* tex,
-    D3D12_RESOURCE_STATES to) {
-    resourceBarrier(ctx->commandList.Get(), tex->resource.Get(),
-        D3D12_RESOURCE_STATE_COMMON, to);
-    resourceBarrier(ctx->commandList.Get(), tex->resource.Get(),
-        to, D3D12_RESOURCE_STATE_COMMON);
-}
-
 // DXGI_FORMAT -> 每 texel 字节数（仅非压缩格式；压缩格式返回 16 = 4x4 块）。
 // 用于 CopyTextureRegion 的 footprint 行距计算。
 UINT blockSizeFor(DXGI_FORMAT f) {
@@ -612,10 +712,78 @@ bool flushAndWait(ID3D12CommandList* list, std::string& err) {
 
 }  // namespace
 
+// 按本 command list 已跟踪状态把资源过渡到 to。fromInitial 为资源创建时的
+// 初始状态（texture=COMMON，buffer=initialStateFor(heapType)）；若本 list 内
+// 已跟踪过该资源则以跟踪状态为准。绝不在 list 内回退到 COMMON（D3D12 禁止
+// 从已提升状态显式回 COMMON；decay 由命令列表执行完成时隐式处理）。
+// beginCommandList 清空 tracking 后一切资源视为初始态——前提是 submit 同步
+// 等待完成（保证上一 command list 已执行完并 decay，见 submitCommandList）。
+// 定义在匿名 namespace 之外：transitionTextureTo 供 dx12_surface.cpp 使用。
+void transitionTo(CommandContext* ctx, ID3D12Resource* res,
+    D3D12_RESOURCE_STATES fromInitial, D3D12_RESOURCE_STATES to) {
+    if (!ctx || !res) return;
+    auto& m = ctx->resourceState;
+    D3D12_RESOURCE_STATES from;
+    auto it = m.find(res);
+    if (it != m.end()) {
+        from = it->second;
+    } else {
+        from = fromInitial;
+        if (!needTransition(from, to)) return;
+    }
+    if (from == to) return;
+    resourceBarrier(ctx->commandList.Get(), res, from, to);
+    m[res] = to;
+}
+
+// buffer 按跟踪状态过渡（不回落初始状态）。
+void transitionBufferTo(CommandContext* ctx, Dx12Object* buf,
+    D3D12_RESOURCE_STATES to) {
+    if (!buf || !buf->resource) return;
+    transitionTo(ctx, buf->resource.Get(), initialStateFor(buf->heapType), to);
+}
+
+// texture 按跟踪状态过渡（初始锚点 COMMON；不回落 COMMON）。
+void transitionTextureTo(CommandContext* ctx, Dx12Object* tex,
+    D3D12_RESOURCE_STATES to) {
+    if (!tex || !tex->resource) return;
+    transitionTo(ctx, tex->resource.Get(), D3D12_RESOURCE_STATE_COMMON, to);
+}
+
+// 阻塞等待 GPU 队列空闲：Signal 新 fence 并等待其完成。
+// 用于销毁 swapchain/设备前，确保 backbuffer 等资源不再被 GPU 使用。
+bool deviceWaitIdle(std::string& err) {
+    if (!gCtx.device || !gCtx.queue) {
+        err = "deviceWaitIdle: device not initialized";
+        return false;
+    }
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        err = "deviceWaitIdle: CreateFence failed";
+        return false;
+    }
+    UINT64 fv = 1;
+    if (FAILED(gCtx.queue->Signal(fence.Get(), fv))) {
+        err = "deviceWaitIdle: Signal failed";
+        return false;
+    }
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!evt) {
+        err = "deviceWaitIdle: CreateEvent failed";
+        return false;
+    }
+    while (fence->GetCompletedValue() < fv) {
+        fence->SetEventOnCompletion(fv, evt);
+        WaitForSingleObject(evt, INFINITE);
+    }
+    CloseHandle(evt);
+    return true;
+}
+
 CommandContext* createCommandEncoder(std::string& err) {
     if (!ensureDevice(err)) return nullptr;
     auto ctx = std::make_unique<CommandContext>();
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         if (FAILED(gCtx.device->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ctx->allocators[i])))) {
             err = "createCommandEncoder: CreateCommandAllocator failed"; return nullptr;
@@ -637,6 +805,13 @@ CommandContext* createCommandEncoder(std::string& err) {
 
 void destroyCommandEncoder(CommandContext* ctx) {
     if (!ctx) return;
+    // 该 ctx 可能仍有未执行的已提交命令（如 createBuffer(data) 的 submit 后
+    // 立即 close）；先等它全部完成再销毁 allocator，否则 GPU 在使用已释放的
+    // allocator 会导致 DXGI_ERROR_DEVICE_REMOVED。
+    if (ctx->fenceValue > 0) {
+        std::string err;
+        waitForFenceValue(ctx, ctx->fenceValue, 5000000000ULL, err);
+    }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
     delete ctx;
 }
@@ -648,6 +823,20 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
     if (FAILED(hr)) { err = "beginCommandList: list Reset " + hrText(hr); return false; }
     ctx->listOpen = 1;
+    ctx->inRenderPass = 0;
+    // 新 command list 从“所有资源处于初始态”开始：submit 同步等待完成保证
+    // 上一 list 已执行完，提升状态已隐式 decay 回 COMMON（见 submitCommandList）。
+    ctx->resourceState.clear();
+    // P6：draw 瞬时描述符 ring 半区（fenceValue%2 与 allocator 同步交替；
+    // 帧 N+2 重写帧 N 半区时，帧 N 的 GPU 工作已完成）
+    ctx->drawHeapSlotBase = (UINT)(ctx->fenceValue % 2) * kDrawHeapPerFrame;
+    ctx->nextDrawSlot = 0;
+    // RTV/DSV 是 CPU-only 描述符堆：命令列表提交时驱动已捕获描述符内容，
+    // 双 allocator + value-2 完成等待保证旧命令已结束，可每帧从 0 复用。
+    gNextRtv = 0;
+    gNextDsv = 0;
+    ID3D12DescriptorHeap* drawHeaps[] = { gCtx.drawHeap.Get() };
+    ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
     return true;
 }
 
@@ -669,10 +858,14 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
         err = "submitCommandList: Signal failed"; return 0;
     }
-    // 等 value-2 完成（对应官方 awaitSubmitCompletion(currentSubmitIndex - 2)）
-    if (value >= 2) {
+    // 提交后同步等待本次 Signal 的值完成（而非 value-2）：保证返回时上一
+    // command list 已执行完，所有提升状态已隐式 decay 回 COMMON。这样
+    // beginCommandList 清空 resourceState 后一切资源都从初始态开始是正确
+    // 的（否则跨 list 的提升状态残留会让后续 barrier 的 Before 状态不匹配）。
+    // P6 以首帧正确性优先；多帧在飞行（双缓冲）的优化留待后续阶段。
+    if (value >= 1) {
         std::string w;
-        if (!waitForFenceValue(ctx, value - 2, 5000000000ULL, w)) {
+        if (!waitForFenceValue(ctx, value, 5000000000ULL, w)) {
             err = "submitCommandList: " + w; return 0;
         }
     }
@@ -796,8 +989,8 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
         srcOffset + size > src->size || dstOffset + size > dst->size) {
         err = "copyBufferToBuffer: range out of bounds"; return false;
     }
-    transitionBufferOnce(ctx, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionBufferOnce(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
+    transitionBufferTo(ctx, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
     ctx->commandList->CopyBufferRegion(dst->resource.Get(), (UINT64)dstOffset,
         src->resource.Get(), (UINT64)srcOffset, (UINT64)size);
     return true;
@@ -817,7 +1010,7 @@ bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     cpu.ptr += (SIZE_T)gNextRtv * gCtx.rtvInc;
     ++gNextRtv;
     gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
-    transitionTextureOnce(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = { r, g, b, a };
     ctx->commandList->ClearRenderTargetView(cpu, color, 0, nullptr);
     return true;
@@ -834,7 +1027,7 @@ bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
     cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
     ++gNextDsv;
     gCtx.device->CreateDepthStencilView(tex->resource.Get(), nullptr, cpu);
-    transitionTextureOnce(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     ctx->commandList->ClearDepthStencilView(cpu,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 0, nullptr);
     return true;
@@ -860,8 +1053,8 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
     constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     bool aligned = (srcRowBytes % kPitchAlign) == 0 && srcWidth == w;
 
-    transitionBufferOnce(ctx, srcBuf, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionTextureOnce(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
+    transitionBufferTo(ctx, srcBuf, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
 
     UINT subresource = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
     if (aligned) {
@@ -914,8 +1107,8 @@ bool copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, int mip, int l
     UINT block = blockSizeFor(srcTex->dxgiFormat);
     UINT rowBytes = (UINT)w * block;
 
-    transitionTextureOnce(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionBufferOnce(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionBufferTo(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
 
     UINT subresource = (UINT)(mip + layer * srcTex->resource->GetDesc().MipLevels);
     // 客户端（Minecraft）按紧凑行距访问读回数据，且读回 buffer 只分配了
@@ -927,8 +1120,6 @@ bool copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, int mip, int l
         err = "copyTextureToBuffer: destination buffer too small";
         return false;
     }
-    transitionTextureOnce(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionBufferOnce(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
 
     D3D12_TEXTURE_COPY_LOCATION src{};
     src.pResource = srcTex->resource.Get();
@@ -978,8 +1169,8 @@ bool copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* d
     if (srcTex->dxgiFormat != dstTex->dxgiFormat) {
         err = "copyTextureToTexture: format mismatch"; return false;
     }
-    transitionTextureOnce(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionTextureOnce(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
 
     UINT srcSub = (UINT)(mip + layer * srcTex->resource->GetDesc().MipLevels);
     UINT dstSub = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
@@ -1018,7 +1209,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         ++gNextRtv;
         gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
         rtvs.push_back(cpu);
-        transitionTextureOnce(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (colorClearFlags && colorClearFlags[i] && clearColors) {
             const float* c = clearColors + i * 4;
             ctx->commandList->ClearRenderTargetView(cpu, c, 0, nullptr);
@@ -1038,7 +1229,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         gCtx.device->CreateDepthStencilView(depthView->resource.Get(), nullptr, cpu);
         dsv = cpu;
         hasDsv = true;
-        transitionTextureOnce(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        transitionTextureTo(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         if (depthClearFlag) {
             ctx->commandList->ClearDepthStencilView(cpu,
                 D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
@@ -1385,6 +1576,183 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 
 void destroyPipeline(Dx12Pipeline* pipeline) {
     delete pipeline;
+}
+
+// ---------------------------------------------------------------------------
+// P6: draw 命令录制（渲染 pass 内）
+// ---------------------------------------------------------------------------
+
+bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "setPipeline: no open command list"; return false; }
+    if (!pipeline) { err = "setPipeline: null pipeline"; return false; }
+    ID3D12PipelineState* pso = hasDepth ? pipeline->withDepth.Get() : pipeline->withoutDepth.Get();
+    if (!pso) pso = pipeline->withDepth.Get();  // 无深度渲染但管线未建 withoutDepth 时回退
+    ctx->commandList->SetPipelineState(pso);
+    return true;
+}
+
+bool setScissor(CommandContext* ctx, int x, int y, int w, int h, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "setScissor: no open command list"; return false; }
+    D3D12_RECT rect{ (LONG)x, (LONG)y, (LONG)x + w, (LONG)y + h };
+    ctx->commandList->RSSetScissorRects(1, &rect);
+    return true;
+}
+
+bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long long offset, int stride, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "setVertexBuffer: no open command list"; return false; }
+    if (slot < 0 || slot >= 16) { err = "setVertexBuffer: slot out of range"; return false; }
+    if (!buffer || buffer->kind != Dx12Object::Kind::Buffer) {
+        err = "setVertexBuffer: invalid buffer handle"; return false;
+    }
+    if (offset < 0 || offset >= buffer->size) { err = "setVertexBuffer: offset out of bounds"; return false; }
+    transitionBufferTo(ctx, buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    D3D12_VERTEX_BUFFER_VIEW vb{};
+    vb.BufferLocation = buffer->resource->GetGPUVirtualAddress() + (UINT64)offset;
+    vb.SizeInBytes = (UINT)(buffer->size - offset);
+    vb.StrideInBytes = (UINT)stride;
+    ctx->commandList->IASetVertexBuffers((UINT)slot, 1, &vb);
+    return true;
+}
+
+bool setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "setIndexBuffer: no open command list"; return false; }
+    if (!buffer || buffer->kind != Dx12Object::Kind::Buffer) {
+        err = "setIndexBuffer: invalid buffer handle"; return false;
+    }
+    transitionBufferTo(ctx, buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    D3D12_INDEX_BUFFER_VIEW ib{};
+    ib.BufferLocation = buffer->resource->GetGPUVirtualAddress();
+    ib.SizeInBytes = (UINT)buffer->size;
+    ib.Format = indexType == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    ctx->commandList->IASetIndexBuffer(&ib);
+    return true;
+}
+
+bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "pushDescriptors: no open command list"; return false; }
+    UINT count = (UINT)bindings.size();
+    if (count == 0) return true;
+    if (ctx->nextDrawSlot + count > kDrawHeapPerFrame) {
+        err = "pushDescriptors: draw descriptor heap exhausted for this frame";
+        return false;
+    }
+    SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += base;
+    for (UINT i = 0; i < count; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)i * gCtx.drawInc };
+        const DrawBinding& b = bindings[i];
+        // P6 诊断：每个 binding 的关键句柄都打到 stdout（游戏日志可见）——
+        // 若此处发生原生 AV（悬垂 Dx12Object* 等），下一轮日志能直接看出哪个
+        // 句柄非法。
+        std::fprintf(stdout, "[dx12] pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d\n",
+            (unsigned)i, (int)b.type, (void*)b.buffer, (void*)b.view,
+            (long long)b.offset, (long long)b.length, b.texelFormat);
+        switch (b.type) {
+            case 0: {  // CBV（offset 须 256 对齐；SizeInBytes 向上取整 256）
+                if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
+                    std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID CBV buffer\n", (unsigned)i);
+                    err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
+                    return false;
+                }
+                // UPLOAD(GENERIC_READ) 直接可读；DEFAULT 需显式过渡（CBV 属于
+                // VERTEX_AND_CONSTANT_BUFFER 状态位，D3D12 无独立 CONSTANT_BUFFER 位）
+                transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+                cbv.BufferLocation = b.buffer->resource->GetGPUVirtualAddress() + (UINT64)b.offset;
+                UINT64 cbvSize = (UINT64)b.length;
+                cbvSize = (cbvSize + 255) & ~255ULL;
+                if (cbvSize == 0) cbvSize = 256;
+                cbv.SizeInBytes = (UINT)cbvSize;
+                gCtx.device->CreateConstantBufferView(&cbv, dst);
+                break;
+            }
+            case 1: {  // SRV：复制 texture view 的现有描述符
+                if (!b.view || b.view->cpuHandle.ptr == 0) {
+                    std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID view\n", (unsigned)i);
+                    err = "pushDescriptors: missing view for SRV entry " + std::to_string(i);
+                    return false;
+                }
+                gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                break;
+            }
+            case 2: {  // SRV：texel buffer
+                if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
+                    std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID texel buffer\n", (unsigned)i);
+                    err = "pushDescriptors: invalid texel buffer handle";
+                    return false;
+                }
+                transitionBufferTo(ctx, b.buffer,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                        | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = toDxgiFormat(b.texelFormat);
+                if (srv.Format == DXGI_FORMAT_UNKNOWN) {
+                    err = "pushDescriptors: unsupported texel buffer format " + std::to_string(b.texelFormat);
+                    return false;
+                }
+                srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                UINT elementBytes = std::max<UINT>(1u, blockSizeFor(srv.Format));
+                srv.Buffer.FirstElement = (UINT)(b.offset / elementBytes);
+                srv.Buffer.NumElements = (UINT)(b.length / elementBytes);
+                gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(), &srv, dst);
+                break;
+            }
+            default:
+                err = "pushDescriptors: unknown binding type " + std::to_string(b.type);
+                return false;
+        }
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += base;
+    ctx->nextDrawSlot += count;
+    ctx->commandList->SetGraphicsRootDescriptorTable(0, gpu);
+    return true;
+}
+
+bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCount,
+    INT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "drawIndexed: no open command list"; return false; }
+    if (!ctx->inRenderPass) { err = "drawIndexed: no open render pass"; return false; }
+    ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
+        startIndexLocation, baseVertexLocation, startInstanceLocation);
+    return true;
+}
+
+bool drawInstanced(CommandContext* ctx, UINT vertexCount, UINT instanceCount,
+    UINT firstVertex, UINT startInstanceLocation, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "draw: no open command list"; return false; }
+    if (!ctx->inRenderPass) { err = "draw: no open render pass"; return false; }
+    ctx->commandList->DrawInstanced(vertexCount, instanceCount, firstVertex, startInstanceLocation);
+    return true;
+}
+
+bool drawIndexedIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
+    UINT drawCount, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "drawIndexedIndirect: no open command list"; return false; }
+    if (!ctx->inRenderPass) { err = "drawIndexedIndirect: no open render pass"; return false; }
+    if (!commands || commands->kind != Dx12Object::Kind::Buffer) {
+        err = "drawIndexedIndirect: invalid buffer handle"; return false;
+    }
+    if (!gCtx.cmdSigIndexed) { err = "drawIndexedIndirect: no indexed command signature"; return false; }
+    ctx->commandList->ExecuteIndirect(gCtx.cmdSigIndexed.Get(), drawCount,
+        commands->resource.Get(), (UINT64)offset, nullptr, 0);
+    return true;
+}
+
+bool drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
+    UINT drawCount, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "drawIndirect: no open command list"; return false; }
+    if (!ctx->inRenderPass) { err = "drawIndirect: no open render pass"; return false; }
+    if (!commands || commands->kind != Dx12Object::Kind::Buffer) {
+        err = "drawIndirect: invalid buffer handle"; return false;
+    }
+    if (!gCtx.cmdSigNonIndexed) { err = "drawIndirect: no non-indexed command signature"; return false; }
+    ctx->commandList->ExecuteIndirect(gCtx.cmdSigNonIndexed.Get(), drawCount,
+        commands->resource.Get(), (UINT64)offset, nullptr, 0);
+    return true;
 }
 
 }  // namespace dx12mc

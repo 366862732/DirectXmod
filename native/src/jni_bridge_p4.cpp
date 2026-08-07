@@ -57,16 +57,16 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateGraphicsPipeline
     jsize remaining = total;
     int vsLen = readI32(p); remaining -= 4;
     if (!readBytes(p, remaining, vsLen, d.vsBytes)) {
-        std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad vsLen\n");
+        std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad vsLen %d (remaining %d)\n", vsLen, remaining);
         return 0;
     }
-    p += vsLen; remaining -= vsLen;
+    remaining -= vsLen;
     int psLen = readI32(p); remaining -= 4;
     if (!readBytes(p, remaining, psLen, d.psBytes)) {
-        std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad psLen\n");
+        std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad psLen %d (remaining %d)\n", psLen, remaining);
         return 0;
     }
-    p += psLen; remaining -= psLen;
+    remaining -= psLen;
 
     d.colorCount = readI32(p); remaining -= 4;
     if (d.colorCount < 0 || d.colorCount > 8) {
@@ -86,7 +86,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateGraphicsPipeline
         ct.dstAlpha = readU8(p);
         ct.alphaOp = readU8(p);
     }
-    remaining -= (jsize)d.colorCount * 10;
+    remaining -= (jsize)d.colorCount * 12;
 
     d.hasDepth = readU8(p) != 0; remaining -= 1;
     if (d.hasDepth) {

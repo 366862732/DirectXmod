@@ -10,12 +10,16 @@ import com.mojang.blaze3d.shaders.GpuDebugOptions;
 import com.mojang.blaze3d.shaders.ShaderSource;
 import com.mojang.blaze3d.shaders.ShaderType;
 import com.mojang.blaze3d.systems.BackendCreationException;
+import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.GpuBackend;
 import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.GpuSurface;
+import com.mojang.blaze3d.systems.SurfaceException;
 import com.mojang.blaze3d.textures.AddressMode;
 import com.mojang.blaze3d.textures.FilterMode;
 import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 import java.util.OptionalDouble;
@@ -35,10 +39,9 @@ import org.slf4j.LoggerFactory;
  *       window is created (no hints needed for DX12).</li>
  *   <li>{@link #handleWindowCreationErrors} is only called when
  *       {@code glfwCreateWindow} returns 0.</li>
- *   <li>{@link #createDevice} is called once the window exists; it verifies the
- *       D3D12 device + resource chain (P2 self-test) and still throws a
- *       {@link BackendCreationException} so the game falls back to GL/Vulkan
- *       until the render layer (P3+) lands.</li>
+ *   <li>{@link #createDevice} is called once the window exists; it runs the
+ *       full D3D12 self-test chain and, when it passes, returns a live
+ *       {@link Dx12Device} that drives the vanilla render flow (P6+).</li>
  * </ul>
  */
 @Environment(EnvType.CLIENT)
@@ -69,31 +72,28 @@ public class Dx12Backend implements GpuBackend {
     @Override
     public GpuDevice createDevice(long window, ShaderSource defaultShaderSource,
         GpuDebugOptions debugOptions, Runnable criticalShaderLoader) throws BackendCreationException {
-        // P2/P3: prove the whole Java -> JNI -> C++ D3D12 resource + command
-        // chain works by creating/destroying real resources and submitting a
-        // command list with readback. P4: compile two real vanilla pipelines
-        // (core/gui + core/position_tex_color) end-to-end: GLSL -> shaderc
-        // SPIR-V -> spvc reflection/rebind -> HLSL -> d3dcompiler DXBC ->
-        // root signature + PSO. The render layer (P5+) is not implemented yet,
-        // so we still fail with a clean BackendCreationException and let the
-        // game fall back to GL/Vulkan.
+        // P6: createDevice returns a real, live GpuDevice. The game then drives
+        // the full vanilla render flow through our backend (RenderSystem
+        // initRenderer, surface, per-frame render passes, present) with no
+        // GL/Vulkan fallback. Self-tests run against the live device; only a
+        // failure closes it and rethrows so the game can fall back.
         try {
-            Dx12Device device = new Dx12Device();
+            Dx12Device device = new Dx12Device(defaultShaderSource);
             try {
                 selfTestJavaResources(device);
                 selfTestCommandLayer(device);
                 selfTestPipelines(device);
-            } finally {
+                selfTestSurface(device, window);
+            } catch (Throwable t) {
                 device.close();
+                throw t;
             }
+            return new GpuDevice(device, criticalShaderLoader);
         } catch (Throwable t) {
-            LOGGER.error("[dx12] D3D12 self-test failed: {}", t.toString());
+            LOGGER.error("[dx12] D3D12 self-test failed", t);
             throw new BackendCreationException(
                 "DX12 self-test failed: " + t, BackendCreationException.Reason.OTHER);
         }
-        throw new BackendCreationException(
-            "DX12 device + pipeline verified; render layer (P5) not yet implemented",
-            BackendCreationException.Reason.OTHER);
     }
 
     /**
@@ -348,5 +348,55 @@ public class Dx12Backend implements GpuBackend {
             }
         }
         LOGGER.info("[dx12] Pipeline self-test OK (GLSL->SPIR-V->HLSL->DXBC->PSO for core/gui + core/position_tex_color)");
+    }
+
+    /**
+     * P5：创建 DXGI swapchain（绑定真实窗口 HWND）→ 配置 → acquire →
+     * 把一张 RGBA8 中间纹理 blit 进当前 back buffer → submit → present。
+     * 首帧会向窗口 present 一次（默认清屏色），随后回退不影响游戏。
+     */
+    private static void selfTestSurface(Dx12Device device, long window) throws SurfaceException {
+        int size = 64;
+        Dx12CommandEncoderBackend encoderBackend = new Dx12CommandEncoderBackend();
+        CommandEncoder encoder = new CommandEncoder(null, device, encoderBackend);
+        GpuSurface surface = null;
+        GpuTexture texture = null;
+        GpuTextureView view = null;
+        try {
+            // blit 源纹理：必须 USAGE_COPY_SRC 且为颜色格式（GpuSurface 高层校验）
+            texture = device.createTexture("dx12-selftest-surface",
+                GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT
+                    | GpuTexture.USAGE_COPY_SRC,
+                GpuFormat.RGBA8_UNORM, size, size, 1, 1);
+            view = device.createTextureView(texture, 0, texture.getMipLevels());
+
+            surface = new GpuSurface(device.createSurface(window));
+            GpuSurface.PresentMode mode = GpuSurface.PresentMode.getSupportedVsyncMode(
+                surface.supportedPresentModes(), false);
+            surface.configure(new GpuSurface.Configuration(size, size, mode));
+            surface.acquireNextTexture();
+            surface.blitFromTexture(encoder, view);
+            GpuFence fence = encoder.createFence();
+            encoder.submit();
+            surface.present();
+            // 必须等 GPU 完成 blit 后再销毁 swapchain，否则 backbuffer 在被
+            // 使用时释放 → DXGI_ERROR_DEVICE_REMOVED（P6 设备保留后立刻暴露）。
+            if (!fence.awaitCompletion(5000L)) {
+                throw new IllegalStateException("surface self-test submit timed out");
+            }
+            fence.close();
+        } finally {
+            if (surface != null) {
+                surface.close();
+            }
+            if (view != null) {
+                view.close();
+            }
+            if (texture != null) {
+                texture.close();
+            }
+            encoderBackend.close();
+        }
+        LOGGER.info("[dx12] Surface self-test OK (DXGI swapchain configure/acquire/blit/present via JNI)");
     }
 }

@@ -22,6 +22,9 @@ add_library(dx12_mc SHARED
     src/jni_bridge.cpp
     src/jni_bridge_p3.cpp
     src/jni_bridge_p4.cpp
+    src/dx12_surface.cpp
+    src/jni_bridge_p5.cpp
+    src/jni_bridge_p6.cpp
 )
 
 # d3dcompiler：D3DCompile 把 HLSL 编译为 DXBC（vs_5_1/ps_5_1）

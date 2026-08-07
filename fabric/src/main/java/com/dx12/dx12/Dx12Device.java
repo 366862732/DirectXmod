@@ -43,6 +43,7 @@ import net.fabricmc.api.Environment;
 import net.minecraft.client.renderer.ShaderDefines;
 import net.minecraft.resources.Identifier;
 import org.jspecify.annotations.Nullable;
+import org.lwjgl.glfw.GLFWNativeWin32;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,10 +67,12 @@ public class Dx12Device implements GpuDeviceBackend {
     private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
     @Nullable
     private Dx12ShaderCompiler glslCompiler;
-    /** 默认 ShaderSource：P4 阶段 createDevice 早于资源加载，保持 null（precompile 时无源则管线无效）。 */
-    private ShaderSource defaultShaderSource;
+    /** 默认 ShaderSource（createDevice 传入的官方 shader 管理器）；precompile/getOrCompilePipeline 用。 */
+    @Nullable
+    private final ShaderSource defaultShaderSource;
 
-    public Dx12Device() {
+    public Dx12Device(@Nullable ShaderSource defaultShaderSource) {
+        this.defaultShaderSource = defaultShaderSource;
         String probe = Dx12Native.dx12CreateDevice();
         LOGGER.info("[dx12] Device probe + resource self-test: {}", probe);
         long frequency = Dx12Native.dx12GetTimestampFrequency();
@@ -140,12 +143,16 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public GpuSurfaceBackend createSurface(long windowHandle) {
-        throw new UnsupportedOperationException("P3: DXGI swapchain not yet implemented");
+        long hwnd = GLFWNativeWin32.glfwGetWin32Window(windowHandle);
+        if (hwnd == 0) {
+            throw new IllegalStateException("glfwGetWin32Window returned null for window " + windowHandle);
+        }
+        return new Dx12GpuSurface(hwnd);
     }
 
     @Override
     public CommandEncoderBackend createCommandEncoder() {
-        return new Dx12CommandEncoderBackend();
+        return new Dx12CommandEncoderBackend(this);
     }
 
     @Override
@@ -153,6 +160,15 @@ public class Dx12Device implements GpuDeviceBackend {
         @Nullable ShaderSource shaderSource) {
         ShaderSource source = shaderSource == null ? this.defaultShaderSource : shaderSource;
         return this.pipelineCache.computeIfAbsent(pipeline, ignored -> this.compilePipeline(pipeline, source));
+    }
+
+    /**
+     * 取（或编译）管线，镜像官方 {@code VulkanDevice.getOrCompilePipeline}。
+     * 渲染 pass setPipeline 时按需编译，使用 createDevice 传入的默认 shader 源。
+     */
+    public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline) {
+        return this.pipelineCache.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource));
     }
 
     @Override
@@ -223,12 +239,12 @@ public class Dx12Device implements GpuDeviceBackend {
         if (vertexShader == Dx12IntermediaryShaderModule.INVALID) {
             LOGGER.error("Couldn't compile pipeline {}: vertex shader {} was invalid",
                 pipeline.getLocation(), pipeline.getVertexShader());
-            return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
         }
         if (fragmentShader == Dx12IntermediaryShaderModule.INVALID) {
             LOGGER.error("Couldn't compile pipeline {}: fragment shader {} was invalid",
                 pipeline.getLocation(), pipeline.getFragmentShader());
-            return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
         }
         try {
             Dx12CompiledShader compiled = this.getOrCreateCompiler()
@@ -237,13 +253,13 @@ public class Dx12Device implements GpuDeviceBackend {
             long handle = Dx12Native.dx12CreateGraphicsPipeline(desc);
             if (handle == 0) {
                 LOGGER.error("Couldn't create native pipeline {}", pipeline.getLocation());
-                return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+                return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
             }
             return new Dx12CompiledRenderPipeline(pipeline, handle,
-                compiled.vertexHlsl(), compiled.fragmentHlsl());
+                compiled.entries(), compiled.vertexHlsl(), compiled.fragmentHlsl());
         } catch (ShaderCompileException e) {
             LOGGER.error("Couldn't compile pipeline {}: {}", pipeline.getLocation(), e.getMessage());
-            return new Dx12CompiledRenderPipeline(pipeline, 0L, "", "");
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
         }
     }
 
@@ -324,7 +340,7 @@ public class Dx12Device implements GpuDeviceBackend {
         List<Dx12BindGroupEntry> entries = compiled.entries();
 
         int size = 4 + vsBytes.length + 4 + psBytes.length;   // vsLen+vs + psLen+ps
-        size += 4 + colorCount * 10;                          // colorCount + per color
+        size += 4 + colorCount * 12;                          // colorCount + per color (int + 8 bytes)
         size += 1 + (hasDepth ? (4 + 2) : 0);                 // hasDepth + depth state
         size += 4 + 1 + 4;                                    // topology + cullEnabled + polygonMode
         size += 4 + inputElements.size() * (4 * 6);           // inputElementCount + per element
@@ -450,7 +466,7 @@ public class Dx12Device implements GpuDeviceBackend {
             "DX12",       // backendName
             timestampPeriod,
             new DeviceLimits(16, 256, 16384, Long.MAX_VALUE, 4096, 8),
-            new DeviceFeatures(true, true, true, true, true, true, true),
+            new DeviceFeatures(true, true, false, true, true, true, true),
             Set.of(),
             new HintsAndWorkarounds(false, false),
             DeviceType.DISCRETE  // heuristic; refine via DXGI adapter info

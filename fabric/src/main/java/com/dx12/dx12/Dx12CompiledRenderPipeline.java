@@ -2,6 +2,7 @@ package com.dx12.dx12;
 
 import com.mojang.blaze3d.pipeline.CompiledRenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
+import java.util.List;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 
@@ -15,13 +16,15 @@ import net.fabricmc.api.Environment;
 public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline, AutoCloseable {
     private final RenderPipeline info;
     private final long handle;          // native Dx12Pipeline*
+    private final List<Dx12BindGroupEntry> bindings;  // 与原生 root signature 表项同序（P6 pushDescriptors 用）
     private final String vertexHlsl;    // 保留便于调试/后续 P5 使用
     private final String fragmentHlsl;
 
     public Dx12CompiledRenderPipeline(RenderPipeline info, long handle,
-        String vertexHlsl, String fragmentHlsl) {
+        List<Dx12BindGroupEntry> bindings, String vertexHlsl, String fragmentHlsl) {
         this.info = info;
         this.handle = handle;
+        this.bindings = bindings;
         this.vertexHlsl = vertexHlsl;
         this.fragmentHlsl = fragmentHlsl;
     }
@@ -32,6 +35,11 @@ public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline,
 
     public long handle() {
         return this.handle;
+    }
+
+    /** 绑定条目（与原生 root signature 描述符表顺序一致）。 */
+    public List<Dx12BindGroupEntry> bindings() {
+        return this.bindings;
     }
 
     @Override
