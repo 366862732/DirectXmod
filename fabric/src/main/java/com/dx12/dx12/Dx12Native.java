@@ -120,6 +120,29 @@ public final class Dx12Native {
     public static native void dx12CopyBuffer(long ctx, long src, long srcOffset,
         long dst, long dstOffset, long size);
 
+    /**
+     * Upload {@code width*height} tightly-packed texels from a staging buffer
+     * into a texture sub-region (writeToTexture).
+     */
+    public static native void dx12WriteToTexture(long ctx, long stagingBuf,
+        long stagingOffset, int width, int height, long dstTex, int mip, int layer,
+        int dstX, int dstY);
+
+    /** Copy a sub-region of a (possibly padded) source buffer into a texture. */
+    public static native void dx12CopyBufferToTexture(long ctx, long srcBuf,
+        long srcOffset, int srcWidth, int srcHeight, long dstTex, int mip, int layer,
+        int dstX, int dstY, int w, int h);
+
+    /** Copy a texture sub-region into a readback buffer (row pitch is 256-aligned). */
+    public static native void dx12CopyTextureToBuffer(long ctx, long srcTex,
+        int mip, int layer, int srcX, int srcY, int w, int h, long dstBuf,
+        long dstOffset);
+
+    /** Copy a texture sub-region into another texture. */
+    public static native void dx12CopyTextureToTexture(long ctx, long srcTex,
+        long dstTex, int mip, int layer, int srcX, int srcY, int dstX, int dstY,
+        int w, int h);
+
     /** Record a full-texture color clear (RENDER_ATTACHMENT texture). */
     public static native void dx12ClearColorTexture(long ctx, long texture,
         float r, float g, float b, float a);

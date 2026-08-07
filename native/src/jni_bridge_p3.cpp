@@ -106,6 +106,57 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBuffer(
     }
 }
 
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12WriteToTexture(
+    JNIEnv* env, jclass, jlong ctx, jlong stagingBuf, jlong stagingOffset,
+    jint width, jint height, jlong dstTex, jint mip, jint layer,
+    jint dstX, jint dstY) {
+    std::string err;
+    if (!dx12mc::copyBufferToTexture(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            fromHandle(stagingBuf), stagingOffset, width, height,
+            fromHandle(dstTex), mip, layer, dstX, dstY, width, height, err)) {
+        throwJava(env, "dx12WriteToTexture: " + err);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBufferToTexture(
+    JNIEnv* env, jclass, jlong ctx, jlong srcBuf, jlong srcOffset,
+    jint srcWidth, jint srcHeight, jlong dstTex, jint mip, jint layer,
+    jint dstX, jint dstY, jint w, jint h) {
+    std::string err;
+    if (!dx12mc::copyBufferToTexture(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            fromHandle(srcBuf), srcOffset, srcWidth, srcHeight,
+            fromHandle(dstTex), mip, layer, dstX, dstY, w, h, err)) {
+        throwJava(env, "dx12CopyBufferToTexture: " + err);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyTextureToBuffer(
+    JNIEnv* env, jclass, jlong ctx, jlong srcTex, jint mip, jint layer,
+    jint srcX, jint srcY, jint w, jint h, jlong dstBuf, jlong dstOffset) {
+    std::string err;
+    if (!dx12mc::copyTextureToBuffer(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            fromHandle(srcTex), mip, layer, srcX, srcY, w, h,
+            fromHandle(dstBuf), dstOffset, err)) {
+        throwJava(env, "dx12CopyTextureToBuffer: " + err);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyTextureToTexture(
+    JNIEnv* env, jclass, jlong ctx, jlong srcTex, jlong dstTex,
+    jint mip, jint layer, jint srcX, jint srcY, jint dstX, jint dstY,
+    jint w, jint h) {
+    std::string err;
+    if (!dx12mc::copyTextureToTexture(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            fromHandle(srcTex), fromHandle(dstTex), mip, layer,
+            srcX, srcY, dstX, dstY, w, h, err)) {
+        throwJava(env, "dx12CopyTextureToTexture: " + err);
+    }
+}
+
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearColorTexture(
     JNIEnv* env, jclass, jlong ctx, jlong texture,
     jfloat r, jfloat g, jfloat b, jfloat a) {

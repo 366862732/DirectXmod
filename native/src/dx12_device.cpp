@@ -828,6 +828,139 @@ bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
     return true;
 }
 
+bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcOffset,
+    int srcWidth, int srcHeight, Dx12Object* dstTex, int mip, int layer,
+    int dstX, int dstY, int w, int h, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "copyBufferToTexture: no open command list"; return false; }
+    if (!srcBuf || srcBuf->kind != Dx12Object::Kind::Buffer ||
+        !dstTex || dstTex->kind != Dx12Object::Kind::Texture) {
+        err = "copyBufferToTexture: invalid handle"; return false;
+    }
+    if (w <= 0 || h <= 0 || srcWidth <= 0 || srcHeight <= 0) {
+        err = "copyBufferToTexture: non-positive size"; return false;
+    }
+    UINT block = blockSizeFor(dstTex->dxgiFormat);
+    UINT rowBytes = (UINT)w * block;
+    UINT srcRowBytes = (UINT)srcWidth * block;  // 源 buffer 每行实际间距（texel*block）
+
+    // D3D12 要求 footprint RowPitch 为 256 的倍数；Minecraft 的 CPU 侧数据是
+    // 紧凑打包的，因此整块 RowPitch 未对齐时逐行拷贝以保证正确。
+    constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    bool aligned = (srcRowBytes % kPitchAlign) == 0 && srcWidth == w;
+
+    transitionBufferOnce(ctx, srcBuf, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTextureOnce(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    UINT subresource = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    if (aligned) {
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = srcBuf->resource.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = (UINT64)srcOffset;
+        src.PlacedFootprint.Footprint.Format = dstTex->dxgiFormat;
+        src.PlacedFootprint.Footprint.Width = (UINT)w;
+        src.PlacedFootprint.Footprint.Height = (UINT)h;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = srcRowBytes;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = dstTex->resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = subresource;
+        ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, nullptr);
+    } else {
+        // 逐行拷贝：每行 1 像素高，footprint 行距 = 源行距（可能未 256 对齐，
+        // 部分驱动允许；这是紧凑数据上传的常见做法）。
+        for (int row = 0; row < h; ++row) {
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = srcBuf->resource.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Offset = (UINT64)srcOffset + (UINT64)row * srcRowBytes;
+            src.PlacedFootprint.Footprint.Format = dstTex->dxgiFormat;
+            src.PlacedFootprint.Footprint.Width = (UINT)w;
+            src.PlacedFootprint.Footprint.Height = 1;
+            src.PlacedFootprint.Footprint.Depth = 1;
+            src.PlacedFootprint.Footprint.RowPitch = rowBytes;
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = dstTex->resource.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = subresource;
+            ctx->commandList->CopyTextureRegion(&dst, dstX, dstY + row, 0, &src, nullptr);
+        }
+    }
+    return true;
+}
+
+bool copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, int mip, int layer,
+    int srcX, int srcY, int w, int h, Dx12Object* dstBuf, long long dstOffset,
+    std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "copyTextureToBuffer: no open command list"; return false; }
+    if (!srcTex || srcTex->kind != Dx12Object::Kind::Texture ||
+        !dstBuf || dstBuf->kind != Dx12Object::Kind::Buffer) {
+        err = "copyTextureToBuffer: invalid handle"; return false;
+    }
+    if (w <= 0 || h <= 0) { err = "copyTextureToBuffer: non-positive size"; return false; }
+    UINT block = blockSizeFor(srcTex->dxgiFormat);
+    UINT rowBytes = (UINT)w * block;
+
+    transitionTextureOnce(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionBufferOnce(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    UINT subresource = (UINT)(mip + layer * srcTex->resource->GetDesc().MipLevels);
+    // 读回行距 256 对齐（D3D12 硬性要求）；客户端按 rowPitch 逐行访问。
+    constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    UINT rowPitch = (rowBytes + kPitchAlign - 1) / kPitchAlign * kPitchAlign;
+    if (dstOffset + (UINT64)rowPitch * h > (UINT64)dstBuf->size) {
+        err = "copyTextureToBuffer: destination buffer too small (need aligned rowPitch)";
+        return false;
+    }
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = srcTex->resource.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = subresource;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = dstBuf->resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = (UINT64)dstOffset;
+    dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
+    dst.PlacedFootprint.Footprint.Width = (UINT)w;
+    dst.PlacedFootprint.Footprint.Height = (UINT)h;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = rowPitch;
+    D3D12_BOX srcBox{ (UINT)srcX, (UINT)srcY, 0, (UINT)(srcX + w), (UINT)(srcY + h), 1 };
+    ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+    return true;
+}
+
+bool copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* dstTex,
+    int mip, int layer, int srcX, int srcY, int dstX, int dstY, int w, int h,
+    std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "copyTextureToTexture: no open command list"; return false; }
+    if (!srcTex || srcTex->kind != Dx12Object::Kind::Texture ||
+        !dstTex || dstTex->kind != Dx12Object::Kind::Texture) {
+        err = "copyTextureToTexture: invalid handle"; return false;
+    }
+    if (w <= 0 || h <= 0) { err = "copyTextureToTexture: non-positive size"; return false; }
+    if (srcTex->dxgiFormat != dstTex->dxgiFormat) {
+        err = "copyTextureToTexture: format mismatch"; return false;
+    }
+    transitionTextureOnce(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTextureOnce(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    UINT srcSub = (UINT)(mip + layer * srcTex->resource->GetDesc().MipLevels);
+    UINT dstSub = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = srcTex->resource.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = srcSub;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = dstTex->resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = dstSub;
+    D3D12_BOX srcBox{ (UINT)srcX, (UINT)srcY, 0, (UINT)(srcX + w), (UINT)(srcY + h), 1 };
+    ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
+    return true;
+}
+
 bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
     int colorCount, const int* colorClearFlags, const float* clearColors,
     Dx12Object* depthView, int depthClearFlag, double depthClearValue,
