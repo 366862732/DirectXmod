@@ -68,10 +68,12 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndCommandList(
 
 JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12Submit(
     JNIEnv* env, jclass, jlong ctx) {
+    dx12mc::dbgLog("submit: JNI enter ctx=%p", (void*)ctx);
     std::string err;
     UINT64 value = dx12mc::submitCommandList(
         reinterpret_cast<dx12mc::CommandContext*>(ctx), err);
     if (value == 0 && !err.empty()) { throwJava(env, "dx12Submit: " + err); }
+    dx12mc::dbgLog("submit: JNI done value=%llu", (unsigned long long)value);
     return (jlong)value;
 }
 
@@ -81,7 +83,14 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12WaitForFence(
     bool ok = dx12mc::waitForFenceValue(
         reinterpret_cast<dx12mc::CommandContext*>(ctx),
         (UINT64)value, (UINT64)timeoutNs, err);
-    if (!ok && !err.empty()) { throwJava(env, "dx12WaitForFence: " + err); }
+    // fence 等待的“超时”是正常语义（官方 GpuFence.awaitCompletion 非阻塞
+    // 轮询 timeout=0 时返回 false 而非抛异常，StagedVertexBuffer 回收 buffer
+    // 依赖这一点）；只有真正的错误（null ctx / SetEventOnCompletion 失败）
+    // 才抛异常。
+    if (!ok && !err.empty() &&
+        err.find("timed out") == std::string::npos) {
+        throwJava(env, "dx12WaitForFence: " + err);
+    }
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -103,6 +112,9 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampNow(
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBuffer(
     JNIEnv* env, jclass, jlong ctx, jlong src, jlong srcOffset,
     jlong dst, jlong dstOffset, jlong size) {
+    dx12mc::dbgLog("copyBuffer: src=%p(%lld) dst=%p(%lld) size=%lld",
+        (void*)src, (long long)srcOffset, (void*)dst, (long long)dstOffset,
+        (long long)size);
     std::string err;
     if (!dx12mc::copyBufferToBuffer(
             reinterpret_cast<dx12mc::CommandContext*>(ctx),

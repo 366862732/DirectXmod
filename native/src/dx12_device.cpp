@@ -3,6 +3,7 @@
 #include <dxgi.h>
 
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -87,6 +88,25 @@ std::string deviceStatusText() {
 }
 
 }  // namespace
+
+// 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
+double nowMs() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+// 诊断插桩：打印到 stderr（PCL 启动器会写入游戏日志；不影响 debug.log）。
+void dbgLog(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    std::fprintf(stderr, "[dx12][t=%8.1fms] ", nowMs());
+    std::vfprintf(stderr, fmt, ap);
+    std::fprintf(stderr, "\n");
+    va_end(ap);
+    fflush(stderr);
+}
 
 // ---------------------------------------------------------------------------
 // 设备生命周期
@@ -689,7 +709,9 @@ UINT blockSizeFor(DXGI_FORMAT f) {
 }
 
 // 在指定队列上执行瞬时提交并等待完成（query 读回 / getTimestampNow 用）。
+// 等待有界（5s）：GPU 队列卡住时返回错误而不是无限挂起（黑屏无响应根因嫌疑）。
 bool flushAndWait(ID3D12CommandList* list, std::string& err) {
+    dbgLog("flushAndWait: enter");
     ID3D12CommandList* lists[] = { list };
     gCtx.queue->ExecuteCommandLists(1, lists);
     ComPtr<ID3D12Fence> fence;
@@ -704,9 +726,15 @@ bool flushAndWait(ID3D12CommandList* list, std::string& err) {
     if (!evt) { err = "flushAndWait: CreateEvent failed"; return false; }
     while (fence->GetCompletedValue() < fv) {
         fence->SetEventOnCompletion(fv, evt);
-        WaitForSingleObject(evt, INFINITE);
+        if (WaitForSingleObject(evt, 5000) != WAIT_OBJECT_0) {
+            CloseHandle(evt);
+            err = "flushAndWait: timed out waiting for queue completion";
+            dbgLog("flushAndWait: TIMEOUT (queue stalled)");
+            return false;
+        }
     }
     CloseHandle(evt);
+    dbgLog("flushAndWait: done");
     return true;
 }
 
@@ -752,11 +780,13 @@ void transitionTextureTo(CommandContext* ctx, Dx12Object* tex,
 
 // 阻塞等待 GPU 队列空闲：Signal 新 fence 并等待其完成。
 // 用于销毁 swapchain/设备前，确保 backbuffer 等资源不再被 GPU 使用。
+// 等待有界（5s）：队列卡住时返回错误，避免销毁路径无限挂起。
 bool deviceWaitIdle(std::string& err) {
     if (!gCtx.device || !gCtx.queue) {
         err = "deviceWaitIdle: device not initialized";
         return false;
     }
+    dbgLog("deviceWaitIdle: enter");
     ComPtr<ID3D12Fence> fence;
     if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
         err = "deviceWaitIdle: CreateFence failed";
@@ -774,14 +804,21 @@ bool deviceWaitIdle(std::string& err) {
     }
     while (fence->GetCompletedValue() < fv) {
         fence->SetEventOnCompletion(fv, evt);
-        WaitForSingleObject(evt, INFINITE);
+        if (WaitForSingleObject(evt, 5000) != WAIT_OBJECT_0) {
+            CloseHandle(evt);
+            err = "deviceWaitIdle: timed out waiting for queue completion";
+            dbgLog("deviceWaitIdle: TIMEOUT (queue stalled)");
+            return false;
+        }
     }
     CloseHandle(evt);
+    dbgLog("deviceWaitIdle: done");
     return true;
 }
 
 CommandContext* createCommandEncoder(std::string& err) {
     if (!ensureDevice(err)) return nullptr;
+    dbgLog("createCommandEncoder: enter");
     auto ctx = std::make_unique<CommandContext>();
     for (int i = 0; i < 3; ++i) {
         if (FAILED(gCtx.device->CreateCommandAllocator(
@@ -800,17 +837,21 @@ CommandContext* createCommandEncoder(std::string& err) {
     }
     ctx->fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!ctx->fenceEvent) { err = "createCommandEncoder: CreateEvent failed"; return nullptr; }
+    dbgLog("createCommandEncoder: done ctx=%p", (void*)ctx.get());
     return ctx.release();
 }
 
 void destroyCommandEncoder(CommandContext* ctx) {
     if (!ctx) return;
+    dbgLog("destroyCommandEncoder: enter fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     // 该 ctx 可能仍有未执行的已提交命令（如 createBuffer(data) 的 submit 后
     // 立即 close）；先等它全部完成再销毁 allocator，否则 GPU 在使用已释放的
     // allocator 会导致 DXGI_ERROR_DEVICE_REMOVED。
     if (ctx->fenceValue > 0) {
         std::string err;
-        waitForFenceValue(ctx, ctx->fenceValue, 5000000000ULL, err);
+        if (!waitForFenceValue(ctx, ctx->fenceValue, 5000000000ULL, err)) {
+            dbgLog("destroyCommandEncoder: wait FAILED: %s", err.c_str());
+        }
     }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
     delete ctx;
@@ -818,6 +859,7 @@ void destroyCommandEncoder(CommandContext* ctx) {
 
 bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "beginCommandList: null ctx"; return false; }
+    dbgLog("beginCommandList: fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandList: allocator Reset " + hrText(hr); return false; }
     hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
@@ -852,9 +894,12 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
 UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "submitCommandList: null ctx"; return 0; }
     if (!endCommandList(ctx, err)) return 0;
+    UINT64 value = ctx->fenceValue + 1;
+    dbgLog("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
     ID3D12CommandList* lists[] = { ctx->commandList.Get() };
     gCtx.queue->ExecuteCommandLists(1, lists);
-    UINT64 value = ++ctx->fenceValue;
+    value = ++ctx->fenceValue;
+    dbgLog("submit: executed, Signal v=%llu", (unsigned long long)value);
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
         err = "submitCommandList: Signal failed"; return 0;
     }
@@ -866,23 +911,32 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (value >= 1) {
         std::string w;
         if (!waitForFenceValue(ctx, value, 5000000000ULL, w)) {
-            err = "submitCommandList: " + w; return 0;
+            err = "submitCommandList: " + w;
+            dbgLog("submit: WAIT FAILED: %s", w.c_str());
+            return 0;
         }
     }
+    dbgLog("submit: done v=%llu", (unsigned long long)value);
     return value;
 }
 
 bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
     std::string& err) {
     if (!ctx) { err = "waitForFenceValue: null ctx"; return false; }
-    if (ctx->fence->GetCompletedValue() >= value) return true;
+    UINT64 cv = ctx->fence->GetCompletedValue();
+    dbgLog("waitFence: value=%llu completed=%llu", (unsigned long long)value, (unsigned long long)cv);
+    if (cv >= value) return true;
     HRESULT hr = ctx->fence->SetEventOnCompletion(value, ctx->fenceEvent);
     if (FAILED(hr)) { err = "waitForFenceValue: SetEventOnCompletion " + hrText(hr); return false; }
     DWORD ms = (DWORD)((timeoutNs + 999999ULL) / 1000000ULL);
     if (WaitForSingleObject(ctx->fenceEvent, ms) != WAIT_OBJECT_0) {
         err = "waitForFenceValue: timed out after " + std::to_string(timeoutNs) + "ns";
+        dbgLog("waitFence: TIMEOUT value=%llu completed=%llu",
+            (unsigned long long)value,
+            (unsigned long long)ctx->fence->GetCompletedValue());
         return false;
     }
+    dbgLog("waitFence: OK value=%llu", (unsigned long long)value);
     return true;
 }
 
