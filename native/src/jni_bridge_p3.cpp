@@ -80,12 +80,14 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12Submit(
 JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12WaitForFence(
     JNIEnv* env, jclass, jlong ctx, jlong value, jlong timeoutNs) {
     std::string err;
-    bool ok = dx12mc::waitForFenceValue(
-        reinterpret_cast<dx12mc::CommandContext*>(ctx),
-        (UINT64)value, (UINT64)timeoutNs, err);
+    // createFence token 的 awaitCompletion：等待设备级队列 fence（目标值 =
+    // 创建时 queueFenceValue+1，下一次任意 ctx 的提交完成），而非 per-ctx
+    // fence——一次性 encoder 从不 submit，per-ctx 等待永不完成（黑屏冻结根因，
+    // 日志表现为连续 waitFence: value=1 completed=0）。
+    bool ok = dx12mc::waitForQueueFenceValue((UINT64)value, (UINT64)timeoutNs, err);
     // fence 等待的“超时”是正常语义（官方 GpuFence.awaitCompletion 非阻塞
     // 轮询 timeout=0 时返回 false 而非抛异常，StagedVertexBuffer 回收 buffer
-    // 依赖这一点）；只有真正的错误（null ctx / SetEventOnCompletion 失败）
+    // 依赖这一点）；只有真正的错误（queue fence 未初始化 / CreateEvent 失败）
     // 才抛异常。
     if (!ok && !err.empty() &&
         err.find("timed out") == std::string::npos) {
@@ -95,9 +97,10 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12WaitForFence(
 }
 
 JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetFenceValue(
-    JNIEnv*, jclass, jlong ctx) {
-    return (jlong)dx12mc::currentFenceValue(
-        reinterpret_cast<dx12mc::CommandContext*>(ctx));
+    JNIEnv*, jclass, jlong) {
+    // createFence 捕获全局队列 fence 值（目标 = 当前值 + 1），对应官方共享
+    // encoder 的 currentSubmitIndex——一次性 encoder 的 token 也随下一次提交完成。
+    return (jlong)dx12mc::currentQueueFenceValue();
 }
 
 JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampNow(

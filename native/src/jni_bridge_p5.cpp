@@ -69,6 +69,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12AcquireSurface(
         std::fprintf(stderr, "[dx12] dx12AcquireSurface: %s\n", err.c_str());
         return JNI_FALSE;
     }
+    dbgLog("acquireSurface: ok surface=%p", toSurface(surface));
     return JNI_TRUE;
 }
 
@@ -77,12 +78,16 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BlitSurface(
     std::string err;
     if (!blitSurface(toCtx(ctx), toSurface(surface), toObject(texture), err)) {
         std::fprintf(stderr, "[dx12] dx12BlitSurface: %s\n", err.c_str());
+        return;
     }
+    dbgLog("blitSurface: ok ctx=%p surface=%p texture=%p",
+        toCtx(ctx), toSurface(surface), toObject(texture));
 }
 
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12PresentSurface(
     JNIEnv*, jclass, jlong surface) {
     presentSurface(toSurface(surface));
+    dbgLog("presentSurface: ok surface=%p", toSurface(surface));
 }
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal(
@@ -94,6 +99,15 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroySurface(
     JNIEnv*, jclass, jlong surface) {
     destroySurface(toSurface(surface));
+}
+
+// P6 诊断：读回当前 back buffer 采样像素（Java 侧每 ~60 帧调用一次）。
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePixels(
+    JNIEnv* env, jclass, jlong surface) {
+    std::string err;
+    if (!readbackSurfacePixels(toSurface(surface), err)) {
+        std::fprintf(stderr, "[dx12] dx12ReadbackSurfacePixels: %s\n", err.c_str());
+    }
 }
 
 }  // extern "C"

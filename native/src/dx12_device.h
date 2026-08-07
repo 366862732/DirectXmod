@@ -59,6 +59,17 @@ struct DeviceContext {
     UINT64 timestampFrequency = 0;  // 从 GetTimestampFrequency 获取（DeviceInfo.timestampPeriod 用）
     ComPtr<ID3D12CommandQueue> queue;   // 图形队列（提交命令用）
 
+    // 全局队列 fence（P6 fence token）：官方 createCommandEncoder() 返回共享
+    // encoder，createFence() 的语义是"下一次提交完成后完成"。vanilla 在一次性
+    // encoder 上创建 fence token（queueFencedTask / StagedVertexBuffer endFrame /
+    // MappableRingBuffer rotate），该 encoder 从不 submit——若用 per-ctx fence 则
+    // 永不完成 → 渲染线程永久等待（waitFence: value=1 completed=0 黑屏冻结）。
+    // 故用设备级队列 fence 复现官方语义：每次 ExecuteCommandLists 后 Signal
+    // (queueFence, ++queueFenceValue)，createFence 目标 = 当前值 + 1。
+    ComPtr<ID3D12Fence> queueFence;
+    HANDLE queueFenceEvent = nullptr;   // waitForQueueFenceValue 用（每调用新建 event，不共享）
+    UINT64 queueFenceValue = 0;         // 每次 ExecuteCommandLists 后递增
+
     // 诊断（调试层）：设备移除时 GetDeviceRemovedReason + InfoQueue 消息定位根因
     ComPtr<ID3D12InfoQueue> infoQueue;
 };
@@ -165,6 +176,16 @@ bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
 // 当前 fence value（Java 侧 createFence 记录用）。
 UINT64 currentFenceValue(CommandContext* ctx);
 
+// ---------------------------------------------------------------------------
+// 全局队列 fence（P6 fence token；对应官方共享 encoder 的 submit index）
+// ---------------------------------------------------------------------------
+// 当前全局队列 fence 值（Java 侧 createFence 记录用：目标 = 当前值 + 1，
+// 下一次任意 ctx 的提交完成后达成——官方语义"共享 encoder 的下一次 submit"）。
+UINT64 currentQueueFenceValue();
+// 等待全局队列 fence 达到 value（createFence token 的 awaitCompletion 用；
+// 等待对象是设备级 queueFence，而非 per-ctx fence）。
+bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err);
+
 // 立即读 GPU 时间戳（等价官方 getTimestampNow：临时 query + 提交 + 读回）。
 long long getTimestampNow(CommandContext* ctx, std::string& err);
 
@@ -259,6 +280,7 @@ struct Dx12Pipeline {
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> withDepth;     // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
     ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
+    int topology = 4;  // MC PrimitiveTopology ordinal（setPipeline 时 IASetPrimitiveTopology 用）
 };
 
 // Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
@@ -382,6 +404,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
 // FIFO_RELAXED=Present(1,ALLOW_TEARING)。
 void presentSurface(Dx12Surface* s);
 void destroySurface(Dx12Surface* s);
+// P6 诊断：把当前 back buffer 读回 CPU 并打印 3x3 采样点 RGBA（每 ~60 帧调用
+// 一次，内部先等 GPU 空闲；用于确认画面实际颜色/内容——纯色=渲染未生效）。
+bool readbackSurfacePixels(Dx12Surface* s, std::string& err);
 
 // 阻塞等待 GPU 队列上所有已提交命令执行完成（销毁 swapchain/设备前调用，
 // 避免 backbuffer 等资源在被 GPU 使用时释放导致 DXGI_ERROR_DEVICE_REMOVED）。

@@ -170,6 +170,12 @@ bool ensureDevice(std::string& errorOut) {
     // 时间戳频率（DeviceInfo.timestampPeriod = 1/freq 用）；失败则保持 0。
     gCtx.queue->GetTimestampFrequency(&gCtx.timestampFrequency);
 
+    // P6：全局队列 fence（createFence token 用，见 waitForQueueFenceValue）。
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gCtx.queueFence)))) {
+        errorOut = "CreateFence(queue) failed";
+        return false;
+    }
+
     // 描述符堆
     if (!createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             kSrvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.srvHeap) ||
@@ -214,6 +220,10 @@ bool ensureDevice(std::string& errorOut) {
 }
 
 void destroyDevice() {
+    if (gCtx.queueFenceEvent) {
+        CloseHandle(gCtx.queueFenceEvent);
+        gCtx.queueFenceEvent = nullptr;
+    }
     gCtx = DeviceContext{};
 }
 
@@ -381,6 +391,12 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
             err += " — " + deviceStatusText();
         }
         return nullptr;
+    }
+    // P6 诊断：只打印 RENDER_ATTACHMENT（usage & 8）纹理——GUI 中间渲染目标/
+    // 主场景 RT 都带此标志，blit 源纹理也在其中（定位 54EE180 之类 handle）。
+    if (usage & 8) {
+        dbgLog("createTexture: RTA handle=%p w=%d h=%d layers=%d mips=%d fmt=%d usage=0x%x",
+            (void*)obj.get(), width, height, depthOrLayers, mipLevels, format, usage);
     }
     return obj.release();
 }
@@ -903,6 +919,15 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
         err = "submitCommandList: Signal failed"; return 0;
     }
+    // 全局队列 fence 同步推进：createFence token 的完成条件 = 下一次提交。
+    // 官方语义（共享 encoder 的 submit index）下，fence 在任意 ctx 的下一次
+    // ExecuteCommandLists 后完成；这里用设备级计数器复现。
+    {
+        UINT64 qv = ++gCtx.queueFenceValue;
+        if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), qv))) {
+            err = "submitCommandList: Signal(queue) failed"; return 0;
+        }
+    }
     // 提交后同步等待本次 Signal 的值完成（而非 value-2）：保证返回时上一
     // command list 已执行完，所有提升状态已隐式 decay 回 COMMON。这样
     // beginCommandList 清空 resourceState 后一切资源都从初始态开始是正确
@@ -942,6 +967,48 @@ bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
 
 UINT64 currentFenceValue(CommandContext* ctx) {
     return ctx ? ctx->fenceValue : 0;
+}
+
+// 全局队列 fence 等待（createFence token 的 awaitCompletion）：等待对象是
+// 设备级 queueFence，目标值 = 创建时 queueFenceValue+1，下一次任意 ctx 的
+// 提交后完成（官方"共享 encoder 的 submit index"语义）。每调用用独立的 event，
+// 避免多线程并发等待同一事件互相干扰。
+bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err) {
+    if (!gCtx.queueFence) {
+        err = "waitForQueueFenceValue: queue fence not initialized";
+        return false;
+    }
+    UINT64 cv = gCtx.queueFence->GetCompletedValue();
+    dbgLog("waitQFence: value=%llu completed=%llu", (unsigned long long)value,
+        (unsigned long long)cv);
+    if (cv >= value) return true;
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!evt) { err = "waitForQueueFenceValue: CreateEvent failed"; return false; }
+    HRESULT hr = gCtx.queueFence->SetEventOnCompletion(value, evt);
+    if (FAILED(hr)) {
+        CloseHandle(evt);
+        err = "waitForQueueFenceValue: SetEventOnCompletion " + hrText(hr);
+        return false;
+    }
+    // 上限钳制：Java awaitCompletion(Long.MAX_VALUE) 换算后的纳秒数溢出 DWORD，
+    // 直接 cast 会得到很小的毫秒数（把"永久等待"变成瞬时轮询）。钳到 ~49.7 天。
+    UINT64 ms64 = (timeoutNs + 999999ULL) / 1000000ULL;
+    DWORD ms = ms64 > 0xFFFFFFF0ULL ? 0xFFFFFFF0ULL : (DWORD)ms64;
+    if (WaitForSingleObject(evt, ms) != WAIT_OBJECT_0) {
+        CloseHandle(evt);
+        err = "waitForQueueFenceValue: timed out after " + std::to_string(timeoutNs) + "ns";
+        dbgLog("waitQFence: TIMEOUT value=%llu completed=%llu",
+            (unsigned long long)value,
+            (unsigned long long)gCtx.queueFence->GetCompletedValue());
+        return false;
+    }
+    CloseHandle(evt);
+    dbgLog("waitQFence: OK value=%llu", (unsigned long long)value);
+    return true;
+}
+
+UINT64 currentQueueFenceValue() {
+    return gCtx.queueFenceValue;
 }
 
 // 读回单个 timestamp 的通用实现：录制 EndQuery + ResolveQueryData 到 READBACK
@@ -1298,12 +1365,21 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
     D3D12_RECT scissor{ x, y, x + w, y + h };
     ctx->commandList->RSSetScissorRects(1, &scissor);
     ctx->inRenderPass = 1;
+    // P6 诊断：确认渲染 pass 绑定的附件（blit 源纹理应出现在 color[0]）。
+    dbgLog("beginRenderPass: ctx=%p colorCount=%d area=%d,%d %dx%d depth=%s",
+        (void*)ctx, colorCount, x, y, w, h, depthView ? "yes" : "no");
+    for (int i = 0; i < colorCount; ++i) {
+        if (colorViews[i]) {
+            dbgLog("  color[%d] tex=%p", i, (void*)colorViews[i]);
+        }
+    }
     return true;
 }
 
 bool endRenderPass(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "endRenderPass: null ctx"; return false; }
     if (!ctx->inRenderPass) return true;  // 幂等
+    dbgLog("endRenderPass: ctx=%p", (void*)ctx);
     // P3 简化：附件 barrier 回切在真实渲染层（P4）统一管理。
     ctx->inRenderPass = 0;
     return true;
@@ -1415,6 +1491,21 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE toTopologyType(int t) {
         case 0: case 1: case 2: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;   // LINES/DEBUG_LINES/DEBUG_LINE_STRIP
         case 3: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;                  // POINTS
         default: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;              // TRIANGLES/STRIP/FAN/QUADS
+    }
+}
+
+// MC PrimitiveTopology ordinal -> 命令列表级 D3D_PRIMITIVE_TOPOLOGY。
+// D3D12 命令列表初始 topology 是 UNDEFINED，任何 draw 前必须 IASetPrimitiveTopology，
+// 否则 GPU 丢弃全部图元（纯 clear 色黑屏根因）。QUADS 无原生支持，回退 TRIANGLELIST。
+D3D12_PRIMITIVE_TOPOLOGY toPrimitiveTopology(int t) {
+    switch (t) {
+        case 0: case 1: return D3D_PRIMITIVE_TOPOLOGY_LINELIST;     // LINES/DEBUG_LINES
+        case 2: return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;            // DEBUG_LINE_STRIP
+        case 3: return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;            // POINTS
+        case 5: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;        // TRIANGLE_STRIP
+        case 6: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN;          // TRIANGLE_FAN
+        case 7: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;         // QUADS（不支持，回退）
+        default: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;        // TRIANGLES 等
     }
 }
 
@@ -1567,6 +1658,7 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     //    仅当管线无深度状态时再创建 withoutDepth（DSV=UNKNOWN，无深度附件）。
     auto pipeline = std::make_unique<Dx12Pipeline>();
     pipeline->rootSignature = rootSig;
+    pipeline->topology = desc.topology;
 
     auto buildPso = [&](DXGI_FORMAT dsvFormat, bool depthEnable,
         D3D12_DEPTH_WRITE_MASK depthWrite, D3D12_COMPARISON_FUNC depthFunc,
@@ -1647,8 +1739,13 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     // signature 解引用崩溃（hs_err：NVIDIA UMD 内读 NULL+0x2b88，AV，PC 0x7ffcd70e8fa3）。
     ctx->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
     ctx->commandList->SetPipelineState(pso);
-    std::fprintf(stdout, "[dx12] setPipeline rootSig=%p pso=%p hasDepth=%d\n",
-        (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth);
+    // P6 纯色黑屏修复：D3D12 命令列表初始 topology 是 UNDEFINED，必须显式
+    // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
+    D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
+    ctx->commandList->IASetPrimitiveTopology(topo);
+    std::fprintf(stdout, "[dx12] setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d\n",
+        (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth,
+        (int)pipeline->topology, (int)topo);
     return true;
 }
 
@@ -1672,6 +1769,10 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long lon
     vb.SizeInBytes = (UINT)(buffer->size - offset);
     vb.StrideInBytes = (UINT)stride;
     ctx->commandList->IASetVertexBuffers((UINT)slot, 1, &vb);
+    // P6 诊断：确认每帧 draw 前确实绑定了顶点缓冲（内容尺寸/stride）。
+    dbgLog("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld stride=%d heap=%d",
+        slot, (void*)buffer, (long long)buffer->size, (long long)offset,
+        (int)stride, (int)buffer->heapType);
     return true;
 }
 
@@ -1686,6 +1787,10 @@ bool setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType, std:
     ib.SizeInBytes = (UINT)buffer->size;
     ib.Format = indexType == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     ctx->commandList->IASetIndexBuffer(&ib);
+    // P6 诊断：确认每帧 draw 前确实绑定了索引缓冲（内容尺寸/索引宽度）。
+    dbgLog("setIndexBuffer: buf=%p size=%lld idxWidth=%d heap=%d",
+        (void*)buffer, (long long)buffer->size, indexType == 1 ? 4 : 2,
+        (int)buffer->heapType);
     return true;
 }
 
@@ -1777,6 +1882,8 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
     INT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "drawIndexed: no open command list"; return false; }
     if (!ctx->inRenderPass) { err = "drawIndexed: no open render pass"; return false; }
+    dbgLog("drawIndexed: indexCount=%u instance=%u firstIndex=%d baseVertex=%d",
+        indexCount, instanceCount, startIndexLocation, baseVertexLocation);
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
     return true;
@@ -1786,6 +1893,8 @@ bool drawInstanced(CommandContext* ctx, UINT vertexCount, UINT instanceCount,
     UINT firstVertex, UINT startInstanceLocation, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "draw: no open command list"; return false; }
     if (!ctx->inRenderPass) { err = "draw: no open render pass"; return false; }
+    dbgLog("draw: vertexCount=%u instance=%u firstVertex=%u",
+        vertexCount, instanceCount, firstVertex);
     ctx->commandList->DrawInstanced(vertexCount, instanceCount, firstVertex, startInstanceLocation);
     return true;
 }

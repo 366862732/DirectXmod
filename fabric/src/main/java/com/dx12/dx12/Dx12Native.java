@@ -266,6 +266,9 @@ public final class Dx12Native {
     /** Whether the last present reported a suboptimal status. */
     public static native boolean dx12IsSurfaceSuboptimal(long surface);
 
+    /** P6 诊断：读回当前 back buffer 采样像素并打印（每 ~60 帧调用一次）。 */
+    public static native void dx12ReadbackSurfacePixels(long surface);
+
     /** Destroy a surface created by {@link #dx12CreateSurface}. */
     public static native void dx12DestroySurface(long surface);
 

@@ -92,6 +92,15 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     s->height = (UINT)height;
     s->presentMode = presentMode;
 
+    // ResizeBuffers 前必须等 GPU 完全空闲：FLIP model 下 backbuffer 仍被
+    // 上一帧命令队列引用时，ResizeBuffers 返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+    // (0x887A0001)——游戏启动/窗口调整时多次 configure 失败即此原因。
+    // 镜像官方 VulkanGpuSurface 调整 swapchain 前的 waitIdle 语义。
+    if (!deviceWaitIdle(err)) {
+        err = "deviceWaitIdle before ResizeBuffers failed: " + err;
+        return false;
+    }
+
     HRESULT hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
         s->format, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     if (FAILED(hr)) {
@@ -184,6 +193,12 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &barrier);
+    // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
+    // 画面会留黑边；若源未渲染则纯色）。
+    D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
+    dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu -> backbuf=%ux%u",
+        (void*)srcTex, (unsigned long long)srcDesc.Width,
+        (unsigned long long)srcDesc.Height, w, h);
     return true;
 }
 
@@ -210,6 +225,117 @@ void destroySurface(Dx12Surface* s) {
     std::string err;
     deviceWaitIdle(err);
     delete s;
+}
+
+// P6 诊断：读回 back buffer 采样像素。内部先等 GPU 完全空闲（同步一帧），
+// 用一次性命令列表拷贝到 readback staging，Map 后打印 3x3 网格 RGBA。
+// 每 ~60 帧调用一次，同步开销可忽略。结论判读：
+//   纯红/纯黑/纯灰 = 画面只有 clear 色（绘制内容不可见/未生效）
+//   多色且中心有内容 = 渲染正常，问题在别处（blit 区域/尺寸等）。
+bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
+    DeviceContext& ctx = deviceContextForJni();
+    if (!ctx.device || !ctx.queue) { err = "device not initialized"; return false; }
+    if (!s || s->backBuffers.empty()) { err = "surface has no back buffers"; return false; }
+    if (!deviceWaitIdle(err)) { err = "deviceWaitIdle failed: " + err; return false; }
+
+    ID3D12Resource* bb = s->backBuffers[s->currentImageIndex].Get();
+    D3D12_RESOURCE_DESC bd = bb->GetDesc();
+    UINT w = (UINT)bd.Width, h = bd.Height;
+    UINT64 rowBytes = (UINT64)w * 4;
+    UINT64 pitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+        & ~(UINT64)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    UINT64 total = pitch * h;
+
+    static ComPtr<ID3D12Resource> staging;
+    if (!staging || staging->GetDesc().Width < total) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = total;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        hp.CreationNodeMask = 0;
+        hp.VisibleNodeMask = 0;
+        if (FAILED(ctx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&staging)))) {
+            err = "CreateCommittedResource(readback staging) failed";
+            return false;
+        }
+    }
+
+    static ComPtr<ID3D12CommandAllocator> alloc;
+    static ComPtr<ID3D12GraphicsCommandList> cl;
+    if (!alloc) {
+        if (FAILED(ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&alloc)))) { err = "CreateCommandAllocator failed"; return false; }
+    }
+    if (!cl) {
+        if (FAILED(ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            alloc.Get(), nullptr, IID_PPV_ARGS(&cl)))) { err = "CreateCommandList failed"; return false; }
+    } else {
+        alloc->Reset();
+        cl->Reset(alloc.Get(), nullptr);
+    }
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = bb;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = bb;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = staging.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = w;
+    dst.PlacedFootprint.Footprint.Height = h;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = (UINT)pitch;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cl->ResourceBarrier(1, &b);
+    cl->Close();
+
+    ID3D12CommandList* lists[] = { cl.Get() };
+    ctx.queue->ExecuteCommandLists(1, lists);
+    UINT64 fv = ++ctx.queueFenceValue;
+    if (FAILED(ctx.queue->Signal(ctx.queueFence.Get(), fv))) {
+        err = "Signal(readback) failed"; return false;
+    }
+    if (!waitForQueueFenceValue(fv, 5'000'000'000ULL, err)) {
+        err = "readback wait timeout: " + err; return false;
+    }
+
+    void* ptr = nullptr;
+    if (FAILED(staging->Map(0, nullptr, &ptr))) { err = "staging Map failed"; return false; }
+    const uint8_t* base = (const uint8_t*)ptr;
+    int xs[3] = { 0, (int)w / 2, (int)w - 1 };
+    int ys[3] = { 0, (int)h / 2, (int)h - 1 };
+    for (int yi = 0; yi < 3; ++yi) {
+        for (int xi = 0; xi < 3; ++xi) {
+            const uint8_t* p = base + (UINT64)ys[yi] * pitch + (UINT64)xs[xi] * 4;
+            dbgLog("readback[%ux%u] (%d,%d) = RGBA(%3d,%3d,%3d,%3d)",
+                w, h, xs[xi], ys[yi], p[0], p[1], p[2], p[3]);
+        }
+    }
+    staging->Unmap(0, nullptr);
+    return true;
 }
 
 }  // namespace dx12mc

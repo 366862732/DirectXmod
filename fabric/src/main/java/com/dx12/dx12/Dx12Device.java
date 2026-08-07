@@ -62,6 +62,13 @@ public class Dx12Device implements GpuDeviceBackend {
     private final DeviceInfo deviceInfo;
     private long timestampCtx;
 
+    // 官方 VulkanDevice 构造时创建一次共享 CommandEncoder，createCommandEncoder()
+    // 每次返回同一实例（blit 与 submit 用同一 encoder，整帧命令一次提交）。
+    // 之前每次 new 一个独立 CommandContext：绘制指令记在 A、帧末 submit 却提交
+    // 新建的空 ctx B → GPU 每帧执行空命令列表 → backbuffer 呈现未初始化垃圾
+    // （疯狂闪烁）。改为懒加载共享单例复现官方语义。
+    private @Nullable Dx12CommandEncoderBackend sharedCommandEncoder;
+
     // P4: pipeline + shader caches（镜像官方 VulkanDevice）
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
     private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
@@ -152,7 +159,13 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public CommandEncoderBackend createCommandEncoder() {
-        return new Dx12CommandEncoderBackend(this);
+        // 共享单例：全帧 blit/绘制/submit 落同一 CommandContext（官方语义）。
+        Dx12CommandEncoderBackend encoder = this.sharedCommandEncoder;
+        if (encoder == null) {
+            encoder = new Dx12CommandEncoderBackend(this);
+            this.sharedCommandEncoder = encoder;
+        }
+        return encoder;
     }
 
     @Override
@@ -213,6 +226,12 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public void close() {
+        // 镜像官方 VulkanDevice.close()：先销毁共享 encoder 再清管线缓存。
+        Dx12CommandEncoderBackend encoder = this.sharedCommandEncoder;
+        if (encoder != null) {
+            encoder.close();
+            this.sharedCommandEncoder = null;
+        }
         this.clearPipelineCache();
         Dx12ShaderCompiler compiler = this.glslCompiler;
         if (compiler != null) {

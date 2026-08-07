@@ -249,8 +249,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public GpuFence createFence() {
-        // Mirror of VulkanCommandEncoder.createFence(): capture the current
-        // submit index; the fence completes once the *next* submit is done.
+        // 官方 VulkanCommandEncoder.createFence()：捕获当前 submit index，fence
+        // 在该 encoder 的下一次提交完成后完成。官方 createCommandEncoder() 返回
+        // 共享 encoder，因此一次性 encoder 上创建的 fence token（queueFencedTask /
+        // StagedVertexBuffer endFrame / MappableRingBuffer rotate）也随下一次提交
+        // 完成。D3D12 侧用设备级队列 fence 复现该语义：目标 = 当前 queueFenceValue
+        // + 1，任何 ctx 的下一次 submit 都会推进它（见 dx12WaitForFence）。
         long fenceValue = Dx12Native.dx12GetFenceValue(this.ctx);
         long target = fenceValue + 1;
         return new GpuFence() {
@@ -259,8 +263,11 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             @Override
             public boolean awaitCompletion(long timeoutMs) {
                 if (!this.completed) {
+                    long timeoutNs = timeoutMs > Long.MAX_VALUE / 1_000_000L
+                        ? Long.MAX_VALUE
+                        : timeoutMs * 1_000_000L;
                     this.completed = Dx12Native.dx12WaitForFence(
-                        Dx12CommandEncoderBackend.this.ctx, target, timeoutMs * 1_000_000L);
+                        Dx12CommandEncoderBackend.this.ctx, target, timeoutNs);
                 }
                 return this.completed;
             }
