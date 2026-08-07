@@ -20,6 +20,7 @@ include_directories("${JAVA_HOME}/include" "${JAVA_HOME}/include/win32")
 add_library(dx12_mc SHARED
     src/dx12_device.cpp
     src/jni_bridge.cpp
+    src/jni_bridge_p3.cpp
 )
 
 target_link_libraries(dx12_mc PRIVATE d3d12 dxgi)

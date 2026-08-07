@@ -84,6 +84,79 @@ public final class Dx12Native {
     /** Unmap a previously mapped buffer. */
     public static native void dx12UnmapBuffer(long bufferHandle);
 
+    // -----------------------------------------------------------------------
+    // P3: command layer
+    // -----------------------------------------------------------------------
+
+    /** Create a command context (CommandContext*); returns the native handle. */
+    public static native long dx12CreateCommandEncoder();
+
+    /** Destroy a command context created by {@link #dx12CreateCommandEncoder}. */
+    public static native void dx12DestroyCommandEncoder(long ctx);
+
+    /** Begin recording on the current command list (resets its allocator). */
+    public static native void dx12BeginCommandList(long ctx);
+
+    /** Close the current command list. */
+    public static native void dx12EndCommandList(long ctx);
+
+    /**
+     * Submit the recorded command list: ExecuteCommandLists + Signal(fence,
+     * ++value), then wait for value-2 (mirror of the vanilla double-buffered
+     * submit). Returns the fence value of this submit.
+     */
+    public static native long dx12Submit(long ctx);
+
+    /** Wait until the fence reaches {@code value}; returns true on completion. */
+    public static native boolean dx12WaitForFence(long ctx, long value, long timeoutNs);
+
+    /** Current fence value of the context (for createFence). */
+    public static native long dx12GetFenceValue(long ctx);
+
+    /** Read the GPU timestamp now (blocking). */
+    public static native long dx12GetTimestampNow(long ctx);
+
+    /** Record a buffer->buffer copy (CopyBufferRegion) into the command list. */
+    public static native void dx12CopyBuffer(long ctx, long src, long srcOffset,
+        long dst, long dstOffset, long size);
+
+    /** Record a full-texture color clear (RENDER_ATTACHMENT texture). */
+    public static native void dx12ClearColorTexture(long ctx, long texture,
+        float r, float g, float b, float a);
+
+    /** Record a full-texture depth clear. */
+    public static native void dx12ClearDepthTexture(long ctx, long texture, double depth);
+
+    /**
+     * Begin a render pass: create RTV/DSV descriptors, transition attachments,
+     * OMSetRenderTargets, viewport/scissor, optional clears.
+     *
+     * @param colorTextures   color attachment textures (nulls are skipped)
+     * @param colorClearFlags per-attachment 0=load / 1=clear
+     * @param clearColors     r,g,b,a per attachment (length colorTextures.length * 4)
+     */
+    public static native void dx12BeginRenderPass(long ctx, long[] colorTextures,
+        byte[] colorClearFlags, float[] clearColors, long depthTexture,
+        byte depthClearFlag, double depthClearValue, int x, int y, int w, int h);
+
+    /** End the current render pass. */
+    public static native void dx12EndRenderPass(long ctx);
+
+    /** Create a timestamp query pool; returns the native handle. */
+    public static native long dx12CreateQueryPool(int size);
+
+    /** Destroy a query pool. */
+    public static native void dx12DestroyQueryPool(long pool);
+
+    /** Record EndQuery(TIMESTAMP) at {@code index} into the command list. */
+    public static native void dx12WriteTimestamp(long ctx, long pool, int index);
+
+    /** Blocking read of one timestamp value. */
+    public static native long dx12ReadQueryValue(long pool, int index);
+
+    /** Blocking read of {@code count} timestamps starting at {@code start}. */
+    public static native void dx12ReadQueryValues(long pool, int start, int count, long[] out);
+
     private Dx12Native() {
     }
 }

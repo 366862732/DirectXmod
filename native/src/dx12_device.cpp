@@ -92,6 +92,8 @@ bool ensureDevice(std::string& errorOut) {
         errorOut = "CreateCommandQueue failed";
         return false;
     }
+    // 时间戳频率（DeviceInfo.timestampPeriod = 1/freq 用）；失败则保持 0。
+    gCtx.queue->GetTimestampFrequency(&gCtx.timestampFrequency);
 
     // 描述符堆
     if (!createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -246,6 +248,7 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
     obj->kind = Dx12Object::Kind::Texture;
     obj->usage = usage;
     obj->size = (long long)desc.Width * desc.Height;
+    obj->dxgiFormat = dxgi;
     HRESULT hr = gCtx.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
         nullptr, IID_PPV_ARGS(&obj->resource));
@@ -443,6 +446,495 @@ std::string runResourceSelfTest() {
     destroyObject(buf);
     destroyObject(tex);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// 命令层（P3）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// initialStateFor 已在 P2 资源层匿名 namespace 中定义（同一翻译单元内不得重复）。
+// GENERIC_READ 已包含 COPY_SOURCE 等只读状态，无需 transition；
+// COPY_DEST（READBACK 初始态）无需 transition。
+bool needTransition(D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    if (from == to) return false;
+    if (from == D3D12_RESOURCE_STATE_GENERIC_READ) return false;
+    return true;
+}
+
+void resourceBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
+    D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    list->ResourceBarrier(1, &b);
+}
+
+// buffer 按需 transition：进入 to，随后立刻回到初始状态（以初始状态为锚点）。
+void transitionBufferOnce(CommandContext* ctx, Dx12Object* buf,
+    D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_STATES from = initialStateFor(buf->heapType);
+    if (!needTransition(from, to)) return;
+    resourceBarrier(ctx->commandList.Get(), buf->resource.Get(), from, to);
+    resourceBarrier(ctx->commandList.Get(), buf->resource.Get(), to, from);
+}
+
+// texture 以 COMMON 为锚点：COMMON -> to，随后回 COMMON。
+void transitionTextureOnce(CommandContext* ctx, Dx12Object* tex,
+    D3D12_RESOURCE_STATES to) {
+    resourceBarrier(ctx->commandList.Get(), tex->resource.Get(),
+        D3D12_RESOURCE_STATE_COMMON, to);
+    resourceBarrier(ctx->commandList.Get(), tex->resource.Get(),
+        to, D3D12_RESOURCE_STATE_COMMON);
+}
+
+// DXGI_FORMAT -> 每 texel 字节数（仅非压缩格式；压缩格式返回 16 = 4x4 块）。
+// 用于 CopyTextureRegion 的 footprint 行距计算。
+UINT blockSizeFor(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_SINT: return 16;
+        case DXGI_FORMAT_R32G32B32_TYPELESS:
+        case DXGI_FORMAT_R32G32B32_FLOAT:
+        case DXGI_FORMAT_R32G32B32_UINT:
+        case DXGI_FORMAT_R32G32B32_SINT: return 12;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SNORM:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
+        case DXGI_FORMAT_R32G32_TYPELESS:
+        case DXGI_FORMAT_R32G32_FLOAT:
+        case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R32G32_SINT:
+        case DXGI_FORMAT_D32_FLOAT: return 8;
+        case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R32_SINT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return 4;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_R8G8B8A8_SNORM:
+        case DXGI_FORMAT_R8G8B8A8_SINT:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R16G16_TYPELESS:
+        case DXGI_FORMAT_R16G16_FLOAT:
+        case DXGI_FORMAT_R16G16_UNORM:
+        case DXGI_FORMAT_R16G16_UINT:
+        case DXGI_FORMAT_R16G16_SNORM:
+        case DXGI_FORMAT_R16G16_SINT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R11G11B10_FLOAT: return 4;
+        case DXGI_FORMAT_R16_FLOAT:
+        case DXGI_FORMAT_R16_UNORM:
+        case DXGI_FORMAT_R16_UINT:
+        case DXGI_FORMAT_R16_SNORM:
+        case DXGI_FORMAT_R16_SINT:
+        case DXGI_FORMAT_R8G8_TYPELESS:
+        case DXGI_FORMAT_R8G8_UNORM:
+        case DXGI_FORMAT_R8G8_UINT:
+        case DXGI_FORMAT_R8G8_SNORM:
+        case DXGI_FORMAT_R8G8_SINT: return 2;
+        case DXGI_FORMAT_R8_UNORM:
+        case DXGI_FORMAT_R8_UINT:
+        case DXGI_FORMAT_R8_SNORM:
+        case DXGI_FORMAT_R8_SINT:
+        case DXGI_FORMAT_A8_UNORM: return 1;
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC4_UNORM:
+        case DXGI_FORMAT_BC4_SNORM: return 8;   // 4x4 块
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM:
+        case DXGI_FORMAT_BC6H_TYPELESS:
+        case DXGI_FORMAT_BC6H_UF16:
+        case DXGI_FORMAT_BC6H_SF16:
+        case DXGI_FORMAT_BC7_TYPELESS:
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB: return 16;  // 4x4 块
+        default: return 4;
+    }
+}
+
+// 在指定队列上执行瞬时提交并等待完成（query 读回 / getTimestampNow 用）。
+bool flushAndWait(ID3D12CommandList* list, std::string& err) {
+    ID3D12CommandList* lists[] = { list };
+    gCtx.queue->ExecuteCommandLists(1, lists);
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        err = "flushAndWait: CreateFence failed"; return false;
+    }
+    UINT64 fv = 1;
+    if (FAILED(gCtx.queue->Signal(fence.Get(), fv))) {
+        err = "flushAndWait: Signal failed"; return false;
+    }
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!evt) { err = "flushAndWait: CreateEvent failed"; return false; }
+    while (fence->GetCompletedValue() < fv) {
+        fence->SetEventOnCompletion(fv, evt);
+        WaitForSingleObject(evt, INFINITE);
+    }
+    CloseHandle(evt);
+    return true;
+}
+
+}  // namespace
+
+CommandContext* createCommandEncoder(std::string& err) {
+    if (!ensureDevice(err)) return nullptr;
+    auto ctx = std::make_unique<CommandContext>();
+    for (int i = 0; i < 2; ++i) {
+        if (FAILED(gCtx.device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ctx->allocators[i])))) {
+            err = "createCommandEncoder: CreateCommandAllocator failed"; return nullptr;
+        }
+    }
+    if (FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ctx->allocators[0].Get(), nullptr, IID_PPV_ARGS(&ctx->commandList)))) {
+        err = "createCommandEncoder: CreateCommandList failed"; return nullptr;
+    }
+    // 初始 closed 状态；beginCommandList 时 Reset。
+    ctx->commandList->Close();
+    if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence)))) {
+        err = "createCommandEncoder: CreateFence failed"; return nullptr;
+    }
+    ctx->fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ctx->fenceEvent) { err = "createCommandEncoder: CreateEvent failed"; return nullptr; }
+    return ctx.release();
+}
+
+void destroyCommandEncoder(CommandContext* ctx) {
+    if (!ctx) return;
+    if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
+    delete ctx;
+}
+
+bool beginCommandList(CommandContext* ctx, std::string& err) {
+    if (!ctx) { err = "beginCommandList: null ctx"; return false; }
+    HRESULT hr = ctx->currentAllocator()->Reset();
+    if (FAILED(hr)) { err = "beginCommandList: allocator Reset " + hrText(hr); return false; }
+    hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
+    if (FAILED(hr)) { err = "beginCommandList: list Reset " + hrText(hr); return false; }
+    ctx->listOpen = 1;
+    return true;
+}
+
+bool endCommandList(CommandContext* ctx, std::string& err) {
+    if (!ctx) { err = "endCommandList: null ctx"; return false; }
+    if (!ctx->listOpen) return true;  // 幂等
+    HRESULT hr = ctx->commandList->Close();
+    if (FAILED(hr)) { err = "endCommandList: Close " + hrText(hr); return false; }
+    ctx->listOpen = 0;
+    return true;
+}
+
+UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
+    if (!ctx) { err = "submitCommandList: null ctx"; return 0; }
+    if (!endCommandList(ctx, err)) return 0;
+    ID3D12CommandList* lists[] = { ctx->commandList.Get() };
+    gCtx.queue->ExecuteCommandLists(1, lists);
+    UINT64 value = ++ctx->fenceValue;
+    if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
+        err = "submitCommandList: Signal failed"; return 0;
+    }
+    // 等 value-2 完成（对应官方 awaitSubmitCompletion(currentSubmitIndex - 2)）
+    if (value >= 2) {
+        std::string w;
+        if (!waitForFenceValue(ctx, value - 2, 5000000000ULL, w)) {
+            err = "submitCommandList: " + w; return 0;
+        }
+    }
+    return value;
+}
+
+bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
+    std::string& err) {
+    if (!ctx) { err = "waitForFenceValue: null ctx"; return false; }
+    if (ctx->fence->GetCompletedValue() >= value) return true;
+    HRESULT hr = ctx->fence->SetEventOnCompletion(value, ctx->fenceEvent);
+    if (FAILED(hr)) { err = "waitForFenceValue: SetEventOnCompletion " + hrText(hr); return false; }
+    DWORD ms = (DWORD)((timeoutNs + 999999ULL) / 1000000ULL);
+    if (WaitForSingleObject(ctx->fenceEvent, ms) != WAIT_OBJECT_0) {
+        err = "waitForFenceValue: timed out after " + std::to_string(timeoutNs) + "ns";
+        return false;
+    }
+    return true;
+}
+
+UINT64 currentFenceValue(CommandContext* ctx) {
+    return ctx ? ctx->fenceValue : 0;
+}
+
+// 读回单个 timestamp 的通用实现：录制 EndQuery + ResolveQueryData 到 READBACK
+// buffer，提交并等待，然后 map 读。list 在调用前必须已 Close。
+bool resolveQuery(QueryPool* pool, int start, int count, long long* out,
+    std::string& err) {
+    if (!pool) { err = "resolveQuery: null pool"; return false; }
+    if (start < 0 || count <= 0 || start + count > pool->size) {
+        err = "resolveQuery: invalid range"; return false;
+    }
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(gCtx.device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+        err = "resolveQuery: create command list failed"; return false;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = (UINT64)count * sizeof(long long);
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
+        err = "resolveQuery: readback alloc failed"; return false;
+    }
+    list->ResolveQueryData(pool->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+        (UINT)start, (UINT)count, readback.Get(), 0);
+    list->Close();
+    if (!flushAndWait(list.Get(), err)) return false;
+    void* p = nullptr;
+    readback->Map(0, nullptr, &p);
+    memcpy(out, p, (size_t)count * sizeof(long long));
+    readback->Unmap(0, nullptr);
+    return true;
+}
+
+long long getTimestampNow(CommandContext* ctx, std::string& err) {
+    (void)ctx;
+    if (!ensureDevice(err)) return 0;
+    QueryPool* pool = createQueryPool(1, err);
+    if (!pool) return 0;
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(gCtx.device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+        destroyQueryPool(pool); err = "getTimestampNow: create command list failed"; return 0;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = sizeof(long long);
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
+        destroyQueryPool(pool); err = "getTimestampNow: readback alloc failed"; return 0;
+    }
+    list->EndQuery(pool->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    list->ResolveQueryData(pool->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 1,
+        readback.Get(), 0);
+    list->Close();
+    if (!flushAndWait(list.Get(), err)) { destroyQueryPool(pool); return 0; }
+    long long ts = 0;
+    void* p = nullptr;
+    readback->Map(0, nullptr, &p);
+    memcpy(&ts, p, sizeof(ts));
+    readback->Unmap(0, nullptr);
+    destroyQueryPool(pool);
+    return ts;
+}
+
+// ---------------------------------------------------------------------------
+// 命令录制（P3）：copy / clear / render pass / timestamp
+// ---------------------------------------------------------------------------
+
+bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffset,
+    Dx12Object* dst, long long dstOffset, long long size, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "copyBufferToBuffer: no open command list"; return false; }
+    if (!src || !dst || src->kind != Dx12Object::Kind::Buffer ||
+        dst->kind != Dx12Object::Kind::Buffer) {
+        err = "copyBufferToBuffer: invalid buffer handle"; return false;
+    }
+    if (srcOffset < 0 || dstOffset < 0 || size < 0 ||
+        srcOffset + size > src->size || dstOffset + size > dst->size) {
+        err = "copyBufferToBuffer: range out of bounds"; return false;
+    }
+    transitionBufferOnce(ctx, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionBufferOnce(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
+    ctx->commandList->CopyBufferRegion(dst->resource.Get(), (UINT64)dstOffset,
+        src->resource.Get(), (UINT64)srcOffset, (UINT64)size);
+    return true;
+}
+
+bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
+    float r, float g, float b, float a, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "clearColorTexture: no open command list"; return false; }
+    if (!tex || tex->kind != Dx12Object::Kind::Texture) {
+        err = "clearColorTexture: invalid texture"; return false;
+    }
+    if (!(tex->usage & 8)) {  // RENDER_ATTACHMENT
+        err = "clearColorTexture: texture lacks RENDER_ATTACHMENT"; return false;
+    }
+    if (gNextRtv >= kRtvHeapSize) { err = "clearColorTexture: rtv heap exhausted"; return false; }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextRtv * gCtx.rtvInc;
+    ++gNextRtv;
+    gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
+    transitionTextureOnce(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float color[4] = { r, g, b, a };
+    ctx->commandList->ClearRenderTargetView(cpu, color, 0, nullptr);
+    return true;
+}
+
+bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
+    std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "clearDepthTexture: no open command list"; return false; }
+    if (!tex || tex->kind != Dx12Object::Kind::Texture) {
+        err = "clearDepthTexture: invalid texture"; return false;
+    }
+    if (gNextDsv >= kDsvHeapSize) { err = "clearDepthTexture: dsv heap exhausted"; return false; }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
+    ++gNextDsv;
+    gCtx.device->CreateDepthStencilView(tex->resource.Get(), nullptr, cpu);
+    transitionTextureOnce(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    ctx->commandList->ClearDepthStencilView(cpu,
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 0, nullptr);
+    return true;
+}
+
+bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
+    int colorCount, const int* colorClearFlags, const float* clearColors,
+    Dx12Object* depthView, int depthClearFlag, double depthClearValue,
+    int x, int y, int w, int h, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "beginRenderPass: no open command list"; return false; }
+    if (ctx->inRenderPass) { err = "beginRenderPass: render pass already open"; return false; }
+    if (colorCount < 0) { err = "beginRenderPass: negative color count"; return false; }
+
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
+    rtvs.reserve((size_t)colorCount);
+    for (int i = 0; i < colorCount; ++i) {
+        Dx12Object* tex = colorViews[i];
+        if (!tex) continue;  // withUnusedColorAttachment 占位
+        if (tex->kind != Dx12Object::Kind::Texture || !(tex->usage & 8)) {
+            err = "beginRenderPass: invalid color attachment (needs RENDER_ATTACHMENT)"; return false;
+        }
+        if (gNextRtv >= kRtvHeapSize) { err = "beginRenderPass: rtv heap exhausted"; return false; }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)gNextRtv * gCtx.rtvInc;
+        ++gNextRtv;
+        gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
+        rtvs.push_back(cpu);
+        transitionTextureOnce(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (colorClearFlags && colorClearFlags[i] && clearColors) {
+            const float* c = clearColors + i * 4;
+            ctx->commandList->ClearRenderTargetView(cpu, c, 0, nullptr);
+        }
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+    bool hasDsv = false;
+    if (depthView) {
+        if (depthView->kind != Dx12Object::Kind::Texture) {
+            err = "beginRenderPass: invalid depth attachment"; return false;
+        }
+        if (gNextDsv >= kDsvHeapSize) { err = "beginRenderPass: dsv heap exhausted"; return false; }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
+        ++gNextDsv;
+        gCtx.device->CreateDepthStencilView(depthView->resource.Get(), nullptr, cpu);
+        dsv = cpu;
+        hasDsv = true;
+        transitionTextureOnce(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        if (depthClearFlag) {
+            ctx->commandList->ClearDepthStencilView(cpu,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                (FLOAT)depthClearValue, 0, 0, nullptr);
+        }
+    }
+
+    ctx->commandList->OMSetRenderTargets((UINT)rtvs.size(),
+        rtvs.empty() ? nullptr : rtvs.data(), false, hasDsv ? &dsv : nullptr);
+    D3D12_VIEWPORT vp{ (FLOAT)x, (FLOAT)y, (FLOAT)w, (FLOAT)h, 0.0f, 1.0f };
+    ctx->commandList->RSSetViewports(1, &vp);
+    D3D12_RECT scissor{ x, y, x + w, y + h };
+    ctx->commandList->RSSetScissorRects(1, &scissor);
+    ctx->inRenderPass = 1;
+    return true;
+}
+
+bool endRenderPass(CommandContext* ctx, std::string& err) {
+    if (!ctx) { err = "endRenderPass: null ctx"; return false; }
+    if (!ctx->inRenderPass) return true;  // 幂等
+    // P3 简化：附件 barrier 回切在真实渲染层（P4）统一管理。
+    ctx->inRenderPass = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp query pool（P3）
+// ---------------------------------------------------------------------------
+
+QueryPool* createQueryPool(int size, std::string& err) {
+    if (!ensureDevice(err)) return nullptr;
+    if (size <= 0) { err = "createQueryPool: size must be positive"; return nullptr; }
+    D3D12_QUERY_HEAP_DESC desc{};
+    desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    desc.Count = (UINT)size;
+    auto pool = std::make_unique<QueryPool>();
+    if (FAILED(gCtx.device->CreateQueryHeap(&desc, IID_PPV_ARGS(&pool->heap)))) {
+        err = "createQueryPool: CreateQueryHeap failed"; return nullptr;
+    }
+    pool->size = size;
+    return pool.release();
+}
+
+void destroyQueryPool(QueryPool* pool) {
+    delete pool;
+}
+
+bool writeTimestampToPool(CommandContext* ctx, QueryPool* pool, int index,
+    std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "writeTimestampToPool: no open command list"; return false; }
+    if (!pool || index < 0 || index >= pool->size) {
+        err = "writeTimestampToPool: invalid index"; return false;
+    }
+    ctx->commandList->EndQuery(pool->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (UINT)index);
+    return true;
+}
+
+bool readQueryValue(QueryPool* pool, int index, long long& out, std::string& err) {
+    return readQueryValues(pool, index, 1, &out, err);
+}
+
+bool readQueryValues(QueryPool* pool, int start, int count, long long* out,
+    std::string& err) {
+    return resolveQuery(pool, start, count, out, err);
 }
 
 }  // namespace dx12mc
