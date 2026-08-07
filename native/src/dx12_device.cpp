@@ -1334,6 +1334,12 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         if (colorClearFlags && colorClearFlags[i] && clearColors) {
             const float* c = clearColors + i * 4;
             ctx->commandList->ClearRenderTargetView(cpu, c, 0, nullptr);
+            // P6 诊断：每 60 帧打印一次 clear 颜色（确认画面底色=clear 值）。
+            static int rpDbg = 0;
+            if ((++rpDbg % 60) == 1) {
+                dbgLog("beginRenderPass clear[%d] = (%.3f, %.3f, %.3f, %.3f)",
+                    i, (double)c[0], (double)c[1], (double)c[2], (double)c[3]);
+            }
         }
     }
 
@@ -1532,10 +1538,41 @@ bool compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageNam
 Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err) {
     if (!ensureDevice(err)) return nullptr;
 
+    // P6 诊断实验（已定位：光栅化链路正常，问题在真实 shader，本开关恢复 false）。
+    // 判定回顾：测试固定输出 shader 时渲染目标出现纯红 => 链路正常。
+    static const bool kTestShader = false;
+    std::vector<uint8_t> vsBytes = desc.vsBytes;
+    std::vector<uint8_t> psBytes = desc.psBytes;
+    if (kTestShader) {
+        const char* vs =
+            "struct VSIn { float4 pos : TEXCOORD0; };\n"
+            "float4 main(VSIn i) : SV_Position {\n"
+            "    return float4(i.pos.xy * float2(0.0015, 0.0015), 0.0, 1.0);\n"
+            "}\n";
+        const char* ps =
+            "float4 main() : SV_Target {\n"
+            "    return float4(1.0, 0.0, 0.0, 1.0);\n"
+            "}\n";
+        vsBytes.assign(vs, vs + strlen(vs));
+        psBytes.assign(ps, ps + strlen(ps));
+        std::fprintf(stdout, "[dx12] TEST SHADER ENABLED (fixed red triangle)\n");
+    }
+    // P6 诊断：打印前 2 个真实管线 HLSL 源码（找 draw 无输出的 shader 根因）。
+    {
+        static int hlslDump = 0;
+        if (hlslDump < 2) {
+            ++hlslDump;
+            std::string vsStr((const char*)vsBytes.data(), vsBytes.size());
+            std::string psStr((const char*)psBytes.data(), psBytes.size());
+            std::fprintf(stdout, "[dx12] === HLSL DUMP #%d vs (%zuB) ===\n%s\n[dx12] === HLSL DUMP #%d ps (%zuB) ===\n%s\n",
+                hlslDump, vsBytes.size(), vsStr.c_str(), hlslDump, psBytes.size(), psStr.c_str());
+        }
+    }
+
     // 1) HLSL -> DXBC（vs_5_1 / ps_5_1，入口 main）
     ComPtr<ID3DBlob> vsBlob, psBlob;
-    if (!compileShaderBytecode(desc.vsBytes, "vertex", "vs_5_1", vsBlob, err)) return nullptr;
-    if (!compileShaderBytecode(desc.psBytes, "fragment", "ps_5_1", psBlob, err)) return nullptr;
+    if (!compileShaderBytecode(vsBytes, "vertex", "vs_5_1", vsBlob, err)) return nullptr;
+    if (!compileShaderBytecode(psBytes, "fragment", "ps_5_1", psBlob, err)) return nullptr;
 
     // 2) root signature：单 descriptor table（CBV/SRV 混合，register=条目序号）
     //    + static sampler（仅 SAMPLED_IMAGE 条目，register=同一序号）
@@ -1773,6 +1810,11 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long lon
     dbgLog("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld stride=%d heap=%d",
         slot, (void*)buffer, (long long)buffer->size, (long long)offset,
         (int)stride, (int)buffer->heapType);
+    // P6 诊断：每 60 次读回顶点 buffer 前 128 字节（确认数据是否真正写入）。
+    static int vbDbg = 0;
+    if ((++vbDbg % 60) == 1) {
+        dbgReadbackBufferBytes(buffer, offset < 0 ? 0 : offset, 128, "vb");
+    }
     return true;
 }
 
@@ -1820,6 +1862,13 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID CBV buffer\n", (unsigned)i);
                     err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
                     return false;
+                }
+                // P6 诊断：每 60 帧读回 binding[0] CBV buffer 内容（多为投影/变换矩阵，
+                // 全零=UBO 未写入→顶点全退化，画面纯色）。
+                static int ubDbg = 0;
+                if (i == 0 && ((++ubDbg % 60) == 1)) {
+                    dbgReadbackBufferBytes(b.buffer, b.offset,
+                        (int)std::min<long long>(b.length, 128), "ubo");
                 }
                 // UPLOAD(GENERIC_READ) 直接可读；DEFAULT 需显式过渡（CBV 属于
                 // VERTEX_AND_CONSTANT_BUFFER 状态位，D3D12 无独立 CONSTANT_BUFFER 位）
@@ -1923,6 +1972,198 @@ bool drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
     ctx->commandList->ExecuteIndirect(gCtx.cmdSigNonIndexed.Get(), drawCount,
         commands->resource.Get(), (UINT64)offset, nullptr, 0);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// P6 诊断：读回纹理/buffer 内容（纯色黑屏定位用）。
+// 内部先等 GPU 空闲（已提交命令全部完成、资源隐式 decay 回初始状态），再用
+// 一次性命令列表拷贝到 readback staging。调用点每 ~60 帧触发一次，同步开销可忽略。
+// ---------------------------------------------------------------------------
+
+void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
+    if (!tex || tex->kind != Dx12Object::Kind::Texture || !tex->resource) return;
+    std::string err;
+    if (!deviceWaitIdle(err)) return;
+    ID3D12Resource* r = tex->resource.Get();
+    D3D12_RESOURCE_DESC td = r->GetDesc();
+    UINT w = (UINT)td.Width, h = td.Height;
+    if (w == 0 || h == 0 || w > 16384 || h > 16384) return;
+    UINT64 rowBytes = (UINT64)w * 4;
+    UINT64 pitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+        & ~(UINT64)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    UINT64 total = pitch * h;
+
+    static ComPtr<ID3D12Resource> staging;
+    if (!staging || staging->GetDesc().Width < total) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = total;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        hp.CreationNodeMask = 0;
+        hp.VisibleNodeMask = 0;
+        if (FAILED(gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&staging)))) return;
+    }
+    static ComPtr<ID3D12CommandAllocator> alloc;
+    static ComPtr<ID3D12GraphicsCommandList> cl;
+    if (!alloc && FAILED(gCtx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&alloc)))) return;
+    if (!cl) {
+        if (FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                alloc.Get(), nullptr, IID_PPV_ARGS(&cl)))) return;
+    } else {
+        alloc->Reset();
+        cl->Reset(alloc.Get(), nullptr);
+    }
+    // deviceWaitIdle 后未保持状态的纹理隐式 decay 回 COMMON。
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = r;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = staging.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = w;
+    dst.PlacedFootprint.Footprint.Height = h;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = (UINT)pitch;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    cl->ResourceBarrier(1, &b);
+    cl->Close();
+
+    ID3D12CommandList* lists[] = { cl.Get() };
+    gCtx.queue->ExecuteCommandLists(1, lists);
+    UINT64 fv = ++gCtx.queueFenceValue;
+    if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), fv))) return;
+    if (!waitForQueueFenceValue(fv, 5'000'000'000ULL, err)) return;
+
+    void* ptr = nullptr;
+    if (FAILED(staging->Map(0, nullptr, &ptr))) return;
+    const uint8_t* base = (const uint8_t*)ptr;
+    int xs[3] = { 0, (int)w / 2, (int)w - 1 };
+    int ys[3] = { 0, (int)h / 2, (int)h - 1 };
+    for (int yi = 0; yi < 3; ++yi) {
+        for (int xi = 0; xi < 3; ++xi) {
+            const uint8_t* p = base + (UINT64)ys[yi] * pitch + (UINT64)xs[xi] * 4;
+            dbgLog("rbTex[%s][%ux%u] (%d,%d) = RGBA(%3d,%3d,%3d,%3d)",
+                tag, w, h, xs[xi], ys[yi], p[0], p[1], p[2], p[3]);
+        }
+    }
+    staging->Unmap(0, nullptr);
+}
+
+void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const char* tag) {
+    if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) return;
+    if (offset < 0 || offset >= buf->size) return;
+    long long avail = buf->size - offset;
+    if (len <= 0) len = (int)std::min(avail, 128LL);
+    len = (int)std::min((long long)len, avail);
+    if (len <= 0) return;
+
+    void* ptr = nullptr;
+    ID3D12Resource* unmapRes = nullptr;
+    if (buf->heapType == D3D12_HEAP_TYPE_UPLOAD) {
+        // UPLOAD：CPU 已写可见，直接 Map 读。
+        if (FAILED(buf->resource->Map(0, nullptr, &ptr))) return;
+        unmapRes = buf->resource.Get();
+    } else {
+        std::string err;
+        if (!deviceWaitIdle(err)) return;
+        UINT64 total = ((UINT64)len + 255) & ~255ULL;
+        static ComPtr<ID3D12Resource> staging;
+        if (!staging || staging->GetDesc().Width < total) {
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = total;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            hp.CreationNodeMask = 0;
+            hp.VisibleNodeMask = 0;
+            if (FAILED(gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+                &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&staging)))) return;
+        }
+        static ComPtr<ID3D12CommandAllocator> alloc;
+        static ComPtr<ID3D12GraphicsCommandList> cl;
+        if (!alloc && FAILED(gCtx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&alloc)))) return;
+        if (!cl) {
+            if (FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    alloc.Get(), nullptr, IID_PPV_ARGS(&cl)))) return;
+        } else {
+            alloc->Reset();
+            cl->Reset(alloc.Get(), nullptr);
+        }
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = buf->resource.Get();
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cl->ResourceBarrier(1, &b);
+        cl->CopyBufferRegion(staging.Get(), 0, buf->resource.Get(), (UINT64)offset, (UINT64)len);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        cl->ResourceBarrier(1, &b);
+        cl->Close();
+
+        ID3D12CommandList* lists[] = { cl.Get() };
+        gCtx.queue->ExecuteCommandLists(1, lists);
+        UINT64 fv = ++gCtx.queueFenceValue;
+        if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), fv))) return;
+        if (!waitForQueueFenceValue(fv, 5'000'000'000ULL, err)) return;
+        if (FAILED(staging->Map(0, nullptr, &ptr))) return;
+        unmapRes = staging.Get();
+    }
+
+    const float* f = (const float*)ptr;
+    const uint8_t* b8 = (const uint8_t*)ptr;
+    std::string fs;
+    int nf = std::min(len / 4, 12);
+    for (int i = 0; i < nf; ++i) {
+        char t[32];
+        snprintf(t, sizeof(t), "%g ", (double)f[i]);
+        fs += t;
+    }
+    std::string hs;
+    int nh = std::min(len, 16);
+    for (int i = 0; i < nh; ++i) {
+        char t[8];
+        snprintf(t, sizeof(t), "%02X ", b8[i]);
+        hs += t;
+    }
+    dbgLog("rbBuf[%s] off=%lld len=%d heap=%d floats=[%s] hex=[%s]",
+        tag, offset, len, (int)buf->heapType, fs.c_str(), hs.c_str());
+    unmapRes->Unmap(0, nullptr);
 }
 
 }  // namespace dx12mc

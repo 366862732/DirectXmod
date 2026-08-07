@@ -89,3 +89,20 @@
   - `setPipeline ... topoOrdinal=4 topo=4` 行出现（TRIANGLELIST）且 `setVertexBuffer/setIndexBuffer` 每帧 draw 前各一次
   - readback 出现非纯色像素（Mojang logo / 进度条白色）或画面可见 → topology 修复生效
   - 若仍纯色 → 下一个嫌疑：顶点坐标范围与 viewport 不匹配（MC GUI 顶点带 UBO 投影矩阵，检查 UBO 内容/绑定）；或 pushDescriptors 的 SRV 表偏移与 root signature 布局错位
+
+## 阶段 6（17:0x 复测）：kTestShader 决定性实验 + HLSL dump → 真实根因 = debug_points 管线编译失败
+
+- **kTestShader 决定性实验（kTestShader=true）**：固定 vs/ps 输出纯红 `(239,50,61)`，渲染目标 3x3 全红、backbuffer 可见 → **证明 PSO→光栅化→blit→backbuffer 链路 100% 正常，问题 100% 在真实 shader**。副作用：固定 shader 与真实输入布局不匹配 → 主菜单 PSO 创建失败（E_INVALIDARG）→ 黑屏。实验已回退 kTestShader=false。
+- **HLSL dump（kTestShader=false）**：真实 vs/ps 结构正常（`mul(Position, mul(ModelViewMat, ProjMat))`、`fragColor = color * ColorModulator`、`discard if w==0`）；`cbuffer Projection register(b0)` / `DynamicTransforms register(b1)`；顶点输入 `TEXCOORD0/1`。
+- **读回可靠性**：`dbgReadbackTexturePixels`（dx12_device.cpp L1983）deviceWaitIdle→一次性 copy→Signal→wait→Map，值随场景变化（64x64 黑 / 854x480 红）→ **读回可信，纯红 = 渲染目标真实内容**。
+- **决定性根因（根因 12）**：日志 L2509 `[Render thread/ERROR]: Couldn't compile pipeline minecraft:pipeline/debug_points: Couldn't compile HLSL (SPVC_ERROR_UNSUPPORTED_SPIRV)` → **ShaderManager.apply() 抛异常 → "Caught error loading resourcepacks, removing all selected resourcepacks" → 资源包全部移除 → UI 黑屏**。
+  - 直接原因：vanilla `debug_point.vsh` 写 `gl_PointSize = LineWidth;`。**SPIRV-Cross HLSL 后端默认不支持 gl_PointSize/gl_PointCoord（SPVC_ERROR_UNSUPPORTED_SPIRV）**，需启用 `HLSL_POINT_SIZE_COMPAT` / `HLSL_POINT_COORD_COMPAT` 选项（映射到 SV_PointSize/PSIZE 语义）。官方 Vulkan 后端直接用 SPIR-V 不经 HLSL 转换，故官方无此问题——这是 D3D12 移植引入的失败点。
+  - 佐证：仅 debug_point.vsh 用 gl_PointSize（全 32 个 core vsh 扫描）；rbBuf[vb]/rbBuf[ubo] 全 0 是 UPLOAD 目标 GPU copy 完成前的 CPU 读（读回时机问题，非真实渲染故障）。
+- **修复（Fix F）**：`Dx12IntermediaryShaderModule.toHlsl()`：
+  - 设置 `SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT=1` + `SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT=1`
+  - `spvc_compiler_compile` 失败时读取 `spvc_context_get_last_error_string` 附加到异常（后续若仍有管线失败可直接定位）
+  - 仅 Java 侧改动，DLL 不变。
+- **待复测判据（下次日志）**：
+  - 无 `Couldn't compile pipeline ... debug_points` 错误；无 "Caught error loading resourcepacks"
+  - 主菜单 GUI 可见（readback 出现非纯色像素 / 用户肉眼可见标题与按钮）
+  - 若仍有 `SPVC_ERROR_UNSUPPORTED_SPIRV` → 新错误消息带 spvc 内部详情，继续修复对应 builtin/指令

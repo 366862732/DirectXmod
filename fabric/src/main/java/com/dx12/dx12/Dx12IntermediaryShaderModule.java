@@ -253,9 +253,28 @@ public record Dx12IntermediaryShaderModule(
                 long options = pointer.get(0);
                 throwIfError(Spvc.spvc_compiler_options_set_uint(options,
                     Spvc.SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, 51), "Couldn't set HLSL shader model");
+                // P6 修复：GLSL 的 gl_PointSize / gl_PointCoord 在 SPIRV-Cross HLSL
+                // 后端默认不支持（SPVC_ERROR_UNSUPPORTED_SPIRV）。vanilla
+                // debug_point 管线（ShaderManager 必需）在 debug_point.vsh 里写
+                // gl_PointSize = LineWidth，若不启用兼容选项则编译失败 → ShaderManager
+                // apply() 抛异常 → 资源包全部移除 → UI 黑屏。启用后 spvc 会把点大小
+                // 输出映射到 SV_PointSize / PSIZE 语义，点坐标映射为 PSIZE/语义。
+                throwIfError(Spvc.spvc_compiler_options_set_uint(options,
+                    Spvc.SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, 1),
+                    "Couldn't set HLSL point size compat");
+                throwIfError(Spvc.spvc_compiler_options_set_uint(options,
+                    Spvc.SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, 1),
+                    "Couldn't set HLSL point coord compat");
                 throwIfError(Spvc.spvc_compiler_install_compiler_options(compiler, options),
                     "Couldn't install compiler options");
-                throwIfError(Spvc.spvc_compiler_compile(compiler, pointer), "Couldn't compile HLSL");
+                int compileResult = Spvc.spvc_compiler_compile(compiler, pointer);
+                if (compileResult != 0) {
+                    // P6 诊断：附加 SPIRV-Cross 内部错误描述（如具体哪个 builtin/指令不支持），
+                    // 便于定位剩余管线编译失败的具体原因。
+                    String detail = Spvc.spvc_context_get_last_error_string(context);
+                    throwIfError(compileResult, "Couldn't compile HLSL"
+                        + (detail != null && !detail.isEmpty() ? ": " + detail : ""));
+                }
                 long address = pointer.get(0);
                 return MemoryUtil.memUTF8(address);
             } finally {

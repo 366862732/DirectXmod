@@ -337,7 +337,6 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer,
 // IASetIndexBuffer（indexType：0=SHORT(R16_UINT)，1=INT(R32_UINT)）。
 bool setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType,
     std::string& err);
-
 // 瞬时描述符绑定（对应官方 pushDescriptors）：
 //   type 0 = CBV（buffer + offset + length，offset 须 256 对齐）
 //   type 1 = SRV（复制 texture view 的现有描述符）
@@ -407,6 +406,12 @@ void destroySurface(Dx12Surface* s);
 // P6 诊断：把当前 back buffer 读回 CPU 并打印 3x3 采样点 RGBA（每 ~60 帧调用
 // 一次，内部先等 GPU 空闲；用于确认画面实际颜色/内容——纯色=渲染未生效）。
 bool readbackSurfacePixels(Dx12Surface* s, std::string& err);
+// P6 诊断：读回任意纹理 3x3 采样点 RGBA（tag 标注来源，如 blit 源=渲染目标，
+// 用于区分 draw 未写入 vs blit 丢失）。
+void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag);
+// P6 诊断：读回 buffer 内容（前若干 float + hex），UPLOAD 直接 Map、DEFAULT 经
+// readback staging；用于确认顶点/UBO 数据是否真正写入 GPU 资源。
+void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const char* tag);
 
 // 阻塞等待 GPU 队列上所有已提交命令执行完成（销毁 swapchain/设备前调用，
 // 避免 backbuffer 等资源在被 GPU 使用时释放导致 DXGI_ERROR_DEVICE_REMOVED）。

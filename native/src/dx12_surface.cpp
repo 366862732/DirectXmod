@@ -199,6 +199,12 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu -> backbuf=%ux%u",
         (void*)srcTex, (unsigned long long)srcDesc.Width,
         (unsigned long long)srcDesc.Height, w, h);
+    // P6 诊断：每 60 次读回 blit 源纹理（=渲染目标 color[0]）3x3，区分
+    // "draw 未写入渲染目标"（纯色）vs "blit/backbuffer 丢失"（源有内容）。
+    static int blDbg = 0;
+    if ((++blDbg % 60) == 1) {
+        dbgReadbackTexturePixels(srcTex, "blitsrc");
+    }
     return true;
 }
 
