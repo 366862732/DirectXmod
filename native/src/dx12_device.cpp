@@ -1887,6 +1887,7 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     // 3) 输入布局：语义名称来自 Java 侧 HLSL 解析；空串时回退到 TEXCOORD<location>
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     inputLayout.reserve(desc.inputElements.size());
+    std::string inputDescStr;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
         D3D12_INPUT_ELEMENT_DESC ie{};
         if (!el.semanticName.empty()) {
@@ -1905,8 +1906,15 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             ie.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
             ie.InstanceDataStepRate = 0;
         }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "  loc=%d bind=%d fmt=%d off=%d stride=%d step=%d semantic=%s\n",
+            el.location, el.binding, el.format, el.offset, el.stride, el.stepRate,
+            el.semanticName.empty() ? "(fallback TEXCOORD)" : el.semanticName.c_str());
+        inputDescStr += buf;
         inputLayout.push_back(ie);
     }
+    dbgLog("createGraphicsPipeline: inputElements=%zu\n%s",
+        desc.inputElements.size(), inputDescStr.c_str());
 
     // 4) PSO 共享状态：混合 + 光栅化
     D3D12_BLEND_DESC blend{};
@@ -1984,9 +1992,18 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         pso.SampleDesc.Count = 1;
         pso.SampleDesc.Quality = 0;
         pso.SampleMask = UINT_MAX;
+        // 诊断：打印 HLSL 前 400 字符，便于检查语义声明格式
+        {
+            std::string vsStr((const char*)vsBytes.data(), vsBytes.size());
+            std::string psStr((const char*)psBytes.data(), psBytes.size());
+            int vsLen = std::min((int)vsStr.size(), 400);
+            int psLen = std::min((int)psStr.size(), 400);
+            dbgLog("createGraphicsPipeline: vs(%zuB)=[%.*s...]\nps(%zuB)=[%.*s...]",
+                vsBytes.size(), vsLen, vsStr.c_str(), psBytes.size(), psLen, psStr.c_str());
+        }
         HRESULT h = gCtx.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&out));
         if (FAILED(h)) {
-            e = "createGraphicsPipeline: CreateGraphicsPipelineState hr=0x" + hrText(h);
+            e = "createGraphicsPipeline: CreateGraphicsPipelineState hr=" + hrText(h);
             return false;
         }
         return true;
