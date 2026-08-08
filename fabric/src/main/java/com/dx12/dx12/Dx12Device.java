@@ -397,13 +397,22 @@ public class Dx12Device implements GpuDeviceBackend {
         int colorCount = colorTargets == null ? 0 : colorTargets.length;
         boolean hasDepth = pipeline.getDepthStencilState() != null;
         List<int[]> inputElements = buildVertexInputElements(pipeline, compiled.vertexShaderInputs());
+        List<String> semanticNames = compiled.semanticNames();
         List<Dx12BindGroupEntry> entries = compiled.entries();
+
+        // 计算 semantic names 总字节数
+        int semanticCount = semanticNames.size();
+        int semanticTotalBytes = 0;
+        for (String sn : semanticNames) {
+            semanticTotalBytes += sn.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        }
 
         int size = 4 + vsBytes.length + 4 + psBytes.length;   // vsLen+vs + psLen+ps
         size += 4 + colorCount * 12;                          // colorCount + per color (int + 8 bytes)
         size += 1 + (hasDepth ? (4 + 2) : 0);                 // hasDepth + depth state
         size += 4 + 1 + 4;                                    // topology + cullEnabled + polygonMode
         size += 4 + inputElements.size() * (4 * 6);           // inputElementCount + per element
+        size += 4 + semanticCount * 4 + semanticTotalBytes;   // semanticCount + per name (len+bytes)
         size += 4 + entries.size() * 2;                       // entryCount + per entry (type, register)
 
         ByteBuffer desc = ByteBuffer.allocateDirect(size).order(ByteOrder.LITTLE_ENDIAN);
@@ -434,6 +443,13 @@ public class Dx12Device implements GpuDeviceBackend {
             desc.putInt(element[3]);  // offset
             desc.putInt(element[4]);  // stride
             desc.putInt(element[5]);  // stepRate
+        }
+
+        desc.putInt(semanticCount);
+        for (String sn : semanticNames) {
+            byte[] snBytes = sn.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            desc.putInt(snBytes.length);
+            desc.put(snBytes);
         }
 
         desc.putInt(entries.size());

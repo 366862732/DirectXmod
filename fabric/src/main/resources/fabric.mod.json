@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gl4dx12",
   "version": "${version}",
-  "name": "DirectX Mod",
+  "name": "DirectXMod",
   "description": "在官方 GPU 后端架构上嵌入原生 D3D12 渲染后端（学习官方 Vulkan 实现）",
   "authors": [
     "xiaozi Graphics Development Team"

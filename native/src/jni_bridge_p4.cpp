@@ -116,6 +116,30 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateGraphicsPipeline
     }
     remaining -= (jsize)elemCount * 24;
 
+    int semanticCount = readI32(p); remaining -= 4;
+    if (semanticCount < 0 || semanticCount > 64) {
+        std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad semanticCount %d\n", semanticCount);
+        return 0;
+    }
+    for (int i = 0; i < semanticCount; ++i) {
+        int len = readI32(p); remaining -= 4;
+        if (len < 0 || len > 64) {
+            std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad semanticNameLen %d\n", len);
+            return 0;
+        }
+        std::vector<uint8_t> snBytes(len);
+        if (!readBytes(p, remaining, len, snBytes)) {
+            std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad semanticName at %d\n", i);
+            return 0;
+        }
+        remaining -= len;
+        std::string sn(reinterpret_cast<const char*>(snBytes.data()), len);
+        // 将语义名分配给对应 location 的 input element
+        if ((size_t)i < d.inputElements.size()) {
+            d.inputElements[i].semanticName = sn;
+        }
+    }
+
     int entryCount = readI32(p); remaining -= 4;
     if (entryCount < 0 || entryCount > 64) {
         std::fprintf(stderr, "[dx12] dx12CreateGraphicsPipeline: bad entryCount %d\n", entryCount);

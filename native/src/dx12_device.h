@@ -311,6 +311,7 @@ struct PipelineDesc {
     struct InputElement {
         int location = 0, binding = 0, format = 0;
         int offset = 0, stride = 0, stepRate = 0;
+        std::string semanticName;  // HLSL 声明的语义名（如 "POSITION"、"TEXCOORD0"）；空串则回退到 "TEXCOORD"
     };
     struct Binding {
         uint8_t type = 0;  // 0=CBV，1=SRV+static sampler，2=SRV

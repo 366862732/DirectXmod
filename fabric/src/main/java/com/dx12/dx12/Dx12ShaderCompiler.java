@@ -11,6 +11,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.renderer.ShaderDefines;
@@ -106,13 +108,46 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         for (Dx12IntermediaryShaderModule.SpvVariable input : vertex.inputs()) {
             vertexShaderInputs.add(input.name());
         }
-        return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexShaderInputs);
+        List<String> semanticNames = extractHlslSemanticNames(vertexHlsl, vertexShaderInputs);
+        return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexShaderInputs, semanticNames);
     }
 
     @Override
     public void close() {
         Shaderc.shaderc_compile_options_release(this.shaderOptions);
         Shaderc.shaderc_compiler_release(this.shaderCompiler);
+    }
+
+    /**
+     * 从 spvc 生成的 HLSL 顶点着色器源码中提取 semantic 名称。
+     * spvc 生成的格式：{@code TypeName VarName : SEMANTIC;}（行内或分行），
+     * 按 vertexShaderInputs 顺序匹配，确保 semantic 列表与输入变量一一对应。
+     */
+    private static List<String> extractHlslSemanticNames(String vertexHlsl,
+        List<String> inputNames) {
+        List<String> result = new ArrayList<>();
+        // spvc HLSL 输入声明格式（兼容行内和换行）：
+        //   float3 Position : POSITION;
+        //   float4 Color : TEXCOORD0;
+        Pattern p = Pattern.compile(
+            "[\\w<>\\*\\s]+?\\b([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*([A-Za-z_][A-Za-z0-9]*)\\s*;");
+        Matcher m = p.matcher(vertexHlsl);
+        while (m.find()) {
+            String varName = m.group(1);
+            String semantic = m.group(2);
+            if (inputNames.contains(varName) && !result.contains(varName)) {
+                result.add(semantic);
+            }
+        }
+        // 兜底：如果正则未匹配到全部（spvc 输出格式可能不同），
+        // 回退到 TEXCOORD<location> 惯例（spvc auto_bind 时的默认行为）。
+        if (result.size() != inputNames.size()) {
+            result.clear();
+            for (int i = 0; i < inputNames.size(); i++) {
+                result.add("TEXCOORD" + i);
+            }
+        }
+        return result;
     }
 
     /** 镜像官方 addToBindGroup：按 shader 声明的 UBO/sampler 顺序收集绑定。 */

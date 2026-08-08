@@ -1307,6 +1307,26 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
     transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
     ctx->commandList->CopyBufferRegion(dst->resource.Get(), (UINT64)dstOffset,
         src->resource.Get(), (UINT64)srcOffset, (UINT64)size);
+    // P6 诊断：dump UPLOAD staging 内容（真实数据源头）。DEFAULT 堆 dst 在
+    // submit 前读回是旧数据（假象），只有 staging（UPLOAD，CPU 可读）才有
+    // Java 刚写入的真实顶点/UBO 数据。MVP 矩阵若全 0 → 顶点变换后全在原点
+    // → 全部被裁剪 → 画面只剩 clear 色。
+    if (src->heapType == D3D12_HEAP_TYPE_UPLOAD && size >= 16) {
+        void* ptr = nullptr;
+        if (SUCCEEDED(src->resource->Map(0, nullptr, &ptr))) {
+            const float* f = (const float*)((const uint8_t*)ptr + srcOffset);
+            int n = std::min((int)(size / 4), 16);
+            std::string fs;
+            for (int i = 0; i < n; ++i) {
+                char b[32];
+                snprintf(b, sizeof(b), " %.2f", f[i]);
+                fs += b;
+            }
+            dbgLog("copyBuf: src=%p(UPLOAD) dst=%p off=%lld size=%lld floats=[%s ]",
+                (void*)src, (void*)dst, (long long)srcOffset, (long long)size, fs.c_str());
+            src->resource->Unmap(0, nullptr);
+        }
+    }
     return true;
 }
 
@@ -1864,13 +1884,17 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         return nullptr;
     }
 
-    // 3) 输入布局：语义 = TEXCOORD<location>（spvc 对顶点输入按 location 生成）
+    // 3) 输入布局：语义名称来自 Java 侧 HLSL 解析；空串时回退到 TEXCOORD<location>
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     inputLayout.reserve(desc.inputElements.size());
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
         D3D12_INPUT_ELEMENT_DESC ie{};
-        ie.SemanticName = "TEXCOORD";
-        ie.SemanticIndex = (UINT)el.location;
+        if (!el.semanticName.empty()) {
+            ie.SemanticName = el.semanticName.c_str();
+        } else {
+            ie.SemanticName = "TEXCOORD";
+            ie.SemanticIndex = (UINT)el.location;
+        }
         ie.Format = toDxgiVertexFormat(el.format);
         ie.InputSlot = (UINT)el.binding;
         ie.AlignedByteOffset = (UINT)el.offset;

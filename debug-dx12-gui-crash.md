@@ -358,3 +358,19 @@
   - 若 readback 仍全 0 但窗口有内容 → 查 back buffer readback 在 FLIP 模型的限制（GetComplete 会话等）
   - 若 readback 全 0 且窗口确实纯色 → 真正确认 draw 未生效，继续查真实 shader/绘制（独立于冻结/崩溃问题）
 
+## 阶段 14（08-08 23:2x 复测）：Fix Q 完全生效（不卡死 + 全链路可见）→ 真画面 = 纯 clear 色 → 根因 21：顶点/UBO 数据源头未验证
+
+- **现象（用户复测 Fix Q，问"启动器不会卡死了？"）**：**不会卡死了！** 决定性证据：
+  - `presentSurface: ok` 从 L243 到 L1364+ **连续几十帧**，无 OCCLUDED/MODE_CHANGED/FAILED → 冻结/卡死彻底消除 ✅
+  - 渲染期 `setPipeline` ×2 每帧（两个 PSO：`491E2F0` + `02DEC20`）、`pushDesc` ×3（两个 CBV + 1 纹理 SRV）、`drawIndexed` ×2 每帧（`indexCount=30` + `indexCount=12 baseVertex=14`）→ 观测盲区消除，全链路真实执行 ✅
+  - **`readback[854x480]` 读到真实画面了**（Fix Q lastBlitIndex 生效）：9 个采样点全 `RGBA(247,48,55,255)`，ASCII dump 96x53 **全 R** → **真画面 = 纯红 = clear 色**
+- **根因 21（决定性结论：draw 无可见输出，非读回假象）**：readback 现在读的是 present+waitFence **之后**的本帧已 blit buffer（L243-248 时间线确认），是**真实 GPU 结果**。画面纯红 = **draw 全部执行但光栅化 0 像素**。候选：顶点/UBO 数据错误（MVP 矩阵全 0 → 顶点全在原点 → 全裁剪）、深度测试配置、cull 方向。
+- **关键诊断修正（根因 19 的延续）**：`rbBuf[vb]`/`rbBuf[ubo]` 读的 DEFAULT 堆 dst（`A4FE00`/`796EF60`）在 **submit 前**读回仍是旧数据（假象）。**真实数据源头 = UPLOAD staging**（`copyBuf: src=A4FF90 dst=A4FE00 size=528` 等，Java `uploadStaging` 写入后 `dx12CopyBuffer` 拷出）。`dbgReadbackBufferBytes` 对 DEFAULT 堆虽有完整 staging 读回路径，但读回发生在**本帧拷贝执行前**。
+- **修复（Fix R）**：[dx12_device.cpp](file:///d:/dx12-lib-template-26.1.2/native/src/dx12_device.cpp) `copyBufferToBuffer` L1312 后新增 staging dump——`src->heapType == UPLOAD` 时直接 Map 读 src（CPU 已写可见），打印前 16 个 float。这将显示 **Java 真实上传的顶点/UBO 数据**（MVP 矩阵是否全 0）。
+- **部署验证**：DLL 重建 + jar zip 替换 + MCP 部署；DLL（native/build ↔ resources ↔ jar 内嵌 ↔ 已部署 mods）= `DA8950E2F7D9929E1331AF03D7301F4F` 四处一致 ✅
+- **待复测判据（Fix R 后，看 `%TEMP%\dx12-native.log` 的 `copyBuf:` 行）**：
+  - **UBO 数据（64 字节 4x4 矩阵区）**：若全 0 → 确认 MVP 矩阵全 0 → 根因锁定 shader 侧 uniform 传递
+  - **顶点数据（528 字节）**：若全 0 → 顶点缓冲数据缺失；若非 0 → 顶点坐标是否合理（GUI 像素坐标 0~854/0~480）
+  - 结合 readback：若 staging 非 0 但画面仍纯红 → 问题在深度测试/cull/视口变换（非数据）
+  - **注意**：`copyBuf:` 行很多（含临时 uniform/纹理上传），聚焦 size=64（UBO 区）与 size=528（主顶点）两个目标
+
