@@ -209,3 +209,106 @@
   - 窗口持续显示、可交互、可 resize，关闭游戏后**启动器不再卡死**
   - readback 出现非纯色像素（GUI 可见）
 
+## 阶段 12（08-08 22:0x 复测）：Fix L 生效（barrier 错误消失）→ 但"关闭流程卡死"→ 可观测性不足 → 修复 = 原生日志镜像到独立文件
+
+- **现象**：启动正常、渲染期正常运行 **约 19 秒**（21:57:46–21:58:12，三大 pass 循环持续生成，**无每帧 `Before state does not match`** → Fix L 关键判据达成 ✅）。但用户报告**启动器彻底卡死**，只能提供 debug.log（1.7MB，5676+ 行，Java 侧 stdout/stderr）。
+- **debug.log 时间线**：
+  - 21:57:46 Fabric Loader 启动，自检无异常
+  - 21:57:46–21:58:12 渲染期：每帧 8 个坑位（854x480 depth=yes 主三通道 + 854x480 CubeMap + 贴图动画 2048/1024/512/256/128/512x256 depth=no）持续生成 → 核心管线运行正常
+  - 21:58:12 `Stopping!` → 渲染线程**仍在渲染**（PostPass.process ×6 / GuiRenderer.executeDrawRange，完成当前帧收尾）→ 21:58:13 全部 Worker-Main 线程 shutdown（= `Util.shutdownExecutors()`，销毁流程已启动）→ 渲染线程日志**戛然而止**，进程不退出，启动器死锁
+- **关键限制（为何定位不到卡点）**：
+  - debug.log 中 `[dx12-java]` **只在 `createRenderPass` 一处打印**（Dx12CommandEncoderBackend.java:154），其余 JNI 调用（`dx12WaitForFence`/`dx12Submit`/`dx12Destroy*`/`dx12EndCommandList`…）**不打 Java 侧日志**
+  - 原生 `dbgLog` 写 stderr → 游戏日志（版本目录 `logs\latest.log`），**被启动器死锁锁住丢失**
+  - 因此"Stopping! 后渲染线程卡在哪"完全不可见
+- **已排查（静态审查）**：
+  - 所有 fence 等待均有界：`waitForFenceValue`/`deviceWaitIdle`/`destroyCommandEncoder` 5s 超时；`waitForQueueFenceValue` 超时钳制 0xFFFFFFF0ms（~49.7 天，`awaitCompletion(Long.MAX_VALUE)` 场景 = **近永久等待**）
+  - **最大嫌疑**：关闭流程中 vanilla 的 `MappableRingBuffer.rotate/currentBuffer` / `StagedVertexBuffer` pending recycle 等路径调用 `awaitCompletion(Long.MAX_VALUE)` → 目标 = `queueFenceValue+1`，**关闭后不再有 submit 推进 queueFence → 目标永不满足 → 渲染线程近永久阻塞** → 进程不退出 → PCL2 作为父进程一直等待 → 启动器彻底卡死
+  - 与阶段 3（黑屏冻结）同机制：一次性 encoder 上 createFence 的 token 依赖"下一次提交"满足，关闭后无下一次提交
+- **修复（Fix M，可观测性）**：原生 `dbgLog` 镜像写入独立文件 `%TEMP%\dx12-native.log`（随写随刷，**不受启动器死锁影响**）——下次复测即使启动器卡死/游戏日志丢失，也能看到关闭序列的最后一条原生调用（fence 等待值 / destroy 路径 / 超时报错），精确定位卡点
+- **验证**：DLL 重建 + jar 重打 + 部署，三处哈希一致 = `7B1D4B1D656BE2A5D3CCA14038A60A5D` ✅（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌，已部署 26.2-Fabric_0.19.3\mods）
+- **待复测判据（下次日志）**：
+  - 若复现卡死：读 `%TEMP%\dx12-native.log` 尾部，最后一条原生日志 = 卡点（预期 `waitQFence: TIMEOUT ...` 或 `waitFence: TIMEOUT ...` → 确认关闭期 fence 近永久等待；据此修 `awaitCompletion` 关闭路径的等待语义）
+  - 若正常退出：`dx12-native.log` 尾部应有 `destroyCommandEncoder`/`destroyDevice` 完整序列 → 关闭路径无卡死
+  - 顺带观察：readback 是否出现非纯色像素（GUI 空白问题独立于关闭卡死，尚未解决）
+
+## 阶段 12b（08-08 22:1x 复测）：dx12-native.log 立功 → 卡点在 destroyCommandEncoder 之后的 Java 关闭路径 → 加销毁路径日志插桩
+
+- **dx12-native.log 首次拿到**（17MB，用户从 %TEMP% 复制到项目目录），最后关闭序列：
+  ```
+  t=5401566.6ms presentSurface: ok surface=...196510
+  t=5401580.0ms deviceWaitIdle: enter → done          ← destroySurface（Dx12GpuSurface.close）
+  t=5401582.4ms destroyCommandEncoder: enter fenceValue=748
+  t=5401582.7ms waitFence: value=748 completed=748    ← 最后一行
+  ```
+- **关键解读**：`completed=748 >= value=748` → `waitForFenceValue` 的 `cv>=value` 分支直接 return（不打 OK 日志，**正常**）。即 GPU 完全空闲（deviceWaitIdle done）、所有提交完成（fence 748 已满足）、destroyCommandEncoder 本体完成。**卡点 = destroyCommandEncoder 返回后的 Java 关闭路径**（`transientMemory.close()` / `clearPipelineCache()` / `compiler.close()` 之一），且**卡死期间没有任何原生日志**（无 waitQFence → 不是 vanilla fence 等待卡死）。
+- **静默根因**：原生 `destroyObject` / `destroyDevice` / `destroySurface` **全部不打日志**——destroyCommandEncoder 之后的一切销毁路径在 dx12-native.log 中不可见，这是定位不到卡点的直接原因。
+- **修复（Fix M2，销毁路径日志插桩）**：
+  - 原生：`destroyObject`（kind/size，可看到 transientMemory.close 逐个 buffer 进度）、`destroyDevice`（enter/done）、`destroySurface`（enter/done）、`destroyCommandEncoder`（delete 后 done）
+  - Java（`[dx12-java]` → debug.log）：`Dx12CommandEncoderBackend.close`（begin / after destroyCommandEncoder / after transientMemory.close）、`Dx12TransientMemory.close`（buffer 计数 / done）、`Dx12Device.close`（begin / after sharedEncoder.close / after clearPipelineCache / done）
+  - 下次复测卡死时，Java + 原生两侧最后一行日志交叉比对 → 精确定位到具体步骤
+- **验证**：DLL 重建 + jar 重打 + 部署，三处哈希一致 = `2CF93BFD4E541DD4454DD0DBA4D5A34D` ✅（已部署 26.2-Fabric_0.19.3\mods）
+- **待复测判据（下次日志）**：
+  - 读 debug.log 尾部 `[dx12-java] close:` / `transientMemory.close:` 系列 + `%TEMP%\dx12-native.log` 尾部 `destroyObject:`/`destroyCommandEncoder: done` 系列，交叉定位卡点：
+    - 无 `destroyCommandEncoder: done` + 无 `close: after destroyCommandEncoder` → JNI 未返回（delete ctx 卡住，极低概率）
+    - 有 done 但无 `transientMemory.close: done` → 卡在 transientMemory.close 的某个 buffer（看最后一条 `destroyObject`）
+    - 有 `transientMemory.close: done` 但无 `after clearPipelineCache` → 卡在 clearPipelineCache（管线销毁）
+    - 有 `device.close: done` → 我们后端关闭完成，卡点在 vanilla 关闭后续（届时看是否有 waitQFence 挂起）
+
+## 阶段 12c（08-08 22:2x 复测）：第二次 dx12-native.log → 卡点收窄到"destroyPipeline 无日志 + Java 关闭路径不可见" → 修复 = Java 双看门狗 + 日志双写 + destroyPipeline 插桩
+
+- **第二次 dx12-native.log 关闭序列（t=58442xx ms，关键突破）**：
+  ```
+  t=5844280.5ms destroyCommandEncoder: enter fenceValue=203
+  t=5844280.7ms waitFence: value=203 completed=203     ← fence 已满足，正常
+  t=5844281.9ms destroyCommandEncoder: done ctx=...     ← JNI 正常返回
+  t=5844282.1~3.0ms destroyObject: kind=1 size=56/1024/56/64 ×8   ← transientMemory.close 的最后一帧 buffer
+  最后一条：destroyObject: kind=1 size=64              ← 之后无任何原生日志
+  ```
+- **交叉比对结论**：
+  - `destroyCommandEncoder: done` 已出现 → JNI 销毁正常；`transientMemory.close()` 的 8 个 buffer 已逐个销毁（kind=1 size=56/1024/56/64 = 一帧瞬时缓冲）→ **卡点被夹在**：
+    1. Java 侧 `transientMemory.close` 之后的 `clearPipelineCache()`（每个 Dx12CompiledRenderPipeline.close → `dx12DestroyPipeline`，**原生无日志**）
+    2. Java 侧日志在 Worker shutdown 后不再转发到 debug.log（DebugLoggedPrintStream 失效）→ **Java 关闭日志全部丢失**
+  - 即：原生的下一个候选卡点（destroyPipeline 纯 `delete pipeline;` 无日志）与 Java 关闭路径日志（全部不可见）之间——两个盲区重叠处就是卡点。
+  - 且 `Util.shutdownExecutors()` 打印 shutdown ≠ 线程终止：非 daemon Worker 若卡在阻塞调用（JNI fence 等待 / 死锁），JVM 不会退出 → PCL2 父进程无限等待 → 启动器彻底卡死。
+- **修复（Fix N，最终观测方案，Java + 原生双管齐下）**：
+  - 原生：`destroyPipeline` 加 `dbgLog`（pso 地址 / done）——销毁路径至此 100% 有日志
+  - Java `Dx12Device.close()`：启动 **5 秒看门狗 daemon 线程**——close() 超时未完成即 dump 全部线程栈到 `%TEMP%\dx12-java.log`（卡死时直接看到渲染线程卡在哪个 Java 方法）
+  - Java `Dx12Mod`：新增**全局退出看门狗** daemon 线程——检测 "Render thread" 消失后宽限 15 秒，JVM 仍存活则 dump 全部线程栈（含 daemon 标记，可看到卡死的 Worker-Main 线程）到 `%TEMP%\dx12-java.log` 并 `System.exit(1)`——**保底让启动器恢复正常**，同时留下卡死证据
+  - Java 关闭日志双写：`appendJavaLog()`（System.err → debug.log + 文件 `%TEMP%\dx12-java.log`）——debug.log 转发丢失后独立文件仍可见
+- **验证**：DLL 重建（含 destroyPipeline 日志）+ `gradlew build` 重新编译 Java class + 重打 jar + 部署，三处哈希一致：
+  - DLL（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌）= `0DC3D1F437FD5EFF2A90F1C522792FB8` ✅
+  - jar（fabric/build/libs ↔ 已部署 mods）= `6B64AD2BD1875BD7E9DB65C8BA323749` ✅
+  - 已验证 jar 内含新 `Dx12Mod.class` / `Dx12Device.class` ✅（Java 源码变更已真正重新编译，非仅更新 DLL）
+- **待复测判据（下次日志）**：
+  - 若复现卡死：读 `%TEMP%\dx12-java.log` 看门狗线程栈 → 精确定位卡死行（预期直接看到渲染线程 / Worker-Main 卡在具体 Java 方法 + 原生栈帧）
+  - `%TEMP%\dx12-native.log` 尾部应有完整 `destroyPipeline: pso=... → done` 序列或卡在具体 destroy 对象
+  - 看门狗 20 秒兜底 `System.exit(1)` → 启动器不再无限卡死（即使根因未除）
+  - 若正常退出：`dx12-java.log` 应有 `device.close: begin → after sharedEncoder.close → after clearPipelineCache → done` 完整序列
+  - 顺带观察：GUI 空白问题（blitsrc 全黑）独立于关闭卡死，尚未解决
+
+## 阶段 12d（08-08 22:3x 复测）：关闭卡死已解决（决定性证据）
+
+- **用户澄清关键事实**："启动器的情况是画面卡死，但是本身没有未响应"——不是关闭卡死，而是**渲染期画面冻结**（进程活着、按钮有声音、窗口不更新）。
+- **dx12-java.log（4 行，决定性证据）**：`device.close: begin → after sharedEncoder.close → after clearPipelineCache → done`——**我们后端关闭路径 100% 完成，无看门狗触发**。
+- **debug.log 尾部（22:33:07）**：`Stopping! → Worker-Main shutdown → device.close: done`（最后一行）→ **JVM 正常退出**，关闭卡死已解决（Fix M/M2/N 观测体系生效：Java 双看门狗未触发 + 日志双写可见）。
+- **dx12-native.log（17MB 多次运行累积）**：22:32 运行段 t=6546xxx-6558xxx；**最后一次 acquire=6546815、present=6546827，之后 11.6 秒渲染循环继续（draw/submit 每帧）但再无 blit/present** → 画面冻结铁证。
+- **javap 反编译 vanilla（minecraft-merged.jar）确认冻结机制**：
+  - `Minecraft.renderFrame`：帧首 `if (windowSurface != null && !windowSurface.isAcquired()) { ... blitFromTexture ... present ... }`
+  - acquire 抛异常 → 输出 "Couldn't acquire next surface" → **`surfaceIsInvalid = true`** → 之后不再 acquire/blit/present，但渲染循环继续（画面冻结、进程活着）
+  - `GameRenderer.renderFrame`：renderLevel → renderLevelPost → `windowSurface.acquireNextTexture()`
+- **debug.log 铁证**：`Couldn't create/acquire next surface!` / `This reaction has already been executed` / `Couldn't configure window surface`
+- **根因 17（机制）**：MC 在 acquire 与 present 之间被窗口 resize 事件触发 `configureSurface` → `ResizeBuffers` 在**仍持有 acquired backbuffer**（`currentImageIndex` 未释放）时返回 `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`（0x887A0001）→ 配置失败 → `surfaceIsInvalid=true` → 不再上屏 → 画面冻结（渲染继续）。
+- **修复（Fix O，画面冻结）**：
+  - `dx12_surface.cpp presentSurface`：present 后**重置 `currentImageIndex = -1`**（backbuffer 所有权已释放；不重置则 configure 的 ResizeBuffers 误判仍有 acquired backbuffer）；真实 HRESULT 日志（OCCLUDED/MODE_CHANGED/FAILED 打 suboptimal，正常 present 清除 suboptimal）
+  - `dx12_surface.cpp configureSurface`：ResizeBuffers 前**防御性 `Present(0,0)` 释放残留 acquired backbuffer** + 完整日志
+  - `jni_bridge_p5.cpp`：`dx12ConfigureSurface` 失败/成功均打 `dbgLog`（此前失败只 `fprintf(stderr)` 不进 native log，正是 configure 失败不可见的直接原因）；`dx12PresentSurface` 移除无条件 "ok" 日志
+- **验证**：DLL 重建 + gradlew build + jar 重打 + 部署，哈希一致：
+  - DLL = `1664682EC1AEA896573D6E04F048F03D` ✅（native/build/bin/Release ↔ jar 内嵌 ↔ 已部署 mods）
+  - jar = `F68EF739087BD00A5681043885A3956D` ✅（fabric/build/libs ↔ 已部署 mods）
+- **待复测判据（下次日志）**：
+  - 正常：`%TEMP%\dx12-native.log` 每帧持续 `presentSurface: ok` + `configureSurface: ok` 交替；窗口持续更新、不冻结；`dx12_dump_backbuf.bmp` 有实际画面内容
+  - 若仍冻结：读 `%TEMP%\dx12-native.log` 看 `configureSurface: FAILED ... 0x887A0001` 或 `presentSurface: OCCLUDED/MODE_CHANGED`
+  - **GUI 内容空白（blitsrc 全黑）独立于冻结**：`dx12_dump_blitsrc.bmp` 纯黑 = 渲染目标无 GUI 内容，真实 shader/绘制问题尚未排查——冻结修复后若仍黑则继续此线
+
+## 阶段 12e（待复测）
+

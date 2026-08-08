@@ -318,6 +318,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     }
 
     public void close() {
+        System.err.println("[dx12-java] close: begin");
+        System.err.flush();
         if (this.currentRenderPass != null) {
             Dx12Native.dx12EndRenderPass(this.ctx);
             this.currentRenderPass = null;
@@ -329,6 +331,10 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // DXGI_ERROR_DEVICE_REMOVED（下一处 CreateCommittedResource 爆发）或调试层
         // 致命异常。等待后再释放则安全。
         Dx12Native.dx12DestroyCommandEncoder(this.ctx);
+        System.err.println("[dx12-java] close: after destroyCommandEncoder");
+        System.err.flush();
         this.transientMemory.close();
+        System.err.println("[dx12-java] close: after transientMemory.close");
+        System.err.flush();
     }
 }

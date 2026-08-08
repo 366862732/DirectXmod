@@ -4,9 +4,11 @@
 
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace dx12mc {
@@ -224,14 +226,25 @@ double nowMs() {
 }
 
 // 诊断插桩：打印到 stderr（PCL 启动器会写入游戏日志；不影响 debug.log）。
+// P12：同时镜像写入 %TEMP%\dx12-native.log——PCL 启动器死锁/游戏异常退出时
+// stderr 重定向的游戏日志丢失，此独立文件随写随刷，进程挂起也能看到卡死点
+// 的最后一条原生调用（fence 等待 / destroy 路径）。
 void dbgLog(const char* fmt, ...) {
+    char line[2048];
     va_list ap;
     va_start(ap, fmt);
-    std::fprintf(stderr, "[dx12][t=%8.1fms] ", nowMs());
-    std::vfprintf(stderr, fmt, ap);
-    std::fprintf(stderr, "\n");
+    std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
+    double t = nowMs();
+    std::fprintf(stderr, "[dx12][t=%8.1fms] %s\n", t, line);
     fflush(stderr);
+    const char* tmp = std::getenv("TEMP");
+    std::string path = (tmp && *tmp) ? tmp : ".";
+    path += "\\dx12-native.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+        std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
+        std::fclose(f);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +368,7 @@ bool ensureDevice(std::string& errorOut) {
 }
 
 void destroyDevice() {
+    dbgLog("destroyDevice: enter");
     if (gCtx.queueFenceEvent) {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
@@ -363,6 +377,7 @@ void destroyDevice() {
     // 被 flush，需在此兜底）。
     flushPendingDeletes();
     gCtx = DeviceContext{};
+    dbgLog("destroyDevice: done");
 }
 
 DeviceContext& deviceContextForJni() {
@@ -680,6 +695,9 @@ void destroyObject(Dx12Object* obj) {
         if (obj->resource) obj->resource->Unmap(0, nullptr);
         obj->mappedPtr = nullptr;
     }
+    // P12 诊断：关闭阶段定位用（destroyCommandEncoder 之后的销毁路径原本
+    // 全静默，卡死时无法判断 Java 侧 transientMemory/管线缓存关闭进行到哪）。
+    dbgLog("destroyObject: kind=%d size=%lld", (int)obj->kind, (long long)obj->size);
     // P6：延迟销毁（官方 VulkanGpuBuffer.close() 的 queueForDestroy 语义）。
     // 若资源正被打开的命令列表引用，立即 delete 会在 Close 时报
     // "deleted prior to closing the command list"（E_INVALIDARG）。登记到
@@ -1030,6 +1048,7 @@ void destroyCommandEncoder(CommandContext* ctx) {
     }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
     delete ctx;
+    dbgLog("destroyCommandEncoder: done ctx=%p", (void*)ctx);
 }
 
 bool beginCommandList(CommandContext* ctx, std::string& err) {
@@ -1968,7 +1987,9 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 }
 
 void destroyPipeline(Dx12Pipeline* pipeline) {
+    dbgLog("destroyPipeline: pso=%p", (void*)pipeline);
     delete pipeline;
+    dbgLog("destroyPipeline: done");
 }
 
 // ---------------------------------------------------------------------------

@@ -190,6 +190,9 @@ public class Dx12TransientMemory implements TransientMemory {
             return;
         }
         this.closed = true;
+        System.err.println("[dx12-java] transientMemory.close: current=" + this.frame.size()
+            + " queuedFrames=" + this.frames.size());
+        System.err.flush();
         for (Dx12GpuBuffer buffer : this.frame) {
             buffer.close();
         }
@@ -200,5 +203,7 @@ public class Dx12TransientMemory implements TransientMemory {
             }
         }
         this.frames.clear();
+        System.err.println("[dx12-java] transientMemory.close: done");
+        System.err.flush();
     }
 }

@@ -106,7 +106,17 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         err = "deviceWaitIdle before ResizeBuffers failed: " + err;
         return false;
     }
-
+    dbgLog("configureSurface: idle ok, ResizeBuffers %dx%d mode=%d", width, height, presentMode);
+    // 防御：vanilla 在 acquire 与 present 之间若被窗口事件触发 configure，
+    // 会残留"已 acquire 未 present"的 backbuffer；ResizeBuffers 对其返回
+    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> MC surfaceIsInvalid=true -> 之后
+    // 不再 acquire/blit/present -> 画面冻结（渲染仍继续）。先 Present 释放。
+    if (s->currentImageIndex >= 0) {
+        dbgLog("configureSurface: releasing acquired backbuffer idx=%d before ResizeBuffers",
+            s->currentImageIndex);
+        s->swapChain->Present(0, 0);
+        s->currentImageIndex = -1;
+    }
     HRESULT hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
         s->format, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     if (FAILED(hr)) {
@@ -118,9 +128,11 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
                 ") w=" + std::to_string(width) + " h=" + std::to_string(height) +
                 " count=" + std::to_string(kSurfaceBufferCount) +
                 " fmt=" + std::to_string((int)s->format);
+            dbgLog("configureSurface: FAILED %s", err.c_str());
             return false;
         }
     }
+    dbgLog("configureSurface: ResizeBuffers ok");
 
     // 重新取 back buffers + RTV
     s->backBuffers.resize(kSurfaceBufferCount);
@@ -237,20 +249,34 @@ void presentSurface(Dx12Surface* s) {
     UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
     UINT flags = (s->presentMode == 3) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
-    if (hr == DXGI_STATUS_OCCLUDED || hr == DXGI_STATUS_MODE_CHANGED) {
+    // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
+    // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
+    // backbuffer 而返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> 画面冻结）。
+    s->currentImageIndex = -1;
+    if (hr == DXGI_STATUS_OCCLUDED) {
+        dbgLog("presentSurface: OCCLUDED (window fully occluded) -> suboptimal");
+        s->suboptimal = true;
+    } else if (hr == DXGI_STATUS_MODE_CHANGED) {
+        dbgLog("presentSurface: MODE_CHANGED -> suboptimal");
         s->suboptimal = true;
     } else if (FAILED(hr)) {
-        std::fprintf(stderr, "[dx12] Present failed %s\n", hrText(hr).c_str());
+        dbgLog("presentSurface: FAILED %s", hrText(hr).c_str());
+        s->suboptimal = true;
+    } else {
+        dbgLog("presentSurface: ok (syncInterval=%u)", syncInterval);
+        s->suboptimal = false;  // 正常 present 清除 suboptimal 标记
     }
 }
 
 void destroySurface(Dx12Surface* s) {
     if (!s) return;
+    dbgLog("destroySurface: enter surface=%p", (void*)s);
     // GPU 可能仍在写入 backbuffer；先等队列空闲再销毁 swapchain，
     // 否则资源在使用中被释放会触发 DXGI_ERROR_DEVICE_REMOVED。
     std::string err;
     deviceWaitIdle(err);
     delete s;
+    dbgLog("destroySurface: done surface=%p", (void*)s);
 }
 
 // P6 诊断：读回 back buffer 采样像素。内部先等 GPU 完全空闲（同步一帧），

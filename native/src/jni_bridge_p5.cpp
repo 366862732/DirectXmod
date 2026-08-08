@@ -56,9 +56,13 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12ConfigureSurface(
     JNIEnv* env, jclass, jlong surface, jint width, jint height, jint presentMode) {
     std::string err;
     if (!configureSurface(toSurface(surface), width, height, presentMode, err)) {
-        std::fprintf(stderr, "[dx12] dx12ConfigureSurface: %s\n", err.c_str());
+        // 此前仅 fprintf(stderr) -> 不进 dx12-native.log；configure 失败正是
+        // MC surfaceIsInvalid -> 画面冻结的根因，必须镜像到 native log。
+        dbgLog("dx12ConfigureSurface FAILED %dx%d mode=%d: %s",
+            width, height, presentMode, err.c_str());
         return JNI_FALSE;
     }
+    dbgLog("dx12ConfigureSurface: ok %dx%d mode=%d", width, height, presentMode);
     return JNI_TRUE;
 }
 
@@ -87,7 +91,9 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BlitSurface(
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12PresentSurface(
     JNIEnv*, jclass, jlong surface) {
     presentSurface(toSurface(surface));
-    dbgLog("presentSurface: ok surface=%p", toSurface(surface));
+    // 注意：present 的真实结果（ok / OCCLUDED / MODE_CHANGED / FAILED）由
+    // presentSurface() 内部 dbgLog 打印；此处不再无条件打 "ok"（会掩盖
+    // OCCLUDED/MODE_CHANGED 导致 MC 误判 suboptimal 的根因）。
 }
 
 JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal(

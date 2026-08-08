@@ -226,17 +226,58 @@ public class Dx12Device implements GpuDeviceBackend {
 
     @Override
     public void close() {
+        // P12b 诊断：看门狗线程——若 close() 5 秒未完成，dump 全部线程栈到
+        // %TEMP%\dx12-java.log（System.err 在 Worker shutdown 后不再写入
+        // debug.log，卡死时只有独立文件能看到渲染线程卡在哪一行）。
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder("[dx12-java] WATCHDOG: device.close() hung >5s\n");
+            for (Map.Entry<Thread, StackTraceElement[]> en : Thread.getAllStackTraces().entrySet()) {
+                Thread t = en.getKey();
+                sb.append("Thread ").append(t.getName()).append(" [").append(t.getState()).append("]\n");
+                for (StackTraceElement el : en.getValue()) {
+                    sb.append("    at ").append(el).append('\n');
+                }
+            }
+            appendJavaLog(sb.toString());
+        }, "dx12-close-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+
+        appendJavaLog("device.close: begin");
         // 镜像官方 VulkanDevice.close()：先销毁共享 encoder 再清管线缓存。
         Dx12CommandEncoderBackend encoder = this.sharedCommandEncoder;
         if (encoder != null) {
             encoder.close();
             this.sharedCommandEncoder = null;
         }
+        appendJavaLog("device.close: after sharedEncoder.close");
         this.clearPipelineCache();
+        appendJavaLog("device.close: after clearPipelineCache");
         Dx12ShaderCompiler compiler = this.glslCompiler;
         if (compiler != null) {
             compiler.close();
             this.glslCompiler = null;
+        }
+        appendJavaLog("device.close: done");
+        watchdog.interrupt();
+    }
+
+    /** P12b：关闭流程日志双写（System.err -> debug.log + 文件 %TEMP%\dx12-java.log）。 */
+    private static void appendJavaLog(String msg) {
+        System.err.println("[dx12-java] " + msg);
+        System.err.flush();
+        try {
+            String path = System.getProperty("java.io.tmpdir");
+            if (path == null) path = ".";
+            java.io.FileWriter fw = new java.io.FileWriter(path + "\\dx12-java.log", true);
+            fw.write("[dx12-java] " + msg + "\n");
+            fw.close();
+        } catch (Exception ignored) {
         }
     }
 
