@@ -156,3 +156,56 @@
   - resize 后画面正确跟随新尺寸；无 `ResizeBuffers failed`（若仍失败，错误消息含参数可定位）
   - 仍可能残留每帧 `ResourceBarrier ... COMMON ... does not match` ERROR（阶段 8 遗留，不崩）
 
+## 阶段 10（08-08 复测）：Fix I 未完全解决 → 黑屏确证根因链 = srv 堆 4096 容量不足 → Fix J 扩容 + 诊断
+
+- **现象**：窗口黑色（按钮有声音）；`dx12_dump_backbuf.bmp` 全 `RGBA(28,24,25,0)`（透明近黑）、`dx12_dump_blitsrc.bmp` 全 `RGBA(0,0,0,0)`（透明黑）→ 渲染目标无任何 GUI 元素，只剩 clear 色。
+- **srv heap exhausted 复发（两处）**：
+  - **t=424821（L9286）**：资源包加载失败 → `Caught error loading resourcepacks, removing all selected resourcepacks`（堆栈：`dx12CreateTextureView → ... → ProfiledReloadInstance`）。资源包移除后 GUI 元素纹理缺失 → `GuiRenderer.draws` 为空 → `draw()` 直接 return（官方 GuiRenderer.java L184-185）→ **GUI 主 pass 在 t=425190.8（L17168）后完全消失**（最后两帧 t=425085.5/425190.8 仍正常 drawIndexed 30+12）。
+  - **t=434953.5（L219544）**：窗口 resize → `RenderTarget.createBuffers → RenderTarget.resize → GameRenderer.resize` → `srv heap exhausted` → `ReportedException: Render Frame` 崩溃。
+- **Fix I（free-list 槽位复用）为何未完全解决**：free-list 只在 view **已销毁**时归还槽位。资源包加载/resize 的瞬时峰值 = 旧 view 在 `gPendingDeletes` 队列（资源被打开的命令列表引用，submit 前不能归还）+ 新 view 批量创建，**瞬时并发持有 >4096** → 堆耗尽（不是长期泄漏，是容量不够 + 归还滞后）。
+- **修复（Fix J，一次性扩容 + 兜底 flush + 诊断）**：
+  - `dx12_device.cpp`：`kSrvHeapSize` 4096→**65536**（D3D12 CBV_SRV_UAV 堆上限 1,000,000，内存仅 ~2MB/堆含 CPU 镜像堆）；`kRtvHeapSize` 512→2048；`kDsvHeapSize` 64→256；`kSamplerHeapSize` 256→4096
+  - `allocSrvSlot`/`allocSamplerSlot`：堆满时若存在 pending 且无打开命令列表，先 `flushPendingDeletes()` 再重试一次（覆盖"批量 create+destroy 夹在两次 submit 间"的归还滞后）
+  - 耗尽错误消息携带画像：`(next=.. free=.. pending=.. openLists=..)`——若 65536 仍耗尽可直接定位泄漏
+- **验证**：DLL 重建 + jar 重打，内嵌 DLL 哈希 = `41C5958B67F259607BB494B55A23CBF6` ✅（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌，jar 1214082 B，08-08 21:27）
+- **待复测判据（下次日志）**：
+  - 无 `srv heap exhausted` → 资源包加载成功、GUI 主 pass 持续出现、窗口可见主菜单
+  - 调整窗口大小不崩溃
+  - 若 65536 仍耗尽 → 错误消息带 `next/free/pending/openLists` 画像，据此定位 Java 侧未 close 的 view
+
+## 阶段 10 追加（08-08 21:31 复测）：Fix J 引入崩溃 = Sampler 堆 4096 超 D3D12 上限 2048
+
+- **现象**：启动 7.3s 崩溃，`EXCEPTION_ACCESS_VIOLATION` @ `dx12_mc.dll+0x8d08`，Java 栈 `dx12CreateSampler → Dx12GpuSampler.<init> → Dx12Device.createSampler → selfTestJavaResources`。游戏日志 `Device probe + resource self-test: ERROR: CreateDescriptorHeap failed`。
+- **根因（Fix J 自身引入）**：`kSamplerHeapSize=4096` **超过 D3D12 Sampler 描述符堆硬上限 2048**（所有 feature level）→ `CreateDescriptorHeap` 失败 → `ensureDevice` 中途失败但 `gCtx.device` 已置位 → 下次调用 guard 只看 device 短路返回 true（半初始化）→ `createSampler` 解引用 null `gCtx.samplerHeap` → AV。
+- **修复（Fix K）**：
+  - `kSamplerHeapSize` 4096→**2048**（D3D12 上限，Sampler 用量实际仅个位数）
+  - `ensureDevice` guard 改为**校验全部描述符堆齐备**（srvHeap/srvCpuHeap/rtvHeap/dsvHeap/samplerHeap/drawHeap 非空才返回 true）——同类"半初始化"问题以后返回错误而非 AV
+- **验证**：DLL 重建 + jar 重打，内嵌 DLL 哈希 = `AEAA8BB7DFB99D142E03A9560A81E91E` ✅（jar 1214104 B，08-08 21:35）
+- **待复测判据（下次日志）**：
+  - 无 `CreateDescriptorHeap failed` / 无原生 AV，自检全 OK
+  - 叠加阶段 10 判据：无 `srv heap exhausted`、GUI 主 pass 持续出现、窗口可见主菜单、resize 不崩溃
+
+## 阶段 11（08-08 21:37 复测）：Fix K 生效，但"冻结"（非崩溃）→ 根因 = 附件状态跨命令列表残留 → 修复 = endRenderPass 显式回切 COMMON
+
+- **现象**：自检全 OK（无 `CreateDescriptorHeap failed`、无 srv heap exhausted、无原生 AV），但约 19 秒后**冻结而非崩溃**：日志在帧 742 `submit: done v=742` → `presentSurface: ok` 后**戛然而止**（t=3194574ms，最后一行 `pushDesc[0]`），无异常无 hs_err。**启动器（PCL2）也每次跟着卡死**。
+- **启动器卡死原因**：游戏 GPU 挂起（非正常退出）→ Windows 触发 TDR（GPU 超时检测与恢复）重置显卡 → TDR 期间**所有**使用同一 GPU 渲染的进程（含 PCL2 的硬件加速 UI）全部停滞；同时 PCL2 作为父进程等待游戏退出，游戏挂死不退出 → 启动器一直阻塞。
+- **证据链（每帧 8 条 InfoQueue ERROR，全部同类）**：
+  - `ResourceBarrier: Before state (0x0: COMMON|PRESENT) of resource (0x...4C60) (subresource 0-4) does not match with the state (0x4: RENDER_TARGET) specified in preceding ResourceBarrier or as InitialState`
+  - 同类资源：`0x...67B0`（COPY_SOURCE）、`0x...23DAA0`（COPY_SOURCE）、`0x...C180`（DEPTH_WRITE）
+- **根因 16（机制）**：D3D12 中 **RENDER_TARGET / DEPTH_WRITE 属"非可提升状态"，命令列表执行完成时不会隐式 decay 回 COMMON**（只有 COMMON/COPY_SOURCE/COPY_DEST/UAV 等"可提升状态"才会）。代码假设：
+  - `beginCommandList` 每次提交后 `ctx->resourceState.clear()`，默认所有资源回到 COMMON
+  - `endRenderPass` 只设 `inRenderPass=0`，**从不把附件状态回切 COMMON**
+  → 附件每帧以 RENDER_TARGET/DEPTH_WRITE 状态残留到下一 command list，下一帧 `beginRenderPass`/`blitSurface` 写 barrier 的 Before=COMMON 与实际状态错配 → 每帧 8 条验证 ERROR → GPU 状态错乱累积 → TDR 冻结（游戏挂死 + 启动器卡死）。COPY_SOURCE/COPY_DEST 同理：**显式进入**的可提升状态不会 decay（dbgReadbackTexturePixels 的"显式进入+显式退出"配对是已验证合法的模式）。
+- **修复（Fix L，附件/拷贝路径显式回切 COMMON）**：
+  - `dx12_device.h`：`CommandContext` 增加 `activeColorTargets`（`std::vector<Dx12Object*>`）/ `activeDepthTarget`（`Dx12Object*`）
+  - `beginRenderPass`：开头清空上次记录；每个非 null color 附件 push 进 `activeColorTargets`；depth 附件记入 `activeDepthTarget`
+  - `endRenderPass`：遍历附件 `transitionTextureTo(ctx, tex, COMMON)`（RENDER_TARGET/DEPTH_WRITE→COMMON，按本 list 跟踪状态幂等回切）后清空
+  - `blitSurface`（dx12_surface.cpp）：拷贝后 `transitionTextureTo(ctx, srcTex, COMMON)` 回切源纹理
+  - `copyBufferToTexture` / `copyTextureToBuffer` / `copyTextureToTexture`：拷贝后显式回切 dst/src 到 COMMON（显式进入的 COPY_DEST/COPY_SOURCE 不会 decay，回切后下一 list 的 Before=COMMON 假设才成立）
+  - `clearColorTexture` / `clearDepthTexture`：clear 后显式回切 COMMON（同类残留）
+- **验证**：DLL 重建 + jar 重打，三处哈希一致 = `8924561EC399F15CD71D235035647D2F5507785BA6B503F0130E6DADEDF68524` ✅（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌，jar D6217772，已部署 26.2-Fabric_0.19.3\mods）
+- **待复测判据（下次日志）**：
+  - 每帧 **8 条 `Before state does not match` ERROR 消失**（关键判据）
+  - 窗口持续显示、可交互、可 resize，关闭游戏后**启动器不再卡死**
+  - readback 出现非纯色像素（GUI 可见）
+

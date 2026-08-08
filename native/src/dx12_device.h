@@ -148,6 +148,15 @@ struct CommandContext {
     int listOpen = 0;                   // command list 是否已 begin
     int inRenderPass = 0;               // 渲染 pass 是否打开
 
+    // P11：当前渲染 pass 的活跃附件。endRenderPass 必须把它们从
+    // RENDER_TARGET/DEPTH_WRITE 显式回切 COMMON——这两种状态属"非可提升状态"，
+    // 命令列表执行完成时【不会】隐式 decay 回 COMMON（只有 COPY_SOURCE/
+    // COPY_DEST/UAV 等可提升状态才 decay）。若省略回切，下一 command list 的
+    // barrier 按 COMMON 写 Before 状态会与资源实际状态错配（每帧验证 ERROR →
+    // GPU 状态错乱 → TDR 冻结：游戏挂死，启动器同 GPU 渲染也卡死）。
+    std::vector<Dx12Object*> activeColorTargets;
+    Dx12Object* activeDepthTarget = nullptr;
+
     // P6：本帧 drawHeap 瞬时描述符分配（ring：fenceValue%2 交替两个半区；
     // 帧 N+2 重写帧 N 半区时 submit 已等 N 完成，故 x2 足够）
     UINT drawHeapSlotBase = 0;

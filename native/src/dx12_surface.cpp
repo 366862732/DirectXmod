@@ -207,6 +207,12 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &barrier);
+    // P11：源纹理显式回切 COMMON。上方是"显式进入" COPY_SOURCE（非隐式提升），
+    // 显式进入的状态不会随命令列表完成 decay，若残留到下一 command list，
+    // 其 beginRenderPass/blit 按 COMMON 写 Before 状态就会错配（验证 ERROR →
+    // GPU 状态错乱 → TDR 冻结）。与 dbgReadbackTexturePixels 的
+    // COMMON→COPY_SOURCE→COMMON 显式配对同一模式。
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。
     D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();

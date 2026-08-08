@@ -53,10 +53,20 @@ UINT gNextRtv = 0;
 UINT gNextDsv = 0;
 UINT gNextSampler = 0;
 
-constexpr UINT kSrvHeapSize = 4096;
-constexpr UINT kRtvHeapSize = 512;
-constexpr UINT kDsvHeapSize = 64;
-constexpr UINT kSamplerHeapSize = 256;
+// P6 修复（srv heap exhausted）：Minecraft 资源包加载/窗口 resize 的瞬时
+// 峰值会同时持有数千个 texture view（旧 view 在 pending 删除队列尚未归还
+// 槽位 + 新 view 批量创建），4096 槽位实测耗尽 → 资源包被移除 → GUI draws
+// 为空 → 渲染目标只剩 clear 色 → 黑屏（按钮有声音）。D3D12 CBV_SRV_UAV
+// SHADER_VISIBLE 堆上限 1,000,000（Tier1），65536 槽位内存约 2MB/堆（含
+// CPU 镜像堆），一次性开大彻底消除该崩溃点；free-list 槽位复用仍保留，
+// 覆盖长期会话的泄漏兜底。
+constexpr UINT kSrvHeapSize = 65536;
+constexpr UINT kRtvHeapSize = 2048;
+constexpr UINT kDsvHeapSize = 256;
+// 注意：D3D12 对 SAMPLER 描述符堆有硬上限 2048（所有 feature level），
+// 扩到此值即为最大；再大 CreateDescriptorHeap 直接失败（曾设为 4096 导致
+// 堆创建失败 → ensureDevice 半初始化 → createSampler 解引用 null 堆 AV）。
+constexpr UINT kSamplerHeapSize = 2048;
 
 // P6：瞬时描述符堆（drawHeap）每帧半区容量 + 总数（ring x2，配合双 allocator）
 constexpr UINT kDrawHeapPerFrame = 32768;
@@ -69,8 +79,24 @@ int allocSrvSlot(std::string& err) {
         gFreeSrvSlots.pop_back();
         return slot;
     }
+    // P6 兜底：堆满但存在未 flush 的延迟删除对象且没有打开的命令列表时，
+    // 先 flush 一次再重试（正常路径 submit 后已 flush，此分支仅防御性的
+    // 覆盖"批量 create+destroy 夹在两次 submit 之间"的时序）。
+    if (gNextSrv >= kSrvHeapSize && !gPendingDeletes.empty() && gOpenListCount == 0) {
+        flushPendingDeletes();
+        if (!gFreeSrvSlots.empty()) {
+            int slot = (int)gFreeSrvSlots.back();
+            gFreeSrvSlots.pop_back();
+            return slot;
+        }
+    }
     if (gNextSrv >= kSrvHeapSize) {
-        err = "srv heap exhausted";
+        // 诊断：若仍耗尽，打印堆使用画像定位泄漏（live 近似 = next - free，
+        // 实际持有者 = next - free - pending 中未 flush 的 view）。
+        err = "srv heap exhausted (next=" + std::to_string((long long)gNextSrv)
+            + " free=" + std::to_string((long long)gFreeSrvSlots.size())
+            + " pending=" + std::to_string((long long)gPendingDeletes.size())
+            + " openLists=" + std::to_string(gOpenListCount) + ")";
         return -1;
     }
     return (int)gNextSrv++;
@@ -83,8 +109,19 @@ int allocSamplerSlot(std::string& err) {
         gFreeSamplerSlots.pop_back();
         return slot;
     }
+    if (gNextSampler >= kSamplerHeapSize && !gPendingDeletes.empty() && gOpenListCount == 0) {
+        flushPendingDeletes();
+        if (!gFreeSamplerSlots.empty()) {
+            int slot = (int)gFreeSamplerSlots.back();
+            gFreeSamplerSlots.pop_back();
+            return slot;
+        }
+    }
     if (gNextSampler >= kSamplerHeapSize) {
-        err = "sampler heap exhausted";
+        err = "sampler heap exhausted (next=" + std::to_string((long long)gNextSampler)
+            + " free=" + std::to_string((long long)gFreeSamplerSlots.size())
+            + " pending=" + std::to_string((long long)gPendingDeletes.size())
+            + " openLists=" + std::to_string(gOpenListCount) + ")";
         return -1;
     }
     return (int)gNextSampler++;
@@ -202,7 +239,12 @@ void dbgLog(const char* fmt, ...) {
 // ---------------------------------------------------------------------------
 
 bool ensureDevice(std::string& errorOut) {
-    if (gCtx.device) return true;
+    // P6 修复：guard 必须同时校验描述符堆齐备。若上次调用在堆创建中途失败
+    // （如 Sampler 堆 4096 超过 D3D12 上限 2048），gCtx.device 已置位但堆为
+    // null，此 guard 若只看 device 会短路返回 true，后续 createSampler/
+    // createTextureView 解引用 null 堆 → 原生 AV。堆全建成功才视为初始化完成。
+    if (gCtx.device && gCtx.srvHeap && gCtx.srvCpuHeap && gCtx.rtvHeap &&
+        gCtx.dsvHeap && gCtx.samplerHeap && gCtx.drawHeap) return true;
 
     // 诊断：先启用 D3D12 调试层（Win10/11 自带；失败则无调试层继续）。
     // 启用后非法 API 调用 / 描述符越界等会写入 InfoQueue，设备移除时可读回定位。
@@ -1266,6 +1308,8 @@ bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = { r, g, b, a };
     ctx->commandList->ClearRenderTargetView(cpu, color, 0, nullptr);
+    // P11：显式回切 COMMON（RENDER_TARGET 不会随命令列表完成 decay）。
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -1283,6 +1327,8 @@ bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     ctx->commandList->ClearDepthStencilView(cpu,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 0, nullptr);
+    // P11：显式回切 COMMON（DEPTH_WRITE 不会随命令列表完成 decay）。
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -1345,6 +1391,9 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
             ctx->commandList->CopyTextureRegion(&dst, dstX, dstY + row, 0, &src, nullptr);
         }
     }
+    // P11：目标纹理显式回切 COMMON（显式进入的 COPY_DEST 不会随命令列表完成
+    // decay；回切后下一 command list 的 Before=COMMON 假设才成立）。
+    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -1407,6 +1456,9 @@ bool copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, int mip, int l
             ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
         }
     }
+    // P11：源纹理显式回切 COMMON（显式进入的 COPY_SOURCE 不会随命令列表完成
+    // decay；回切后下一 command list 的 Before=COMMON 假设才成立）。
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -1437,6 +1489,10 @@ bool copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* d
     dst.SubresourceIndex = dstSub;
     D3D12_BOX srcBox{ (UINT)srcX, (UINT)srcY, 0, (UINT)(srcX + w), (UINT)(srcY + h), 1 };
     ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
+    // P11：src/dst 显式回切 COMMON（显式进入的 COPY_SOURCE/COPY_DEST 不会随
+    // 命令列表完成 decay；回切后下一 command list 的 Before=COMMON 假设才成立）。
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -1447,6 +1503,11 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
     if (!ctx || !ctx->listOpen) { err = "beginRenderPass: no open command list"; return false; }
     if (ctx->inRenderPass) { err = "beginRenderPass: render pass already open"; return false; }
     if (colorCount < 0) { err = "beginRenderPass: negative color count"; return false; }
+
+    // P11：本 pass 的附件在 endRenderPass 时需显式回切 COMMON（见 endRenderPass），
+    // 先清空上次记录（防御：上次 pass 未正常 end）。
+    ctx->activeColorTargets.clear();
+    ctx->activeDepthTarget = nullptr;
 
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
     rtvs.reserve((size_t)colorCount);
@@ -1462,6 +1523,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         ++gNextRtv;
         gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
         rtvs.push_back(cpu);
+        ctx->activeColorTargets.push_back(tex);
         transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (colorClearFlags && colorClearFlags[i] && clearColors) {
             const float* c = clearColors + i * 4;
@@ -1488,6 +1550,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         gCtx.device->CreateDepthStencilView(depthView->resource.Get(), nullptr, cpu);
         dsv = cpu;
         hasDsv = true;
+        ctx->activeDepthTarget = depthView;
         transitionTextureTo(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         if (depthClearFlag) {
             ctx->commandList->ClearDepthStencilView(cpu,
@@ -1518,7 +1581,22 @@ bool endRenderPass(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "endRenderPass: null ctx"; return false; }
     if (!ctx->inRenderPass) return true;  // 幂等
     dbgLog("endRenderPass: ctx=%p", (void*)ctx);
-    // P3 简化：附件 barrier 回切在真实渲染层（P4）统一管理。
+    // P11 修复：附件必须显式回切 COMMON。D3D12 的 RENDER_TARGET/DEPTH_WRITE 属
+    // "非可提升状态"，命令列表执行完成时【不会】隐式 decay 回 COMMON（只有
+    // COPY_SOURCE/COPY_DEST/UAV 等可提升状态才会）。若此处不显式回切，下一
+    // command list 的 beginRenderPass/blit 会按 COMMON 写 barrier 的 Before 状态，
+    // 与资源实际状态错配 → 每帧验证 ERROR（"Before state ... does not match"）→
+    // GPU 状态错乱 → TDR 冻结（游戏挂死，启动器同 GPU 渲染也卡死）。
+    // transitionTextureTo 按本 list 已跟踪状态回切（进入时为 RENDER_TARGET/
+    // DEPTH_WRITE），from==to 时自动跳过，幂等。
+    for (Dx12Object* tex : ctx->activeColorTargets) {
+        if (tex) transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (ctx->activeDepthTarget) {
+        transitionTextureTo(ctx, ctx->activeDepthTarget, D3D12_RESOURCE_STATE_COMMON);
+    }
+    ctx->activeColorTargets.clear();
+    ctx->activeDepthTarget = nullptr;
     ctx->inRenderPass = 0;
     return true;
 }
