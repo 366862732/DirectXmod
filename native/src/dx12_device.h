@@ -42,6 +42,10 @@ struct DeviceContext {
     ComPtr<ID3D12Device> device;
 
     ComPtr<ID3D12DescriptorHeap> srvHeap;      // SRV（SHADER_VISIBLE）
+    // P6：SRV 的 CPU-only 镜像堆（非 SHADER_VISIBLE）。CopyDescriptorsSimple
+    // 的源必须是 CPU-only 堆——texture view 的 cpuHandle 指向这里（供
+    // pushDescriptors 复制到 drawHeap），srvHeap 的 GPU 句柄仍供直接绑定用。
+    ComPtr<ID3D12DescriptorHeap> srvCpuHeap;
     ComPtr<ID3D12DescriptorHeap> rtvHeap;      // RTV
     ComPtr<ID3D12DescriptorHeap> dsvHeap;      // DSV
     ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler（SHADER_VISIBLE）
@@ -89,6 +93,9 @@ struct Dx12Object {
     void* mappedPtr = nullptr;  // map 后的指针
     int usage = 0;
     long long size = 0;
+    // P6：描述符堆槽位索引（TextureView → SRV 槽位；Sampler → sampler 槽位；
+    // -1 = 未占用）。销毁时归还 free-list 复用，防止长会话 SRV 堆耗尽。
+    int descSlot = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -409,6 +416,11 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err);
 // P6 诊断：读回任意纹理 3x3 采样点 RGBA（tag 标注来源，如 blit 源=渲染目标，
 // 用于区分 draw 未写入 vs blit 丢失）。
 void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag);
+// P6 诊断：把 RGBA8 像素数据保存为 BMP 文件（32bpp，覆盖写当前工作目录
+// dx12_dump_<tag>.bmp）并在日志打印 ASCII 缩略图（亮度字符 + 色相字母）。
+// 用于把画面完整可视化，定位 GUI 元素绘制目标是否与 blit 源一致。
+void dbgDumpPixelsToFile(const uint8_t* rgba, UINT w, UINT h, UINT64 pitch,
+    const char* tag);
 // P6 诊断：读回 buffer 内容（前若干 float + hex），UPLOAD 直接 Map、DEFAULT 经
 // readback staging；用于确认顶点/UBO 数据是否真正写入 GPU 资源。
 void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const char* tag);

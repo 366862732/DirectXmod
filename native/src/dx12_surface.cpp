@@ -88,6 +88,12 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         err = "surface not created";
         return false;
     }
+    // 窗口最小化/边框切换瞬间 WM_SIZE 可能传 0 尺寸——ResizeBuffers 对 0 尺寸
+    // 返回 DXGI_ERROR_INVALID_CALL (0x887A0001)，保持旧尺寸继续，不视为错误。
+    if (width <= 0 || height <= 0) {
+        s->presentMode = presentMode;
+        return true;
+    }
     s->width = (UINT)width;
     s->height = (UINT)height;
     s->presentMode = presentMode;
@@ -104,8 +110,16 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     HRESULT hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
         s->format, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     if (FAILED(hr)) {
-        err = "ResizeBuffers failed " + hrText(hr);
-        return false;
+        // 拖拽窗口期间 Present 与 ResizeBuffers 竞争可能偶发失败，重试一次。
+        HRESULT hr2 = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
+            s->format, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        if (FAILED(hr2)) {
+            err = "ResizeBuffers failed " + hrText(hr) + " (retry " + hrText(hr2) +
+                ") w=" + std::to_string(width) + " h=" + std::to_string(height) +
+                " count=" + std::to_string(kSurfaceBufferCount) +
+                " fmt=" + std::to_string((int)s->format);
+            return false;
+        }
     }
 
     // 重新取 back buffers + RTV
@@ -340,6 +354,8 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
                 w, h, xs[xi], ys[yi], p[0], p[1], p[2], p[3]);
         }
     }
+    // P6 可视化：整帧 dump 成 BMP + ASCII 缩略图，直接看 backbuffer 实际画面。
+    dbgDumpPixelsToFile(base, w, h, pitch, "backbuf");
     staging->Unmap(0, nullptr);
     return true;
 }

@@ -106,3 +106,53 @@
   - 无 `Couldn't compile pipeline ... debug_points` 错误；无 "Caught error loading resourcepacks"
   - 主菜单 GUI 可见（readback 出现非纯色像素 / 用户肉眼可见标题与按钮）
   - 若仍有 `SPVC_ERROR_UNSUPPORTED_SPIRV` → 新错误消息带 spvc 内部详情，继续修复对应 builtin/指令
+
+## 阶段 7（18:xx 复测）：UI 首现（红窗）+ 新崩溃 = submit Close E_INVALIDARG
+
+- **Fix F 完全生效**：日志无 debug_points 错误、无资源包移除；用户首次看到"红色游戏窗口"（主菜单开始真实渲染，大量 16/4/1024/256/64B copyBuffer = 字体 glyph 上传）。
+- **新崩溃（根因 13）**：`java.lang.IllegalStateException: dx12Submit: endCommandList: Close HRESULT 0x80070057`（E_INVALIDARG）。崩溃帧（t=9999300）特征：20+ 次小尺寸 copyBuffer（文字上传）→ beginRenderPass 854x480 → setVertexBuffer(16)/draw 30 → setVertexBuffer(24)/draw 12 → endRenderPass → blit → submit 时 `endCommandList Close` 失败（`submit: JNI done value=0`，未到 ExecuteCommandLists）。
+- **诊断手段（Fix G 插桩，DLL 哈希 `E7DA405B...`）**：
+  - `endCommandList` Close 失败时附加 `deviceStatusText()`（InfoQueue 最近 24 条验证消息）——Close E_INVALIDARG 是 debug layer 验证错误，InfoQueue 会给确切非法调用（UPLOAD 非法 transition / 未绑定或越界描述符 / root 参数未设置 / PSO-root signature 不匹配等）
+  - `beginCommandList` 每帧开头转储并清空 InfoQueue 消息（不崩溃的静默验证错误也能看到）
+- **待复测判据**：下次日志中 `endCommandList: Close ... — GetDeviceRemovedReason=0x00000000 | msg[N](<验证消息>)` 给出确切根因，据此修复后主菜单应持续渲染；若 InfoQueue 无 ERROR → 转查 root table/描述符越界。
+
+## 阶段 8（08-08 复测）：根因 14 确认 = 共享命令列表引用已删资源 → 修复 = 原生延迟销毁（queueForDestroy）
+
+- **日志证据（Fix G 插桩首次完整生效）**：崩溃块 24 条 InfoQueue ERROR，全部 `ID3D12CommandList::Close: An ID3D12Resource object ... was deleted prior to closing the command list`，指向同一命令列表 `0x000001BA50327BD0`（= 共享渲染 encoder ctx 4F942520）。24 个资源 = 12 个字形上传的 UPLOAD staging + DEFAULT gpu buffer 对。
+- **时间线**：共享 ctx 4F942520 自 `beginCommandList: fenceValue=28`（t=10353340）后 **2.85 秒不 submit**；期间 vanilla `TrueTypeGlyphProvider.writeToTexture` 经共享命令列表录制 12 次字形上传（copyBufferRegion 引用 staging 对）；崩溃帧 L8353 共享 ctx submit → Close E_INVALIDARG。
+- **根因 14（机制）**：vanilla 创建的一次性 staging buffer（`GpuDevice.createBuffer(data)` 等**不经过 Dx12TransientMemory 保护**的路径）由 vanilla 直接 `close()` → Java `Dx12GpuBuffer.close()` → 原生 `destroyObject` **立即 `delete obj`** 释放最后一个 `ComPtr<ID3D12Resource>` → **立即销毁 D3D12 资源**。但打开中的共享命令列表仍引用它 → Close 校验失败（E_INVALIDARG）。官方用 `VulkanGpuBuffer.close() → device.createCommandEncoder().queueForDestroy(this)` **延迟销毁**（VulkanCommandEncoder 的延迟删除队列在提交执行完成后释放），我们的实现缺失此机制。
+- **修复（Fix H，原生延迟销毁）**：
+  - `dx12_device.cpp`：新增全局 `gPendingDeletes`（`std::vector<Dx12Object*>`）+ `gOpenListCount`（打开未提交的命令列表数）+ `flushPendingDeletes()`（统一 `delete`）
+  - `destroyObject` 不再立即 `delete obj`，改为登记 `gPendingDeletes`（unmap 仍立即做）
+  - `beginCommandList` 成功后 `++gOpenListCount`
+  - `submitCommandList` 同步等待完成后 `--gOpenListCount`，归零则 `flushPendingDeletes()`（此时所有已打开命令列表均已提交并执行完，被删资源不再被引用）
+  - `destroyCommandEncoder` 若 ctx 仍打开（未提交即销毁）：递减计数，归零 flush（命令列表已销毁，引用随之失效）
+  - `destroyDevice` 兜底 flush（进程退出前释放残留 pending）
+  - 与 Dx12TransientMemory 的 rotate 机制互补：TransientMemory 只保护"注册过的"瞬态 buffer，本修复覆盖**全部**销毁路径（含 vanilla 直接 close 的 staging buffer）
+- **顺带修复（次要 ERROR ①）**：`CopyDescriptorsSimple` 的源必须是 **CPU-only** 描述符堆，此前 texture view 的 cpuHandle 来自 SHADER_VISIBLE srvHeap（每帧 ERROR）。`DeviceContext` 新增 CPU-only `srvCpuHeap`；`createTextureView` 在 CPU-only 堆创建描述符（cpuHandle 指向它，供 pushDescriptors 复制源），同槽位在 SHADER_VISIBLE 堆再创建一份（gpuHandle 供 GPU 直接引用）。
+- **验证**：DLL 重建 + jar 重打（手动 zip 替换，Gradle 8.13 不支持 Java 26 class 文件），三处哈希一致 = `EABAA0194019989564EFB75C5245198C` ✅（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌）。
+- **待复测判据（下次日志）**：
+  - 无 `was deleted prior to closing the command list` → 崩溃消除，主菜单持续渲染
+  - 无 `CopyDescriptorsSimple ... CPU write only` ERROR（Fix H 附带修复）
+  - 仍可能残留每帧 ERROR：`ResourceBarrier Before state (COMMON) ... does not match (COPY_SOURCE)/(DEPTH_WRITE)`（资源 0x48AC8560/0x48AC5320）——DEPTH_WRITE 等状态不隐式 decay 到 COMMON，跨命令列表残留，下一轮在 beginCommandList 时对不 decay 状态显式回退 COMMON；不影响本次崩溃
+
+## 阶段 9（08-08 复测）：Fix H 生效（持续渲染，主菜单可交互）→ 窗口 resize 崩溃 = SRV 堆耗尽
+
+- **Fix H 完全生效**：根因 14 崩溃消失，主菜单持续渲染（日志 7 万行无 `was deleted prior to closing`；每帧稳定 submit + pushDesc + blitSurface），用户可交互操作菜单。
+- **新崩溃（根因 15）**：用户调整窗口大小（854x540 → 854x539）→ `RenderTarget.resize → createBuffers` → `dx12CreateTextureView: srv heap exhausted`（`IllegalStateException`）。前一行还有 `dx12ConfigureSurface: ResizeBuffers failed HRESULT 0x887A0001`（DXGI_ERROR_INVALID_CALL，WARN 级，MC 继续）。
+- **根因 15（机制）**：SRV 描述符堆槽位 `gNextSrv` 从 0 单调递增**从不回收**（kSrvHeapSize=4096）。长会话中纹理 view 累积分配（字体 glyph/纹理重载每次创建新 view，旧 view close 不还槽位）；窗口 resize 触发 RenderTarget 重建 color/depth 纹理 view → 槽位耗尽崩溃。RTV/DSV 堆每帧 beginCommandList 归零复用（L968-969），无此问题；Sampler 堆（256）同理可能耗尽。
+- **修复（Fix I，描述符槽位 free-list 复用）**：
+  - `Dx12Object` 增加 `int descSlot = -1`（TextureView → SRV 槽位；Sampler → sampler 槽位）
+  - 匿名 namespace 新增 `gFreeSrvSlots` / `gFreeSamplerSlots` + `allocSrvSlot()` / `allocSamplerSlot()`（free-list 优先，空则堆尾递增，仍耗尽时返回错误）
+  - `createTextureView` / `createSampler` 改用 allocator 并记录 descSlot
+  - `flushPendingDeletes` delete 前按 kind 归还槽位（与延迟销毁共用同一时机，保证资源不再被引用后才复用描述符）
+- **顺带修复（ResizeBuffers 0x887A0001）**：
+  - 0 尺寸防护：窗口最小化/边框切换瞬间 WM_SIZE 传 0 时 ResizeBuffers 返回 INVALID_CALL——保持旧尺寸直接返回成功（不 ResizeBuffers）
+  - 非 0 尺寸偶发失败（拖拽期间 Present 与 ResizeBuffers 竞争）重试一次
+  - 错误消息携带 w/h/count/fmt 参数便于下次定位
+- **验证**：DLL 重建 + jar 重打（手动 zip 替换），三处哈希一致 = `59C77EB3690AC01388A7563D1BC1D2C8` ✅（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌）。
+- **待复测判据（下次日志）**：
+  - 调整窗口大小不再崩溃（SRV 槽位复用生效；`srv heap exhausted` 不再出现）
+  - resize 后画面正确跟随新尺寸；无 `ResizeBuffers failed`（若仍失败，错误消息含参数可定位）
+  - 仍可能残留每帧 `ResourceBarrier ... COMMON ... does not match` ERROR（阶段 8 遗留，不崩）
+

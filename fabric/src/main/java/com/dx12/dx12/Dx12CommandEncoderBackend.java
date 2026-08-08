@@ -137,6 +137,22 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorClearFlags, clearColors,
             depthTexture, depthClearFlag, depthClearValue, x, y, w, h);
         boolean hasDepth = depthTexture != 0L;
+        // P6 诊断：打印 pass 尺寸 + Java 调用来源，区分 cubeMap 全景 / GUI
+        // before|after blur / 物品图集 / blur effect 的 pass，定位 GUI 主 pass 缺失。
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        StringBuilder sb = new StringBuilder();
+        sb.append("createRenderPass: ").append(w).append('x').append(h)
+            .append(hasDepth ? " depth=yes" : " depth=no").append(" from:");
+        int shown = 0;
+        for (int i = 3; i < st.length && shown < 6; ++i) {
+            String cn = st[i].getClassName();
+            int dot = cn.lastIndexOf('.');
+            sb.append(' ').append(dot >= 0 ? cn.substring(dot + 1) : cn)
+                .append('.').append(st[i].getMethodName());
+            shown++;
+        }
+        System.err.println("[dx12-java] " + sb);
+        System.err.flush();
         Dx12RenderPassBackend pass = new Dx12RenderPassBackend(this.device, this.ctx,
             area, w, h, hasDepth);
         this.currentRenderPass = pass;

@@ -15,6 +15,38 @@ namespace {
 
 DeviceContext gCtx;
 
+// P6：延迟销毁（官方 queueForDestroy 语义）。D3D12 资源若被一个"打开但
+// 未提交"的命令列表引用（如共享渲染 encoder 长时间打开期间 vanilla 临时
+// 创建并 close 的 staging buffer），立即释放会在 Close 时报 E_INVALIDARG
+// （"was deleted prior to closing the command list"）。因此 destroyObject
+// 只登记到 pending，等所有打开的命令列表都提交完成（submit 同步等待后）
+// 才统一 delete。
+std::vector<Dx12Object*> gPendingDeletes;
+int gOpenListCount = 0;  // 当前打开（已 begin 未提交）的命令列表数
+
+// P6：SRV / sampler 描述符堆槽位复用。纹理 view 与 sampler 长会话累积分配，
+// gNextSrv 单调递增会耗尽 4096 槽位（窗口 resize 触发 RenderTarget 重建 view
+// 时崩溃："srv heap exhausted"）。对象销毁时把槽位归还 free-list。
+std::vector<UINT> gFreeSrvSlots;
+std::vector<UINT> gFreeSamplerSlots;
+
+// 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
+// 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
+void flushPendingDeletes() {
+    for (Dx12Object* o : gPendingDeletes) {
+        // 先归还描述符堆槽位（delete 后句柄失效，须在此前完成）
+        if (o->descSlot >= 0) {
+            if (o->kind == Dx12Object::Kind::TextureView) {
+                gFreeSrvSlots.push_back((UINT)o->descSlot);
+            } else if (o->kind == Dx12Object::Kind::Sampler) {
+                gFreeSamplerSlots.push_back((UINT)o->descSlot);
+            }
+        }
+        delete o;
+    }
+    gPendingDeletes.clear();
+}
+
 // 描述符堆槽位分配（P2 简单递增；P3 渲染层再做槽位回收）
 UINT gNextSrv = 0;
 UINT gNextRtv = 0;
@@ -29,6 +61,34 @@ constexpr UINT kSamplerHeapSize = 256;
 // P6：瞬时描述符堆（drawHeap）每帧半区容量 + 总数（ring x2，配合双 allocator）
 constexpr UINT kDrawHeapPerFrame = 32768;
 constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * 2;
+
+// 从 free-list 复用或从堆尾分配一个 SRV 槽位；失败填充 err 返回 -1。
+int allocSrvSlot(std::string& err) {
+    if (!gFreeSrvSlots.empty()) {
+        int slot = (int)gFreeSrvSlots.back();
+        gFreeSrvSlots.pop_back();
+        return slot;
+    }
+    if (gNextSrv >= kSrvHeapSize) {
+        err = "srv heap exhausted";
+        return -1;
+    }
+    return (int)gNextSrv++;
+}
+
+// 同上，sampler 槽位。
+int allocSamplerSlot(std::string& err) {
+    if (!gFreeSamplerSlots.empty()) {
+        int slot = (int)gFreeSamplerSlots.back();
+        gFreeSamplerSlots.pop_back();
+        return slot;
+    }
+    if (gNextSampler >= kSamplerHeapSize) {
+        err = "sampler heap exhausted";
+        return -1;
+    }
+    return (int)gNextSampler++;
+}
 
 bool createHeap(ID3D12Device* dev, D3D12_DESCRIPTOR_HEAP_TYPE type,
     UINT count, D3D12_DESCRIPTOR_HEAP_FLAGS flags, ComPtr<ID3D12DescriptorHeap>& out) {
@@ -85,6 +145,35 @@ std::string deviceStatusText() {
         }
     }
     return s;
+}
+
+// P6 诊断：转储并清空调试层 InfoQueue 消息（每帧开始时调用）。验证错误
+// （ERROR/CORRUPTION）在 API 调用时写入 InfoQueue，但多数不导致崩溃，若
+// 不主动读就会静默累积；打印出来可定位非法调用（UPLOAD heap 非法 transition、
+// 未绑定/越界描述符、root 参数未设置、PSO 与 root signature 不匹配等）。
+void dumpInfoQueueMessages() {
+    if (!gCtx.infoQueue) return;
+    UINT64 count = gCtx.infoQueue->GetNumStoredMessages();
+    if (count == 0) return;
+    UINT64 start = count > 16 ? count - 16 : 0;
+    for (UINT64 i = start; i < count; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(gCtx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+        std::vector<char> buf(len > 0 ? len : 1);
+        D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        if (SUCCEEDED(gCtx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+            const char* sev = "?";
+            switch (msg->Severity) {
+                case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
+                case D3D12_MESSAGE_SEVERITY_ERROR: sev = "ERROR"; break;
+                case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
+                case D3D12_MESSAGE_SEVERITY_INFO: sev = "INFO"; break;
+                default: break;
+            }
+            dbgLog("InfoQueue[%s] %s", sev, msg->pDescription ? msg->pDescription : "");
+        }
+    }
+    gCtx.infoQueue->ClearStoredMessages();
 }
 
 }  // namespace
@@ -179,6 +268,10 @@ bool ensureDevice(std::string& errorOut) {
     // 描述符堆
     if (!createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             kSrvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.srvHeap) ||
+        // P6：SRV 的 CPU-only 镜像堆（CopyDescriptorsSimple 复制源必须非
+        // SHADER_VISIBLE；texture view 的 cpuHandle 指向这里）
+        !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            kSrvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.srvCpuHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
             kRtvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.rtvHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
@@ -224,6 +317,9 @@ void destroyDevice() {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
     }
+    // 进程退出前释放所有延迟删除对象（若此后不再有 submit，pending 不会
+    // 被 flush，需在此兜底）。
+    flushPendingDeletes();
     gCtx = DeviceContext{};
 }
 
@@ -461,12 +557,12 @@ Dx12Object* createSampler(int addressU, int addressV, int minFilter,
         desc.Filter = linear ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_MIN_MAG_MIP_POINT;
     }
 
-    if (gNextSampler >= kSamplerHeapSize) { err = "sampler heap exhausted"; return nullptr; }
+    int slot = allocSamplerSlot(err);
+    if (slot < 0) { return nullptr; }
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.samplerHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextSampler * gCtx.samplerInc;
+    cpu.ptr += (SIZE_T)slot * gCtx.samplerInc;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = gCtx.samplerHeap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += (SIZE_T)gNextSampler * gCtx.samplerInc;
-    gNextSampler++;
+    gpu.ptr += (SIZE_T)slot * gCtx.samplerInc;
 
     gCtx.device->CreateSampler(&desc, cpu);
 
@@ -474,6 +570,7 @@ Dx12Object* createSampler(int addressU, int addressV, int minFilter,
     obj->kind = Dx12Object::Kind::Sampler;
     obj->cpuHandle = cpu;
     obj->gpuHandle = gpu;
+    obj->descSlot = slot;  // 销毁时归还 sampler 槽位
     return obj.release();
 }
 
@@ -488,12 +585,16 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
         err = "createTextureView: texture lacks TEXTURE_BINDING usage"; return nullptr;
     }
 
-    if (gNextSrv >= kSrvHeapSize) { err = "srv heap exhausted"; return nullptr; }
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextSrv * gCtx.srvInc;
+    int slot = allocSrvSlot(err);
+    if (slot < 0) { return nullptr; }
+    // P6：CPU-only 镜像堆创建描述符（CopyDescriptorsSimple 复制源必须非
+    // SHADER_VISIBLE）；同槽位在 SHADER_VISIBLE 堆再创建一份供 GPU 直接引用。
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.srvCpuHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)slot * gCtx.srvInc;
+    D3D12_CPU_DESCRIPTOR_HANDLE gpuCpu = gCtx.srvHeap->GetCPUDescriptorHandleForHeapStart();
+    gpuCpu.ptr += (SIZE_T)slot * gCtx.srvInc;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = gCtx.srvHeap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += (SIZE_T)gNextSrv * gCtx.srvInc;
-    gNextSrv++;
+    gpu.ptr += (SIZE_T)slot * gCtx.srvInc;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     // 深度格式（D32_FLOAT/D16_UNORM/D32_FLOAT_S8X24_UINT/D24_UNORM_S8_UINT）
@@ -520,11 +621,14 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
         srv.Texture2D.MostDetailedMip = (UINT)std::max(0, baseMipLevel);
     }
     gCtx.device->CreateShaderResourceView(texture->resource.Get(), &srv, cpu);
+    // 同槽位在 SHADER_VISIBLE 堆再创建一份（gpuHandle 供 GPU 直接引用）。
+    gCtx.device->CreateShaderResourceView(texture->resource.Get(), &srv, gpuCpu);
 
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::TextureView;
     obj->cpuHandle = cpu;
     obj->gpuHandle = gpu;
+    obj->descSlot = slot;  // 销毁时归还 SRV 槽位
     return obj.release();
 }
 
@@ -534,7 +638,12 @@ void destroyObject(Dx12Object* obj) {
         if (obj->resource) obj->resource->Unmap(0, nullptr);
         obj->mappedPtr = nullptr;
     }
-    delete obj;
+    // P6：延迟销毁（官方 VulkanGpuBuffer.close() 的 queueForDestroy 语义）。
+    // 若资源正被打开的命令列表引用，立即 delete 会在 Close 时报
+    // "deleted prior to closing the command list"（E_INVALIDARG）。登记到
+    // pending，等所有打开的命令列表提交完成（submitCommandList 同步等待后
+    // 调用 flushPendingDeletes）再统一释放。
+    gPendingDeletes.push_back(obj);
 }
 
 // ---------------------------------------------------------------------------
@@ -869,12 +978,22 @@ void destroyCommandEncoder(CommandContext* ctx) {
             dbgLog("destroyCommandEncoder: wait FAILED: %s", err.c_str());
         }
     }
+    // 若该 ctx 仍处于打开（begin 后从未 submit）状态：命令列表即将销毁，
+    // 从未进入 GPU 执行队列，引用它的资源随之不再被任何命令列表引用，
+    // 因此计入的打开计数一并释放；计数归零时顺带 flush 延迟删除对象。
+    if (ctx->listOpen) {
+        ctx->listOpen = 0;
+        if (gOpenListCount > 0) --gOpenListCount;
+        if (gOpenListCount == 0) flushPendingDeletes();
+    }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
     delete ctx;
 }
 
 bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "beginCommandList: null ctx"; return false; }
+    // P6 诊断：转储上一帧累积的验证错误（Close 成功后不打印不代表无错）。
+    dumpInfoQueueMessages();
     dbgLog("beginCommandList: fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandList: allocator Reset " + hrText(hr); return false; }
@@ -882,6 +1001,7 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (FAILED(hr)) { err = "beginCommandList: list Reset " + hrText(hr); return false; }
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
+    ++gOpenListCount;  // 延迟销毁：登记打开计数，submit 完成前不释放资源
     // 新 command list 从“所有资源处于初始态”开始：submit 同步等待完成保证
     // 上一 list 已执行完，提升状态已隐式 decay 回 COMMON（见 submitCommandList）。
     ctx->resourceState.clear();
@@ -902,7 +1022,14 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "endCommandList: null ctx"; return false; }
     if (!ctx->listOpen) return true;  // 幂等
     HRESULT hr = ctx->commandList->Close();
-    if (FAILED(hr)) { err = "endCommandList: Close " + hrText(hr); return false; }
+    if (FAILED(hr)) {
+        // P6 诊断：Close 返回 E_INVALIDARG 通常是 debug layer 的验证错误
+        // （UPLOAD heap 非法 transition、未绑定/越界描述符、root 参数未设置、
+        // PSO 与 root signature 不匹配等）。附加 InfoQueue 最近消息定位具体
+        // 非法调用——这是 Close 失败时唯一的确定性证据。
+        err = "endCommandList: Close " + hrText(hr) + " — " + deviceStatusText();
+        return false;
+    }
     ctx->listOpen = 0;
     return true;
 }
@@ -942,6 +1069,11 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
         }
     }
     dbgLog("submit: done v=%llu", (unsigned long long)value);
+    // 提交并同步等待完成：本命令列表已执行完，其引用的资源可安全释放。
+    // 若所有打开的命令列表都已提交完成，则统一释放 pending 删除对象
+    // （延迟销毁的 flush 点，对应官方 queueForDestroy 的 execute 时机）。
+    if (gOpenListCount > 0) --gOpenListCount;
+    if (gOpenListCount == 0) flushPendingDeletes();
     return value;
 }
 
@@ -1780,9 +1912,12 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
     D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
     ctx->commandList->IASetPrimitiveTopology(topo);
-    std::fprintf(stdout, "[dx12] setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d\n",
+    // P6 诊断：stderr + fflush（与 dbgLog 同一流），避免 stdout 全缓冲造成
+    // 与 drawIndexed/setVertexBuffer 等日志顺序错乱。
+    std::fprintf(stderr, "[dx12] setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d\n",
         (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth,
         (int)pipeline->topology, (int)topo);
+    std::fflush(stderr);
     return true;
 }
 
@@ -1850,16 +1985,18 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     for (UINT i = 0; i < count; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)i * gCtx.drawInc };
         const DrawBinding& b = bindings[i];
-        // P6 诊断：每个 binding 的关键句柄都打到 stdout（游戏日志可见）——
-        // 若此处发生原生 AV（悬垂 Dx12Object* 等），下一轮日志能直接看出哪个
-        // 句柄非法。
-        std::fprintf(stdout, "[dx12] pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d\n",
+        // P6 诊断：每个 binding 的关键句柄都打到 stderr（与 dbgLog 同流，fflush
+        // 防缓冲延迟）——若此处发生原生 AV（悬垂 Dx12Object* 等），下一轮日志
+        // 能直接看出哪个句柄非法。
+        std::fprintf(stderr, "[dx12] pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d\n",
             (unsigned)i, (int)b.type, (void*)b.buffer, (void*)b.view,
             (long long)b.offset, (long long)b.length, b.texelFormat);
+        std::fflush(stderr);
         switch (b.type) {
             case 0: {  // CBV（offset 须 256 对齐；SizeInBytes 向上取整 256）
                 if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
-                    std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID CBV buffer\n", (unsigned)i);
+                    std::fprintf(stderr, "[dx12] pushDesc[%u] INVALID CBV buffer\n", (unsigned)i);
+                    std::fflush(stderr);
                     err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
                     return false;
                 }
@@ -1884,7 +2021,8 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
             }
             case 1: {  // SRV：复制 texture view 的现有描述符
                 if (!b.view || b.view->cpuHandle.ptr == 0) {
-                    std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID view\n", (unsigned)i);
+                    std::fprintf(stderr, "[dx12] pushDesc[%u] INVALID view\n", (unsigned)i);
+                    std::fflush(stderr);
                     err = "pushDescriptors: missing view for SRV entry " + std::to_string(i);
                     return false;
                 }
@@ -1894,7 +2032,8 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
             }
             case 2: {  // SRV：texel buffer
                 if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
-                    std::fprintf(stdout, "[dx12] pushDesc[%u] INVALID texel buffer\n", (unsigned)i);
+                    std::fprintf(stderr, "[dx12] pushDesc[%u] INVALID texel buffer\n", (unsigned)i);
+                    std::fflush(stderr);
                     err = "pushDescriptors: invalid texel buffer handle";
                     return false;
                 }
@@ -2071,7 +2210,125 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
                 tag, w, h, xs[xi], ys[yi], p[0], p[1], p[2], p[3]);
         }
     }
+    dbgDumpPixelsToFile(base, w, h, pitch, tag);
     staging->Unmap(0, nullptr);
+}
+
+// P6 诊断：把 RGBA8 像素完整导出（BMP 文件 + 日志 ASCII 缩略图）。
+// BMP：32bpp BGRA，bottom-up 行序，写到当前工作目录 dx12_dump_<tag>.bmp。
+// ASCII：缩略到 <=96 列，亮度映射 .:-=+*#%@ 字符，高饱和度用色相字母标注
+// （R/G/B/Y/M/C），用于快速识别画面内容（全景/按钮/文字）。
+void dbgDumpPixelsToFile(const uint8_t* rgba, UINT w, UINT h, UINT64 pitch,
+    const char* tag) {
+    if (!rgba || w == 0 || h == 0 || w > 16384 || h > 16384) return;
+
+    // ---- 1) 写 BMP 文件 ----
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "dx12_dump_%s.bmp", tag);
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            UINT64 rowBytes = (UINT64)w * 4;
+            UINT64 padded = (rowBytes + 3) & ~3ULL;  // BMP 行 4 字节对齐（RGBA 已对齐）
+            UINT64 imgSize = padded * h;
+            uint32_t bfSize = (uint32_t)(54 + imgSize);
+            // BITMAPFILEHEADER (14)
+            uint8_t hdr[54] = {0};
+            hdr[0] = 'B'; hdr[1] = 'M';
+            hdr[2] = (uint8_t)(bfSize & 0xFF); hdr[3] = (uint8_t)((bfSize >> 8) & 0xFF);
+            hdr[4] = (uint8_t)((bfSize >> 16) & 0xFF); hdr[5] = (uint8_t)((bfSize >> 24) & 0xFF);
+            hdr[10] = 54;  // pixel data offset
+            // BITMAPINFOHEADER (40)
+            hdr[14] = 40;
+            hdr[18] = (uint8_t)(w & 0xFF); hdr[19] = (uint8_t)((w >> 8) & 0xFF);
+            hdr[20] = (uint8_t)((w >> 16) & 0xFF); hdr[21] = (uint8_t)((w >> 24) & 0xFF);
+            uint32_t hh = h;
+            hdr[22] = (uint8_t)(hh & 0xFF); hdr[23] = (uint8_t)((hh >> 8) & 0xFF);
+            hdr[24] = (uint8_t)((hh >> 16) & 0xFF); hdr[25] = (uint8_t)((hh >> 24) & 0xFF);
+            hdr[26] = 1;    // planes
+            hdr[28] = 32;   // bpp
+            hdr[34] = (uint8_t)(imgSize & 0xFF); hdr[35] = (uint8_t)((imgSize >> 8) & 0xFF);
+            hdr[36] = (uint8_t)((imgSize >> 16) & 0xFF); hdr[37] = (uint8_t)((imgSize >> 24) & 0xFF);
+            fwrite(hdr, 1, 54, f);
+            // bottom-up：BMP 首行是图片最后一行
+            for (UINT y = h; y > 0; --y) {
+                const uint8_t* row = rgba + (UINT64)(y - 1) * pitch;
+                for (UINT x = 0; x < w; ++x) {
+                    uint8_t bgr[4];
+                    bgr[0] = row[x * 4 + 2];  // B
+                    bgr[1] = row[x * 4 + 1];  // G
+                    bgr[2] = row[x * 4 + 0];  // R
+                    bgr[3] = row[x * 4 + 3];  // A
+                    fwrite(bgr, 1, 4, f);
+                }
+            }
+            fclose(f);
+            dbgLog("dump[%s] BMP saved %ux%u -> %s (rgba=%p)", tag, w, h, path,
+                (const void*)rgba);
+        } else {
+            dbgLog("dump[%s] BMP open failed (%s)", tag, path);
+        }
+    }
+
+    // ---- 2) 日志 ASCII 缩略图（亮度字符 + 色相字母）----
+    const int cols = 96;
+    const char* lumaChars = " .:-=+*#%@";
+    int rows = (int)((UINT64)h * cols / w);
+    if (rows < 1) rows = 1;
+    if (rows > 64) rows = 64;
+    std::string art;
+    art.reserve((size_t)cols * rows + rows);
+    for (int ry = 0; ry < rows; ++ry) {
+        UINT y0 = (UINT)((UINT64)ry * h / rows);
+        UINT y1 = (UINT)((UINT64)(ry + 1) * h / rows);
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > h) y1 = h;
+        for (int rx = 0; rx < cols; ++rx) {
+            UINT x0 = (UINT)((UINT64)rx * w / cols);
+            UINT x1 = (UINT)((UINT64)(rx + 1) * w / cols);
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > w) x1 = w;
+            unsigned r = 0, g = 0, b = 0, a = 0;
+            UINT cnt = 0;
+            for (UINT y = y0; y < y1; ++y) {
+                const uint8_t* row = rgba + (UINT64)y * pitch;
+                for (UINT x = x0; x < x1; ++x) {
+                    r += row[x * 4 + 0];
+                    g += row[x * 4 + 1];
+                    b += row[x * 4 + 2];
+                    a += row[x * 4 + 3];
+                    ++cnt;
+                }
+            }
+            if (cnt == 0) { art += ' '; continue; }
+            r /= cnt; g /= cnt; b /= cnt; a /= cnt;
+            // 亮度 + 饱和度（判断用亮度字符还是色相字母）
+            int mx = (int)r, mn = (int)r;
+            if ((int)g > mx) mx = g; if ((int)b > mx) mx = b;
+            if ((int)g < mn) mn = g; if ((int)b < mn) mn = b;
+            int luma = (r * 299 + g * 587 + b * 114) / 1000;
+            int sat = (mx == 0) ? 0 : (mx - mn) * 255 / mx;
+            if (sat > 90 && luma > 40) {
+                // 高饱和度：用色相字母标出主色
+                char hue = '?';
+                if (r > g && r > b) hue = 'R';
+                else if (g > r && g > b) hue = 'G';
+                else if (b > r && b > g) hue = 'B';
+                else if (r > 120 && g > 120 && b < 90) hue = 'Y';
+                else if (r > 120 && b > 120 && g < 90) hue = 'M';
+                else if (g > 120 && b > 120 && r < 90) hue = 'C';
+                else if (r > 180 && g > 180 && b > 180) hue = 'W';
+                art += hue;
+            } else {
+                int idx = luma * 9 / 255;
+                if (idx > 9) idx = 9;
+                art += lumaChars[idx];
+            }
+        }
+        art += '\n';
+    }
+    dbgLog("dump[%s] ASCII %dx%d (grid %dx%d):\n%s", tag, w, h, cols, rows,
+        art.c_str());
 }
 
 void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const char* tag) {

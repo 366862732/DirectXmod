@@ -1,5 +1,6 @@
 {
     "java.configuration.updateBuildConfiguration": "disabled",
     "java.compile.nullAnalysis.mode": "automatic",
-    "konveyor.genai.agentMode": true
+    "konveyor.genai.agentMode": true,
+    "cmake.ignoreCMakeListsMissing": true
 }
