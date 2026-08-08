@@ -231,12 +231,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu -> backbuf=%ux%u",
         (void*)srcTex, (unsigned long long)srcDesc.Width,
         (unsigned long long)srcDesc.Height, w, h);
-    // P6 诊断：每 60 次读回 blit 源纹理（=渲染目标 color[0]）3x3，区分
-    // "draw 未写入渲染目标"（纯色）vs "blit/backbuffer 丢失"（源有内容）。
-    static int blDbg = 0;
-    if ((++blDbg % 60) == 1) {
-        dbgReadbackTexturePixels(srcTex, "blitsrc");
-    }
+    // 记录本帧 blit 写入的 back buffer 下标（present 后 currentImageIndex=-1，
+    // readback 必须用此值才能读到真实画面）。
+    s->lastBlitIndex = s->currentImageIndex;
     return true;
 }
 
@@ -290,7 +287,22 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
     if (!s || s->backBuffers.empty()) { err = "surface has no back buffers"; return false; }
     if (!deviceWaitIdle(err)) { err = "deviceWaitIdle failed: " + err; return false; }
 
-    ID3D12Resource* bb = s->backBuffers[s->currentImageIndex].Get();
+    // present 后 currentImageIndex 被重置为 -1（Fix O：释放 acquire 状态防
+    // ResizeBuffers 误判）。此处若直接索引 backBuffers[-1] 会越界 AV（hs_err:
+    // dx12ReadbackSurfacePixels 读 0xffffffffffffffff）。优先用最近 blit 的
+    // back buffer（Fix Q：读真实画面——GetCurrentBackBufferIndex 兜底会读到
+    // 下一帧尚未写入的 buffer，全 0 假黑屏）。
+    int idx = s->currentImageIndex;
+    if (s->lastBlitIndex >= 0 && s->lastBlitIndex < (int)s->backBuffers.size()) {
+        idx = s->lastBlitIndex;
+    } else if (idx < 0 || idx >= (int)s->backBuffers.size()) {
+        idx = (int)s->swapChain->GetCurrentBackBufferIndex();
+    }
+    if (idx < 0 || idx >= (int)s->backBuffers.size()) {
+        err = "no valid back buffer for readback (idx=" + std::to_string(idx) + ")";
+        return false;
+    }
+    ID3D12Resource* bb = s->backBuffers[(size_t)idx].Get();
     D3D12_RESOURCE_DESC bd = bb->GetDesc();
     UINT w = (UINT)bd.Width, h = bd.Height;
     UINT64 rowBytes = (UINT64)w * 4;

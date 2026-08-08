@@ -394,6 +394,11 @@ struct Dx12Surface {
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     int presentMode = 2;               // 默认 FIFO
     int currentImageIndex = -1;        // 最近 acquire 的 back buffer
+    // P6 诊断：最近一次 blit 写入的 back buffer 下标。present 后 currentImageIndex
+    // 被重置为 -1（防 ResizeBuffers 误判），而 readback 需要读"本帧已 blit 的
+    // buffer"才能看到真实画面——用 GetCurrentBackBufferIndex() 兜底会读到下一帧
+    // 尚未写入的 buffer（全 0 假黑屏）。blit 成功时记录此处。
+    int lastBlitIndex = -1;
     bool suboptimal = false;
     std::vector<ComPtr<ID3D12Resource>> backBuffers;
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvHandles;  // 由 rtvHeap 分配

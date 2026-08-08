@@ -2011,12 +2011,12 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
     D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
     ctx->commandList->IASetPrimitiveTopology(topo);
-    // P6 诊断：stderr + fflush（与 dbgLog 同一流），避免 stdout 全缓冲造成
-    // 与 drawIndexed/setVertexBuffer 等日志顺序错乱。
-    std::fprintf(stderr, "[dx12] setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d\n",
+    // P6 诊断：dbgLog 双写（stderr + %TEMP%\dx12-native.log）。fprintf 只写
+    // stderr 不进文件（PCL 启动器不捕获原生 stderr），setPipeline 是否被调用
+    // 曾是完全的观测盲区。
+    dbgLog("setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d",
         (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth,
         (int)pipeline->topology, (int)topo);
-    std::fflush(stderr);
     return true;
 }
 
@@ -2084,18 +2084,15 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     for (UINT i = 0; i < count; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)i * gCtx.drawInc };
         const DrawBinding& b = bindings[i];
-        // P6 诊断：每个 binding 的关键句柄都打到 stderr（与 dbgLog 同流，fflush
-        // 防缓冲延迟）——若此处发生原生 AV（悬垂 Dx12Object* 等），下一轮日志
-        // 能直接看出哪个句柄非法。
-        std::fprintf(stderr, "[dx12] pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d\n",
+        // P6 诊断：每个 binding 的关键句柄用 dbgLog 双写（stderr + native log）。
+        // fprintf 不进文件，曾导致 pushDesc 完全不可见。
+        dbgLog("pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d",
             (unsigned)i, (int)b.type, (void*)b.buffer, (void*)b.view,
             (long long)b.offset, (long long)b.length, b.texelFormat);
-        std::fflush(stderr);
         switch (b.type) {
             case 0: {  // CBV（offset 须 256 对齐；SizeInBytes 向上取整 256）
                 if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
-                    std::fprintf(stderr, "[dx12] pushDesc[%u] INVALID CBV buffer\n", (unsigned)i);
-                    std::fflush(stderr);
+                    dbgLog("pushDesc[%u] INVALID CBV buffer", (unsigned)i);
                     err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
                     return false;
                 }
@@ -2120,8 +2117,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
             }
             case 1: {  // SRV：复制 texture view 的现有描述符
                 if (!b.view || b.view->cpuHandle.ptr == 0) {
-                    std::fprintf(stderr, "[dx12] pushDesc[%u] INVALID view\n", (unsigned)i);
-                    std::fflush(stderr);
+                    dbgLog("pushDesc[%u] INVALID view", (unsigned)i);
                     err = "pushDescriptors: missing view for SRV entry " + std::to_string(i);
                     return false;
                 }
@@ -2131,8 +2127,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
             }
             case 2: {  // SRV：texel buffer
                 if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
-                    std::fprintf(stderr, "[dx12] pushDesc[%u] INVALID texel buffer\n", (unsigned)i);
-                    std::fflush(stderr);
+                    dbgLog("pushDesc[%u] INVALID texel buffer", (unsigned)i);
                     err = "pushDescriptors: invalid texel buffer handle";
                     return false;
                 }

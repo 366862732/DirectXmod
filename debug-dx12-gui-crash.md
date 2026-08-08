@@ -310,5 +310,51 @@
   - 若仍冻结：读 `%TEMP%\dx12-native.log` 看 `configureSurface: FAILED ... 0x887A0001` 或 `presentSurface: OCCLUDED/MODE_CHANGED`
   - **GUI 内容空白（blitsrc 全黑）独立于冻结**：`dx12_dump_blitsrc.bmp` 纯黑 = 渲染目标无 GUI 内容，真实 shader/绘制问题尚未排查——冻结修复后若仍黑则继续此线
 
-## 阶段 12e（待复测）
+## 阶段 12e（08-08 22:57 复测）：Fix O 引入回归崩溃 = readbackSurfacePixels 用 -1 索引 backBuffers → 已修复
+
+- **现象（用户复测 Fix O）**：不再冻结，改为**启动 7.4s 原生崩溃**（`hs_err_pid17984.log`，22:57:44，elapsed 7.459s）。debug.log 与 dx12-native.log 均停在自检末尾。
+- **最直观的定位手段（用户问"有没有比日志更直观的方式"）**：**hs_err 崩溃文件就是最直观的**——原生 AV 时 JVM 自动生成 `hs_err_pid*.log`（版本目录），头部直接给完整 Java 调用栈 + 崩溃指令 + 寄存器。本次靠它一次定位：
+  ```
+  EXCEPTION_ACCESS_VIOLATION at pc=dx12_mc.dll+0x171dc, reading address 0xffffffffffffffff
+  Java frames:
+    j  Dx12Native.dx12ReadbackSurfacePixels(J)V
+    j  Dx12GpuSurface.present()V+29
+    j  GpuSurface.present()V+38
+    j  Dx12Backend.selfTestSurface(...)V+135     ← surface 自检
+    j  Dx12Backend.createDevice(...)V+28
+    j  Minecraft.<init>(...)V+1148
+  ```
+- **根因 18（Fix O 引入的回归）**：`presentSurface` 新增 `currentImageIndex = -1`（释放 acquire 状态防 ResizeBuffers 误判）与自检诊断路径 `dx12ReadbackSurfacePixels` 冲突——原生 [dx12_surface.cpp](file:///d:/dx12-lib-template-26.1.2/native/src/dx12_surface.cpp) L293 `s->backBuffers[s->currentImageIndex]` 在 `currentImageIndex == -1` 时越界索引 `backBuffers[-1]` → 读 `0xffffffffffffffff` → AV。
+- **日志-崩溃交叉验证**（dx12-native.log 最后 4 行）：
+  ```
+  submit: done v=1 → beginCommandList: fenceValue=1 → presentSurface: ok (syncInterval=0)
+  deviceWaitIdle: enter → done        ← readbackSurfacePixels 内
+  [崩溃]                               ← backBuffers[-1]
+  ```
+- **修复（Fix P）**：`readbackSurfacePixels` 索引前边界检查——`currentImageIndex < 0`（present 后）时用 `GetCurrentBackBufferIndex()` 兜底，仍非法则返回错误（不再越界）。
+- **验证**：DLL 重建 + jar 手动 zip 替换 + MCP 部署：
+  - DLL（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌）= `3242DA204FD9BD72D22DD669B8572CAF` ✅
+  - jar（fabric/build/libs ↔ 已部署 mods）= `278C17F98AB77284E05993956E60FB55` ✅
+- **待复测判据（下次日志）**：
+  - 无原生 AV（无新 `hs_err_pid*.log`），自检通过后进入主窗口 configure（854x480 级，而非自检 64x64）
+  - 主渲染循环每帧 `presentSurface: ok` + `configureSurface: ok` 交替，窗口持续更新不冻结
+  - 仍待观察：GUI 内容空白（blitsrc 全黑）独立问题——若画面更新但全黑/纯色，继续查真实 shader/绘制
+
+## 阶段 13（08-08 23:3x 部署）：Fix P 复测生效 + 假黑屏认知修正 + Fix Q（readback 时机 + 观测盲区消除）
+
+- **现象（用户复测 Fix P）**：无新 `hs_err_pid*.log`（Fix P 崩溃回归已消除 ✅），但进入游戏后"卡死在红色界面"，`dx12_dump_blitsrc.bmp` 与 `dx12_dump_backbuf.bmp` **两张都是纯色黑色**（上一轮 backbuf 曾为纯红）。
+- **"红色界面"机制确证**：dx12-native.log L317-319 InfoQueue WARNING 显示 `ClearRenderTargetView` / `ClearDepthStencilView` 已执行——用户看到的红色就是 **clear 色**（每帧 present 的 back buffer 只有 clear 结果，draw 内容不可见）。画面并非冻结：主循环每帧 `acquireSurface: ok → presentSurface: ok` 持续交替，无 OCCLUDED/MODE_CHANGED/FAILED（Fix O 冻结已修复）。
+- **根因 19（决定性认知修正：假黑屏，非数据未写入）**：所有 readback（`rbBuf[vb]`/`rbBuf[ubo]`/blitsrc/backbuf）都在 **submit 前**执行（GPU 尚未执行 draw/copy），而 buffer 是 DEFAULT heap（`heap=1` = `D3D12_HEAP_TYPE_DEFAULT`，非 UPLOAP）→ 读回全 0 是**必然假象**，**不能证明数据没写入**。此前"vb/ubo/blit src/backbuf 全 0 → 数据未写入"的结论作废。
+- **根因 20（观测盲区）**：`setPipeline` / `pushDescriptors` 原用 `fprintf(stderr)`，只写 stderr 不进文件（PCL 启动器不捕获原生 stderr）→ 渲染期这两个关键调用完全不可见（Grep 验证只剩 dx12_device.cpp L239 dbgLog 内部一处）。
+- **修复（Fix Q）**：
+  1. [dx12_device.h](file:///d:/dx12-lib-template-26.1.2/native/src/dx12_device.h) L401：`Dx12Surface` 新增 `lastBlitIndex`——记录最后一次 blit 写入的 back buffer 下标。present 后 `currentImageIndex=-1`，而 `GetCurrentBackBufferIndex()` 兜底会读到**下一帧尚未写入的 buffer**（全 0 假黑屏），只有"本帧已 blit 的 buffer"才有真实画面。
+  2. [dx12_surface.cpp](file:///d:/dx12-lib-template-26.1.2/native/src/dx12_surface.cpp) L236：blitSurface 记录 `lastBlitIndex = currentImageIndex`；删除 submit 前读 DEFAULT blitsrc 纹理的错误读回（必然全 0）。
+  3. [dx12_surface.cpp](file:///d:/dx12-lib-template-26.1.2/native/src/dx12_surface.cpp) L296-297：readbackSurfacePixels 优先用 `lastBlitIndex`（越界时再回退 `GetCurrentBackBufferIndex`）。
+  4. [dx12_device.cpp](file:///d:/dx12-lib-template-26.1.2/native/src/dx12_device.cpp)：setPipeline（L2016 附近）+ pushDescriptors（L2073-2137，4 处：正常 pushDesc、INVALID CBV buffer、INVALID view、INVALID texel buffer）的 `fprintf(stderr)` → `dbgLog()`（双写 stderr + `%TEMP%\dx12-native.log`，随写随刷）。
+- **部署验证**：DLL 重建（仅 C4996 警告）+ jar zip 替换 + MCP 部署；DLL（native/build ↔ resources ↔ jar 内嵌 ↔ 已部署 mods）= `C808B34B86DF270EF1B0E11AE505E52D` 四处一致 ✅
+- **待复测判据（Fix Q 后）**：
+  - `%TEMP%\dx12-native.log` 渲染期应出现 `setPipeline rootSig=... pso=... topoOrdinal=...` 与 `pushDesc[...]` × n（证明 shader 真实绑定 + 描述符真实下发——此前是完全盲区）
+  - `readback[854x480]` 应显示非 0 内容（若 GUI 真实绘制了）；**若 readback 非 0 = 画面有内容 → GUI 其实已画出，此前纯黑是读回假象**
+  - 若 readback 仍全 0 但窗口有内容 → 查 back buffer readback 在 FLIP 模型的限制（GetComplete 会话等）
+  - 若 readback 全 0 且窗口确实纯色 → 真正确认 draw 未生效，继续查真实 shader/绘制（独立于冻结/崩溃问题）
 
