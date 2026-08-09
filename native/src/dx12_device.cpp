@@ -467,9 +467,9 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
 // 但输入布局加宽会导致与 shader 语义分量数不匹配，PSO 创建失败）。
 DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
     switch (gpuFormat) {
-        case 36: return DXGI_FORMAT_R32G32B32A32_UINT;  // RGB32_UINT → RGBA32 (D3D12 不支持 R32G32B32*)
-        case 37: return DXGI_FORMAT_R32G32B32A32_SINT;  // RGB32_SINT → RGBA32
-        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT; // RGB32_FLOAT → RGBA32 (D3D12 不支持 R32G32B32_FLOAT)
+        case 36: return DXGI_FORMAT_R32G32B32_UINT;   // RGB32_UINT
+        case 37: return DXGI_FORMAT_R32G32B32_SINT;   // RGB32_SINT
+        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;  // RGB32_FLOAT
         default: return toDxgiFormat(gpuFormat);
     }
 }
@@ -1992,6 +1992,20 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         pso.SampleDesc.Count = 1;
         pso.SampleDesc.Quality = 0;
         pso.SampleMask = UINT_MAX;
+        // 诊断：打印 PSO 关键字段
+        {
+            std::string descInfo =
+                "inputElements=" + std::to_string(inputLayout.size()) +
+                " numRT=" + std::to_string(numRT) +
+                " colorCount=" + std::to_string(desc.colorCount) +
+                " topology=" + std::to_string((int)desc.topology) +
+                " hasDepth=" + std::to_string(desc.hasDepth) +
+                " dsv=" + std::to_string((int)dsvFormat);
+            for (int i = 0; i < desc.colorCount; ++i) {
+                descInfo += " rt" + std::to_string(i) + "=" + std::to_string((int)pso.RTVFormats[i]);
+            }
+            dbgLog("createGraphicsPipeline: PSO=[%s]\n", descInfo.c_str());
+        }
         // 诊断：打印 HLSL 前 400 字符，便于检查语义声明格式
         {
             std::string vsStr((const char*)vsBytes.data(), vsBytes.size());
