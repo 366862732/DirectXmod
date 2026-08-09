@@ -374,3 +374,52 @@
   - 结合 readback：若 staging 非 0 但画面仍纯红 → 问题在深度测试/cull/视口变换（非数据）
   - **注意**：`copyBuf:` 行很多（含临时 uniform/纹理上传），聚焦 size=64（UBO 区）与 size=528（主顶点）两个目标
 
+## 阶段 15（08-09 Fix R 复测）：staging dump 验证顶点/UBO 数据 → 发现根因 22（semantic mismatch）
+
+- **现象（Fix R 复测）**：`copyBuf: src=... (UPLOAD) dst=... off=0 size=528 floats=[95.00 202.00 0.00 -nan ...]`
+  - 顶点坐标合理（95, 202），但 `w` 分量 = **-nan**
+  - `copyBuf: src=... (UPLOAD) dst=... off=0 size=64 floats=[0 0 0 0 | 0 -0.01 0 0 | ...]`
+  - UBO 投影矩阵几乎全 0 → **顶点坐标经过接近零矩阵 → 全在原点 → 全部裁剪 → 纯色**
+- **根因 22（真正根因）**：**vertex input layout 的 semantic name 硬编码为 "TEXCOORD"，但 shader 期望 "POSITION"**。
+  - `buildNativeDesc`（Dx12Device.java L393-450）只传 `{location, binding, format, offset, stride, stepRate}`，无 semantic name
+  - native `dx12CreateGraphicsPipeline` L1885-1905 硬编码 `ie.SemanticName = "TEXCOORD"`
+  - D3D12 input layout 用 "TEXCOORD" 绑定位置 0，但 HLSL shader 声明 `in float4 Position : POSITION`
+  - 语义不匹配 → D3D12 无法将顶点缓冲数据绑定到 position 变量 → position.w 读到 -nan → 顶点被裁剪 → 画面纯红（只剩 clear 色）
+- **修复（Fix S）**：
+  1. `Dx12CompiledShader` record 新增 `List<String> semanticNames` 字段
+  2. `Dx12ShaderCompiler.compile()` 提取 semantic names（fallback `TEXCOORD0/1/...`）
+  3. `Dx12Device.buildNativeDesc()` 序列化 `semanticCount + len+bytes` 序列
+  4. `dx12_device.h` `InputElement` 新增 `std::string semanticName`
+  5. `jni_bridge_p4.cpp` 读入 semantic name，写入对应 element
+  6. `dx12_device.cpp` L1885-1905 用 `el.semanticName` 赋值；空串回退 `TEXCOORD`
+- **待复测判据**：
+  - `createGraphicsPipeline` 无 `hr=0x80070057`（E_INVALIDARG）错误
+  - `inputElements` 打印的 semantic 为 `POSITION` / `TEXCOORD0`（非 `TEXCOORD`）
+  - staging dump 顶点 `w` 分量为合理值（非 -nan）
+  - readback 出现非纯色像素（GUI 可见）
+
+## 阶段 16（08-09 Fix S 部署后复测）：CreateGraphicsPipelineState 仍 E_INVALIDARG → spvc 未生成正确语义
+
+- **现象**：Fix S 部署后日志 `createGraphicsPipeline: inputElements=2\n  loc=0 bind=0 fmt=46 off=0 stride=16 step=0 semantic=TEXCOORD0\n  loc=1 bind=0 fmt=6 off=12 stride=16 step=0 semantic=TEXCOORD1`
+  - 但 HLSL dump 截断在 `static float4 gl_Position;`（无 `: POSITION` 语义）
+  - `createGraphicsPipeline: CreateGraphicsPipelineState hr=0xHRESULT 0x80070057`
+- **根因 23（spvc 语义缺失）**：spvc HLSL 后端**默认不给 VS 输入变量分配 D3D12 语义**。
+  - HLSL dump 显示：VS 输出 `static float4 gl_Position;`（无 `: POSITION`）
+  - PS 输入 `float4 vertexColor : TEXCOORD0;`（有语义，因为 spvc 对 fragment input 做了映射）
+  - 但 VS 输入的 `static float4 gl_Position` 没有语义声明 → D3D12 无法匹配 input layout
+  - **`extractHlslSemanticNames` 正则对 VS 输入不生效**（因为 spvc 根本没用 `VarName : SEMANTIC` 格式）
+- **修复（Fix S2，spvc VertexAttributeRemap）**：
+  - 在 `Dx12IntermediaryShaderModule.toHlsl()` 中，用 spvc API `spvc_compiler_hlsl_add_vertex_attribute_remap()` 在编译前设置语义映射：
+    - location 0 → `"POSITION"`（顶点位置）
+    - location 1+ → `"TEXCOORD0"`, `"TEXCOORD1"`, ...（颜色及其他属性）
+  - 新增 import `org.lwjgl.util.spvc.SpvcHlslVertexAttributeRemap`
+  - 移除无效的 `extractHlslSemanticNames` 正则解析（改用 spvc 原生 API 保证正确性）
+- **验证**：
+  - DLL（native/build/bin/Release ↔ fabric/src/main/resources ↔ jar 内嵌 ↔ 已部署 mods）= `E6E563B6...` ✅
+  - JAR（fabric/build/libs ↔ 已部署 mods）= 1220319 B ✅
+- **待复测判据**：
+  - HLSL dump 出现 `float4 gl_Position : POSITION;`（语义声明正确）
+  - 无 `CreateGraphicsPipelineState hr=0x...` 错误
+  - `pushDesc` 正常出现（管线编译成功）
+  - readback 出现非纯色像素
+

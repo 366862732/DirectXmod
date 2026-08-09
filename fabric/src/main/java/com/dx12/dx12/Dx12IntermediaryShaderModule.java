@@ -13,6 +13,7 @@ import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.spvc.Spvc;
+import org.lwjgl.util.spvc.SpvcHlslVertexAttributeRemap;
 import org.lwjgl.util.spvc.SpvcReflectedResource;
 
 /**
