@@ -292,18 +292,19 @@ public class Dx12Device implements GpuDeviceBackend {
      */
     private Dx12CompiledRenderPipeline compilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource) {
+        String pipeName = pipeline.getLocation().toString();
         Dx12IntermediaryShaderModule vertexShader = this.getOrCompileShader(
             pipeline.getVertexShader(), ShaderType.VERTEX, pipeline.getShaderDefines(), shaderSource);
         Dx12IntermediaryShaderModule fragmentShader = this.getOrCompileShader(
             pipeline.getFragmentShader(), ShaderType.FRAGMENT, pipeline.getShaderDefines(), shaderSource);
         if (vertexShader == Dx12IntermediaryShaderModule.INVALID) {
-            LOGGER.error("Couldn't compile pipeline {}: vertex shader {} was invalid",
-                pipeline.getLocation(), pipeline.getVertexShader());
+            LOGGER.error("[dx12-java] {} COMPILE FAILED (vertex): shader {} invalid",
+                pipeName, pipeline.getVertexShader());
             return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
         }
         if (fragmentShader == Dx12IntermediaryShaderModule.INVALID) {
-            LOGGER.error("Couldn't compile pipeline {}: fragment shader {} was invalid",
-                pipeline.getLocation(), pipeline.getFragmentShader());
+            LOGGER.error("[dx12-java] {} COMPILE FAILED (fragment): shader {} invalid",
+                pipeName, pipeline.getFragmentShader());
             return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
         }
         try {
@@ -312,13 +313,15 @@ public class Dx12Device implements GpuDeviceBackend {
             ByteBuffer desc = buildNativeDesc(compiled, pipeline);
             long handle = Dx12Native.dx12CreateGraphicsPipeline(desc);
             if (handle == 0) {
-                LOGGER.error("Couldn't create native pipeline {}", pipeline.getLocation());
+                LOGGER.error("[dx12-java] {} COMPILE FAILED (native): dx12CreateGraphicsPipeline returned 0",
+                    pipeName);
                 return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
             }
+            LOGGER.info("[dx12-java] {} COMPILE OK (handle={})", pipeName, handle);
             return new Dx12CompiledRenderPipeline(pipeline, handle,
                 compiled.entries(), compiled.vertexHlsl(), compiled.fragmentHlsl());
         } catch (ShaderCompileException e) {
-            LOGGER.error("Couldn't compile pipeline {}: {}", pipeline.getLocation(), e.getMessage());
+            LOGGER.error("[dx12-java] {} COMPILE FAILED (compile): {}", pipeName, e.getMessage());
             return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
         }
     }
@@ -466,9 +469,9 @@ public class Dx12Device implements GpuDeviceBackend {
     }
 
     /**
-     * 写入一个颜色目标（10 字节）。{@code null}（withUnusedColorTargetState）
+     * 写入一个颜色目标（12 字节）。{@code null}（withUnusedColorTargetState）
      * 表示该槽位未使用：format=-1（DXGI_FORMAT_UNKNOWN）、无混合、无写入。
-     * 混合枚举序数即官方枚举 ordinal（见各枚举声明顺序）。
+     * 布局：format(4) + writeMask(1) + blendEnabled(1) + blend[6]。
      */
     private static void writeColorTarget(ByteBuffer desc, @Nullable ColorTargetState state) {
         if (state == null) {

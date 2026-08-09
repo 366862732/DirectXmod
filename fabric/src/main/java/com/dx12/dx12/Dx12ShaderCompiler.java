@@ -166,6 +166,8 @@ public class Dx12ShaderCompiler implements AutoCloseable {
             uniformDescription = BindGroupLayout.flattenUniforms(pipeline.getBindGroupLayouts()).stream()
                 .filter(d -> d.name().equals(name)).findFirst();
             if (uniformDescription.isEmpty()) {
+                System.err.printf("[dx12-java] addToBindGroup: uniform '%s' not found in %s%n",
+                    name, pipeline.getLocation());
                 throw new ShaderCompileException("Unable to find shader defined uniform (" + name + ")");
             }
             if (!entries.stream().noneMatch(e -> e.type() == Dx12BindGroupEntry.Type.UNIFORM_BUFFER
@@ -178,6 +180,8 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 .filter(d -> d.name().equals(name)).findFirst();
             if (uniformDescription.isPresent()) {
                 if (sampler.dimensions() != 5) {
+                    System.err.printf("[dx12-java] addToBindGroup: UTB '%s' in %s has dim %d (expected 5)%n",
+                        name, pipeline.getLocation(), sampler.dimensions());
                     throw new ShaderCompileException("UTB (" + name + ") must have type of SpvDimBuffer");
                 }
                 if (!entries.stream().noneMatch(e -> e.type() == Dx12BindGroupEntry.Type.TEXEL_BUFFER
@@ -187,9 +191,13 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 continue;
             }
             if (BindGroupLayout.flattenSamplers(pipeline.getBindGroupLayouts()).stream().noneMatch(name::equals)) {
+                System.err.printf("[dx12-java] addToBindGroup: sampler '%s' not found in %s%n",
+                    name, pipeline.getLocation());
                 throw new ShaderCompileException("Unable to find shader defined uniform (" + name + ")");
             }
             if (sampler.dimensions() != 1 && sampler.dimensions() != 3) {
+                System.err.printf("[dx12-java] addToBindGroup: sampled texture '%s' in %s has dim %d (expected 1 or 3)%n",
+                    name, pipeline.getLocation(), sampler.dimensions());
                 throw new ShaderCompileException(
                     "Sampled texture (" + name + ") must have type of SpvDim2D or SpvDimCube");
             }

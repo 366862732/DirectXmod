@@ -467,9 +467,9 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
 // 但输入布局加宽会导致与 shader 语义分量数不匹配，PSO 创建失败）。
 DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
     switch (gpuFormat) {
-        case 36: return DXGI_FORMAT_R32G32B32_UINT;   // RGB32_UINT
-        case 37: return DXGI_FORMAT_R32G32B32_SINT;   // RGB32_SINT
-        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;  // RGB32_FLOAT
+        case 36: return DXGI_FORMAT_R32G32B32A32_UINT;  // RGB32_UINT → RGBA32 (D3D12 不支持 R32G32B32*)
+        case 37: return DXGI_FORMAT_R32G32B32A32_SINT;  // RGB32_SINT → RGBA32
+        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT; // RGB32_FLOAT → RGBA32 (D3D12 不支持 R32G32B32_FLOAT)
         default: return toDxgiFormat(gpuFormat);
     }
 }
