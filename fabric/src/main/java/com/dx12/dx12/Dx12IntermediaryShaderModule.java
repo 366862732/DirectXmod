@@ -349,16 +349,32 @@ public record Dx12IntermediaryShaderModule(
                         }
                     }
                 }
-                // 检测 static 前缀
+                // 检测 static/const 前缀，并找到类型真正的起始位置
+                int typeStart = back;
+                boolean isStaticDecl = false;
                 int staticLen = 6;
                 int scanBack = back - staticLen;
                 while (scanBack >= 0 && Character.isWhitespace(hlsl.charAt(scanBack))) scanBack--;
-                boolean isStaticDecl = (scanBack + 1 >= 0
+                if (scanBack + 1 >= 0
                     && hlsl.regionMatches(true, scanBack + 1, "static", 0, staticLen)
                     && (scanBack + 1 + staticLen >= hlsl.length()
-                        || AFTER_STATIC_ALLOWED.contains(hlsl.charAt(scanBack + 1 + staticLen))));
-                // 输出类型+空白部分（从变量名前到 static 之后）
-                int typeStart = isStaticDecl ? scanBack + staticLen : back;
+                        || AFTER_STATIC_ALLOWED.contains(hlsl.charAt(scanBack + 1 + staticLen)))) {
+                    isStaticDecl = true;
+                    typeStart = scanBack + staticLen;
+                }
+                // 再检查 const（如果前面没有 static）
+                if (!isStaticDecl) {
+                    int constLen = 5;
+                    scanBack = back - constLen;
+                    while (scanBack >= 0 && Character.isWhitespace(hlsl.charAt(scanBack))) scanBack--;
+                    if (scanBack + 1 >= 0
+                        && hlsl.regionMatches(true, scanBack + 1, "const", 0, constLen)
+                        && (scanBack + 1 + constLen >= hlsl.length()
+                            || AFTER_STATIC_ALLOWED.contains(hlsl.charAt(scanBack + 1 + constLen)))) {
+                        typeStart = scanBack + constLen;
+                    }
+                }
+                // 跳过类型前的空白
                 while (typeStart <= end && Character.isWhitespace(hlsl.charAt(typeStart))) typeStart++;
                 String typePart = hlsl.substring(typeStart, end + 1);
                 String semanticSuffix = hasExistingSemantic
