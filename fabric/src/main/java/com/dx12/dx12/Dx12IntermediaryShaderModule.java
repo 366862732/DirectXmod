@@ -279,7 +279,8 @@ public record Dx12IntermediaryShaderModule(
                 }
                 long address = pointer.get(0);
                 String hlsl = MemoryUtil.memUTF8(address);
-                return isVertex ? injectHlslSemanticNames(hlsl) : hlsl;
+                String result = isVertex ? injectHlslSemanticNames(hlsl) : hlsl;
+                return result;
             } finally {
                 Spvc.spvc_context_destroy(context);
             }
@@ -292,6 +293,7 @@ public record Dx12IntermediaryShaderModule(
      * 的正则可以正确匹配，避免原生层 input layout 匹配失败。
      * 按 inputs 列表中的索引分配语义：index 0 → POSITION，其余 → TEXCOORD0、TEXCOORD1、…
      * 如果变量已有语义（如 :TEXCOORD0），则跳过，避免产生 :TEXCOORD0 POSITION 之类的非法语法。
+     * 同时移除全局作用域的 static 关键字（D3D12 不支持全局 static）。
      * 注意：只处理顶层（大括号深度=0）声明，跳过 struct 成员和函数调用。
      */
     private String injectHlslSemanticNames(String hlsl) {
@@ -303,6 +305,10 @@ public record Dx12IntermediaryShaderModule(
         }
         StringBuilder sb = new StringBuilder(hlsl.length() + inputs.size() * 20);
         int braceDepth = 0; // 跟踪大括号深度，只处理顶层声明
+        // static 关键字后跟字母的字符集合（防止误判 static_cast 等）
+        java.util.Set<Character> afterStaticAllowed = new java.util.HashSet<>();
+        afterStaticAllowed.add(' '); afterStaticAllowed.add('\t');
+        afterStaticAllowed.add('\n'); afterStaticAllowed.add('\r');
         for (int i = 0; i < hlsl.length(); i++) {
             char c = hlsl.charAt(i);
             if (c == '{') {
@@ -316,13 +322,16 @@ public record Dx12IntermediaryShaderModule(
                 int back = i - 1;
                 while (back >= 0 && Character.isWhitespace(hlsl.charAt(back))) back--;
                 if (back < 0 || !Character.isJavaIdentifierPart(hlsl.charAt(back))) continue;
-                // 提取变量名（从 back 向前跳过标识符字符）
+                // 提取变量名
                 int nameEnd = back + 1;
                 while (back >= 0 && Character.isJavaIdentifierPart(hlsl.charAt(back))) back--;
                 String varName = hlsl.substring(back + 1, nameEnd);
                 // 检查是否是我们关注的输入变量
                 Integer inputIdx = inputIndexMap.get(varName);
-                if (inputIdx == null) continue;
+                if (inputIdx == null) {
+                    sb.append(';');
+                    continue;
+                }
                 // 检查从变量名结束到分号之间是否已有语义（':'+标识符 形式）
                 boolean hasExistingSemantic = false;
                 int checkPos = nameEnd;
@@ -336,9 +345,28 @@ public record Dx12IntermediaryShaderModule(
                     }
                     checkPos++;
                 }
-                if (!hasExistingSemantic) {
-                    String semantic = (inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1);
-                    sb.append(semantic);
+                String semanticSuffix = hasExistingSemantic
+                    ? ""
+                    : ((inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1));
+                // 向前回溯，移除 static 关键字（跳过其后的空白）
+                int staticLen = 6;
+                int scanBack = back - staticLen;
+                while (scanBack >= 0 && Character.isWhitespace(hlsl.charAt(scanBack))) scanBack--;
+                boolean isStaticDecl = (scanBack + 1 >= 0
+                    && hlsl.regionMatches(true, scanBack + 1, "static", 0, staticLen)
+                    && (scanBack + 1 + staticLen > back || afterStaticAllowed.contains(hlsl.charAt(scanBack + 1 + staticLen))));
+                if (isStaticDecl) {
+                    // 从 static 之后、变量名之前输出类型+空白，然后输出变量名+语义
+                    int typeEnd = scanBack + 1 + staticLen;
+                    // 跳过 static 后的空白
+                    while (typeEnd <= back && Character.isWhitespace(hlsl.charAt(typeEnd))) typeEnd++;
+                    sb.append(hlsl, typeEnd, nameEnd);
+                    sb.append(semanticSuffix);
+                    sb.append(';');
+                } else {
+                    sb.append(varName);
+                    sb.append(semanticSuffix);
+                    sb.append(';');
                 }
             } else {
                 sb.append(c);
