@@ -110,6 +110,12 @@ public class Dx12ShaderCompiler implements AutoCloseable {
             vertexShaderInputs.add(input.name());
         }
         List<String> semanticNames = extractHlslSemanticNames(vertexHlsl, vertexShaderInputs);
+        // P7 诊断：打印第一个管线的 HLSL，定位注入语义后的语法错误
+        if (pipeline.getLocation().toString().contains("gui") || pipeline.getLocation().toString().contains("debug")) {
+            System.err.println("[dx12-java] HLSL vs:\n" + vertexHlsl
+                + "\n[dx12-java] HLSL ps:\n" + fragmentHlsl
+                + "\n[dx12-java] inputs=" + vertex.inputs() + " sems=" + semanticNames);
+        }
         return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexShaderInputs, semanticNames);
     }
 

@@ -1,0 +1,11 @@
+{
+    "required": true,
+    "package": "com.dx12.mixin",
+    "compatibilityLevel": "JAVA_25",
+    "client": [
+        "PreferredGraphicsApiMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

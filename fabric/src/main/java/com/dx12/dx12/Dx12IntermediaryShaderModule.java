@@ -286,6 +286,10 @@ public record Dx12IntermediaryShaderModule(
                 long address = pointer.get(0);
                 String hlsl = MemoryUtil.memUTF8(address);
                 String result = isVertex ? injectHlslSemanticNames(hlsl) : hlsl;
+                // P7 诊断：打印 raw + injected HLSL
+                System.err.println("[dx12-java] [" + name + "] raw=" + hlsl.length()
+                    + " injected=" + result.length()
+                    + " preview=" + result.substring(0, Math.min(200, result.length())));
                 return result;
             } finally {
                 Spvc.spvc_context_destroy(context);
@@ -350,33 +354,39 @@ public record Dx12IntermediaryShaderModule(
                     }
                 }
                 // 检测 static/const 前缀，并找到类型真正的起始位置
-                int typeStart = back;
+                // 策略：先找到变量名起始，再从那里向前扫描跳过标识符和空白找到类型关键字
+                int nameStart = back + 1; // 变量名起始
+                // 从变量名前一个位置开始，向前跳过空白和标识符字符
+                int typeStart = nameStart;
+                while (typeStart > 0 && !Character.isJavaIdentifierPart(hlsl.charAt(typeStart - 1))) typeStart--;
+                // typeStart 现在指向类型关键字的起始
+                // 检查 static 修饰符（类型关键字之前）
                 boolean isStaticDecl = false;
                 int staticLen = 6;
-                int scanBack = back - staticLen;
+                int scanBack = typeStart - staticLen;
                 while (scanBack >= 0 && Character.isWhitespace(hlsl.charAt(scanBack))) scanBack--;
                 if (scanBack + 1 >= 0
                     && hlsl.regionMatches(true, scanBack + 1, "static", 0, staticLen)
                     && (scanBack + 1 + staticLen >= hlsl.length()
                         || AFTER_STATIC_ALLOWED.contains(hlsl.charAt(scanBack + 1 + staticLen)))) {
                     isStaticDecl = true;
-                    typeStart = scanBack + staticLen;
+                    typeStart = scanBack + staticLen; // 跳过 static，指向其后的空白
                 }
-                // 再检查 const（如果前面没有 static）
+                // 检查 const 修饰符（如果前面没有 static）
                 if (!isStaticDecl) {
                     int constLen = 5;
-                    scanBack = back - constLen;
+                    scanBack = typeStart - constLen;
                     while (scanBack >= 0 && Character.isWhitespace(hlsl.charAt(scanBack))) scanBack--;
                     if (scanBack + 1 >= 0
                         && hlsl.regionMatches(true, scanBack + 1, "const", 0, constLen)
                         && (scanBack + 1 + constLen >= hlsl.length()
                             || AFTER_STATIC_ALLOWED.contains(hlsl.charAt(scanBack + 1 + constLen)))) {
-                        typeStart = scanBack + constLen;
+                        typeStart = scanBack + constLen; // 跳过 const
                     }
                 }
                 // 跳过类型前的空白
-                while (typeStart <= end && Character.isWhitespace(hlsl.charAt(typeStart))) typeStart++;
-                String typePart = hlsl.substring(typeStart, end + 1);
+                while (typeStart > 0 && Character.isWhitespace(hlsl.charAt(typeStart - 1))) typeStart++;
+                String typePart = hlsl.substring(typeStart, nameStart);
                 String semanticSuffix = hasExistingSemantic
                     ? ""
                     : ((inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1));
