@@ -102,8 +102,8 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         vertex.rebind(vertexInputNames, entries);
         fragment.rebind(vertexOutputNames, entries);
 
-        String vertexHlsl = vertex.toHlsl();
-        String fragmentHlsl = fragment.toHlsl();
+        String vertexHlsl = vertex.toHlsl(true);
+        String fragmentHlsl = fragment.toHlsl(false);
         List<String> vertexShaderInputs = new ArrayList<>();
         for (Dx12IntermediaryShaderModule.SpvVariable input : vertex.inputs()) {
             vertexShaderInputs.add(input.name());

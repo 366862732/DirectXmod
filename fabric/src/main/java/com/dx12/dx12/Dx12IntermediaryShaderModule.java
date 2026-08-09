@@ -4,8 +4,9 @@ import com.mojang.blaze3d.vulkan.glsl.ShaderCompileException;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
@@ -13,7 +14,6 @@ import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.spvc.Spvc;
-import org.lwjgl.util.spvc.SpvcHlslVertexAttributeRemap;
 import org.lwjgl.util.spvc.SpvcReflectedResource;
 
 /**
@@ -234,7 +234,7 @@ public record Dx12IntermediaryShaderModule(
      * HLSL，shader model 5.1（SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL=51）。
      * 原生层随后用 d3dcompiler_47 把 HLSL 编成 vs_5_1/ps_5_1 字节码。
      */
-    public String toHlsl() throws ShaderCompileException {
+    public String toHlsl(boolean isVertex) throws ShaderCompileException {
         if (this.spirv == null) {
             throw new IllegalStateException("Attempt to use invalid shader");
         }
@@ -277,11 +277,73 @@ public record Dx12IntermediaryShaderModule(
                         + (detail != null && !detail.isEmpty() ? ": " + detail : ""));
                 }
                 long address = pointer.get(0);
-                return MemoryUtil.memUTF8(address);
+                String hlsl = MemoryUtil.memUTF8(address);
+                return isVertex ? injectHlslSemanticNames(hlsl) : hlsl;
             } finally {
                 Spvc.spvc_context_destroy(context);
             }
         }
+    }
+
+    /**
+     * spvc HLSL 后端不会为所有 stage input 变量注入 D3D12 语义名（如 :POSITION、:TEXCOORD0）。
+     * 此方法在生成的 HLSL 中为缺少语义的顶层输入变量注入语义名，使 {@code extractHlslSemanticNames}
+     * 的正则可以正确匹配，避免原生层 input layout 匹配失败。
+     * 按 inputs 列表中的索引分配语义：index 0 → POSITION，其余 → TEXCOORD0、TEXCOORD1、…
+     * 如果变量已有语义（如 :TEXCOORD0），则跳过，避免产生 :TEXCOORD0 POSITION 之类的非法语法。
+     * 注意：只处理顶层（大括号深度=0）声明，跳过 struct 成员和函数调用。
+     */
+    private String injectHlslSemanticNames(String hlsl) {
+        if (inputs.isEmpty()) return hlsl;
+        // 构建 变量名 → 在inputs中的索引 的映射，用于按inputs顺序分配语义
+        java.util.Map<String, Integer> inputIndexMap = new java.util.HashMap<>();
+        for (int i = 0; i < inputs.size(); i++) {
+            inputIndexMap.put(inputs.get(i).name(), i);
+        }
+        StringBuilder sb = new StringBuilder(hlsl.length() + inputs.size() * 20);
+        int braceDepth = 0; // 跟踪大括号深度，只处理顶层声明
+        for (int i = 0; i < hlsl.length(); i++) {
+            char c = hlsl.charAt(i);
+            if (c == '{') {
+                braceDepth++;
+                sb.append(c);
+            } else if (c == '}') {
+                braceDepth--;
+                sb.append(c);
+            } else if (c == ';' && braceDepth == 0) {
+                // 只处理顶层（braceDepth==0）的分号
+                int back = i - 1;
+                while (back >= 0 && Character.isWhitespace(hlsl.charAt(back))) back--;
+                if (back < 0 || !Character.isJavaIdentifierPart(hlsl.charAt(back))) continue;
+                // 提取变量名（从 back 向前跳过标识符字符）
+                int nameEnd = back + 1;
+                while (back >= 0 && Character.isJavaIdentifierPart(hlsl.charAt(back))) back--;
+                String varName = hlsl.substring(back + 1, nameEnd);
+                // 检查是否是我们关注的输入变量
+                Integer inputIdx = inputIndexMap.get(varName);
+                if (inputIdx == null) continue;
+                // 检查从变量名结束到分号之间是否已有语义（':'+标识符 形式）
+                boolean hasExistingSemantic = false;
+                int checkPos = nameEnd;
+                while (checkPos < i && checkPos < hlsl.length()) {
+                    if (hlsl.charAt(checkPos) == ':' && checkPos + 1 < i) {
+                        char afterColon = hlsl.charAt(checkPos + 1);
+                        if (Character.isJavaIdentifierStart(afterColon) || afterColon == '_') {
+                            hasExistingSemantic = true;
+                            break;
+                        }
+                    }
+                    checkPos++;
+                }
+                if (!hasExistingSemantic) {
+                    String semantic = (inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1);
+                    sb.append(semantic);
+                }
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     private @Nullable SpvUniformBuffer getUniformBuffer(String name) {
