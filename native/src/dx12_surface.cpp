@@ -117,17 +117,20 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         s->swapChain->Present(0, 0);
         s->currentImageIndex = -1;
     }
+    // 使用 swap chain 创建时的格式，而非 s->format（后者可能因内存损坏/误用而变为无效值，
+    // 导致 ResizeBuffers 以 0x887A0001 (DXGI_ERROR_INVALID_CALL) 失败）。
+    const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     HRESULT hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
-        s->format, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     if (FAILED(hr)) {
         // 拖拽窗口期间 Present 与 ResizeBuffers 竞争可能偶发失败，重试一次。
         HRESULT hr2 = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
-            s->format, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+            scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
         if (FAILED(hr2)) {
             err = "ResizeBuffers failed " + hrText(hr) + " (retry " + hrText(hr2) +
                 ") w=" + std::to_string(width) + " h=" + std::to_string(height) +
                 " count=" + std::to_string(kSurfaceBufferCount) +
-                " fmt=" + std::to_string((int)s->format);
+                " fmt=" + std::to_string((int)scFmt);
             dbgLog("configureSurface: FAILED %s", err.c_str());
             return false;
         }

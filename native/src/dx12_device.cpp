@@ -465,11 +465,14 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
 // 顶点输入布局格式：RGB32_* 用精确三分量格式（DXGI 仅对 32 位三分量提供
 // R32G32B32_* 输入格式；纹理用途的 toDxgiFormat 会把 RGB32 加宽成 RGBA32，
 // 但输入布局加宽会导致与 shader 语义分量数不匹配，PSO 创建失败）。
+//
+// 注意：R32G32B32_FLOAT/UINT/SINT 在 D3D12 中不是合法的顶点输入格式，
+// 必须回退到 R32G32B32A32_* 变体。shader 使用 .xyz 提取三个分量，.w 忽略。
 DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
     switch (gpuFormat) {
-        case 36: return DXGI_FORMAT_R32G32B32_UINT;   // RGB32_UINT
-        case 37: return DXGI_FORMAT_R32G32B32_SINT;   // RGB32_SINT
-        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;  // RGB32_FLOAT
+        case 36: return DXGI_FORMAT_R32G32B32A32_UINT;    // RGB32_UINT → RGBA32_UINT
+        case 37: return DXGI_FORMAT_R32G32B32A32_SINT;    // RGB32_SINT → RGBA32_SINT
+        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT;   // RGB32_FLOAT → RGBA32_FLOAT
         default: return toDxgiFormat(gpuFormat);
     }
 }
@@ -1885,17 +1888,33 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     }
 
     // 3) 输入布局：语义名称来自 Java 侧 HLSL 解析；空串时回退到 TEXCOORD<location>
+    //    D3D12 要求 SemanticName 不能以数字结尾，数字必须放在 SemanticIndex 字段。
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     inputLayout.reserve(desc.inputElements.size());
     std::string inputDescStr;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
         D3D12_INPUT_ELEMENT_DESC ie{};
+        // 解析 semantic：如 "TEXCOORD0" → name="TEXCOORD", index=0；"COLOR" → name="COLOR", index=0
+        std::string baseName;
+        UINT semanticIndex = 0;
         if (!el.semanticName.empty()) {
-            ie.SemanticName = el.semanticName.c_str();
+            const std::string& sn = el.semanticName;
+            size_t lastNonDigit = sn.find_last_not_of("0123456789");
+            if (lastNonDigit == std::string::npos) {
+                // 全是数字（如 "0"），视为 index=0，name=""
+                baseName = "";
+            } else {
+                baseName = sn.substr(0, lastNonDigit + 1);
+                if (lastNonDigit + 1 < sn.size()) {
+                    semanticIndex = (UINT)std::stoi(sn.substr(lastNonDigit + 1));
+                }
+            }
+            ie.SemanticName = baseName.empty() ? "" : baseName.c_str();
         } else {
             ie.SemanticName = "TEXCOORD";
-            ie.SemanticIndex = (UINT)el.location;
+            semanticIndex = (UINT)el.location;
         }
+        ie.SemanticIndex = semanticIndex;
         ie.Format = toDxgiVertexFormat(el.format);
         ie.InputSlot = (UINT)el.binding;
         ie.AlignedByteOffset = (UINT)el.offset;
@@ -1907,9 +1926,10 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             ie.InstanceDataStepRate = 0;
         }
         char buf[128];
-        snprintf(buf, sizeof(buf), "  loc=%d bind=%d fmt=%d off=%d stride=%d step=%d semantic=%s\n",
+        snprintf(buf, sizeof(buf), "  loc=%d bind=%d fmt=%d off=%d stride=%d step=%d semantic=%s idx=%u\n",
             el.location, el.binding, el.format, el.offset, el.stride, el.stepRate,
-            el.semanticName.empty() ? "(fallback TEXCOORD)" : el.semanticName.c_str());
+            el.semanticName.empty() ? "(fallback TEXCOORD)" : el.semanticName.c_str(),
+            semanticIndex);
         inputDescStr += buf;
         inputLayout.push_back(ie);
     }
@@ -2015,9 +2035,60 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             dbgLog("createGraphicsPipeline: vs(%zuB)=[%.*s...]\nps(%zuB)=[%.*s...]",
                 vsBytes.size(), vsLen, vsStr.c_str(), psBytes.size(), psLen, psStr.c_str());
         }
+        // 详细 PSO 字段诊断（定位 E_INVALIDARG 根因）
+        {
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                "  pso_fields: rootSig=%p vsPtr=%p vsSize=%u psPtr=%p psSize=%u "
+                "inputElts=%u rtCount=%u dsvFmt=%d topType=%d "
+                "blendIndep=%d depthEnable=%d depthWrite=%d depthFunc=%d",
+                (void*)pso.pRootSignature,
+                (void*)pso.VS.pShaderBytecode, (UINT)pso.VS.BytecodeLength,
+                (void*)pso.PS.pShaderBytecode, (UINT)pso.PS.BytecodeLength,
+                (UINT)pso.InputLayout.NumElements,
+                (UINT)pso.NumRenderTargets, (int)pso.DSVFormat,
+                (int)pso.PrimitiveTopologyType,
+                (int)pso.BlendState.IndependentBlendEnable,
+                (int)pso.DepthStencilState.DepthEnable,
+                (int)pso.DepthStencilState.DepthWriteMask,
+                (int)pso.DepthStencilState.DepthFunc);
+            dbgLog(buf);
+            // 打印每个输入元素的完整描述
+            for (UINT i = 0; i < pso.InputLayout.NumElements; ++i) {
+                const D3D12_INPUT_ELEMENT_DESC& ie = inputLayout[i];
+                snprintf(buf, sizeof(buf),
+                    "  inputEl[%u]: fmt=%d slot=%u offset=%u class=%u step=%u semantic=%s",
+                    i, (int)ie.Format, ie.InputSlot, ie.AlignedByteOffset,
+                    ie.InputSlotClass, ie.InstanceDataStepRate,
+                    ie.SemanticName);
+                dbgLog(buf);
+            }
+        }
         HRESULT h = gCtx.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&out));
         if (FAILED(h)) {
             e = "createGraphicsPipeline: CreateGraphicsPipelineState hr=" + hrText(h);
+            dbgLog("  === D3D12 validation messages ===");
+            if (gCtx.infoQueue) {
+                UINT64 count = gCtx.infoQueue->GetNumStoredMessages();
+                dbgLog("  InfoQueue stored=%llu", (unsigned long long)count);
+                UINT64 start = count > 64 ? count - 64 : 0;
+                for (UINT64 i = start; i < count; ++i) {
+                    SIZE_T len = 0;
+                    if (FAILED(gCtx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+                    std::vector<char> buf(len > 0 ? len : 1);
+                    D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                    if (SUCCEEDED(gCtx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+                        const char* sev = "?";
+                        switch (msg->Severity) {
+                            case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
+                            case D3D12_MESSAGE_SEVERITY_ERROR: sev = "ERROR"; break;
+                            case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
+                            default: break;
+                        }
+                        dbgLog("  InfoQueue[%s] %s", sev, msg->pDescription ? msg->pDescription : "");
+                    }
+                }
+            }
             return false;
         }
         return true;
