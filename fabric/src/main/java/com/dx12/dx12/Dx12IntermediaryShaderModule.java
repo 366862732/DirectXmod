@@ -16,7 +16,6 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.spvc.Spvc;
 import org.lwjgl.util.spvc.SpvcReflectedResource;
-
 /**
  * 镜像官方 {@code com.mojang.blaze3d.vulkan.glsl.IntermediaryShaderModule}。
  *
@@ -40,6 +39,13 @@ public record Dx12IntermediaryShaderModule(
         new Dx12IntermediaryShaderModule("invalid", null, List.of(), List.of(), List.of(), List.of());
 
     /** SPIR-V 中 uniform buffer 块（bindingOffset 指向 binding decoration 的字节偏移）。 */
+    /** static 关键字后允许的字符集合（区分 static float4 与 static_cast）。 */
+    private static final java.util.Set<Character> AFTER_STATIC_ALLOWED;
+    static {
+        java.util.HashSet<Character> s = new java.util.HashSet<>();
+        s.add(' '); s.add('\t'); s.add('\n'); s.add('\r');
+        AFTER_STATIC_ALLOWED = java.util.Collections.unmodifiableSet(s);
+    }
     public record SpvUniformBuffer(String name, int bindingOffset) {
     }
 
@@ -298,17 +304,12 @@ public record Dx12IntermediaryShaderModule(
      */
     private String injectHlslSemanticNames(String hlsl) {
         if (inputs.isEmpty()) return hlsl;
-        // 构建 变量名 → 在inputs中的索引 的映射，用于按inputs顺序分配语义
         java.util.Map<String, Integer> inputIndexMap = new java.util.HashMap<>();
         for (int i = 0; i < inputs.size(); i++) {
             inputIndexMap.put(inputs.get(i).name(), i);
         }
         StringBuilder sb = new StringBuilder(hlsl.length() + inputs.size() * 20);
-        int braceDepth = 0; // 跟踪大括号深度，只处理顶层声明
-        // static 关键字后跟字母的字符集合（防止误判 static_cast 等）
-        java.util.Set<Character> afterStaticAllowed = new java.util.HashSet<>();
-        afterStaticAllowed.add(' '); afterStaticAllowed.add('\t');
-        afterStaticAllowed.add('\n'); afterStaticAllowed.add('\r');
+        int braceDepth = 0;
         for (int i = 0; i < hlsl.length(); i++) {
             char c = hlsl.charAt(i);
             if (c == '{') {
@@ -318,56 +319,52 @@ public record Dx12IntermediaryShaderModule(
                 braceDepth--;
                 sb.append(c);
             } else if (c == ';' && braceDepth == 0) {
-                // 只处理顶层（braceDepth==0）的分号
-                int back = i - 1;
-                while (back >= 0 && Character.isWhitespace(hlsl.charAt(back))) back--;
-                if (back < 0 || !Character.isJavaIdentifierPart(hlsl.charAt(back))) continue;
+                // 从分号向前回溯，收集完整语句（跳过末尾空白）
+                int end = i - 1;
+                while (end >= 0 && Character.isWhitespace(hlsl.charAt(end))) end--;
+                int stmtStart = end + 1; // 语句起始位置（含分号）
                 // 提取变量名
-                int nameEnd = back + 1;
+                int back = end;
                 while (back >= 0 && Character.isJavaIdentifierPart(hlsl.charAt(back))) back--;
-                String varName = hlsl.substring(back + 1, nameEnd);
-                // 检查是否是我们关注的输入变量
-                Integer inputIdx = inputIndexMap.get(varName);
-                if (inputIdx == null) {
-                    sb.append(';');
+                if (back < 0 || !Character.isJavaIdentifierPart(hlsl.charAt(back))) {
+                    // 不是变量声明（如 #define 等），原样输出
+                    sb.append(hlsl, stmtStart - 1, i + 1);
                     continue;
                 }
-                // 检查从变量名结束到分号之间是否已有语义（':'+标识符 形式）
+                String varName = hlsl.substring(back + 1, end + 1);
+                Integer inputIdx = inputIndexMap.get(varName);
+                if (inputIdx == null) {
+                    // 非输入变量，原样输出
+                    sb.append(hlsl, stmtStart - 1, i + 1);
+                    continue;
+                }
+                // 检查是否已有语义
                 boolean hasExistingSemantic = false;
-                int checkPos = nameEnd;
-                while (checkPos < i && checkPos < hlsl.length()) {
-                    if (hlsl.charAt(checkPos) == ':' && checkPos + 1 < i) {
-                        char afterColon = hlsl.charAt(checkPos + 1);
-                        if (Character.isJavaIdentifierStart(afterColon) || afterColon == '_') {
+                for (int p = end + 1; p < i; p++) {
+                    if (hlsl.charAt(p) == ':' && p + 1 < i) {
+                        char ch = hlsl.charAt(p + 1);
+                        if (Character.isJavaIdentifierStart(ch) || ch == '_') {
                             hasExistingSemantic = true;
                             break;
                         }
                     }
-                    checkPos++;
                 }
-                String semanticSuffix = hasExistingSemantic
-                    ? ""
-                    : ((inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1));
-                // 向前回溯，移除 static 关键字（跳过其后的空白）
+                // 检测 static 前缀
                 int staticLen = 6;
                 int scanBack = back - staticLen;
                 while (scanBack >= 0 && Character.isWhitespace(hlsl.charAt(scanBack))) scanBack--;
                 boolean isStaticDecl = (scanBack + 1 >= 0
                     && hlsl.regionMatches(true, scanBack + 1, "static", 0, staticLen)
-                    && (scanBack + 1 + staticLen > back || afterStaticAllowed.contains(hlsl.charAt(scanBack + 1 + staticLen))));
-                if (isStaticDecl) {
-                    // 从 static 之后、变量名之前输出类型+空白，然后输出变量名+语义
-                    int typeEnd = scanBack + 1 + staticLen;
-                    // 跳过 static 后的空白
-                    while (typeEnd <= back && Character.isWhitespace(hlsl.charAt(typeEnd))) typeEnd++;
-                    sb.append(hlsl, typeEnd, nameEnd);
-                    sb.append(semanticSuffix);
-                    sb.append(';');
-                } else {
-                    sb.append(varName);
-                    sb.append(semanticSuffix);
-                    sb.append(';');
-                }
+                    && (scanBack + 1 + staticLen >= hlsl.length()
+                        || AFTER_STATIC_ALLOWED.contains(hlsl.charAt(scanBack + 1 + staticLen))));
+                // 输出类型+空白部分（从变量名前到 static 之后）
+                int typeStart = isStaticDecl ? scanBack + staticLen : back;
+                while (typeStart <= end && Character.isWhitespace(hlsl.charAt(typeStart))) typeStart++;
+                String typePart = hlsl.substring(typeStart, end + 1);
+                String semanticSuffix = hasExistingSemantic
+                    ? ""
+                    : ((inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1));
+                sb.append(typePart).append(semanticSuffix).append(';');
             } else {
                 sb.append(c);
             }
