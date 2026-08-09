@@ -38,7 +38,6 @@ dx12-lib-template-26.1.2/
 ├── fabric/                          # Fabric 模组（Java）
 │   ├── src/main/java/com/dx12/
 │   │   ├── Dx12Mod.java            # 模组入口，设置图形 API 偏好 + 日志自检信息
-│   │   ├── D3D12Bridge.java        # （已弃用，保留兼容）旧版 native 方法封装
 │   │   ├── ModMenuIntegration.java # ModMenuApi 实现，配置界面集成
 │   │   ├── config/
 │   │   │   └── Dx12Config.java     # 配置持久化（aa_mode 等，Properties 格式）
@@ -47,30 +46,39 @@ dx12-lib-template-26.1.2/
 │   │   ├── mixin/
 │   │   │   └── PreferredGraphicsApiMixin.java  # 将 D3D12 设为首选图形 API
 │   │   └── dx12/                    # D3D12 后端核心实现（镜像官方 Vulkan 后端）
-│   │       ├── Dx12Native.java     # JNI 桥接层（70+ native 方法）
-│   │       ├── Dx12Backend.java    # GpuBackend 实现：窗口/设备创建 + 4 轮自测
-│   │       ├── Dx12Device.java     # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存
-│   │       ├── Dx12ShaderCompiler.java  # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc）
-│   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息
-│   │       ├── Dx12CompiledShader.java  # 编译产物（HLSL 源码 + 绑定列表）
+│   │       ├── Dx12Native.java        # JNI 桥接层（66 native 方法）
+│   │       ├── Dx12Backend.java       # GpuBackend 实现：窗口/设备创建 + 4 轮自测（394 行）
+│   │       ├── Dx12Device.java        # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存（533 行）
+│   │       ├── Dx12ShaderCompiler.java    # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，190 行）
+│   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息（429 行）
+│   │       ├── Dx12CompiledShader.java    # 编译产物（HLSL 源码 + 绑定列表）
 │   │       ├── Dx12CompiledRenderPipeline.java  # 编译后的渲染管线
 │   │       ├── Dx12BindGroupEntry.java    # 管线绑定条目（UBO/SRV/TexelBuffer）
-│   │       ├── Dx12GpuSurface.java     # DXGI swapchain（P5 交换链层）
-│   │       ├── Dx12CommandEncoderBackend.java  # 命令编码层（P3 submit/copy/clear）
-│   │       ├── Dx12RenderPassBackend.java   # 渲染通道层（P6 draw 全链路）
-│   │       ├── Dx12TransientMemory.java    # 瞬时内存管理（per-frame 缓冲回收）
-│   │       ├── Dx12GpuTexture.java       # D3D12 纹理资源包装
-│   │       ├── Dx12GpuTextureView.java   # D3D12 纹理视图（SRV）
-│   │       ├── Dx12GpuBuffer.java        # D3D12 缓冲区资源包装
-│   │       ├── Dx12GpuSampler.java       # D3D12 采样器包装
-│   │       └── Dx12GpuQueryPool.java     # D3D12 GPU 时间戳查询池
+│   │       ├── Dx12GpuSurface.java      # DXGI swapchain（P5 交换链层）
+│   │       ├── Dx12CommandEncoderBackend.java   # 命令编码层（P3 submit/copy/clear，334 行）
+│   │       ├── Dx12RenderPassBackend.java     # 渲染通道层（P6 draw 全链路，368 行）
+│   │       ├── Dx12TransientMemory.java     # 瞬时内存管理（per-frame 缓冲回收，210 行）
+│   │       ├── Dx12GpuTexture.java        # D3D12 纹理资源包装
+│   │       ├── Dx12GpuTextureView.java    # D3D12 纹理视图（SRV）
+│   │       ├── Dx12GpuBuffer.java         # D3D12 缓冲区资源包装
+│   │       ├── Dx12GpuSampler.java        # D3D12 采样器包装
+│   │       └── Dx12GpuQueryPool.java      # D3D12 GPU 时间戳查询池
 │   ├── src/main/resources/
 │   │   ├── fabric.mod.json         # Fabric 模组描述（client + modmenu entrypoints）
-│   │   └── gl4dx12.mixins.json     # Mixin 配置（1 个 mixin）
+│   │   ├── gl4dx12.mixins.json     # Mixin 配置（1 个 mixin）
+│   │   └── assets/dx12mod/icon.png # 模组图标（16x16）
 │   ├── libs/
 │   │   └── modmenu-20.0.1.jar     # ModMenu 本地依赖（MC 26.2）
 │   ├── build.gradle                # Gradle 构建配置 (loom 1.15.5)
 │   └── gradle.properties           # 版本参数
+├── native/                          # D3D12 原生层（C++17）
+│   ├── src/
+│   │   ├── dx12_device.cpp         # D3D12 设备/资源创建 + 渲染通道 + 时间戳
+│   │   ├── dx12_device.h           # DX12DeviceHandle 结构体定义
+│   │   ├── dx12_surface.cpp        # DXGI swapchain + blit + present
+│   │   └── dx12_native.cpp         # JNI 入口（66 native 方法）
+│   ├── CMakeLists.txt              # CMake 构建配置
+│   └── build/bin/Release/dx12_mc.dll  # 预编译 DLL（~150KB，从 JAR 提取部署）
 └── 步骤.md                         # 详细开发步骤文档
 ```
 
@@ -226,11 +234,14 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 |------|------|----------|------|
 | **GPU TDR 超时（~2s 后崩溃）** | GL + D3D12 同窗口共存导致 WDDM 驱动级冲突 | **1 个 Mixin**：设置 `D3D12` 为首选 API，Minecraft 不再初始化 GL 后端 | ✅ 已修复 |
 | **DLL 版本不匹配** | 旧版 `dx12_mc.dll` 与新版 Java 层 JNI 签名不一致 | 每次启动从 JAR 重新提取到 `{user.dir}/dx12mod/` | ✅ 已修复 |
-| **Shader 编译失败** | shaderc/spvc 库缺失或 GLSL 语法不兼容 | 内嵌核心 shader 源码用于自检，真实 shader 由资源包提供 | 🔜 |
-| **Surface present 黑屏** | 首帧 back buffer 未初始化 | 自测 surface 时首次 present 会黑屏一帧，随后正常 | 🔜 |
-| **ModMenu 按钮无响应** | `modmenu` entrypoint 未注册 | fabric.mod.json 中添加了 `"modmenu"` entrypoint | ✅ 已修复 |
-| **D3D12 资源泄漏** | close() 未调用 | 所有 Dx12Gpu* 类实现 AutoCloseable，try-with-resources 管理生命周期 | ✅ 已修复 |
+| **RootSignature 未设置（UMD AV）** | `setPipeline` 只调 `SetPipelineState`，未调 `SetGraphicsRootSignature` | 补 `SetGraphicsRootSignature(pipeline->rootSignature.Get())` | ✅ 已修复 (cd1e029) |
+| **命令列表拓扑未设置** | D3D12 初始 topology=UNDEFINED，draw 被 GPU 丢弃 | `setPipeline` 补 `IASetPrimitiveTopology(toPrimitiveTopology(topology))` | ✅ 已修复 |
+| **顶点语义硬编码** | `InputElement.semanticName` 硬编码为 `TEXCOORD`，不匹配 HLSL 输入 | 从 pipeline binding 反射提取 SPVC semantic name | ✅ 已修复 (88a9253) |
+| **GUI 纯红显示** | 顶点属性与 HLSL 输入语义不匹配 → 顶点数据被丢弃 | 修复 `dx12CreateGraphicsPipeline` 语义映射（`POSITION→SV_Position` 等） | ✅ 已修复 (cb653a7) |
+| **HLSL static/const 误判** | 解析变量声明时将 `static`/`const` 误认为类型前缀 | 重构为按类型关键字列表扫描；支持 `const` 修饰符检测 | ✅ 已修复 (86b5f7c/784d331) |
+| **Descriptor heap 耗尽** | SRV/Sampler heap 未释放旧 handle → 堆空间耗尽 | `createGraphicsPipeline` 成功后释放旧 handle | ✅ 已修复 (85ea7cf) |
 | **命令编码器共享导致渲染异常** | 每帧新建 CommandContext 导致命令丢失 | 懒加载共享单例 encoder（镜像官方语义） | ✅ 已修复 |
+| **GPU idle 等待** | 连续 submit 导致 GPU 等待时间过长 | 新增 `d3d12mc_gpu_idle_wait_ms`（默认 2ms） | ✅ 已修复 (85ea7cf) |
 
 ## 技术栈
 
@@ -266,11 +277,11 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| **多帧并行命令队列** | P0 | 当前双缓冲 submit，可升级到三缓冲 |
-| **Descriptor heap 优化** | P1 | 当前每帧 push descriptors，可改用 heap 池化 |
-| **TransientMemory 块分配器** | P1 | 当前每帧新建 committed buffer，可改为 block allocator |
-| **完整 Shader 支持** | P2 | 当前仅自检 core/gui 和 core/position_tex_color，需支持完整 Minecraft shader |
-| **Vulkan 后端兼容层** | P2 | 添加 fallback 路径，D3D12 失败时自动回退到 Vulkan |
+| **多帧并行命令队列** | P0 | 当前共享单例 encoder + fence 等待，可升级到三缓冲 |
+| **Descriptor heap 优化** | P1 | 当前每帧 push descriptors，可改用 heap 池化（已修复 heap 泄漏） |
+| **TransientMemory 块分配器** | P1 | 当前 per-frame committed buffer，可改为 block allocator |
+| **完整 Shader 支持** | P2 | 当前自检 core/gui + core/position_tex_color，需支持 terrain/entity/particle 等全量 shader |
+| **P6 GUI 渲染修复** | ✅ 已完成 | 修复 RootSignature/Topology/顶点语义/static/const HLSL 等 12 个根因 |
 | **性能基准测试** | P3 | 对比 GL/Vulkan/D3D12 的 FPS、内存占用、GPU 利用率 |
 
 ### 🎯 最终目标
