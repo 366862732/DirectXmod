@@ -1,4 +1,4 @@
-# dx12-lib-template-26.1.2
+# DirectXmod
 
 > **一个 Minecraft 26.1.2+ Fabric 模组的 DirectX 12 后端实现。**
 > 通过实现 Minecraft 官方的 `GpuBackend` / `GpuDeviceBackend` 接口，用预编译的 C++ DLL（`dx12_mc.dll`）替代原生 OpenGL 渲染路径，使 Minecraft 使用 D3D12 直接渲染游戏画面，同时保留 Mod 扩展点（AA 设置、ModMenu 集成）。
