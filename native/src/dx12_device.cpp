@@ -1889,8 +1889,11 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 
     // 3) 输入布局：语义名称来自 Java 侧 HLSL 解析；空串时回退到 TEXCOORD<location>
     //    D3D12 要求 SemanticName 不能以数字结尾，数字必须放在 SemanticIndex 字段。
+    //    注意：SemanticName 是 const char*，必须指向持久化内存，不能指向局部 string 的 c_str()。
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     inputLayout.reserve(desc.inputElements.size());
+    std::vector<std::string> semanticStore;  // 持久化存储，防止 c_str() 悬空
+    semanticStore.reserve(desc.inputElements.size());
     std::string inputDescStr;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
         D3D12_INPUT_ELEMENT_DESC ie{};
@@ -1909,11 +1912,12 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
                     semanticIndex = (UINT)std::stoi(sn.substr(lastNonDigit + 1));
                 }
             }
-            ie.SemanticName = baseName.empty() ? "" : baseName.c_str();
         } else {
-            ie.SemanticName = "TEXCOORD";
+            baseName = "TEXCOORD";
             semanticIndex = (UINT)el.location;
         }
+        semanticStore.push_back(baseName);
+        ie.SemanticName = semanticStore.back().c_str();
         ie.SemanticIndex = semanticIndex;
         ie.Format = toDxgiVertexFormat(el.format);
         ie.InputSlot = (UINT)el.binding;

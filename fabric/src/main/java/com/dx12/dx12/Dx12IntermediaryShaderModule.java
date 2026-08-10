@@ -8,6 +8,8 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
@@ -300,101 +302,113 @@ public record Dx12IntermediaryShaderModule(
     }
 
     /**
-     * spvc HLSL 后端问题修复与语义注入：
-     *   1) 规范化 spvc 产生的 "}};" 为 "};"  (cbuffer/struct 双重关闭)
-     *   2) 移除全局 static 声明（D3D12 不支持）
-     *   3) 对顶点着色器输入变量注入 :POSITION / :TEXCOORDn 语义
-     *   4) 跳过已有语义的变量，避免产生 :TEXCOORD0 POSITION 之类非法语法
+     * spvc HLSL 语义注入：预处理策略，先定位 struct 块边界，再精确替换。
+     * 完全避开动态 braceDepth 追踪和 inStruct 状态机的不可靠性。
      */
     private String injectHlslSemanticNames(String hlsl) {
         // Step 1: 规范化 spvc 输出
         String normalized = hlsl.replace("}};", "};");
-        java.util.Map<String, Integer> inputIndexMap = new java.util.HashMap<>();
+
+        if (inputs.isEmpty()) {
+            System.err.println("[dx12-java] [DIAG] no inputs to inject, skip");
+            return normalized;
+        }
+
+        // 构建输入变量名 -> 语义索引的映射
+        Map<String, Integer> inputIndexMap = new HashMap<>();
         for (int i = 0; i < inputs.size(); i++) {
             inputIndexMap.put(inputs.get(i).name(), i);
         }
-        StringBuilder sb = new StringBuilder(normalized.length() + inputs.size() * 20);
-        int braceDepth = 0;
-        for (int i = 0; i < normalized.length(); i++) {
-            char c = normalized.charAt(i);
-            if (c == '{') {
-                braceDepth++;
-                sb.append(c);
-            } else if (c == '}') {
-                braceDepth--;
-                sb.append(c);
-            } else if (c == ';' && braceDepth == 0) {
-                // 从分号向前回溯，收集完整语句（跳过末尾空白）
-                int end = i - 1;
-                while (end >= 0 && Character.isWhitespace(normalized.charAt(end))) end--;
-                // 提取变量名（向前扫描标识符）
-                int back = end;
-                while (back >= 0 && Character.isJavaIdentifierPart(normalized.charAt(back))) back--;
-                if (back < 0 || !Character.isJavaIdentifierPart(normalized.charAt(back))) {
-                    // 不是变量声明，原样输出
-                    sb.append(normalized, end + 1, i + 1);
-                    continue;
-                }
-                String varName = normalized.substring(back + 1, end + 1);
-                // 检测 static/const 修饰符，找到类型起始位置
-                // 从变量名第一个字符（back+1）向前扫描，跳过标识符字符
-                int nameFirst = back + 1;
-                int typeStart = nameFirst;
-                while (typeStart > 0 && !Character.isJavaIdentifierPart(normalized.charAt(typeStart - 1))) typeStart--;
-                boolean isStaticDecl = false;
-                int staticLen = 6;
-                int scanBack = typeStart - staticLen;
-                while (scanBack >= 0 && Character.isWhitespace(normalized.charAt(scanBack))) scanBack--;
-                if (scanBack + 1 >= 0
-                    && normalized.regionMatches(true, scanBack + 1, "static", 0, staticLen)
-                    && (scanBack + 1 + staticLen >= normalized.length()
-                        || AFTER_STATIC_ALLOWED.contains(normalized.charAt(scanBack + 1 + staticLen)))) {
-                    isStaticDecl = true;
-                    typeStart = scanBack + staticLen;
-                }
-                if (!isStaticDecl) {
-                    int constLen = 5;
-                    scanBack = typeStart - constLen;
-                    while (scanBack >= 0 && Character.isWhitespace(normalized.charAt(scanBack))) scanBack--;
-                    if (scanBack + 1 >= 0
-                        && normalized.regionMatches(true, scanBack + 1, "const", 0, constLen)
-                        && (scanBack + 1 + constLen >= normalized.length()
-                            || AFTER_STATIC_ALLOWED.contains(normalized.charAt(scanBack + 1 + constLen)))) {
-                        typeStart = scanBack + constLen;
-                    }
-                }
-                // 跳过类型前的空白
-                while (typeStart < nameFirst && Character.isWhitespace(normalized.charAt(typeStart))) typeStart++;
-                // 跳过类型后的空白到变量名
-                while (typeStart < nameFirst && !Character.isJavaIdentifierPart(normalized.charAt(typeStart))) typeStart++;
-                String typePart = normalized.substring(typeStart, nameFirst);
-                // 检查是否已有语义
-                boolean hasExistingSemantic = false;
-                for (int p = end + 1; p < i; p++) {
-                    if (normalized.charAt(p) == ':' && p + 1 < i) {
-                        char ch = normalized.charAt(p + 1);
-                        if (Character.isJavaIdentifierStart(ch) || ch == '_') {
-                            hasExistingSemantic = true;
-                            break;
-                        }
-                    }
-                }
-                if (!isStaticDecl && !hasExistingSemantic) {
-                    // 这是输入变量且需要注入语义
-                    Integer inputIdx = inputIndexMap.get(varName);
-                    if (inputIdx != null) {
-                        String semanticSuffix = (inputIdx == 0) ? " :POSITION" : " :TEXCOORD" + (inputIdx - 1);
-                        sb.append(typePart).append(semanticSuffix).append(';');
-                        continue;
-                    }
-                }
-                // 非输入变量或已有语义，原样输出
-                sb.append(normalized, end + 1, i + 1);
-            } else {
-                sb.append(c);
+
+        // Step 2: 找到 SPIRV_Cross_Input 结构体
+        String inputStructName = "SPIRV_Cross_Input";
+        int inputStructStart = normalized.indexOf("struct " + inputStructName);
+
+        // 兜底：查找任何包含 Input 字样的 struct
+        if (inputStructStart == -1) {
+            Pattern structPattern = Pattern.compile("struct\\s+(\\w*Input\\w*)\\s*\\{");
+            Matcher m = structPattern.matcher(normalized);
+            if (m.find()) {
+                inputStructName = m.group(1);
+                inputStructStart = m.start();
+                System.err.println("[dx12-java] [DIAG] found alternative input struct: " + inputStructName);
             }
         }
-        return sb.toString();
+
+        if (inputStructStart == -1) {
+            System.err.println("[dx12-java] [DIAG] WARNING: no input struct found, returning normalized");
+            return normalized;
+        }
+
+        // Step 3: 找到 Input 结构体的 '{' 和匹配的 '}'
+        int inputBraceStart = normalized.indexOf('{', inputStructStart);
+        if (inputBraceStart == -1) {
+            System.err.println("[dx12-java] [DIAG] WARNING: no '{' in input struct, returning normalized");
+            return normalized;
+        }
+
+        int braceDepth = 1;
+        int inputBraceEnd = -1;
+        for (int i = inputBraceStart + 1; i < normalized.length(); i++) {
+            char c = normalized.charAt(i);
+            if (c == '{') braceDepth++;
+            else if (c == '}') {
+                braceDepth--;
+                if (braceDepth == 0) {
+                    inputBraceEnd = i;
+                    break;
+                }
+            }
+        }
+
+        if (inputBraceEnd == -1) {
+            System.err.println("[dx12-java] [DIAG] WARNING: cannot find matching '}' for input struct, returning normalized");
+            return normalized;
+        }
+
+        // Step 4: 逐行替换结构体内部变量的语义
+        String structBody = normalized.substring(inputBraceStart + 1, inputBraceEnd);
+        String[] lines = structBody.split("\n", -1);
+
+        StringBuilder newBody = new StringBuilder(structBody.length() + inputs.size() * 20);
+        int injectedCount = 0;
+
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty() || trimmed.startsWith("//")) {
+                newBody.append(line).append('\n');
+                continue;
+            }
+
+            // 匹配: 类型 变量名; （先去除可能的旧语义）
+            String cleanLine = trimmed.replaceAll("\\s*:\\s*\\w+", "").trim();
+            Pattern varPattern = Pattern.compile("\\s*([\\w<>\\[\\]]+)\\s+([A-Za-z_]\\w*)\\s*;");
+            Matcher m = varPattern.matcher(cleanLine);
+            if (m.find()) {
+                String varName = m.group(2);
+                Integer expectedIdx = inputIndexMap.get(varName);
+                if (expectedIdx != null) {
+                    String semantic = (expectedIdx == 0) ? "POSITION" : "TEXCOORD" + (expectedIdx - 1);
+                    newBody.append("    ").append(m.group(1)).append(" ").append(varName)
+                           .append(" :").append(semantic).append(";\n");
+                    injectedCount++;
+                } else {
+                    newBody.append(line).append('\n');
+                }
+            } else {
+                newBody.append(line).append('\n');
+            }
+        }
+
+        System.err.println("[dx12-java] [DIAG] injected " + injectedCount + "/" + inputs.size() + " input semantics");
+
+        // Step 5: 组装结果
+        String beforeStruct = normalized.substring(0, inputBraceStart + 1);
+        String afterStruct = normalized.substring(inputBraceEnd);
+        String result = beforeStruct + "\n" + newBody.toString() + afterStruct;
+
+        System.err.println("[dx12-java] [DIAG] inject done, result length=" + result.length());
+        return result;
     }
 
     private @Nullable SpvUniformBuffer getUniformBuffer(String name) {

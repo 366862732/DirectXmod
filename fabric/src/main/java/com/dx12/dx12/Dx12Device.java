@@ -401,6 +401,11 @@ public class Dx12Device implements GpuDeviceBackend {
         boolean hasDepth = pipeline.getDepthStencilState() != null;
         List<int[]> inputElements = buildVertexInputElements(pipeline, compiled.vertexShaderInputs());
         List<String> semanticNames = compiled.semanticNames();
+        // 补齐：semanticNames 数量可能少于 inputElements（如 gui 管线 HLSL 只有 1 个输入，
+        // 但顶点格式有 2 个元素）。多余的元素自动生成 TEXCOORDn 语义。
+        while (semanticNames.size() < inputElements.size()) {
+            semanticNames.add("TEXCOORD" + semanticNames.size());
+        }
         List<Dx12BindGroupEntry> entries = compiled.entries();
 
         // 计算 semantic names 总字节数

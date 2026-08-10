@@ -167,6 +167,11 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         err = "GetCurrentBackBufferIndex returned an invalid index";
         return false;
     }
+    // 同步 lastBlitIndex：当游戏直接通过 beginRenderPass 渲染到表面纹理
+    //（而非走 blitSurface 路径）时，readbackSurfacePixels 需要用最新的
+    // currentImageIndex 才能读到正确的 backBuffer，否则会读到上一帧 blit 的
+    // 旧数据（表现为黑屏/错误内容）。
+    s->lastBlitIndex = s->currentImageIndex;
     return true;
 }
 
@@ -290,16 +295,20 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
     if (!s || s->backBuffers.empty()) { err = "surface has no back buffers"; return false; }
     if (!deviceWaitIdle(err)) { err = "deviceWaitIdle failed: " + err; return false; }
 
-    // present 后 currentImageIndex 被重置为 -1（Fix O：释放 acquire 状态防
-    // ResizeBuffers 误判）。此处若直接索引 backBuffers[-1] 会越界 AV（hs_err:
-    // dx12ReadbackSurfacePixels 读 0xffffffffffffffff）。优先用最近 blit 的
-    // back buffer（Fix Q：读真实画面——GetCurrentBackBufferIndex 兜底会读到
-    // 下一帧尚未写入的 buffer，全 0 假黑屏）。
+    // 选择要读回的 back buffer：
+    // 1. 优先 currentImageIndex：表示当前已 acquire、本帧正在使用的 backBuffer。
+    //    游戏可能直接通过 beginRenderPass 渲染到表面纹理而非走 blit 路径，
+    //    此时 lastBlitIndex 是旧帧的残留值，用它会读到过时数据（黑屏/错误内容）。
+    // 2. 其次 lastBlitIndex：当 currentImageIndex == -1（present 后尚未 acquire
+    //    新帧）时，用最近一次 blit 的 backBuffer 作为兜底，保证测试自检能读到
+    //    真实画面——GetCurrentBackBufferIndex 会跳到下一帧未写入的 buffer（全 0 假黑屏）。
     int idx = s->currentImageIndex;
-    if (s->lastBlitIndex >= 0 && s->lastBlitIndex < (int)s->backBuffers.size()) {
-        idx = s->lastBlitIndex;
-    } else if (idx < 0 || idx >= (int)s->backBuffers.size()) {
-        idx = (int)s->swapChain->GetCurrentBackBufferIndex();
+    if (idx < 0 || idx >= (int)s->backBuffers.size()) {
+        if (s->lastBlitIndex >= 0 && s->lastBlitIndex < (int)s->backBuffers.size()) {
+            idx = s->lastBlitIndex;
+        } else {
+            idx = (int)s->swapChain->GetCurrentBackBufferIndex();
+        }
     }
     if (idx < 0 || idx >= (int)s->backBuffers.size()) {
         err = "no valid back buffer for readback (idx=" + std::to_string(idx) + ")";
