@@ -423,3 +423,30 @@
   - `pushDesc` 正常出现（管线编译成功）
   - readback 出现非纯色像素
 
+---
+
+## 附录 B：RB_VB 读回中 w 分量为 -nan 的根因
+
+### 现象
+```
+rbBuf[vb] off=0 len=128 heap=1 floats=[264 202 0 -8.79609e+12 264 196 0 -8.79609e+12 95 196 0 -8.79609e+12 ]
+copyBuf: ... FLOATS (UPLOAD) ... floats=[ 95.00 202.00 0.00 -nan 95.00 196.00 0.00 -nan 95.00 196.00 0.00 -nan ]
+```
+
+### 根因
+`BufferBuilder.addVertex(x, y, z)` → `putVec3f(ptr, x, y, z)` 仅写入 3 个 float（12 字节）。
+DX12 管线将 `GpuFormat.RGB32_FLOAT` 映射为 `DXGI_FORMAT_R32G32B32A32_FLOAT`（4 float = 16 字节）。
+第 4 个 float（w）从未被写入，UPLOAD staging heap 中为未初始化内存 → 读回显示 -nan。
+
+### 影响
+- **渲染不受影响**：HLSL 中 `float3 Position : POSITION;` 只读 xyz
+- **诊断数据污染**：readback、copyBuf dump 中出现 -nan
+
+### 已实施的修复
+1. **Fabric 运行时修复**（[BufferBuilderMixin.java](file:///d:/dx12-lib-template-26.1.2/fabric/src/main/java/com/dx12/mixin/BufferBuilderMixin.java)）：
+   - 在 `addVertex(float,float,float)` TAIL 注入后，通过 `@Shadow` 访问 `vertexPointer` 和 `elements[0]`，调用 `MemoryUtil.memPutFloat(ptr+12, 0.0f)` 填充 w 分量
+   - 已注册至 [gl4dx12.mixins.json](file:///d:/dx12-lib-template-26.1.2/fabric/src/main/resources/gl4dx12.mixins.json)
+
+2. **参考源码修复**（[docs/official-262/.../BufferBuilder.java](file:///d:/dx12-lib-template-26.1.2/docs/official-262/com/mojang/blaze3d/vertex/BufferBuilder.java#L168-L173)）：
+   - 在 `addVertex` 末尾添加 `MemoryUtil.memPutFloat(pointer + 12L, 0.0f);`
+

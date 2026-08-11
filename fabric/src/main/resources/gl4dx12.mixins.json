@@ -3,7 +3,8 @@
     "package": "com.dx12.mixin",
     "compatibilityLevel": "JAVA_25",
     "client": [
-        "PreferredGraphicsApiMixin"
+        "PreferredGraphicsApiMixin",
+        "BufferBuilderMixin"
     ],
     "injectors": {
         "defaultRequire": 1

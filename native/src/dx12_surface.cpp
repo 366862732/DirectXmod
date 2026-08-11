@@ -16,6 +16,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 namespace dx12mc {
 
@@ -120,20 +122,69 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     // 使用 swap chain 创建时的格式，而非 s->format（后者可能因内存损坏/误用而变为无效值，
     // 导致 ResizeBuffers 以 0x887A0001 (DXGI_ERROR_INVALID_CALL) 失败）。
     const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    HRESULT hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
-        scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
-    if (FAILED(hr)) {
-        // 拖拽窗口期间 Present 与 ResizeBuffers 竞争可能偶发失败，重试一次。
-        HRESULT hr2 = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
-            scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
-        if (FAILED(hr2)) {
-            err = "ResizeBuffers failed " + hrText(hr) + " (retry " + hrText(hr2) +
-                ") w=" + std::to_string(width) + " h=" + std::to_string(height) +
-                " count=" + std::to_string(kSurfaceBufferCount) +
-                " fmt=" + std::to_string((int)scFmt);
-            dbgLog("configureSurface: FAILED %s", err.c_str());
-            return false;
+    HRESULT hr = S_OK;
+    // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
+    // + 窗口模式的已知竞态）。等待几毫秒后重试，最多 3 次。
+    for (int retry = 0; retry < 3; ++retry) {
+        if (retry > 0) {
+            dbgLog("configureSurface: retry %d after %dms", retry, retry * 16);
+            std::this_thread::sleep_for(std::chrono::milliseconds(retry * 16));
         }
+        hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
+            scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        if (SUCCEEDED(hr)) {
+            dbgLog("configureSurface: ResizeBuffers ok (retry=%d)", retry);
+            break;
+        }
+        dbgLog("configureSurface: ResizeBuffers failed %s (retry=%d)", hrText(hr).c_str(), retry);
+        if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) break;  // 非竞态错误，直接失败
+    }
+    // 重试全部失败：DWM 仍持有 backbuffer。获取窗口句柄并 destroy+recreate swapchain。
+    if (FAILED(hr)) {
+        HWND hwnd = nullptr;
+        s->swapChain->GetHwnd(&hwnd);
+        dbgLog("configureSurface: recreate swapchain hwnd=%p w=%d h=%d", (void*)hwnd, width, height);
+        ComPtr<IDXGIFactory4> factory;
+        HRESULT hrFactory = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (SUCCEEDED(hrFactory) && hwnd) {
+            DXGI_SWAP_CHAIN_DESC1 sd{};
+            sd.Width = 1;
+            sd.Height = 1;
+            sd.Format = scFmt;
+            sd.Stereo = FALSE;
+            sd.SampleDesc.Count = 1;
+            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sd.BufferCount = kSurfaceBufferCount;
+            sd.Scaling = DXGI_SCALING_STRETCH;
+            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+            sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            ComPtr<IDXGISwapChain1> newSwapChain1;
+            HRESULT hrNew = factory->CreateSwapChainForHwnd(
+                ctx.queue.Get(), hwnd, &sd, nullptr, nullptr, &newSwapChain1);
+            if (SUCCEEDED(hrNew)) {
+                ComPtr<IDXGISwapChain3> newSwapChain3;
+                if (SUCCEEDED(newSwapChain1.As(&newSwapChain3))) {
+                    s->swapChain = newSwapChain3;
+                    hr = s->swapChain->ResizeBuffers(
+                        kSurfaceBufferCount, (UINT)width, (UINT)height,
+                        scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+                    if (SUCCEEDED(hr)) {
+                        dbgLog("configureSurface: swapchain recreated ok");
+                    } else {
+                        dbgLog("configureSurface: recreate resize failed %s", hrText(hr).c_str());
+                    }
+                }
+            }
+        }
+    }
+    if (FAILED(hr)) {
+        err = "ResizeBuffers/recreate failed w=" + std::to_string(width) +
+            " h=" + std::to_string(height) +
+            " count=" + std::to_string(kSurfaceBufferCount) +
+            " fmt=" + std::to_string((int)scFmt);
+        dbgLog("configureSurface: FAILED %s", err.c_str());
+        return false;
     }
     dbgLog("configureSurface: ResizeBuffers ok");
 
