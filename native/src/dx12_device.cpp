@@ -1788,16 +1788,17 @@ bool compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageNam
 Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err) {
     if (!ensureDevice(err)) return nullptr;
 
-    // P6 诊断实验（已定位：光栅化链路正常，问题在真实 shader，本开关恢复 false）。
-    // 判定回顾：测试固定输出 shader 时渲染目标出现纯红 => 链路正常。
+    // P6 诊断实验（修复：VS 改用 SV_VertexID，不依赖顶点缓冲输入，避免
+    // "Input Assembler object is expected, but none is bound" 错误导致 PSO 创建失败）。
+    // 若测试 shader 输出青色三角形 => 渲染管线正常，问题在真实 shader 或数据。
     static const bool kTestShader = true;
     std::vector<uint8_t> vsBytes = desc.vsBytes;
     std::vector<uint8_t> psBytes = desc.psBytes;
     if (kTestShader) {
         const char* vs =
-            "struct VSIn { float4 pos : POSITION; };\n"
-            "float4 main(VSIn i) : SV_Position {\n"
-            "    return float4(i.pos.xy * float2(0.5, -0.5) + float2(0.5, 0.5), 0.0, 1.0);\n"
+            "float4 main(uint vid : SV_VertexID) : SV_Position {\n"
+            "    float2 pos = float2((vid << 1) & 2, vid & 2) - 1.0h;\n"
+            "    return float4(pos, 0.0, 1.0);\n"
             "}\n";
         const char* ps =
             "float4 main() : SV_Target {\n"
