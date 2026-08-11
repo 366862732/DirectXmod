@@ -975,13 +975,11 @@ bool deviceWaitIdle(std::string& err) {
         return false;
     }
     dbgLog("deviceWaitIdle: enter");
-    ComPtr<ID3D12Fence> fence;
-    if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
-        err = "deviceWaitIdle: CreateFence failed";
-        return false;
-    }
-    UINT64 fv = 1;
-    if (FAILED(gCtx.queue->Signal(fence.Get(), fv))) {
+    // 用队列级 fence 等待：本地 fence(value=1) 在队列已提交更多工作时
+    // 会立即完成（不真实等待），导致后续 ResizeBuffers 看到 DWM 仍持有
+    // backbuffer 引用而失败（DXGI_ERROR_NOT_CURRENTLY_AVAILABLE）。
+    UINT64 fv = ++gCtx.queueFenceValue;
+    if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), fv))) {
         err = "deviceWaitIdle: Signal failed";
         return false;
     }
@@ -990,8 +988,8 @@ bool deviceWaitIdle(std::string& err) {
         err = "deviceWaitIdle: CreateEvent failed";
         return false;
     }
-    while (fence->GetCompletedValue() < fv) {
-        fence->SetEventOnCompletion(fv, evt);
+    while (gCtx.queueFence->GetCompletedValue() < fv) {
+        gCtx.queueFence->SetEventOnCompletion(fv, evt);
         if (WaitForSingleObject(evt, 5000) != WAIT_OBJECT_0) {
             CloseHandle(evt);
             err = "deviceWaitIdle: timed out waiting for queue completion";
@@ -1792,22 +1790,23 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 
     // P6 诊断实验（已定位：光栅化链路正常，问题在真实 shader，本开关恢复 false）。
     // 判定回顾：测试固定输出 shader 时渲染目标出现纯红 => 链路正常。
-    static const bool kTestShader = false;
+    static const bool kTestShader = true;
     std::vector<uint8_t> vsBytes = desc.vsBytes;
     std::vector<uint8_t> psBytes = desc.psBytes;
     if (kTestShader) {
         const char* vs =
-            "struct VSIn { float4 pos : TEXCOORD0; };\n"
+            "struct VSIn { float4 pos : POSITION; };\n"
             "float4 main(VSIn i) : SV_Position {\n"
-            "    return float4(i.pos.xy * float2(0.0015, 0.0015), 0.0, 1.0);\n"
+            "    return float4(i.pos.xy * float2(0.5, -0.5) + float2(0.5, 0.5), 0.0, 1.0);\n"
             "}\n";
         const char* ps =
             "float4 main() : SV_Target {\n"
-            "    return float4(1.0, 0.0, 0.0, 1.0);\n"
+            "    return float4(0.0, 1.0, 1.0, 1.0);\n"
             "}\n";
         vsBytes.assign(vs, vs + strlen(vs));
         psBytes.assign(ps, ps + strlen(ps));
-        std::fprintf(stdout, "[dx12] TEST SHADER ENABLED (fixed red triangle)\n");
+        std::fprintf(stderr, "[dx12] TEST SHADER ACTIVE: vsSize=%zu psSize=%zu (injected fixed cyan triangle)\n",
+            vsBytes.size(), psBytes.size());
     }
     // P6 诊断：打印前 2 个真实管线 HLSL 源码（找 draw 无输出的 shader 根因）。
     {
@@ -1816,7 +1815,8 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             ++hlslDump;
             std::string vsStr((const char*)vsBytes.data(), vsBytes.size());
             std::string psStr((const char*)psBytes.data(), psBytes.size());
-            std::fprintf(stdout, "[dx12] === HLSL DUMP #%d vs (%zuB) ===\n%s\n[dx12] === HLSL DUMP #%d ps (%zuB) ===\n%s\n",
+            // 输出到 stderr（与 [dx12] 日志同流）以便确认测试 shader 是否生效
+            std::fprintf(stderr, "[dx12] === HLSL DUMP #%d vs (%zuB) ===\n%s\n[dx12] === HLSL DUMP #%d ps (%zuB) ===\n%s\n",
                 hlslDump, vsBytes.size(), vsStr.c_str(), hlslDump, psBytes.size(), psStr.c_str());
         }
     }

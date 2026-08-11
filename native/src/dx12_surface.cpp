@@ -124,11 +124,12 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
-    // + 窗口模式的已知竞态）。等待几毫秒后重试，最多 3 次。
-    for (int retry = 0; retry < 3; ++retry) {
+    // + 窗口模式的已知竞态）。等待较长时间后重试，最多 5 次。
+    for (int retry = 0; retry < 5; ++retry) {
         if (retry > 0) {
-            dbgLog("configureSurface: retry %d after %dms", retry, retry * 16);
-            std::this_thread::sleep_for(std::chrono::milliseconds(retry * 16));
+            int waitMs = retry * 32;
+            dbgLog("configureSurface: retry %d after %dms", retry, waitMs);
+            std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
         }
         hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
             scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
@@ -156,9 +157,9 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
             sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             sd.BufferCount = kSurfaceBufferCount;
             sd.Scaling = DXGI_SCALING_STRETCH;
-            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;  // recreate 用 DISCARD，避免 DWM 持有引用
             sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-            sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            sd.Flags = 0;  // recreate 不用 ALLOW_TEARING
             ComPtr<IDXGISwapChain1> newSwapChain1;
             HRESULT hrNew = factory->CreateSwapChainForHwnd(
                 ctx.queue.Get(), hwnd, &sd, nullptr, nullptr, &newSwapChain1);
@@ -168,13 +169,15 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
                     s->swapChain = newSwapChain3;
                     hr = s->swapChain->ResizeBuffers(
                         kSurfaceBufferCount, (UINT)width, (UINT)height,
-                        scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+                        scFmt, 0);
                     if (SUCCEEDED(hr)) {
-                        dbgLog("configureSurface: swapchain recreated ok");
+                        dbgLog("configureSurface: swapchain recreated ok (DISCARD mode)");
                     } else {
                         dbgLog("configureSurface: recreate resize failed %s", hrText(hr).c_str());
                     }
                 }
+            } else {
+                dbgLog("configureSurface: CreateSwapChainForHwnd failed %s", hrText(hrNew).c_str());
             }
         }
     }
