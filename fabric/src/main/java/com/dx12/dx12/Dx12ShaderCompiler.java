@@ -114,7 +114,8 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         if (pipeline.getLocation().toString().contains("gui") || pipeline.getLocation().toString().contains("debug")) {
             System.err.println("[dx12-java] HLSL vs:\n" + vertexHlsl
                 + "\n[dx12-java] HLSL ps:\n" + fragmentHlsl
-                + "\n[dx12-java] inputs=" + vertex.inputs() + " sems=" + semanticNames);
+                + "\n[dx12-java] inputs=" + vertex.inputs() + " sems=" + semanticNames
+                + "\n[dx12-java] vertexInputNames(from format)=" + vertexInputNames);
         }
         return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexShaderInputs, semanticNames);
     }

@@ -372,6 +372,23 @@ public class Dx12Device implements GpuDeviceBackend {
         List<int[]> elements = new ArrayList<>();
         int attribLocation = 0;
         VertexFormat[] bindings = pipeline.getVertexFormatBindings();
+        if (bindings == null || bindings.length == 0 || pipeline.getLocation().toString().contains("gui")) {
+            LOGGER.warn("[dx12-java] {}: formatBindings={} inputs={}",
+                pipeline.getLocation(), bindings == null ? "null" : bindings.length, vertexShaderInputs);
+            if (bindings != null) {
+                for (int i = 0; i < bindings.length; i++) {
+                    VertexFormat fmt = bindings[i];
+                    if (fmt == null) continue;
+                    StringBuilder sb = new StringBuilder();
+                    for (VertexFormatElement e : fmt.getElements()) {
+                        if (sb.length() > 0) sb.append(',');
+                        sb.append(e.name()).append('(').append(e.format()).append(')');
+                    }
+                    LOGGER.warn("[dx12-java]   slot[{}] stride={} elements=[{}]", i,
+                        fmt.getVertexSize(), sb);
+                }
+            }
+        }
         for (int i = 0; i < bindings.length; i++) {
             VertexFormat format = bindings[i];
             if (format == null) continue;

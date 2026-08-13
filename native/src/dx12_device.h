@@ -139,6 +139,7 @@ void unmapBuffer(Dx12Object* buffer);
 // 三 ring：帧 N 用 index (N-1)%3，帧 N+3 复用同一 index 时 submit 已等 N 完成。
 // （双 ring + 等 value-2 会差一帧：帧 N+2 复用帧 N 的 allocator 但只等了 N-1。）
 // ---------------------------------------------------------------------------
+struct Dx12Pipeline;  // forward，CommandContext 持有其裸指针
 struct CommandContext {
     ComPtr<ID3D12CommandAllocator> allocators[3];   // 三帧飞行，等待 value-2 后复用
     ComPtr<ID3D12GraphicsCommandList> commandList;
@@ -168,6 +169,9 @@ struct CommandContext {
     // 执行结束后所有提升状态已隐式 decay 回 COMMON，故每个新 list 一切资源
     // 都从初始态开始。绝不在 list 内显式回退 COMMON（D3D12 禁止）。
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState;
+
+    // P6：当前绑定的管线，用于 setVertexBuffer 查找修正 stride
+    Dx12Pipeline* currentPipeline = nullptr;
 
     ComPtr<ID3D12CommandAllocator>& currentAllocator() {
         return allocators[fenceValue % 3];
@@ -297,6 +301,8 @@ struct Dx12Pipeline {
     ComPtr<ID3D12PipelineState> withDepth;     // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
     ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
     int topology = 4;  // MC PrimitiveTopology ordinal（setPipeline 时 IASetPrimitiveTopology 用）
+    // P6：per-slot 修正 stride（由 inputElements 实际格式推算，覆盖 Java 侧 getVertexSize() 的错误值）
+    std::unordered_map<int, UINT> vertexStrides;
 };
 
 // Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。

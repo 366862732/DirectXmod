@@ -1788,13 +1788,15 @@ bool compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageNam
 Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err) {
     if (!ensureDevice(err)) return nullptr;
 
-    // P6 诊断实验（修复：VS 改用 SV_VertexID，不依赖顶点缓冲输入，避免
-    // "Input Assembler object is expected, but none is bound" 错误导致 PSO 创建失败）。
-    // 若测试 shader 输出青色三角形 => 渲染管线正常，问题在真实 shader 或数据。
-    static const bool kTestShader = true;
+    // P6 诊断实验：仅在 self-test 阶段（前 2 次 createGraphicsPipeline 调用）注入
+    // 测试 shader，验证渲染管线后自动关闭，后续游戏渲染使用真实 shader。
+    // VS 用 SV_VertexID 不依赖顶点缓冲，避免 "Input Assembler object is expected" 错误。
+    static int kTestPipelineCount = 0;
+    const bool kTestShader = (kTestPipelineCount < 2);
     std::vector<uint8_t> vsBytes = desc.vsBytes;
     std::vector<uint8_t> psBytes = desc.psBytes;
     if (kTestShader) {
+        ++kTestPipelineCount;
         const char* vs =
             "float4 main(uint vid : SV_VertexID) : SV_Position {\n"
             "    float2 pos = float2((vid << 1) & 2, vid & 2) - 1.0h;\n"
@@ -1938,6 +1940,66 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         inputDescStr += buf;
         inputLayout.push_back(ie);
     }
+    // 修正 stride：Java 侧 getVertexSize() 可能不准确（如 gui 格式报告 16，
+    // 但 shader 期望 28 字节）。改为按最大 end-offset 计算真实 stride。
+    UINT correctedStride = 0;
+    for (const PipelineDesc::InputElement& el : desc.inputElements) {
+        UINT sz = toDxgiVertexFormat(el.format) == DXGI_FORMAT_R32G32B32A32_FLOAT
+            ? 16u : (toDxgiVertexFormat(el.format) == DXGI_FORMAT_R32G32_FLOAT ? 8u
+            : (toDxgiVertexFormat(el.format) == DXGI_FORMAT_R32G32B32_FLOAT ? 12u
+            : 4u));
+        UINT end = (UINT)el.offset + sz;
+        if (end > correctedStride) correctedStride = end;
+    }
+    if (correctedStride > 0) {
+        for (auto& ie : inputLayout) {
+            // 用 correctedStride 替换 Java 传入的 stride
+        }
+        // 重新构建带修正 stride 的描述
+        inputDescStr.clear();
+        inputLayout.clear();
+        for (size_t k = 0; k < desc.inputElements.size(); ++k) {
+            const PipelineDesc::InputElement& el = desc.inputElements[k];
+            D3D12_INPUT_ELEMENT_DESC ie{};
+            std::string baseName;
+            UINT semanticIndex = 0;
+            if (!el.semanticName.empty()) {
+                const std::string& sn = el.semanticName;
+                size_t lastNonDigit = sn.find_last_not_of("0123456789");
+                if (lastNonDigit == std::string::npos) {
+                    baseName = "";
+                } else {
+                    baseName = sn.substr(0, lastNonDigit + 1);
+                    if (lastNonDigit + 1 < sn.size()) {
+                        semanticIndex = (UINT)std::stoi(sn.substr(lastNonDigit + 1));
+                    }
+                }
+            } else {
+                baseName = "TEXCOORD";
+                semanticIndex = (UINT)el.location;
+            }
+            semanticStore.push_back(baseName);
+            ie.SemanticName = semanticStore.back().c_str();
+            ie.SemanticIndex = semanticIndex;
+            ie.Format = toDxgiVertexFormat(el.format);
+            ie.InputSlot = (UINT)el.binding;
+            ie.AlignedByteOffset = (UINT)el.offset;
+            if (el.stepRate > 0) {
+                ie.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+                ie.InstanceDataStepRate = (UINT)el.stepRate;
+            } else {
+                ie.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+                ie.InstanceDataStepRate = 0;
+            }
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  loc=%d bind=%d fmt=%d off=%d stride=%d step=%d semantic=%s idx=%u\n",
+                el.location, el.binding, el.format, el.offset, correctedStride, el.stepRate,
+                el.semanticName.empty() ? "(fallback TEXCOORD)" : el.semanticName.c_str(),
+                semanticIndex);
+            inputDescStr += buf;
+            inputLayout.push_back(ie);
+        }
+    }
     dbgLog("createGraphicsPipeline: inputElements=%zu\n%s",
         desc.inputElements.size(), inputDescStr.c_str());
 
@@ -1982,6 +2044,13 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     auto pipeline = std::make_unique<Dx12Pipeline>();
     pipeline->rootSignature = rootSig;
     pipeline->topology = desc.topology;
+
+    // 记录 per-slot 修正 stride，供 setVertexBuffer 覆盖 Java 传入的错误值。
+    for (const auto& ie : inputLayout) {
+        int slot = (int)ie.InputSlot;
+        if (!pipeline->vertexStrides.count(slot) || correctedStride > pipeline->vertexStrides[slot])
+            pipeline->vertexStrides[slot] = correctedStride;
+    }
 
     auto buildPso = [&](DXGI_FORMAT dsvFormat, bool depthEnable,
         D3D12_DEPTH_WRITE_MASK depthWrite, D3D12_COMPARISON_FUNC depthFunc,
@@ -2104,15 +2173,17 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     D3D12_COMPARISON_FUNC depthFunc = desc.hasDepth
         ? toD3d12Compare((uint8_t)desc.depthCompareOp) : D3D12_COMPARISON_FUNC_ALWAYS;
 
-    if (!buildPso(DXGI_FORMAT_D32_FLOAT, desc.hasDepth, depthWrite, depthFunc,
+    // 始终同时创建两个 PSO：withDepth（DSV=D32_FLOAT，depthEnable=true）和
+    // withoutDepth（DSV=UNKNOWN，depthEnable=false），以支持运行时 hasDepth 与
+    // 编译时 desc.hasDepth 不一致的场景（如 pipeline/gui 编译时无深度，但渲染
+    // pass 请求 hasDepth=true）。
+    if (!buildPso(DXGI_FORMAT_D32_FLOAT, true, depthWrite, depthFunc,
         pipeline->withDepth, err)) {
         return nullptr;
     }
-    if (!desc.hasDepth) {
-        if (!buildPso(DXGI_FORMAT_UNKNOWN, FALSE, D3D12_DEPTH_WRITE_MASK_ZERO,
-            D3D12_COMPARISON_FUNC_ALWAYS, pipeline->withoutDepth, err)) {
-            return nullptr;
-        }
+    if (!buildPso(DXGI_FORMAT_UNKNOWN, false, D3D12_DEPTH_WRITE_MASK_ZERO,
+        D3D12_COMPARISON_FUNC_ALWAYS, pipeline->withoutDepth, err)) {
+        return nullptr;
     }
     return pipeline.release();
 }
@@ -2138,6 +2209,7 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     // signature 解引用崩溃（hs_err：NVIDIA UMD 内读 NULL+0x2b88，AV，PC 0x7ffcd70e8fa3）。
     ctx->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
     ctx->commandList->SetPipelineState(pso);
+    ctx->currentPipeline = pipeline;
     // P6 纯色黑屏修复：D3D12 命令列表初始 topology 是 UNDEFINED，必须显式
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
     D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
@@ -2166,15 +2238,19 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long lon
     }
     if (offset < 0 || offset >= buffer->size) { err = "setVertexBuffer: offset out of bounds"; return false; }
     transitionBufferTo(ctx, buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    // P6：使用管线中记录的修正 stride（覆盖 Java 传入的错误值）
+    UINT effectiveStride = (UINT)stride;
+    if (ctx->currentPipeline && ctx->currentPipeline->vertexStrides.count(slot))
+        effectiveStride = ctx->currentPipeline->vertexStrides[slot];
     D3D12_VERTEX_BUFFER_VIEW vb{};
     vb.BufferLocation = buffer->resource->GetGPUVirtualAddress() + (UINT64)offset;
     vb.SizeInBytes = (UINT)(buffer->size - offset);
-    vb.StrideInBytes = (UINT)stride;
+    vb.StrideInBytes = effectiveStride;
     ctx->commandList->IASetVertexBuffers((UINT)slot, 1, &vb);
     // P6 诊断：确认每帧 draw 前确实绑定了顶点缓冲（内容尺寸/stride）。
-    dbgLog("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld stride=%d heap=%d",
+    dbgLog("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
         slot, (void*)buffer, (long long)buffer->size, (long long)offset,
-        (int)stride, (int)buffer->heapType);
+        (int)stride, (int)effectiveStride, (int)buffer->heapType);
     // P6 诊断：每 60 次读回顶点 buffer 前 128 字节（确认数据是否真正写入）。
     static int vbDbg = 0;
     if ((++vbDbg % 60) == 1) {
