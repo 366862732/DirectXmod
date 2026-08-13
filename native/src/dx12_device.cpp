@@ -297,6 +297,14 @@ bool ensureDevice(std::string& errorOut) {
     }
     gCtx.device = device;
     gCtx.adapterName = queryAdapterName(device.Get());
+    // 存储与 device 绑定的 DXGI adapter（供 swapchain 创建使用，避免 factory/adapter 不匹配）。
+    {
+        LUID luid = device->GetAdapterLuid();
+        ComPtr<IDXGIFactory4> tmpFactory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&tmpFactory)))) {
+            tmpFactory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&gCtx.adapter));
+        }
+    }
     // 取 InfoQueue（调试层启用后可用）用于设备移除时回读验证消息。
     if (debugEnabled) {
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&gCtx.infoQueue)))) {
@@ -1940,22 +1948,47 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         inputDescStr += buf;
         inputLayout.push_back(ie);
     }
-    // 修正 stride：Java 侧 getVertexSize() 可能不准确（如 gui 格式报告 16，
-    // 但 shader 期望 28 字节）。改为按最大 end-offset 计算真实 stride。
+    // 修正 stride：Java 侧 getVertexSize() 可能不准确，按 DXGI_FORMAT 实际字节数计算 end-offset。
+    auto dxgiByteSize = [](DXGI_FORMAT fmt) -> UINT {
+        switch (fmt) {
+            case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16u;
+            case DXGI_FORMAT_R32G32B32_FLOAT:    return 12u;
+            case DXGI_FORMAT_R32G32_FLOAT:       return 8u;
+            case DXGI_FORMAT_R32_FLOAT:          return 4u;
+            case DXGI_FORMAT_R16G16B16A16_UNORM: return 8u;
+            case DXGI_FORMAT_R16G16B16A16_SNORM:return 8u;
+            case DXGI_FORMAT_R16G16_FLOAT:       return 8u;
+            case DXGI_FORMAT_R16_UNORM:          return 2u;
+            case DXGI_FORMAT_R16_SNORM:          return 2u;
+            case DXGI_FORMAT_R16_FLOAT:          return 2u;
+            case DXGI_FORMAT_R8G8B8A8_UNORM:     return 4u;
+            case DXGI_FORMAT_R8G8B8A8_SNORM:     return 4u;
+            case DXGI_FORMAT_R8G8B8A8_UINT:      return 4u;
+            case DXGI_FORMAT_R8G8B8A8_SINT:      return 4u;
+            case DXGI_FORMAT_R8G8_UNORM:         return 2u;
+            case DXGI_FORMAT_R8G8_SNORM:         return 2u;
+            case DXGI_FORMAT_R8_UNORM:           return 1u;
+            case DXGI_FORMAT_R8_SNORM:           return 1u;
+            case DXGI_FORMAT_R8_UINT:            return 1u;
+            case DXGI_FORMAT_R8_SINT:            return 1u;
+            case DXGI_FORMAT_R10G10B10A2_UNORM:  return 4u;
+            case DXGI_FORMAT_R10G10B10A2_UINT:   return 4u;
+            case DXGI_FORMAT_R11G11B10_FLOAT:    return 4u;
+            default:                             return 4u;  // fallback
+        }
+    };
     UINT correctedStride = 0;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
-        UINT sz = toDxgiVertexFormat(el.format) == DXGI_FORMAT_R32G32B32A32_FLOAT
-            ? 16u : (toDxgiVertexFormat(el.format) == DXGI_FORMAT_R32G32_FLOAT ? 8u
-            : (toDxgiVertexFormat(el.format) == DXGI_FORMAT_R32G32B32_FLOAT ? 12u
-            : 4u));
+        DXGI_FORMAT dfmt = toDxgiVertexFormat(el.format);
+        UINT sz = dxgiByteSize(dfmt);
         UINT end = (UINT)el.offset + sz;
         if (end > correctedStride) correctedStride = end;
     }
     if (correctedStride > 0) {
-        for (auto& ie : inputLayout) {
-            // 用 correctedStride 替换 Java 传入的 stride
-        }
-        // 重新构建带修正 stride 的描述
+        // 重新构建 inputLayout，语义名称从 semanticStore 恢复（避免悬空指针）。
+        // 先清空 semanticStore 以便重新填充。
+        semanticStore.clear();
+        semanticStore.reserve(desc.inputElements.size());
         inputDescStr.clear();
         inputLayout.clear();
         for (size_t k = 0; k < desc.inputElements.size(); ++k) {
@@ -2291,8 +2324,6 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     for (UINT i = 0; i < count; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)i * gCtx.drawInc };
         const DrawBinding& b = bindings[i];
-        // P6 诊断：每个 binding 的关键句柄用 dbgLog 双写（stderr + native log）。
-        // fprintf 不进文件，曾导致 pushDesc 完全不可见。
         dbgLog("pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d",
             (unsigned)i, (int)b.type, (void*)b.buffer, (void*)b.view,
             (long long)b.offset, (long long)b.length, b.texelFormat);
@@ -2303,15 +2334,11 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
                     return false;
                 }
-                // P6 诊断：每 60 帧读回 binding[0] CBV buffer 内容（多为投影/变换矩阵，
-                // 全零=UBO 未写入→顶点全退化，画面纯色）。
                 static int ubDbg = 0;
                 if (i == 0 && ((++ubDbg % 60) == 1)) {
                     dbgReadbackBufferBytes(b.buffer, b.offset,
                         (int)std::min<long long>(b.length, 128), "ubo");
                 }
-                // UPLOAD(GENERIC_READ) 直接可读；DEFAULT 需显式过渡（CBV 属于
-                // VERTEX_AND_CONSTANT_BUFFER 状态位，D3D12 无独立 CONSTANT_BUFFER 位）
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
                 cbv.BufferLocation = b.buffer->resource->GetGPUVirtualAddress() + (UINT64)b.offset;

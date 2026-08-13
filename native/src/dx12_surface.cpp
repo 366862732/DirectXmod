@@ -45,6 +45,21 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         err = "CreateDXGIFactory1 failed " + hrText(hr);
         return nullptr;
     }
+    // 确保 factory 能访问 device 所在的 adapter（防止多 GPU 系统上 factory/adapter 不匹配）
+    {
+        LUID devLuid = ctx.device->GetAdapterLuid();
+        for (UINT i = 0; ; ++i) {
+            ComPtr<IDXGIAdapter> adj;
+            if (FAILED(factory->EnumAdapters(i, &adj))) break;
+            DXGI_ADAPTER_DESC desc{};
+            if (SUCCEEDED(adj->GetDesc(&desc)) &&
+                desc.AdapterLuid.LowPart == devLuid.LowPart &&
+                desc.AdapterLuid.HighPart == devLuid.HighPart) {
+                ctx.adapter = adj;
+                break;
+            }
+        }
+    }
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = 1;                    // 占位；configure() 时 ResizeBuffers 到实际尺寸
@@ -144,6 +159,9 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     if (FAILED(hr)) {
         HWND hwnd = nullptr;
         s->swapChain->GetHwnd(&hwnd);
+        // 保留原 swapchain 的 tearing 标志（ResizeBuffers 要求 flags 不变）
+        DXGI_SWAP_CHAIN_DESC1 origDesc{};
+        s->swapChain->GetDesc1(&origDesc);
         dbgLog("configureSurface: recreate swapchain hwnd=%p w=%d h=%d", (void*)hwnd, width, height);
         ComPtr<IDXGIFactory4> factory;
         HRESULT hrFactory = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -157,9 +175,9 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
             sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             sd.BufferCount = kSurfaceBufferCount;
             sd.Scaling = DXGI_SCALING_STRETCH;
-            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;  // recreate 用 DISCARD，避免 DWM 持有引用
+            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;  // 必须与原始 swapchain 一致
             sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-            sd.Flags = 0;  // recreate 不用 ALLOW_TEARING
+            sd.Flags = origDesc.Flags;  // 保留 ALLOW_TEARING 等标志
             ComPtr<IDXGISwapChain1> newSwapChain1;
             HRESULT hrNew = factory->CreateSwapChainForHwnd(
                 ctx.queue.Get(), hwnd, &sd, nullptr, nullptr, &newSwapChain1);
@@ -171,7 +189,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
                         kSurfaceBufferCount, (UINT)width, (UINT)height,
                         scFmt, 0);
                     if (SUCCEEDED(hr)) {
-                        dbgLog("configureSurface: swapchain recreated ok (DISCARD mode)");
+                        dbgLog("configureSurface: swapchain recreated ok (FLIP_DISCARD mode)");
                     } else {
                         dbgLog("configureSurface: recreate resize failed %s", hrText(hr).c_str());
                     }

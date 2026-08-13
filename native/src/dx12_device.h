@@ -59,6 +59,7 @@ struct DeviceContext {
     UINT drawInc = 0;  // == srvInc（同属 CBV_SRV_UAV 堆类型）
 
     std::string adapterName;
+    ComPtr<IDXGIAdapter> adapter;  // 与 device 绑定的 DXGI adapter（用于 CreateDXGIFactoryForAdapter）
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
     UINT64 timestampFrequency = 0;  // 从 GetTimestampFrequency 获取（DeviceInfo.timestampPeriod 用）
     ComPtr<ID3D12CommandQueue> queue;   // 图形队列（提交命令用）

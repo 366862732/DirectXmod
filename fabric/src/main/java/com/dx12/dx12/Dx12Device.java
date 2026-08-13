@@ -479,12 +479,16 @@ public class Dx12Device implements GpuDeviceBackend {
 
         desc.putInt(entries.size());
         for (int i = 0; i < entries.size(); i++) {
-            desc.put((byte) switch (entries.get(i).type()) {
-                case UNIFORM_BUFFER -> 0;   // CBV b{i}
-                case SAMPLED_IMAGE -> 1;    // SRV t{i} + static sampler s{i}
-                case TEXEL_BUFFER -> 2;     // SRV t{i}
-            });
-            desc.put((byte) i);
+            Dx12BindGroupEntry entry = entries.get(i);
+            byte type;
+            switch (entry.type()) {
+                case UNIFORM_BUFFER: type = 0; break;   // CBV
+                case SAMPLED_IMAGE:  type = 1; break;   // SRV + sampler
+                case TEXEL_BUFFER:   type = 2; break;   // SRV (texel buffer)
+                default:             type = 0; break;
+            }
+            desc.put(type);
+            desc.put((byte) i);   // reg = 条目序号（与 HLSL shader register 一一对应）
         }
         desc.flip();
         return desc;
