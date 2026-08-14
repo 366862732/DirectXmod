@@ -65,8 +65,10 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
     @Override
     public void blitFromTexture(CommandEncoderBackend commandEncoder, GpuTextureView textureView) {
         Dx12CommandEncoderBackend encoder = (Dx12CommandEncoderBackend) commandEncoder;
-        Dx12GpuTexture texture = (Dx12GpuTexture) textureView.texture();
-        Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, texture.handle());
+        // 传 texture.handle()（底层纹理对象），而非 view.handle()（SRV view 对象）。
+        // view 是 texture 的视图包装，CopyTextureRegion 需要的是纹理资源本身。
+        Dx12GpuTexture tex = (Dx12GpuTexture) ((Dx12GpuTextureView) textureView).texture();
+        Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle());
     }
 
     @Override

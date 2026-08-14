@@ -271,14 +271,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。
     D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
-    // P17 诊断：检查源纹理在本 command list 中是否被 draw 写入过
-    bool srcWasWritten = false;
-    for (size_t i = 0; i < ctx->activeColorTargets.size() && i < ctx->activeColorTargetsTouched.size(); ++i) {
-        if (ctx->activeColorTargets[i] == srcTex && ctx->activeColorTargetsTouched[i]) {
-            srcWasWritten = true;
-            break;
-        }
-    }
+    // P17 诊断：检查本 command list 是否有过任何 draw 写入
+    // （endRenderPass 后 activeColorTargetsTouched 已被清空，改用 persist 字段）
+    bool srcWasWritten = ctx->colorTargetsWritten;
     dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu fmt=%d wasWritten=%d -> backbuf=%ux%u",
         (void*)srcTex, (unsigned long long)srcDesc.Width,
         (unsigned long long)srcDesc.Height, (int)srcTex->dxgiFormat,

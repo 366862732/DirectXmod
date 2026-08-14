@@ -1114,6 +1114,7 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (FAILED(hr)) { err = "beginCommandList: list Reset " + hrText(hr); return false; }
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
+    ctx->colorTargetsWritten = false;  // 新 command list 从零开始追踪绘制状态
     ++gOpenListCount;  // 延迟销毁：登记打开计数，submit 完成前不释放资源
     // submit 阻塞等待 GPU 完成（见 submitCommandList），此处清空 resourceState
     // 后一切资源视为初始态是正确且保守的（D3D12 驱动会按实际 GPU 状态纠正）。
@@ -2493,6 +2494,7 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
         if (i < ctx->activeColorTargetsTouched.size())
             ctx->activeColorTargetsTouched[i] = true;
     }
+    ctx->colorTargetsWritten = true;
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
     return true;

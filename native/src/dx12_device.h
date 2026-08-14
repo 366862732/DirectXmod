@@ -181,6 +181,8 @@ struct CommandContext {
     std::vector<Dx12Object*> activeColorTargets;
     // P17：标记每个 color target 在本 command list 中是否被 draw 写入过
     std::vector<bool> activeColorTargetsTouched;
+    // P17：整个 command list 是否有过任何 draw 写入（endRenderPass 后仍有效，供 blitSurface 判断）
+    bool colorTargetsWritten = false;
     Dx12Object* activeDepthTarget = nullptr;
 
     // P6：本帧 drawHeap 瞬时描述符分配（ring：fenceValue%2 交替两个半区；
