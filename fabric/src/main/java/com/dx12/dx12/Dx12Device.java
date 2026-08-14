@@ -255,9 +255,12 @@ public class Dx12Device implements GpuDeviceBackend {
 
         appendJavaLog("device.close: begin");
         // 镜像官方 VulkanDevice.close()：先销毁共享 encoder 再清管线缓存。
+        // 注意：encoder.close() 对共享 encoder 不调用 dx12DestroyCommandEncoder
+        // （避免 CubeMap.render() 内部 close 时意外销毁 ctx），此处显式销毁。
         Dx12CommandEncoderBackend encoder = this.sharedCommandEncoder;
         if (encoder != null) {
             encoder.close();
+            Dx12Native.dx12DestroyCommandEncoder(encoder.nativeHandle());
             this.sharedCommandEncoder = null;
         }
         appendJavaLog("device.close: after sharedEncoder.close");

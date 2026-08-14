@@ -423,6 +423,7 @@ constexpr UINT kSurfaceBufferCount = 3;  // 镜像官方 minImageCount max(3, mi
 
 struct Dx12Surface {
     ComPtr<IDXGISwapChain3> swapChain;
+    uintptr_t hwnd = 0;   // 重建 swapchain 时需要；ResizeBuffers 失败时销毁重建用
     UINT width = 1;
     UINT height = 1;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;

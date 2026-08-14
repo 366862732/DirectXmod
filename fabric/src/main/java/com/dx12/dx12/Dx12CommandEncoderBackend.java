@@ -333,14 +333,16 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             this.currentRenderPass = null;
         }
         Dx12Native.dx12EndCommandList(this.ctx);
-        // 必须先销毁命令上下文（其内部等待本 ctx 所有已提交命令完成）再关闭瞬时缓冲：
-        // createBuffer(data) 等一次性 encoder 在 submit 后立即 close，若先释放
-        // staging/gpu buffer，GPU 可能仍在使用它们（资源飞行中释放）→ 驱动延迟错误
-        // DXGI_ERROR_DEVICE_REMOVED（下一处 CreateCommittedResource 爆发）或调试层
-        // 致命异常。等待后再释放则安全。
-        Dx12Native.dx12DestroyCommandEncoder(this.ctx);
-        System.err.println("[dx12-java] close: after destroyCommandEncoder");
-        System.err.flush();
+        // 共享 encoder（device != null）由 Dx12Device.close() 负责销毁 CommandContext，
+        // 此处不调用 dx12DestroyCommandEncoder，避免 CubeMap.render() 等内部调用
+        // close() 时意外销毁共享 ctx 导致后续渲染使用悬空指针。
+        // 临时/一次性 encoder（device == null，如 createBuffer(data)）仍调用
+        // dx12DestroyCommandEncoder，保证资源在 fence 等待后安全释放。
+        if (this.device == null) {
+            Dx12Native.dx12DestroyCommandEncoder(this.ctx);
+            System.err.println("[dx12-java] close: after destroyCommandEncoder");
+            System.err.flush();
+        }
         this.transientMemory.close();
         System.err.println("[dx12-java] close: after transientMemory.close");
         System.err.flush();

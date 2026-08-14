@@ -89,6 +89,7 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     }
 
     Dx12Surface* s = new Dx12Surface();
+    s->hwnd = hwnd;
     s->swapChain = swapChain3;
     return s;
 }
@@ -142,9 +143,6 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
     // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
-    // 注意：绝不在这里尝试 recreate swapchain——同一 HWND 只能有一个 swapchain，
-    // CreateSwapChainForHwnd 会返回 E_ACCESSDENIED (0x80070005)，导致 surface
-    // 状态永久损坏、此后所有 configure 失败、画面冻结。
     for (int retry = 0; retry < 10; ++retry) {
         if (retry > 0) {
             int waitMs = (1 << retry);  // 2,4,8,16,32,64,128,256,512 ms
@@ -163,14 +161,55 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && hr != DXGI_ERROR_INVALID_CALL) break;
     }
     if (FAILED(hr)) {
-        err = "ResizeBuffers failed w=" + std::to_string(width) +
-            " h=" + std::to_string(height) +
-            " count=" + std::to_string(kSurfaceBufferCount) +
-            " fmt=" + std::to_string((int)scFmt);
-        dbgLog("configureSurface: FAILED %s", err.c_str());
-        return false;
+        // ResizeBuffers 全部失败（flip model 限制）：参照 VulkanGpuSurface.configure()
+        // 的做法——销毁旧 swapchain 后重建全新 swapchain（同样尺寸、同样 HWND）。
+        // 必须先 Release 旧 swapchain，否则 CreateSwapChainForHwnd 返回 E_ACCESSDENIED。
+        dbgLog("configureSurface: ResizeBuffers FAILED after 10 retries, falling back to recreate");
+        // 先 Present 释放任何残留的 acquired backbuffer
+        if (s->currentImageIndex >= 0) {
+            s->swapChain->Present(0, 0);
+            s->currentImageIndex = -1;
+        }
+        deviceWaitIdle(err);
+        s->swapChain.Reset();
+        s->backBuffers.clear();
+        s->rtvHandles.clear();
+        s->currentImageIndex = -1;
+        s->lastBlitIndex = -1;
+
+        // 重建 swapchain（与 createSurface 相同的描述符，但尺寸正确）
+        ComPtr<IDXGIFactory4> factory;
+        hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) {
+            err = "CreateDXGIFactory1 failed " + hrText(hr);
+            return false;
+        }
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = (UINT)width;
+        sd.Height = (UINT)height;
+        sd.Format = scFmt;
+        sd.Stereo = FALSE;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = kSurfaceBufferCount;
+        sd.Scaling = DXGI_SCALING_STRETCH;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+        sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
+        ComPtr<IDXGISwapChain1> swapChain1;
+        hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
+            &sd, nullptr, nullptr, &swapChain1);
+        if (FAILED(hr)) {
+            err = "CreateSwapChainForHwnd (recreate) failed " + hrText(hr);
+            return false;
+        }
+        if (FAILED(swapChain1.As(&s->swapChain))) {
+            err = "swapchain does not support IDXGISwapChain3";
+            return false;
+        }
+        dbgLog("configureSurface: recreated swapchain %dx%d", width, height);
     }
-    dbgLog("configureSurface: ResizeBuffers ok");
 
     // 重新取 back buffers + RTV
     s->backBuffers.resize(kSurfaceBufferCount);
@@ -274,6 +313,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     // P17 诊断：检查本 command list 是否有过任何 draw 写入
     // （endRenderPass 后 activeColorTargetsTouched 已被清空，改用 persist 字段）
     bool srcWasWritten = ctx->colorTargetsWritten;
+    dbgLog("blitSurface: ctx=%p ctxW=%d src=%p -> backbuf=%ux%u",
+        (void*)ctx, (int)ctx->colorTargetsWritten, (void*)srcTex, w, h);
     dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu fmt=%d wasWritten=%d -> backbuf=%ux%u",
         (void*)srcTex, (unsigned long long)srcDesc.Width,
         (unsigned long long)srcDesc.Height, (int)srcTex->dxgiFormat,

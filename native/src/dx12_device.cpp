@@ -2495,6 +2495,8 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
             ctx->activeColorTargetsTouched[i] = true;
     }
     ctx->colorTargetsWritten = true;
+    dbgLog("drawIndexed[%llu] colorTargetsWritten -> %d",
+        (unsigned long long)ctx->fenceValue, (int)ctx->colorTargetsWritten);
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
     return true;
