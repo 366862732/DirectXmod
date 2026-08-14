@@ -71,10 +71,10 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
 
     @Override
     public void present() {
-        Dx12Native.dx12PresentSurface(this.handle);
+        Dx12Native.dx12PresentSurface(handle);
         // P6 诊断：约每秒读回一次 back buffer，打印 3x3 采样像素颜色。
-        if (++this.debugReadbackCounter % 60 == 1) {
-            Dx12Native.dx12ReadbackSurfacePixels(this.handle);
+        if (++debugReadbackCounter % 60 == 1) {
+            Dx12Native.dx12ReadbackSurfacePixels(handle);
         }
     }
 

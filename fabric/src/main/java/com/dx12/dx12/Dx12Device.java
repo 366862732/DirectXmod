@@ -59,6 +59,10 @@ import org.slf4j.LoggerFactory;
 public class Dx12Device implements GpuDeviceBackend {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12");
 
+    /** P15 诊断：标记 DX12 后端是否已成功初始化。 */
+    private static volatile boolean initialized = false;
+    public static boolean isInitialized() { return initialized; }
+
     private final DeviceInfo deviceInfo;
     private long timestampCtx;
 
@@ -87,6 +91,7 @@ public class Dx12Device implements GpuDeviceBackend {
             LOGGER.warn("[dx12] GetTimestampFrequency returned 0; timestampPeriod=1.0");
         }
         this.deviceInfo = buildDeviceInfo(parseAdapterName(probe), frequency);
+        initialized = true;
     }
 
     // -----------------------------------------------------------------------

@@ -1151,6 +1151,12 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "submitCommandList: null ctx"; return 0; }
     if (!endCommandList(ctx, err)) return 0;
     UINT64 value = ctx->fenceValue + 1;
+    // P15 诊断：每 30 帧打印 submit 摘要（含 fence 值 + queueFence）
+    if ((value % 30ULL) == 1) {
+        dbgLog("submitCommandList: frame=%llu ctx=%p queueFence=%llu",
+            (unsigned long long)value, (void*)ctx,
+            (unsigned long long)gCtx.queueFenceValue);
+    }
     DBG_LOG_DEBUG("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
     ID3D12CommandList* lists[] = { ctx->commandList.Get() };
     gCtx.queue->ExecuteCommandLists(1, lists);

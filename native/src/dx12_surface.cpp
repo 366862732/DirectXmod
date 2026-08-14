@@ -288,6 +288,11 @@ void presentSurface(Dx12Surface* s) {
     // 其余（FIFO=2 等）-> Present(1, 0)。
     UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
     UINT flags = (s->presentMode == 3) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
+    if ((s->currentImageIndex + 1) % 30 == 0) {
+        dbgLogInfo("presentSurface: idx=%d sync=%u suboptimal=%d",
+            (int)s->currentImageIndex, syncInterval, (int)s->suboptimal);
+    }
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired

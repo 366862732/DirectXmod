@@ -306,6 +306,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void submit() {
+        // P15 诊断：记录提交前的 fence 值，用于排查命令未提交/未完成
+        long fenceBefore = Dx12Native.dx12GetFenceValue(this.ctx);
         Dx12Native.dx12Submit(this.ctx);
         this.transientMemory.rotate();
         // Run callbacks queued by the previous frame's copyTextureToBuffer.
@@ -315,6 +317,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             callback.run();
         }
         Dx12Native.dx12BeginCommandList(this.ctx);
+        // P15: 每 30 帧打印一次 submit 摘要
+        if ((fenceBefore % 30L) == 0) {
+            System.err.println("[dx12-java] submit: frame=" + fenceBefore
+                + " ctx=" + Long.toHexString(this.ctx));
+            System.err.flush();
+        }
     }
 
     public void close() {
