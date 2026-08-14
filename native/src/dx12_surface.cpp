@@ -107,6 +107,8 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     }
     // 窗口最小化/边框切换瞬间 WM_SIZE 可能传 0 尺寸——ResizeBuffers 对 0 尺寸
     // 返回 DXGI_ERROR_INVALID_CALL (0x887A0001)，保持旧尺寸继续，不视为错误。
+    // 非 0 尺寸时也偶发 INVALID_CALL（DWM 仍持有 backbuffer 引用，与 NOT_CURRENTLY_AVAILABLE
+    // 同源竞态），交由下方重试循环处理。
     if (width <= 0 || height <= 0) {
         s->presentMode = presentMode;
         return true;
@@ -139,10 +141,13 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
-    // + 窗口模式的已知竞态）。等待较长时间后重试，最多 5 次。
-    for (int retry = 0; retry < 5; ++retry) {
+    // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
+    // 注意：绝不在这里尝试 recreate swapchain——同一 HWND 只能有一个 swapchain，
+    // CreateSwapChainForHwnd 会返回 E_ACCESSDENIED (0x80070005)，导致 surface
+    // 状态永久损坏、此后所有 configure 失败、画面冻结。
+    for (int retry = 0; retry < 10; ++retry) {
         if (retry > 0) {
-            int waitMs = retry * 32;
+            int waitMs = (1 << retry);  // 2,4,8,16,32,64,128,256,512 ms
             dbgLog("configureSurface: retry %d after %dms", retry, waitMs);
             std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
         }
@@ -153,54 +158,12 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
             break;
         }
         dbgLog("configureSurface: ResizeBuffers failed %s (retry=%d)", hrText(hr).c_str(), retry);
-        if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) break;  // 非竞态错误，直接失败
-    }
-    // 重试全部失败：DWM 仍持有 backbuffer。获取窗口句柄并 destroy+recreate swapchain。
-    if (FAILED(hr)) {
-        HWND hwnd = nullptr;
-        s->swapChain->GetHwnd(&hwnd);
-        // 保留原 swapchain 的 tearing 标志（ResizeBuffers 要求 flags 不变）
-        DXGI_SWAP_CHAIN_DESC1 origDesc{};
-        s->swapChain->GetDesc1(&origDesc);
-        dbgLog("configureSurface: recreate swapchain hwnd=%p w=%d h=%d", (void*)hwnd, width, height);
-        ComPtr<IDXGIFactory4> factory;
-        HRESULT hrFactory = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-        if (SUCCEEDED(hrFactory) && hwnd) {
-            DXGI_SWAP_CHAIN_DESC1 sd{};
-            sd.Width = 1;
-            sd.Height = 1;
-            sd.Format = scFmt;
-            sd.Stereo = FALSE;
-            sd.SampleDesc.Count = 1;
-            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            sd.BufferCount = kSurfaceBufferCount;
-            sd.Scaling = DXGI_SCALING_STRETCH;
-            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;  // 必须与原始 swapchain 一致
-            sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-            sd.Flags = origDesc.Flags;  // 保留 ALLOW_TEARING 等标志
-            ComPtr<IDXGISwapChain1> newSwapChain1;
-            HRESULT hrNew = factory->CreateSwapChainForHwnd(
-                ctx.queue.Get(), hwnd, &sd, nullptr, nullptr, &newSwapChain1);
-            if (SUCCEEDED(hrNew)) {
-                ComPtr<IDXGISwapChain3> newSwapChain3;
-                if (SUCCEEDED(newSwapChain1.As(&newSwapChain3))) {
-                    s->swapChain = newSwapChain3;
-                    hr = s->swapChain->ResizeBuffers(
-                        kSurfaceBufferCount, (UINT)width, (UINT)height,
-                        scFmt, 0);
-                    if (SUCCEEDED(hr)) {
-                        dbgLog("configureSurface: swapchain recreated ok (FLIP_DISCARD mode)");
-                    } else {
-                        dbgLog("configureSurface: recreate resize failed %s", hrText(hr).c_str());
-                    }
-                }
-            } else {
-                dbgLog("configureSurface: CreateSwapChainForHwnd failed %s", hrText(hrNew).c_str());
-            }
-        }
+        // INVALID_CALL 与 NOT_CURRENTLY_AVAILABLE 同源：DWM 异步持有 backbuffer 引用时
+        // 均可能出现，统一重试（递增等待，最多 ~1s）。
+        if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && hr != DXGI_ERROR_INVALID_CALL) break;
     }
     if (FAILED(hr)) {
-        err = "ResizeBuffers/recreate failed w=" + std::to_string(width) +
+        err = "ResizeBuffers failed w=" + std::to_string(width) +
             " h=" + std::to_string(height) +
             " count=" + std::to_string(kSurfaceBufferCount) +
             " fmt=" + std::to_string((int)scFmt);

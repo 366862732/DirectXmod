@@ -29,11 +29,33 @@ namespace dx12mc {
 
 using Microsoft::WRL::ComPtr;
 
+// P15: 日志分级 - ERROR/WARNING 始终输出；INFO/DEBUG 默认关闭，需 DX12_LOG_VERBOSE=1
+
+enum class DbgLogLevel : int {
+    ERR  = 0,
+    WARN = 1,
+    INFO = 2,
+    DEBUG = 3,
+};
+
 // 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
 double nowMs();
 
-// 诊断插桩：带毫秒时间戳打印到 stderr（PCL 启动器写入游戏日志）。
+// 错误/警告（始终输出）
 void dbgLog(const char* fmt, ...);
+// 信息级别（默认关闭）
+void dbgLogInfo(const char* fmt, ...);
+// 调试级别（默认关闭）
+void dbgLogDebug(const char* fmt, ...);
+// 设置日志级别（0=ERR 1=WARN 2=INFO 3=DEBUG）
+void setLogLevel(int level);
+
+// 高频调试宏：默认静默，DX12_LOG_VERBOSE=1 或编译时 DX12_DEBUG_VERBOSE 宏开启
+#ifdef DX12_DEBUG_VERBOSE
+#define DBG_LOG_DEBUG(...) dbgLogDebug(__VA_ARGS__)
+#else
+#define DBG_LOG_DEBUG(...) ((void)0)
+#endif
 
 // ---------------------------------------------------------------------------
 // 设备上下文（进程内单例，Java 侧首次调用 dx12CreateDevice 时创建）

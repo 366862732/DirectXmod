@@ -225,11 +225,15 @@ double nowMs() {
     return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
+// P15: 日志级别 - 默认只输出 WARNING 及以上；设置环境变量 DX12_LOG_VERBOSE=1 开启 INFO/DEBUG
+static int gLogLevel = 1; // WARN=1; ERR=0, WARN=1, INFO=2, DEBUG=3
+
 // 诊断插桩：打印到 stderr（PCL 启动器会写入游戏日志；不影响 debug.log）。
 // P12：同时镜像写入 %TEMP%\dx12-native.log——PCL 启动器死锁/游戏异常退出时
 // stderr 重定向的游戏日志丢失，此独立文件随写随刷，进程挂起也能看到卡死点
 // 的最后一条原生调用（fence 等待 / destroy 路径）。
 void dbgLog(const char* fmt, ...) {
+    if (gLogLevel < 1) return; // WARN=1, ERR=0
     char line[2048];
     va_list ap;
     va_start(ap, fmt);
@@ -245,6 +249,45 @@ void dbgLog(const char* fmt, ...) {
         std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
         std::fclose(f);
     }
+}
+void dbgLogInfo(const char* fmt, ...) {
+    if (gLogLevel < 2) return; // INFO=2
+    char line[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    double t = nowMs();
+    std::fprintf(stderr, "[dx12][t=%8.1fms] %s\n", t, line);
+    fflush(stderr);
+    const char* tmp = std::getenv("TEMP");
+    std::string path = (tmp && *tmp) ? tmp : ".";
+    path += "\\dx12-native.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+        std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
+        std::fclose(f);
+    }
+}
+void dbgLogDebug(const char* fmt, ...) {
+    if (gLogLevel < 3) return; // DEBUG=3
+    char line[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    double t = nowMs();
+    std::fprintf(stderr, "[dx12][t=%8.1fms] %s\n", t, line);
+    fflush(stderr);
+    const char* tmp = std::getenv("TEMP");
+    std::string path = (tmp && *tmp) ? tmp : ".";
+    path += "\\dx12-native.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+        std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
+        std::fclose(f);
+    }
+}
+void setLogLevel(int level) {
+    gLogLevel = (level < 0) ? 0 : (level > 3) ? 3 : level;
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +602,7 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
     // P6 诊断：只打印 RENDER_ATTACHMENT（usage & 8）纹理——GUI 中间渲染目标/
     // 主场景 RT 都带此标志，blit 源纹理也在其中（定位 54EE180 之类 handle）。
     if (usage & 8) {
-        dbgLog("createTexture: RTA handle=%p w=%d h=%d layers=%d mips=%d fmt=%d usage=0x%x",
+        dbgLogInfo("createTexture: RTA handle=%p w=%d h=%d layers=%d mips=%d fmt=%d usage=0x%x",
             (void*)obj.get(), width, height, depthOrLayers, mipLevels, format, usage);
     }
     return obj.release();
@@ -708,7 +751,7 @@ void destroyObject(Dx12Object* obj) {
     }
     // P12 诊断：关闭阶段定位用（destroyCommandEncoder 之后的销毁路径原本
     // 全静默，卡死时无法判断 Java 侧 transientMemory/管线缓存关闭进行到哪）。
-    dbgLog("destroyObject: kind=%d size=%lld", (int)obj->kind, (long long)obj->size);
+    DBG_LOG_DEBUG("destroyObject: kind=%d size=%lld", (int)obj->kind, (long long)obj->size);
     // P6：延迟销毁（官方 VulkanGpuBuffer.close() 的 queueForDestroy 语义）。
     // 若资源正被打开的命令列表引用，立即 delete 会在 Close 时报
     // "deleted prior to closing the command list"（E_INVALIDARG）。登记到
@@ -1012,7 +1055,7 @@ bool deviceWaitIdle(std::string& err) {
 
 CommandContext* createCommandEncoder(std::string& err) {
     if (!ensureDevice(err)) return nullptr;
-    dbgLog("createCommandEncoder: enter");
+    DBG_LOG_DEBUG("createCommandEncoder: enter");
     auto ctx = std::make_unique<CommandContext>();
     for (int i = 0; i < 3; ++i) {
         if (FAILED(gCtx.device->CreateCommandAllocator(
@@ -1031,13 +1074,13 @@ CommandContext* createCommandEncoder(std::string& err) {
     }
     ctx->fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!ctx->fenceEvent) { err = "createCommandEncoder: CreateEvent failed"; return nullptr; }
-    dbgLog("createCommandEncoder: done ctx=%p", (void*)ctx.get());
+    dbgLogInfo("createCommandEncoder: done ctx=%p", (void*)ctx.get());
     return ctx.release();
 }
 
 void destroyCommandEncoder(CommandContext* ctx) {
     if (!ctx) return;
-    dbgLog("destroyCommandEncoder: enter fenceValue=%llu", (unsigned long long)ctx->fenceValue);
+    DBG_LOG_DEBUG("destroyCommandEncoder: enter fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     // 该 ctx 可能仍有未执行的已提交命令（如 createBuffer(data) 的 submit 后
     // 立即 close）；先等它全部完成再销毁 allocator，否则 GPU 在使用已释放的
     // allocator 会导致 DXGI_ERROR_DEVICE_REMOVED。
@@ -1057,14 +1100,14 @@ void destroyCommandEncoder(CommandContext* ctx) {
     }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
     delete ctx;
-    dbgLog("destroyCommandEncoder: done ctx=%p", (void*)ctx);
+    dbgLogInfo("destroyCommandEncoder: done ctx=%p", (void*)ctx);
 }
 
 bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "beginCommandList: null ctx"; return false; }
     // P6 诊断：转储上一帧累积的验证错误（Close 成功后不打印不代表无错）。
     dumpInfoQueueMessages();
-    dbgLog("beginCommandList: fenceValue=%llu", (unsigned long long)ctx->fenceValue);
+    DBG_LOG_DEBUG("beginCommandList: fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandList: allocator Reset " + hrText(hr); return false; }
     hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
@@ -1108,11 +1151,11 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "submitCommandList: null ctx"; return 0; }
     if (!endCommandList(ctx, err)) return 0;
     UINT64 value = ctx->fenceValue + 1;
-    dbgLog("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
+    DBG_LOG_DEBUG("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
     ID3D12CommandList* lists[] = { ctx->commandList.Get() };
     gCtx.queue->ExecuteCommandLists(1, lists);
     value = ++ctx->fenceValue;
-    dbgLog("submit: executed, Signal v=%llu", (unsigned long long)value);
+    DBG_LOG_DEBUG("submit: executed, Signal v=%llu", (unsigned long long)value);
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
         err = "submitCommandList: Signal failed"; return 0;
     }
@@ -1138,7 +1181,7 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
             return 0;
         }
     }
-    dbgLog("submit: done v=%llu", (unsigned long long)value);
+    DBG_LOG_DEBUG("submit: done v=%llu", (unsigned long long)value);
     // 提交并同步等待完成：本命令列表已执行完，其引用的资源可安全释放。
     // 若所有打开的命令列表都已提交完成，则统一释放 pending 删除对象
     // （延迟销毁的 flush 点，对应官方 queueForDestroy 的 execute 时机）。
@@ -1151,7 +1194,7 @@ bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
     std::string& err) {
     if (!ctx) { err = "waitForFenceValue: null ctx"; return false; }
     UINT64 cv = ctx->fence->GetCompletedValue();
-    dbgLog("waitFence: value=%llu completed=%llu", (unsigned long long)value, (unsigned long long)cv);
+    DBG_LOG_DEBUG("waitFence: value=%llu completed=%llu", (unsigned long long)value, (unsigned long long)cv);
     if (cv >= value) return true;
     HRESULT hr = ctx->fence->SetEventOnCompletion(value, ctx->fenceEvent);
     if (FAILED(hr)) { err = "waitForFenceValue: SetEventOnCompletion " + hrText(hr); return false; }
@@ -1205,7 +1248,7 @@ bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err) {
         return false;
     }
     CloseHandle(evt);
-    dbgLog("waitQFence: OK value=%llu", (unsigned long long)value);
+    DBG_LOG_DEBUG("waitQFence: OK value=%llu", (unsigned long long)value);
     return true;
 }
 
@@ -1628,7 +1671,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
 bool endRenderPass(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "endRenderPass: null ctx"; return false; }
     if (!ctx->inRenderPass) return true;  // 幂等
-    dbgLog("endRenderPass: ctx=%p", (void*)ctx);
+    DBG_LOG_DEBUG("endRenderPass: ctx=%p", (void*)ctx);
     // P11 修复：附件必须显式回切 COMMON。D3D12 的 RENDER_TARGET/DEPTH_WRITE 属
     // "非可提升状态"，命令列表执行完成时【不会】隐式 decay 回 COMMON（只有
     // COPY_SOURCE/COPY_DEST/UAV 等可提升状态才会）。若此处不显式回切，下一
@@ -2033,7 +2076,7 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             inputLayout.push_back(ie);
         }
     }
-    dbgLog("createGraphicsPipeline: inputElements=%zu\n%s",
+    dbgLogInfo("createGraphicsPipeline: inputElements=%zu\n%s",
         desc.inputElements.size(), inputDescStr.c_str());
 
     // 4) PSO 共享状态：混合 + 光栅化
@@ -2222,9 +2265,9 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 }
 
 void destroyPipeline(Dx12Pipeline* pipeline) {
-    dbgLog("destroyPipeline: pso=%p", (void*)pipeline);
+    DBG_LOG_DEBUG("destroyPipeline: pso=%p", (void*)pipeline);
     delete pipeline;
-    dbgLog("destroyPipeline: done");
+    DBG_LOG_DEBUG("destroyPipeline: done");
 }
 
 // ---------------------------------------------------------------------------
@@ -2281,7 +2324,7 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long lon
     vb.StrideInBytes = effectiveStride;
     ctx->commandList->IASetVertexBuffers((UINT)slot, 1, &vb);
     // P6 诊断：确认每帧 draw 前确实绑定了顶点缓冲（内容尺寸/stride）。
-    dbgLog("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
+    DBG_LOG_DEBUG("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
         slot, (void*)buffer, (long long)buffer->size, (long long)offset,
         (int)stride, (int)effectiveStride, (int)buffer->heapType);
     // P6 诊断：每 60 次读回顶点 buffer 前 128 字节（确认数据是否真正写入）。
@@ -2304,7 +2347,7 @@ bool setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType, std:
     ib.Format = indexType == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     ctx->commandList->IASetIndexBuffer(&ib);
     // P6 诊断：确认每帧 draw 前确实绑定了索引缓冲（内容尺寸/索引宽度）。
-    dbgLog("setIndexBuffer: buf=%p size=%lld idxWidth=%d heap=%d",
+    DBG_LOG_DEBUG("setIndexBuffer: buf=%p size=%lld idxWidth=%d heap=%d",
         (void*)buffer, (long long)buffer->size, indexType == 1 ? 4 : 2,
         (int)buffer->heapType);
     return true;
@@ -2324,7 +2367,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     for (UINT i = 0; i < count; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)i * gCtx.drawInc };
         const DrawBinding& b = bindings[i];
-        dbgLog("pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d",
+        DBG_LOG_DEBUG("pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d",
             (unsigned)i, (int)b.type, (void*)b.buffer, (void*)b.view,
             (long long)b.offset, (long long)b.length, b.texelFormat);
         switch (b.type) {
@@ -2398,7 +2441,7 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
     INT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "drawIndexed: no open command list"; return false; }
     if (!ctx->inRenderPass) { err = "drawIndexed: no open render pass"; return false; }
-    dbgLog("drawIndexed: indexCount=%u instance=%u firstIndex=%d baseVertex=%d",
+    DBG_LOG_DEBUG("drawIndexed: indexCount=%u instance=%u firstIndex=%d baseVertex=%d",
         indexCount, instanceCount, startIndexLocation, baseVertexLocation);
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
@@ -2409,7 +2452,7 @@ bool drawInstanced(CommandContext* ctx, UINT vertexCount, UINT instanceCount,
     UINT firstVertex, UINT startInstanceLocation, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "draw: no open command list"; return false; }
     if (!ctx->inRenderPass) { err = "draw: no open render pass"; return false; }
-    dbgLog("draw: vertexCount=%u instance=%u firstVertex=%u",
+    DBG_LOG_DEBUG("draw: vertexCount=%u instance=%u firstVertex=%u",
         vertexCount, instanceCount, firstVertex);
     ctx->commandList->DrawInstanced(vertexCount, instanceCount, firstVertex, startInstanceLocation);
     return true;

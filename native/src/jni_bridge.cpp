@@ -40,6 +40,11 @@ JNIEXPORT jstring JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateDevice(
     if (!dx12mc::ensureDevice(err)) {
         return toJString(env, "ERROR: " + err);
     }
+    // P15: 读取 DX12_LOG_VERBOSE 环境变量控制日志级别
+    const char* verbose = std::getenv("DX12_LOG_VERBOSE");
+    dx12mc::setLogLevel(verbose && *verbose ? 3 : 1);
+    dx12mc::dbgLog("dx12: log level=%d (0=ERR 1=WARN 2=INFO 3=DEBUG), DX12_LOG_VERBOSE=%s",
+        verbose && *verbose ? 3 : 1, verbose ? verbose : "off");
     auto& ctx = dx12mc::deviceContextForJni();
     int level = ctx.featureLevel & 0xffff;
     char levelName[64];

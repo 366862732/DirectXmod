@@ -62,7 +62,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12ConfigureSurface(
             width, height, presentMode, err.c_str());
         return JNI_FALSE;
     }
-    dbgLog("dx12ConfigureSurface: ok %dx%d mode=%d", width, height, presentMode);
+    dbgLogInfo("dx12ConfigureSurface: ok %dx%d mode=%d", width, height, presentMode);
     return JNI_TRUE;
 }
 
@@ -84,7 +84,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BlitSurface(
         std::fprintf(stderr, "[dx12] dx12BlitSurface: %s\n", err.c_str());
         return;
     }
-    dbgLog("blitSurface: ok ctx=%p surface=%p texture=%p",
+    dbgLogInfo("blitSurface: ok ctx=%p surface=%p texture=%p",
         toCtx(ctx), toSurface(surface), toObject(texture));
 }
 

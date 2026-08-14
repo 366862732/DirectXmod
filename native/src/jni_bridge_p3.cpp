@@ -73,7 +73,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12Submit(
     UINT64 value = dx12mc::submitCommandList(
         reinterpret_cast<dx12mc::CommandContext*>(ctx), err);
     if (value == 0 && !err.empty()) { throwJava(env, "dx12Submit: " + err); }
-    dx12mc::dbgLog("submit: JNI done value=%llu", (unsigned long long)value);
+    DBG_LOG_DEBUG("submit: JNI done value=%llu", (unsigned long long)value);
     return (jlong)value;
 }
 
@@ -115,7 +115,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampNow(
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBuffer(
     JNIEnv* env, jclass, jlong ctx, jlong src, jlong srcOffset,
     jlong dst, jlong dstOffset, jlong size) {
-    dx12mc::dbgLog("copyBuffer: src=%p(%lld) dst=%p(%lld) size=%lld",
+    DBG_LOG_DEBUG("copyBuffer: src=%p(%lld) dst=%p(%lld) size=%lld",
         (void*)src, (long long)srcOffset, (void*)dst, (long long)dstOffset,
         (long long)size);
     std::string err;
