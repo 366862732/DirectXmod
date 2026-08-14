@@ -179,6 +179,8 @@ struct CommandContext {
     // barrier 按 COMMON 写 Before 状态会与资源实际状态错配（每帧验证 ERROR →
     // GPU 状态错乱 → TDR 冻结：游戏挂死，启动器同 GPU 渲染也卡死）。
     std::vector<Dx12Object*> activeColorTargets;
+    // P17：标记每个 color target 在本 command list 中是否被 draw 写入过
+    std::vector<bool> activeColorTargetsTouched;
     Dx12Object* activeDepthTarget = nullptr;
 
     // P6：本帧 drawHeap 瞬时描述符分配（ring：fenceValue%2 交替两个半区；

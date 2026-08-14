@@ -983,8 +983,8 @@ bool flushAndWait(ID3D12CommandList* list, std::string& err) {
 // 初始状态（texture=COMMON，buffer=initialStateFor(heapType)）；若本 list 内
 // 已跟踪过该资源则以跟踪状态为准。绝不在 list 内回退到 COMMON（D3D12 禁止
 // 从已提升状态显式回 COMMON；decay 由命令列表执行完成时隐式处理）。
-// beginCommandList 清空 tracking 后一切资源视为初始态——前提是 submit 同步
-// 等待完成（保证上一 command list 已执行完并 decay，见 submitCommandList）。
+// beginCommandList 无条件清空 tracking（submit 阻塞等待 GPU 完成，资源已
+// 隐式 decay 回 COMMON；此处按初始态开始录制是正确且保守的）。
 // 定义在匿名 namespace 之外：transitionTextureTo 供 dx12_surface.cpp 使用。
 void transitionTo(CommandContext* ctx, ID3D12Resource* res,
     D3D12_RESOURCE_STATES fromInitial, D3D12_RESOURCE_STATES to) {
@@ -1115,8 +1115,8 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
     ++gOpenListCount;  // 延迟销毁：登记打开计数，submit 完成前不释放资源
-    // 新 command list 从“所有资源处于初始态”开始：submit 同步等待完成保证
-    // 上一 list 已执行完，提升状态已隐式 decay 回 COMMON（见 submitCommandList）。
+    // submit 阻塞等待 GPU 完成（见 submitCommandList），此处清空 resourceState
+    // 后一切资源视为初始态是正确且保守的（D3D12 驱动会按实际 GPU 状态纠正）。
     ctx->resourceState.clear();
     // P6：draw 瞬时描述符 ring 半区（fenceValue%2 与 allocator 同步交替；
     // 帧 N+2 重写帧 N 半区时，帧 N 的 GPU 工作已完成）
@@ -1174,11 +1174,13 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
             err = "submitCommandList: Signal(queue) failed"; return 0;
         }
     }
-    // 提交后同步等待本次 Signal 的值完成（而非 value-2）：保证返回时上一
-    // command list 已执行完，所有提升状态已隐式 decay 回 COMMON。这样
-    // beginCommandList 清空 resourceState 后一切资源都从初始态开始是正确
-    // 的（否则跨 list 的提升状态残留会让后续 barrier 的 Before 状态不匹配）。
-    // P6 以首帧正确性优先；多帧在飞行（双缓冲）的优化留待后续阶段。
+    // 等待本帧 command list 完成：保证背缓冲在 acquire 时已不再被 GPU 使用。
+    // 对应官方 VulkanQueue::Submission::close 的 vkQueueSubmit2KHR + acquire
+    // semaphore 语义。非阻塞版本曾尝试将等待移至 acquireSurface，但发现
+    // GetCurrentBackBufferIndex 无同步原语，导致 Frame N+2 acquire 时 GPU 仍
+    // 在渲染 Frame N 的背缓冲 → blitSurface 写入与 GPU 读取冲突 → 画面损坏。
+    // 恢复 per-ctx fence 阻塞等待（~1-2ms GPU 等待），保证每帧完整执行后才
+    // 开始录制下一帧，acquireSurface 无需额外同步。
     if (value >= 1) {
         std::string w;
         if (!waitForFenceValue(ctx, value, 5000000000ULL, w)) {
@@ -1604,6 +1606,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
     // P11：本 pass 的附件在 endRenderPass 时需显式回切 COMMON（见 endRenderPass），
     // 先清空上次记录（防御：上次 pass 未正常 end）。
     ctx->activeColorTargets.clear();
+    ctx->activeColorTargetsTouched.clear();
     ctx->activeDepthTarget = nullptr;
 
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
@@ -1668,7 +1671,16 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         (void*)ctx, colorCount, x, y, w, h, depthView ? "yes" : "no");
     for (int i = 0; i < colorCount; ++i) {
         if (colorViews[i]) {
-            dbgLog("  color[%d] tex=%p", i, (void*)colorViews[i]);
+            auto* tex = colorViews[i];
+            auto desc = tex->resource->GetDesc();
+            const float* cc = clearColors ? (clearColors + i * 4) : nullptr;
+            dbgLog("beginRenderPass color[%d] tex=%p dims=%ux%u fmt=%d clear=(%.3f,%.3f,%.3f,%.3f)",
+                i, (void*)tex, (UINT)desc.Width, (UINT)desc.Height,
+                (int)tex->dxgiFormat,
+                cc ? (double)cc[0] : 0.0, cc ? (double)cc[1] : 0.0,
+                cc ? (double)cc[2] : 0.0, cc ? (double)cc[3] : 0.0);
+            ctx->activeColorTargets.push_back(tex);
+            ctx->activeColorTargetsTouched.push_back(false);
         }
     }
     return true;
@@ -1693,6 +1705,7 @@ bool endRenderPass(CommandContext* ctx, std::string& err) {
         transitionTextureTo(ctx, ctx->activeDepthTarget, D3D12_RESOURCE_STATE_COMMON);
     }
     ctx->activeColorTargets.clear();
+    ctx->activeColorTargetsTouched.clear();
     ctx->activeDepthTarget = nullptr;
     ctx->inRenderPass = 0;
     return true;
@@ -2367,6 +2380,15 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
         err = "pushDescriptors: draw descriptor heap exhausted for this frame";
         return false;
     }
+    // P16 诊断：每帧首 pushDescriptors 打印 binding 数量（确认 uniform/texture 被推送）
+    static int pdFrameCount = 0;
+    if ((int)ctx->fenceValue != pdFrameCount) {
+        pdFrameCount = (int)ctx->fenceValue;
+        dbgLog("pushDescriptors[%llu]: count=%u firstBuf=%p firstView=%p",
+            (unsigned long long)ctx->fenceValue, count,
+            (void*)(count > 0 ? (void*)bindings[0].buffer : nullptr),
+            (void*)(count > 0 ? (void*)bindings[0].view : nullptr));
+    }
     SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += base;
@@ -2447,8 +2469,30 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
     INT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "drawIndexed: no open command list"; return false; }
     if (!ctx->inRenderPass) { err = "drawIndexed: no open render pass"; return false; }
-    DBG_LOG_DEBUG("drawIndexed: indexCount=%u instance=%u firstIndex=%d baseVertex=%d",
-        indexCount, instanceCount, startIndexLocation, baseVertexLocation);
+    // P17 诊断：每次 drawIndexed 都记录（验证 GUI pass 是否有实际 draw call）
+    // 使用静态计数器区分同一 command list 内的多个 pass（如 512x256 + 854x480）
+    static UINT64 lastFence = 0;
+    static int passCount = 0;
+    if (ctx->fenceValue != lastFence) {
+        lastFence = ctx->fenceValue;
+        passCount = 0;
+    }
+    passCount++;
+    if (indexCount == 0) {
+        dbgLog("drawIndexed[%llu] PASS#%d: ZERO-COUNT (skip) topo=%d",
+            (unsigned long long)ctx->fenceValue, passCount,
+            (int)(ctx->currentPipeline ? ctx->currentPipeline->topology : -1));
+    } else {
+        dbgLog("drawIndexed[%llu] PASS#%d: count=%u inst=%u first=%d base=%d topo=%d",
+            (unsigned long long)ctx->fenceValue, passCount, indexCount, instanceCount,
+            startIndexLocation, baseVertexLocation,
+            (int)(ctx->currentPipeline ? ctx->currentPipeline->topology : -1));
+    }
+    // P17：标记当前 render pass 的所有 color target 为"已写入"
+    for (size_t i = 0; i < ctx->activeColorTargets.size(); ++i) {
+        if (i < ctx->activeColorTargetsTouched.size())
+            ctx->activeColorTargetsTouched[i] = true;
+    }
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
     return true;

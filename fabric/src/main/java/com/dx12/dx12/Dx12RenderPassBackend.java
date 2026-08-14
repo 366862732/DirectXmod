@@ -140,12 +140,25 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         this.anyDescriptorDirty = false;
         Dx12CompiledRenderPipeline pipeline = this.pipeline;
         if (pipeline == null || !pipeline.isValid()) {
+            System.err.println("[dx12-java] pushDescriptors: SKIP (pipeline null or invalid)");
             return;
         }
         List<Dx12BindGroupEntry> bindings = pipeline.bindings();
         int count = bindings.size();
         if (count == 0) {
+            System.err.println("[dx12-java] pushDescriptors: SKIP (0 bindings)");
             return;
+        }
+        // P16 诊断：首帧打印 binding 名称列表
+        if (System.err instanceof java.io.PrintStream) {
+            StringBuilder sb = new StringBuilder("[dx12-java] pushDesc pipeline=")
+                .append(pipeline.info().getLocation()).append(" count=").append(count);
+            for (int i = 0; i < count && i < 8; i++) {
+                sb.append(" [").append(i).append("=").append(bindings.get(i).type())
+                    .append(":").append(bindings.get(i).name()).append("]");
+            }
+            System.err.println(sb);
+            System.err.flush();
         }
         int[] types = new int[count];
         long[] buffers = new long[count];
@@ -277,6 +290,14 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     @Override
     public void drawIndexed(int indexCount, int instanceCount, int firstIndex,
         int vertexOffset, int firstInstance) {
+        // P17 诊断：记录每次 drawIndexed 调用（含参数），验证 GUI pass 是否有实际 draw
+        if (System.err instanceof java.io.PrintStream) {
+            System.err.println("[dx12-java] drawIndexed pipeline=" + pipeline.info().getLocation()
+                + " count=" + indexCount + " inst=" + instanceCount
+                + " first=" + firstIndex + " base=" + vertexOffset
+                + (indexCount == 0 ? " [ZERO-COUNT!]" : ""));
+            System.err.flush();
+        }
         this.pushDescriptors();
         if (!Dx12Native.dx12DrawIndexed(this.ctx, indexCount, instanceCount,
             firstIndex, vertexOffset, firstInstance)) {
