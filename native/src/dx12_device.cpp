@@ -1859,42 +1859,22 @@ bool compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageNam
 Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err) {
     if (!ensureDevice(err)) return nullptr;
 
-    // P6 诊断实验：仅在 self-test 阶段（前 2 次 createGraphicsPipeline 调用）注入
-    // 测试 shader，验证渲染管线后自动关闭，后续游戏渲染使用真实 shader。
-    // VS 用 SV_VertexID 不依赖顶点缓冲，避免 "Input Assembler object is expected" 错误。
-    static int kTestPipelineCount = 0;
-    const bool kTestShader = (kTestPipelineCount < 2);
     std::vector<uint8_t> vsBytes = desc.vsBytes;
     std::vector<uint8_t> psBytes = desc.psBytes;
-    if (kTestShader) {
-        ++kTestPipelineCount;
-        const char* vs =
-            "float4 main(uint vid : SV_VertexID) : SV_Position {\n"
-            "    float2 pos = float2((vid << 1) & 2, vid & 2) - 1.0h;\n"
-            "    return float4(pos, 0.0, 1.0);\n"
-            "}\n";
-        const char* ps =
-            "float4 main() : SV_Target {\n"
-            "    return float4(0.0, 1.0, 1.0, 1.0);\n"
-            "}\n";
-        vsBytes.assign(vs, vs + strlen(vs));
-        psBytes.assign(ps, ps + strlen(ps));
-        std::fprintf(stderr, "[dx12] TEST SHADER ACTIVE: vsSize=%zu psSize=%zu (injected fixed cyan triangle)\n",
-            vsBytes.size(), psBytes.size());
-    }
-    // P6 诊断：打印前 2 个真实管线 HLSL 源码（找 draw 无输出的 shader 根因）。
+    // P7 诊断：打印前 2 个真实管线 HLSL（stderr 输出，帮助排查着色器数据流问题）
     {
         static int hlslDump = 0;
         if (hlslDump < 2) {
             ++hlslDump;
             std::string vsStr((const char*)vsBytes.data(), vsBytes.size());
             std::string psStr((const char*)psBytes.data(), psBytes.size());
-            // 输出到 stderr（与 [dx12] 日志同流）以便确认测试 shader 是否生效
-            std::fprintf(stderr, "[dx12] === HLSL DUMP #%d vs (%zuB) ===\n%s\n[dx12] === HLSL DUMP #%d ps (%zuB) ===\n%s\n",
-                hlslDump, vsBytes.size(), vsStr.c_str(), hlslDump, psBytes.size(), psStr.c_str());
+            std::fprintf(stderr,
+                "[dx12] === HLSL #%d vs (%zuB) ===\n%s\n"
+                "[dx12] === HLSL #%d ps (%zuB) ===\n%s\n",
+                hlslDump, vsBytes.size(), vsStr.c_str(),
+                hlslDump, psBytes.size(), psStr.c_str());
         }
     }
-
     // 1) HLSL -> DXBC（vs_5_1 / ps_5_1，入口 main）
     ComPtr<ID3DBlob> vsBlob, psBlob;
     if (!compileShaderBytecode(vsBytes, "vertex", "vs_5_1", vsBlob, err)) return nullptr;
