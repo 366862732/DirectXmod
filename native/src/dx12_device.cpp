@@ -13,6 +13,8 @@
 
 namespace dx12mc {
 
+Dx12Surface* gActiveSurface = nullptr;  // P18：当前 active surface（渲染线程单例）
+
 namespace {
 
 DeviceContext gCtx;
@@ -1175,19 +1177,16 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
             err = "submitCommandList: Signal(queue) failed"; return 0;
         }
     }
-    // 等待本帧 command list 完成：保证背缓冲在 acquire 时已不再被 GPU 使用。
-    // 对应官方 VulkanQueue::Submission::close 的 vkQueueSubmit2KHR + acquire
-    // semaphore 语义。非阻塞版本曾尝试将等待移至 acquireSurface，但发现
-    // GetCurrentBackBufferIndex 无同步原语，导致 Frame N+2 acquire 时 GPU 仍
-    // 在渲染 Frame N 的背缓冲 → blitSurface 写入与 GPU 读取冲突 → 画面损坏。
-    // 恢复 per-ctx fence 阻塞等待（~1-2ms GPU 等待），保证每帧完整执行后才
-    // 开始录制下一帧，acquireSurface 无需额外同步。
-    if (value >= 1) {
-        std::string w;
-        if (!waitForFenceValue(ctx, value, 5000000000ULL, w)) {
-            err = "submitCommandList: " + w;
-            dbgLog("submit: WAIT FAILED: %s", w.c_str());
-            return 0;
+    // P18：记录 per-backbuffer fence 值，供 acquireSurface 按需同步（非阻塞）。
+    // submit 本身不等待 GPU，改为在 acquireSurface 中检查重用的 back buffer
+    // 是否仍被 GPU 使用（上次 blit 未完成时等待），避免渲染线程阻塞导致鼠标卡顿。
+    Dx12Surface* s = getActiveSurface();
+    if (s) {
+        int idx = s->currentImageIndex;
+        if (idx >= 0 && idx < (int)kSurfaceBufferCount) {
+            if (s->surfaceFences.size() < (size_t)kSurfaceBufferCount)
+                s->surfaceFences.resize(kSurfaceBufferCount, 0);
+            s->surfaceFences[(size_t)idx] = gCtx.queueFenceValue;
         }
     }
     DBG_LOG_DEBUG("submit: done v=%llu", (unsigned long long)value);

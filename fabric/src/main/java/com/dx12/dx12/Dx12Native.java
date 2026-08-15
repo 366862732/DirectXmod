@@ -107,8 +107,9 @@ public final class Dx12Native {
 
     /**
      * Submit the recorded command list: ExecuteCommandLists + Signal(fence,
-     * ++value), then wait for value-2 (mirror of the vanilla double-buffered
-     * submit). Returns the fence value of this submit.
+     * ++value). Non-blocking (GPU async); the fence value is recorded per-backbuffer
+     * so acquireSurface can wait only when reusing a buffer still in use by GPU.
+     * Returns the fence value of this submit.
      */
     public static native long dx12Submit(long ctx);
 

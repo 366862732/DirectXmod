@@ -213,8 +213,8 @@ void destroyCommandEncoder(CommandContext* ctx);
 bool beginCommandList(CommandContext* ctx, std::string& err);
 // 结束录制：Close list（之后可提交）。
 bool endCommandList(CommandContext* ctx, std::string& err);
-// 提交：ExecuteCommandLists + Signal(fence, ++fenceValue) + 等待 fenceValue-2
-// 完成（对应官方 awaitSubmitCompletion(currentSubmitIndex - 2)）。
+// 提交：ExecuteCommandLists + Signal(fence, ++fenceValue)。
+// 非阻塞（GPU 异步执行）；fence 信号值同时写入当前 active surface 的 per-backbuffer 记录。
 // 返回本次提交的 fence value。
 UINT64 submitCommandList(CommandContext* ctx, std::string& err);
 // 等待 fence 值达到 value；timeoutNs 为纳秒。返回是否完成。
@@ -437,7 +437,15 @@ struct Dx12Surface {
     bool suboptimal = false;
     std::vector<ComPtr<ID3D12Resource>> backBuffers;
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvHandles;  // 由 rtvHeap 分配
+    // P18：per-backbuffer fence 值。submitCommandList 记录本帧写入的 fence 值，
+    // acquireSurface 据此判断重用的 back buffer 是否仍被 GPU 使用。
+    std::vector<UINT64> surfaceFences;
 };
+
+// P18：当前 active surface（单例，渲染线程访问）。submit 时写入 per-backbuffer fence。
+extern Dx12Surface* gActiveSurface;
+inline void setActiveSurface(Dx12Surface* s) { gActiveSurface = s; }
+inline Dx12Surface* getActiveSurface() { return gActiveSurface; }
 
 // 从 rtvHeap 分配一个 RTV CPU 句柄（surface 的 back buffer 用）。
 D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err);

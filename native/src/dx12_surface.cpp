@@ -91,6 +91,7 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
     s->swapChain = swapChain3;
+    setActiveSurface(s);  // P18：注册为 active surface（submit 时记录 per-backbuffer fence）
     return s;
 }
 
@@ -214,6 +215,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     // 重新取 back buffers + RTV
     s->backBuffers.resize(kSurfaceBufferCount);
     s->rtvHandles.clear();
+    s->surfaceFences.assign(kSurfaceBufferCount, 0);  // P18：per-backbuffer fence 初值
     for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
         hr = s->swapChain->GetBuffer(i, IID_PPV_ARGS(&s->backBuffers[i]));
         if (FAILED(hr)) {
@@ -240,6 +242,26 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         s->currentImageIndex >= (int)s->backBuffers.size()) {
         err = "GetCurrentBackBufferIndex returned an invalid index";
         return false;
+    }
+    // P18：如果重用的是上一帧的 back buffer（上次 blit 可能还没完成），
+    // 等待该 buffer 对应的 fence 完成，再允许 CPU 写入。
+    // 对于 3-buffer swapchain 正常情况，GPU 早已完成，等待为 0ms。
+    // 仅在 CPU 跑太快追上 GPU 时才短暂等待（比 submitCommandList 阻塞好，
+    // 因为只在真正需要重用时才等，且等的是已提交的 blit 命令而非当前帧）。
+    {
+        UINT64 needed = s->surfaceFences.empty() ? 0 : s->surfaceFences[(size_t)s->currentImageIndex];
+        if (needed > 0) {
+            UINT64 cv = deviceContextForJni().queueFence->GetCompletedValue();
+            if (cv < needed) {
+                dbgLog("acquireSurface: wait fence idx=%d needed=%llu cv=%llu",
+                    s->currentImageIndex, (unsigned long long)needed, (unsigned long long)cv);
+                std::string w;
+                if (!waitForQueueFenceValue(needed, 5000000000ULL, w)) {
+                    err = "acquireSurface: " + w;
+                    return false;
+                }
+            }
+        }
     }
     // 同步 lastBlitIndex：当游戏直接通过 beginRenderPass 渲染到表面纹理
     //（而非走 blitSurface 路径）时，readbackSurfacePixels 需要用最新的
@@ -365,6 +387,7 @@ void destroySurface(Dx12Surface* s) {
     // 否则资源在使用中被释放会触发 DXGI_ERROR_DEVICE_REMOVED。
     std::string err;
     deviceWaitIdle(err);
+    if (getActiveSurface() == s) setActiveSurface(nullptr);  // P18：清除 active 指针
     delete s;
     dbgLog("destroySurface: done surface=%p", (void*)s);
 }
