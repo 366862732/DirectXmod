@@ -4,10 +4,8 @@ import com.mojang.blaze3d.vulkan.glsl.ShaderCompileException;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import net.fabricmc.api.EnvType;
@@ -291,124 +289,18 @@ public record Dx12IntermediaryShaderModule(
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")) {
                     System.err.println("[dx12-java] [" + name + "] RAW spvc HLSL:\n" + hlsl);
                 }
-                String result = isVertex ? injectHlslSemanticNames(hlsl) : hlsl;
-                // P7 诊断：打印 injected HLSL
-                System.err.println("[dx12-java] [" + name + "] INJECTED:\n" + result);
+                // spvc HLSL 后端会根据 SPIR-V location 装饰自动为输入变量
+                // 生成 TEXCOORD<n> 语义，无需手动注入。直接使用原生输出。
+                String result = hlsl;
+                // P7 诊断：打印 raw spvc 输出，确认语义已正确生成
+                if (name.contains("gui") || name.contains("debug") || name.contains("position")) {
+                    System.err.println("[dx12-java] [" + name + "] spvc HLSL (no inject):\n" + result);
+                }
                 return result;
             } finally {
                 Spvc.spvc_context_destroy(context);
             }
         }
-    }
-
-    /**
-     * spvc HLSL 语义注入：预处理策略，先定位 struct 块边界，再精确替换。
-     * 完全避开动态 braceDepth 追踪和 inStruct 状态机的不可靠性。
-     */
-    private String injectHlslSemanticNames(String hlsl) {
-        // Step 1: 规范化 spvc 输出
-        String normalized = hlsl.replace("}};", "};");
-
-        if (inputs.isEmpty()) {
-            System.err.println("[dx12-java] [DIAG] no inputs to inject, skip");
-            return normalized;
-        }
-
-        // 构建输入变量名 -> 语义索引的映射
-        Map<String, Integer> inputIndexMap = new HashMap<>();
-        for (int i = 0; i < inputs.size(); i++) {
-            inputIndexMap.put(inputs.get(i).name(), i);
-        }
-
-        // Step 2: 找到 SPIRV_Cross_Input 结构体
-        String inputStructName = "SPIRV_Cross_Input";
-        int inputStructStart = normalized.indexOf("struct " + inputStructName);
-
-        // 兜底：查找任何包含 Input 字样的 struct
-        if (inputStructStart == -1) {
-            Pattern structPattern = Pattern.compile("struct\\s+(\\w*Input\\w*)\\s*\\{");
-            Matcher m = structPattern.matcher(normalized);
-            if (m.find()) {
-                inputStructName = m.group(1);
-                inputStructStart = m.start();
-                System.err.println("[dx12-java] [DIAG] found alternative input struct: " + inputStructName);
-            }
-        }
-
-        if (inputStructStart == -1) {
-            System.err.println("[dx12-java] [DIAG] WARNING: no input struct found, returning normalized");
-            return normalized;
-        }
-
-        // Step 3: 找到 Input 结构体的 '{' 和匹配的 '}'
-        int inputBraceStart = normalized.indexOf('{', inputStructStart);
-        if (inputBraceStart == -1) {
-            System.err.println("[dx12-java] [DIAG] WARNING: no '{' in input struct, returning normalized");
-            return normalized;
-        }
-
-        int braceDepth = 1;
-        int inputBraceEnd = -1;
-        for (int i = inputBraceStart + 1; i < normalized.length(); i++) {
-            char c = normalized.charAt(i);
-            if (c == '{') braceDepth++;
-            else if (c == '}') {
-                braceDepth--;
-                if (braceDepth == 0) {
-                    inputBraceEnd = i;
-                    break;
-                }
-            }
-        }
-
-        if (inputBraceEnd == -1) {
-            System.err.println("[dx12-java] [DIAG] WARNING: cannot find matching '}' for input struct, returning normalized");
-            return normalized;
-        }
-
-        // Step 4: 逐行替换结构体内部变量的语义
-        String structBody = normalized.substring(inputBraceStart + 1, inputBraceEnd);
-        String[] lines = structBody.split("\n", -1);
-
-        StringBuilder newBody = new StringBuilder(structBody.length() + inputs.size() * 20);
-        int injectedCount = 0;
-
-        for (String line : lines) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("//")) {
-                newBody.append(line).append('\n');
-                continue;
-            }
-
-            // 匹配: 类型 变量名; （先去除可能的旧语义）
-            String cleanLine = trimmed.replaceAll("\\s*:\\s*\\w+", "").trim();
-            Pattern varPattern = Pattern.compile("\\s*([\\w<>\\[\\]]+)\\s+([A-Za-z_]\\w*)\\s*;");
-            Matcher m = varPattern.matcher(cleanLine);
-            if (m.find()) {
-                String varName = m.group(2);
-                Integer expectedIdx = inputIndexMap.get(varName);
-                if (expectedIdx != null) {
-                    String semantic = (expectedIdx == 0) ? "POSITION" : "TEXCOORD" + (expectedIdx - 1);
-                    newBody.append("    ").append(m.group(1)).append(" ").append(varName)
-                           .append(" :").append(semantic).append(";\n");
-                    injectedCount++;
-                } else {
-                    newBody.append(line).append('\n');
-                }
-            } else {
-                newBody.append(line).append('\n');
-            }
-        }
-
-        System.err.println("[dx12-java] [DIAG] injected " + injectedCount + "/" + inputs.size() + " input semantics");
-
-        // Step 5: 组装结果
-        String beforeStruct = normalized.substring(0, inputBraceStart + 1);
-        String afterStruct = normalized.substring(inputBraceEnd);
-        String result = beforeStruct + "\n" + newBody.toString() + afterStruct;
-
-        System.err.println("[dx12-java] [DIAG] inject done, result length=" + result.length());
-        return result;
     }
 
     private @Nullable SpvUniformBuffer getUniformBuffer(String name) {

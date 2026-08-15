@@ -9,7 +9,6 @@ import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.mojang.blaze3d.vulkan.glsl.ShaderCompileException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.Matcher;
@@ -105,19 +104,16 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
-        List<String> vertexShaderInputs = new ArrayList<>();
-        for (Dx12IntermediaryShaderModule.SpvVariable input : vertex.inputs()) {
-            vertexShaderInputs.add(input.name());
-        }
-        List<String> semanticNames = extractHlslSemanticNames(vertexHlsl, vertexShaderInputs);
-        // P7 诊断：打印第一个管线的 HLSL，定位注入语义后的语法错误
-        if (pipeline.getLocation().toString().contains("gui") || pipeline.getLocation().toString().contains("debug")) {
-            System.err.println("[dx12-java] HLSL vs:\n" + vertexHlsl
-                + "\n[dx12-java] HLSL ps:\n" + fragmentHlsl
-                + "\n[dx12-java] inputs=" + vertex.inputs() + " sems=" + semanticNames
-                + "\n[dx12-java] vertexInputNames(from format)=" + vertexInputNames);
-        }
-        return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexShaderInputs, semanticNames);
+        // 注意：必须用 vertexInputNames（Java 格式顺序）而不是 vertex.inputs()（spvc 顺序）。
+        // rebind() 已按 format 顺序重排 SPIR-V location，HLSL 变量顺序也随之改变。
+        // 若用 spvc 顺序，extractHlslSemanticNames 会读取错误顺序的语义名，
+        // 导致 native input layout 与 HLSL 变量语义错位，渲染黑屏。
+        List<String> semanticNames = extractHlslSemanticNames(vertexHlsl, vertexInputNames);
+        // 诊断：打印 vertex format 顺序的输入名 vs 提取的语义名，
+        // 用于排查语义顺序错配导致黑屏的问题。所有管线均打印（stderr 可被 PCL 捕获）。
+        System.err.printf("[dx12-java] pipeline=%s inputs=%s sems=%s%n",
+            pipeline.getLocation(), vertexInputNames, semanticNames);
+        return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexInputNames, semanticNames);
     }
 
     @Override
@@ -127,34 +123,42 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     }
 
     /**
-     * 从 spvc 生成的 HLSL 顶点着色器源码中提取 semantic 名称。
-     * spvc 生成的格式：{@code TypeName VarName : SEMANTIC;}（行内或分行），
-     * 按 vertexShaderInputs 顺序匹配，确保 semantic 列表与输入变量一一对应。
+     * 从 spvc 生成的 HLSL 顶点着色器源码中提取 semantic 名称，
+     * 按 {@code inputNames}（= vertex format 顺序）返回对应语义。
+     *
+     * <p>spvc 自动根据 SPIR-V location 装饰生成 {@code :TEXCOORD<n>} 语义。
+     * 本方法先构建变量名→语义映射，再按 inputNames 顺序输出，
+     * 确保与 native 层 inputElements 顺序一一对应。
      */
     private static List<String> extractHlslSemanticNames(String vertexHlsl,
         List<String> inputNames) {
-        List<String> result = new ArrayList<>();
-        // spvc HLSL 输入声明格式（兼容行内和换行）：
-        //   float3 Position : POSITION;
-        //   float4 Color : TEXCOORD0;
+        // 扫描 HLSL，收集每个输入变量的语义名（变量名 → 语义）。
+        // spvc 输出格式：TypeName VarName : SEMANTIC;
+        java.util.Map<String, String> varToSemantic = new java.util.LinkedHashMap<>();
         Pattern p = Pattern.compile(
             "[\\w<>\\*\\s]+?\\b([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*([A-Za-z_][A-Za-z0-9]*)\\s*;");
         Matcher m = p.matcher(vertexHlsl);
         while (m.find()) {
             String varName = m.group(1);
             String semantic = m.group(2);
-            if (inputNames.contains(varName) && !result.contains(varName)) {
+            if (!varToSemantic.containsKey(varName)) {
+                varToSemantic.put(varName, semantic);
+            }
+        }
+        // 按 inputNames 顺序（= vertex format 顺序）返回语义
+        List<String> result = new ArrayList<>();
+        for (String name : inputNames) {
+            String semantic = varToSemantic.get(name);
+            if (semantic != null) {
                 result.add(semantic);
+            } else {
+                // spvc 未为该变量生成语义（罕见）：fallback 到 TEXCOORD<location>
+                result.add("TEXCOORD" + result.size());
             }
         }
-        // 兜底：如果正则未匹配到全部（spvc 输出格式可能不同），
-        // 回退到 TEXCOORD<location> 惯例（spvc auto_bind 时的默认行为）。
-        if (result.size() != inputNames.size()) {
-            result.clear();
-            for (int i = 0; i < inputNames.size(); i++) {
-                result.add("TEXCOORD" + i);
-            }
-        }
+        // 诊断：每管线打印一次（stderr 可被 PCL 启动器捕获）
+        System.err.printf("[dx12-java] extractSems: inputs=%d extracted=%d %s%n",
+            inputNames.size(), result.size(), result);
         return result;
     }
 

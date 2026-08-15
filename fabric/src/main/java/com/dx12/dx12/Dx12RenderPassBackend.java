@@ -263,9 +263,10 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             }
         }
         if (stride == 0) {
-            LOGGER.warn("setVertexBuffer: cannot derive stride for slot {} (pipeline {}), skipping",
-                slot, pipeline != null ? pipeline.info().getLocation() : "null");
-            return;
+            throw new IllegalStateException(
+                "setVertexBuffer: cannot derive stride for slot " + slot
+                + " (pipeline=" + (pipeline != null ? pipeline.info().getLocation() : "null")
+                + "), vertexFormatBindings is empty or slot out of range");
         }
         if (!Dx12Native.dx12SetVertexBuffer(this.ctx, slot,
             ((Dx12GpuBuffer) buffer).handle(), vertexBuffer.offset(), stride)) {
