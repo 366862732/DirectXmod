@@ -104,6 +104,14 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
+        // P6 诊断：所有 pipeline 强制输出纯绿色，区分"管线问题"vs"数据问题"
+        // 按行扫描精确匹配含嵌套花括号的函数体
+        String loc = pipeline.getLocation().toString();
+        boolean diag = loc.contains("gui_textured") || loc.contains("panorama") || loc.contains("gui");
+        if (diag) {
+            fragmentHlsl = stripFragMainAndReplace(fragmentHlsl);
+            System.err.println("[dx12-java] [DIAG] " + loc + " frag forced GREEN");
+        }
         // 注意：必须用 vertexInputNames（Java 格式顺序）而不是 vertex.inputs()（spvc 顺序）。
         // rebind() 已按 format 顺序重排 SPIR-V location，HLSL 变量顺序也随之改变。
         // 若用 spvc 顺序，extractHlslSemanticNames 会读取错误顺序的语义名，
@@ -210,5 +218,38 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 && e.name().equals(name))) continue;
             entries.add(new Dx12BindGroupEntry(Dx12BindGroupEntry.Type.SAMPLED_IMAGE, name, null));
         }
+    }
+
+    /** 精确匹配含嵌套花括号（for/条件块等）的 frag_main 函数体并替换为纯绿色输出 */
+    private static String stripFragMainAndReplace(String hlsl) {
+        String[] lines = hlsl.split("\n", -1);
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < lines.length) {
+            String trimmed = lines[i].trim();
+            // 匹配 "void frag_main() {" 这一行（可能有空白字符）
+            if (trimmed.matches("void\\s+frag_main\\(\\)\\s*\\{.*")) {
+                // 计算当前行的开/关括号
+                int braceCount = 0;
+                for (char c : lines[i].toCharArray()) {
+                    if (c == '{') braceCount++;
+                    else if (c == '}') braceCount--;
+                }
+                sb.append("void frag_main() { fragColor = float4(0.0, 1.0, 0.0, 1.0); }\n");
+                i++;
+                // 继续读行直到平衡所有括号
+                while (i < lines.length && braceCount > 0) {
+                    for (char c : lines[i].toCharArray()) {
+                        if (c == '{') braceCount++;
+                        else if (c == '}') braceCount--;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            sb.append(lines[i]).append('\n');
+            i++;
+        }
+        return sb.toString();
     }
 }

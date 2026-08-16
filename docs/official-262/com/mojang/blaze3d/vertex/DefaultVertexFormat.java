@@ -22,7 +22,7 @@ public class DefaultVertexFormat {
     public static final String NORMAL_SEMANTIC_NAME = "Normal";
     public static final String LINE_WIDTH_SEMANTIC_NAME = "LineWidth";
     private static final GpuFormat POSITION_FORMAT = GpuFormat.RGB32_FLOAT;
-    private static final GpuFormat COLOR_FORMAT = GpuFormat.RGBA8_UNORM;
+    private static final GpuFormat COLOR_FORMAT = GpuFormat.RGBA32_FLOAT;
     private static final GpuFormat UV0_FORMAT = GpuFormat.RG32_FLOAT;
     private static final GpuFormat UV1_FORMAT = GpuFormat.RG16_SINT;
     private static final GpuFormat UV2_FORMAT = GpuFormat.RG16_SINT;

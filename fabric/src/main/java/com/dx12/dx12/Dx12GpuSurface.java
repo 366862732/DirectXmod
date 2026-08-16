@@ -26,6 +26,8 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
     private boolean closed;
     /** P6 诊断：每 ~60 帧读回一次 back buffer 采样像素（确认画面实际内容）。 */
     private int debugReadbackCounter;
+    /** P6 诊断：缓存最近一次 blit 的 color texture handle，用于直接读回验证。 */
+    private long lastColorTextureHandle = 0L;
 
     public Dx12GpuSurface(long hwnd) {
         this.handle = Dx12Native.dx12CreateSurface(hwnd);
@@ -71,23 +73,23 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         // 传 texture.handle()（底层纹理对象），而非 view.handle()（SRV view 对象）。
         // view 是 texture 的视图包装，CopyTextureRegion 需要的是纹理资源本身。
         Dx12GpuTexture tex = (Dx12GpuTexture) ((Dx12GpuTextureView) textureView).texture();
+        this.lastColorTextureHandle = tex.handle();
         Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle());
     }
 
     @Override
     public void present() {
         Dx12Native.dx12PresentSurface(handle);
-        // P6 诊断：约每秒读回一次 back buffer，打印 3x3 采样像素颜色到 Java 日志。
-        if (++debugReadbackCounter % 60 == 1) {
-            int[] pixels = Dx12Native.dx12ReadbackSurfacePixels(handle);
-            if (pixels != null && pixels.length >= 12) {
-                System.err.printf("[dx12-java] readback %dx%d center=RGBA(%d,%d,%d,%d) corners=%d black=%d%n",
-                    0, 0,
-                    pixels[4], pixels[5], pixels[6], pixels[7],
-                    (pixels[0]!=0||pixels[1]!=0||pixels[2]!=0) ? 1 : 0,
-                    (pixels[0]==0&&pixels[1]==0&&pixels[2]==0&&pixels[3]==0) ? 1 : 0);
-            }
-        }
+    }
+
+    /** P6 诊断：供 Dx12Backend.selfTestSurface 在 fence 完成后读取 color texture。 */
+    public long getColorTextureHandle() {
+        return lastColorTextureHandle;
+    }
+
+    /** P6 诊断：供 Dx12Backend.selfTestSurface 在 fence 完成后读取 back buffer。 */
+    public long getHandle() {
+        return handle;
     }
 
     @Override

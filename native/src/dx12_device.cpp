@@ -2531,7 +2531,35 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
     D3D12_RESOURCE_DESC td = r->GetDesc();
     UINT w = (UINT)td.Width, h = td.Height;
     if (w == 0 || h == 0 || w > 16384 || h > 16384) return;
-    UINT64 rowBytes = (UINT64)w * 4;
+
+    // 根据纹理实际格式计算每像素字节数和读回足迹格式。
+    // 硬编码 R8G8B8A8_UNORM（原代码）对 R16 类格式（fmt=28/30/31等）会导致
+    // 字节偏移错位（*4 vs *8）和 staging buffer 容量不足（total 减半）。
+    DXGI_FORMAT fmt = td.Format;
+    UINT bpp = 4;
+    DXGI_FORMAT fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_SNORM:
+        case DXGI_FORMAT_R8G8B8A8_SINT:
+            bpp = 4; fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R16G16B16A16_SNORM:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            bpp = 8; fbFmt = DXGI_FORMAT_R16G16B16A16_UNORM; break;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_SINT:
+            bpp = 16; fbFmt = DXGI_FORMAT_R32G32_FLOAT; break;
+        default:
+            // 未知格式：按4字节处理（多数常见格式兼容）
+            bpp = 4; fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    }
+    UINT64 rowBytes = (UINT64)w * bpp;
     UINT64 pitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
         & ~(UINT64)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     UINT64 total = pitch * h;
@@ -2584,7 +2612,7 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
     dst.pResource = staging.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Offset = 0;
-    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Format = fbFmt;
     dst.PlacedFootprint.Footprint.Width = w;
     dst.PlacedFootprint.Footprint.Height = h;
     dst.PlacedFootprint.Footprint.Depth = 1;
@@ -2609,7 +2637,7 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
     int ys[3] = { 0, (int)h / 2, (int)h - 1 };
     for (int yi = 0; yi < 3; ++yi) {
         for (int xi = 0; xi < 3; ++xi) {
-            const uint8_t* p = base + (UINT64)ys[yi] * pitch + (UINT64)xs[xi] * 4;
+            const uint8_t* p = base + (UINT64)ys[yi] * pitch + (UINT64)xs[xi] * bpp;
             dbgLog("rbTex[%s][%ux%u] (%d,%d) = RGBA(%3d,%3d,%3d,%3d)",
                 tag, w, h, xs[xi], ys[yi], p[0], p[1], p[2], p[3]);
         }

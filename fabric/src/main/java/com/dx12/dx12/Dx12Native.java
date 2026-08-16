@@ -272,6 +272,9 @@ public final class Dx12Native {
     /** P6 诊断：读回当前 back buffer 3x3 采样像素，返回 int[36]（9像素×RGBA）。为 null 表示失败。 */
     public static native int[] dx12ReadbackSurfacePixels(long surface);
 
+    /** P6 诊断：读回任意纹理 3x3 采样像素，返回 int[36]（9像素×RGBA）。为 null 表示失败。 */
+    public static native int[] dx12ReadbackTexturePixels(long texHandle);
+
     /** Destroy a surface created by {@link #dx12CreateSurface}. */
     public static native void dx12DestroySurface(long surface);
 

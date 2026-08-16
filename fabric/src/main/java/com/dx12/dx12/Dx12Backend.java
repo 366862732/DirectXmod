@@ -378,13 +378,36 @@ public class Dx12Backend implements GpuBackend {
             surface.blitFromTexture(encoder, view);
             GpuFence fence = encoder.createFence();
             encoder.submit();
-            surface.present();
             // 必须等 GPU 完成 blit 后再销毁 swapchain，否则 backbuffer 在被
             // 使用时释放 → DXGI_ERROR_DEVICE_REMOVED（P6 设备保留后立刻暴露）。
             if (!fence.awaitCompletion(5000L)) {
                 throw new IllegalStateException("surface self-test submit timed out");
             }
+            // P6 诊断：GPU 完成后读回 color texture 确认写入成功（区分 blit 问题 vs PSO 问题）。
+            // 必须在 present() 之前读回，否则 swapchain 已翻页，读回的是未写入的下一帧 back buffer。
+            try {
+                java.lang.reflect.Field f = GpuSurface.class.getDeclaredField("backend");
+                f.setAccessible(true);
+                if (f.get(surface) instanceof Dx12GpuSurface dx) {
+                    long handle = dx.getColorTextureHandle();
+                    if (handle != 0L) {
+                        int[] r = Dx12Native.dx12ReadbackTexturePixels(handle);
+                        if (r != null && r.length >= 12) {
+                            System.err.printf("[dx12-java] selfTest rbTex center=RGBA(%d,%d,%d,%d) black=%d%n",
+                                r[4], r[5], r[6], r[7],
+                                (r[0]==0&&r[1]==0&&r[2]==0&&r[3]==0) ? 1 : 0);
+                        }
+                    }
+                    int[] bb = Dx12Native.dx12ReadbackSurfacePixels(dx.getHandle());
+                    if (bb != null && bb.length >= 12) {
+                        System.err.printf("[dx12-java] selfTest rbBuf center=RGBA(%d,%d,%d,%d) black=%d%n",
+                            bb[4], bb[5], bb[6], bb[7],
+                            (bb[0]==0&&bb[1]==0&&bb[2]==0&&bb[3]==0) ? 1 : 0);
+                    }
+                }
+            } catch (Exception ignored) {}
             fence.close();
+            surface.present();
         } finally {
             if (surface != null) {
                 surface.close();

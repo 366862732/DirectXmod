@@ -96,6 +96,150 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12PresentSurface(
     // OCCLUDED/MODE_CHANGED 导致 MC 误判 suboptimal 的根因）。
 }
 
+// P6 诊断：读回指定纹理 3x3 采样像素，返回 Java int[]（[r,g,b,a] × 9）。
+// 用此函数直接读 render pass 的 colorTexture，判断渲染写入是否成功。
+JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackTexturePixels(
+    JNIEnv* env, jclass, jlong texHandle) {
+    std::string err;
+    DeviceContext& ctx = deviceContextForJni();
+    Dx12Object* tex = toObject(texHandle);
+    if (!ctx.device || !ctx.queue || !tex || tex->kind != Dx12Object::Kind::Texture || !tex->resource) {
+        std::fprintf(stderr, "[dx12] dx12ReadbackTexturePixels: invalid handle=%p kind=%d\n",
+            tex, (int)(tex ? (int)tex->kind : -1));
+        return nullptr;
+    }
+    if (!deviceWaitIdle(err)) {
+        std::fprintf(stderr, "[dx12] dx12ReadbackTexturePixels: waitIdle failed: %s\n", err.c_str());
+        return nullptr;
+    }
+    ID3D12Resource* r = tex->resource.Get();
+    D3D12_RESOURCE_DESC td = r->GetDesc();
+    UINT w = (UINT)td.Width, h = (UINT)td.Height;
+    if (w == 0 || h == 0 || w > 16384 || h > 16384) {
+        std::fprintf(stderr, "[dx12] dx12ReadbackTexturePixels: bad dims %ux%u\n", w, h);
+        return nullptr;
+    }
+    DXGI_FORMAT fmt = td.Format;
+    UINT bpp = 4;
+    DXGI_FORMAT fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_SNORM:
+        case DXGI_FORMAT_R8G8B8A8_SINT:
+            bpp = 4; fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R16G16B16A16_SNORM:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            bpp = 8; fbFmt = DXGI_FORMAT_R16G16B16A16_UNORM; break;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_SINT:
+            bpp = 16; fbFmt = DXGI_FORMAT_R32G32_FLOAT; break;
+        default:
+            bpp = 4; fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    }
+    UINT64 rowBytes = (UINT64)w * bpp;
+    UINT64 pitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+        & ~(UINT64)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    UINT64 total = pitch * h;
+
+    static ComPtr<ID3D12Resource> staging;
+    static ComPtr<ID3D12CommandAllocator> alloc;
+    static ComPtr<ID3D12GraphicsCommandList> cl;
+    if (!staging || staging->GetDesc().Width < total) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = total; desc.Height = 1; desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        if (FAILED(ctx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&staging)))) {
+            std::fprintf(stderr, "[dx12] readback staging create failed\n");
+            return nullptr;
+        }
+    }
+    if (!alloc) {
+        ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+    }
+    if (!cl) {
+        ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            alloc.Get(), nullptr, IID_PPV_ARGS(&cl));
+    } else {
+        alloc->Reset();
+        cl->Reset(alloc.Get(), nullptr);
+    }
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = r;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = staging.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = fbFmt;
+    dst.PlacedFootprint.Footprint.Width = w;
+    dst.PlacedFootprint.Footprint.Height = h;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = (UINT)pitch;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    cl->ResourceBarrier(1, &b);
+    cl->Close();
+    ID3D12CommandList* lists[] = { cl.Get() };
+    ctx.queue->ExecuteCommandLists(1, lists);
+    UINT64 fv = ++ctx.queueFenceValue;
+    ctx.queue->Signal(ctx.queueFence.Get(), fv);
+    if (!waitForQueueFenceValue(fv, 5'000'000'000ULL, err)) {
+        std::fprintf(stderr, "[dx12] dx12ReadbackTexturePixels: wait timeout\n");
+        return nullptr;
+    }
+    void* ptr = nullptr;
+    if (FAILED(staging->Map(0, nullptr, &ptr))) {
+        std::fprintf(stderr, "[dx12] dx12ReadbackTexturePixels: Map failed\n");
+        return nullptr;
+    }
+    const uint8_t* base = (const uint8_t*)ptr;
+    int xs[3] = { 0, (int)w / 2, (int)w - 1 };
+    int ys[3] = { 0, (int)h / 2, (int)h - 1 };
+    jintArray arr = env->NewIntArray(36);
+    if (arr) {
+        jint* pixels = env->GetIntArrayElements(arr, nullptr);
+        for (int yi = 0; yi < 3; ++yi) {
+            for (int xi = 0; xi < 3; ++xi) {
+                const uint8_t* p = base + (UINT64)ys[yi] * pitch + (UINT64)xs[xi] * bpp;
+                int idx2 = (yi * 3 + xi) * 4;
+                pixels[idx2 + 0] = p[0];
+                pixels[idx2 + 1] = p[1];
+                pixels[idx2 + 2] = p[2];
+                pixels[idx2 + 3] = p[3];
+            }
+        }
+        env->ReleaseIntArrayElements(arr, pixels, 0);
+        std::fprintf(stderr, "[dx12-java] rbTex %dx%d center=(%d,%d) RGBA=(%d,%d,%d,%d) black=%d\n",
+            w, h, xs[1], ys[1],
+            base[ys[1]*pitch+xs[1]*bpp], base[ys[1]*pitch+xs[1]*bpp+1],
+            base[ys[1]*pitch+xs[1]*bpp+2], base[ys[1]*pitch+xs[1]*bpp+3],
+            (base[0]==0&&base[1]==0&&base[2]==0&&base[3]==0) ? 1 : 0);
+    }
+    staging->Unmap(0, nullptr);
+    return arr;
+}
+
 JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal(
     JNIEnv* env, jclass, jlong surface) {
     Dx12Surface* s = toSurface(surface);
