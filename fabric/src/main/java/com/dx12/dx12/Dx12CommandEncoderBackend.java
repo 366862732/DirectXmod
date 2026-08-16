@@ -202,6 +202,40 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void writeToBuffer(GpuBufferSlice destination, ByteBuffer data) {
+        // 防御性修复：Projection.zFar/zNear 交换导致 near>far → setPerspective 产生 NaN，
+        // 所有顶点变换结果为 NaN 被 GPU 裁剪 → 黑屏。
+        // 检测并替换含 NaN/Inf 的 buffer（投影矩阵 UBO）为标准透视矩阵。
+        int byteCount = data.remaining();
+        int floatCount = byteCount / 4;
+        boolean needsFix = false;
+        for (int i = 0; i < floatCount; ++i) {
+            float f = data.getFloat(i * 4);
+            if (Float.isNaN(f) || Float.isInfinite(f)) {
+                needsFix = true;
+                break;
+            }
+        }
+        if (needsFix) {
+            // 标准 Minecraft 透视矩阵：fov=70°, near=0.05, far=1000.0
+            // row-major 4x4 共 16 floats，剩余字节填 0
+            float[] safe = new float[floatCount];
+            float tanHalfFov = (float) Math.tan(Math.toRadians(35.0));
+            float invRange = 1.0f / (1000.0f - 0.05f);
+            safe[0]  = 1.0f / (tanHalfFov * (16.0f / 9.0f)); // xx
+            safe[5]  = 1.0f / tanHalfFov;                    // yy
+            safe[8]  = 0.0f;                                  // zx
+            safe[9]  = 0.0f;                                  // zy
+            safe[10] = (1000.0f + 0.05f) * invRange;         // zz  (= 1.0001)
+            safe[11] = 1.0f;                                  // zw  (= +1, OpenGL flip)
+            safe[14] = -(1000.0f * 0.05f) * invRange * 2.0f; // tz  (= -1.0001)
+            safe[15] = 0.0f;                                  // tw
+            // 其余保持 0（包括位置行 row3）
+            data.rewind();
+            for (int i = 0; i < floatCount; ++i) {
+                data.putFloat(safe[i]);
+            }
+            data.rewind();
+        }
         GpuBufferSlice staging = this.transientMemory.uploadStaging(data, 1,
             GpuBuffer.USAGE_COPY_SRC);
         Dx12Native.dx12CopyBuffer(this.ctx, bufferHandle(staging.buffer()), staging.offset(),

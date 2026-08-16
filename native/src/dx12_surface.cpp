@@ -115,9 +115,24 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         s->presentMode = presentMode;
         return true;
     }
-    s->width = (UINT)width;
-    s->height = (UINT)height;
+    // 防御：glfwGetFramebufferSize 在某些时机（DWM 切换/显示器热插拔瞬间）会返回错误
+    // 尺寸（如 854x1048 而非实际的 854x480）。若新高度相对旧高度偏差超过 2 倍且宽度
+    // 未变化，视为无效回调，保留旧尺寸避免 swapchain 重建为错误比例导致黑屏。
+    if (s->width > 0 && s->height > 0
+        && width == s->width && height > static_cast<int>(s->height) * 2) {
+        dbgLog("configureSurface: rejecting invalid height %d (current %d), keeping old",
+            height, s->height);
+        s->presentMode = presentMode;
+        return true;
+    }
     s->presentMode = presentMode;
+
+    // 新尺寸与当前 swapchain 一致时，无需 ResizeBuffers（避免已重建的 swapchain
+    // 被错误尺寸锁死后再调 ResizeBuffers 仍报 INVALID_CALL）。
+    if ((UINT)width == s->width && (UINT)height == s->height) {
+        dbgLog("configureSurface: size unchanged %dx%d, skip ResizeBuffers", width, height);
+        return true;
+    }
 
     // ResizeBuffers 前必须等 GPU 完全空闲：FLIP model 下 backbuffer 仍被
     // 上一帧命令队列引用时，ResizeBuffers 返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
@@ -211,6 +226,11 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         }
         dbgLog("configureSurface: recreated swapchain %dx%d", width, height);
     }
+
+    // 仅在成功路径上更新尺寸：失败时保持旧尺寸，避免后续调用因 s->width/s->height
+    // 已被设为错误值而反复尝试无效 ResizeBuffers。
+    s->width = (UINT)width;
+    s->height = (UINT)height;
 
     // 重新取 back buffers + RTV
     s->backBuffers.resize(kSurfaceBufferCount);

@@ -182,13 +182,21 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         int i = 0;
         while (i < lines.length) {
             String trimmed = lines[i].trim();
-            // 匹配 "void frag_main() {" 这一行（可能有空白字符）
-            if (trimmed.matches("void\\s+frag_main\\(\\)\\s*\\{.*")) {
-                // 计算当前行的开/关括号
+            // 匹配 "void frag_main()" 这一行（可能有空白字符），spvc 输出的 { 可能在下一行
+            if (trimmed.matches("void\\s+frag_main\\(\\).*")) {
+                // 从当前行开始统计括号
                 int braceCount = 0;
                 for (char c : lines[i].toCharArray()) {
                     if (c == '{') braceCount++;
                     else if (c == '}') braceCount--;
+                }
+                // 如果当前行没有开括号，继续读下一行直到找到 {
+                while (braceCount <= 0 && i + 1 < lines.length) {
+                    i++;
+                    for (char c : lines[i].toCharArray()) {
+                        if (c == '{') braceCount++;
+                        else if (c == '}') braceCount--;
+                    }
                 }
                 sb.append("void frag_main() { fragColor = float4(0.0, 1.0, 0.0, 1.0); }\n");
                 i++;
