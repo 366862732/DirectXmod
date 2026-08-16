@@ -100,7 +100,11 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         }
         this.pipeline = compiled;
         this.anyDescriptorDirty = true;
-        if (!Dx12Native.dx12SetPipeline(this.ctx, compiled.handle(), this.hasDepth)) {
+        boolean ok = Dx12Native.dx12SetPipeline(this.ctx, compiled.handle(), this.hasDepth);
+        System.err.println("[dx12-java] setPipeline: " + pipeline.getLocation()
+                + " pso=" + Long.toHexString(compiled.handle())
+                + " hasDepth=" + this.hasDepth + " ok=" + ok);
+        if (!ok) {
             throw new IllegalStateException("dx12SetPipeline failed for " + pipeline.getLocation());
         }
     }

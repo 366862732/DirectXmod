@@ -43,8 +43,11 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
 
     @Override
     public void configure(GpuSurface.Configuration config) throws SurfaceException {
-        if (!Dx12Native.dx12ConfigureSurface(this.handle, config.width(), config.height(),
-            config.presentMode().ordinal())) {
+        boolean ok = Dx12Native.dx12ConfigureSurface(this.handle, config.width(), config.height(),
+            config.presentMode().ordinal());
+        System.err.println("[dx12-java] configureSurface: " + config.width() + "x" + config.height()
+                + " mode=" + config.presentMode() + " ok=" + ok);
+        if (!ok) {
             throw new SurfaceException("Failed to configure DX12 surface to "
                 + config.width() + "x" + config.height());
         }
@@ -74,9 +77,16 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
     @Override
     public void present() {
         Dx12Native.dx12PresentSurface(handle);
-        // P6 诊断：约每秒读回一次 back buffer，打印 3x3 采样像素颜色。
+        // P6 诊断：约每秒读回一次 back buffer，打印 3x3 采样像素颜色到 Java 日志。
         if (++debugReadbackCounter % 60 == 1) {
-            Dx12Native.dx12ReadbackSurfacePixels(handle);
+            int[] pixels = Dx12Native.dx12ReadbackSurfacePixels(handle);
+            if (pixels != null && pixels.length >= 12) {
+                System.err.printf("[dx12-java] readback %dx%d center=RGBA(%d,%d,%d,%d) corners=%d black=%d%n",
+                    0, 0,
+                    pixels[4], pixels[5], pixels[6], pixels[7],
+                    (pixels[0]!=0||pixels[1]!=0||pixels[2]!=0) ? 1 : 0,
+                    (pixels[0]==0&&pixels[1]==0&&pixels[2]==0&&pixels[3]==0) ? 1 : 0);
+            }
         }
     }
 
