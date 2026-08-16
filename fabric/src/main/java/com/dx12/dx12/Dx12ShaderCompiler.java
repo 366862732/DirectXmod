@@ -11,8 +11,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.renderer.ShaderDefines;
@@ -112,15 +110,12 @@ public class Dx12ShaderCompiler implements AutoCloseable {
             fragmentHlsl = stripFragMainAndReplace(fragmentHlsl);
             System.err.println("[dx12-java] [DIAG] " + loc + " frag forced GREEN");
         }
-        // 注意：必须用 vertexInputNames（Java 格式顺序）而不是 vertex.inputs()（spvc 顺序）。
-        // rebind() 已按 format 顺序重排 SPIR-V location，HLSL 变量顺序也随之改变。
-        // 若用 spvc 顺序，extractHlslSemanticNames 会读取错误顺序的语义名，
-        // 导致 native input layout 与 HLSL 变量语义错位，渲染黑屏。
-        List<String> semanticNames = extractHlslSemanticNames(vertexHlsl, vertexInputNames);
-        // 诊断：打印 vertex format 顺序的输入名 vs 提取的语义名，
-        // 用于排查语义顺序错配导致黑屏的问题。所有管线均打印（stderr 可被 PCL 捕获）。
-        System.err.printf("[dx12-java] pipeline=%s inputs=%s sems=%s%n",
-            pipeline.getLocation(), vertexInputNames, semanticNames);
+        // Fix S2：语义名称由 toHlsl() 通过 spvc_compiler_hlsl_add_vertex_attribute_remap 注入，
+        // 此处直接按 vertex format 位置生成：location 0 → POSITION，其余 → TEXCOORD<n>。
+        List<String> semanticNames = new ArrayList<>();
+        for (int i = 0; i < vertexInputNames.size(); ++i) {
+            semanticNames.add(i == 0 ? "POSITION" : ("TEXCOORD" + (i - 1)));
+        }
         return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexInputNames, semanticNames);
     }
 
@@ -128,46 +123,6 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     public void close() {
         Shaderc.shaderc_compile_options_release(this.shaderOptions);
         Shaderc.shaderc_compiler_release(this.shaderCompiler);
-    }
-
-    /**
-     * 从 spvc 生成的 HLSL 顶点着色器源码中提取 semantic 名称，
-     * 按 {@code inputNames}（= vertex format 顺序）返回对应语义。
-     *
-     * <p>spvc 自动根据 SPIR-V location 装饰生成 {@code :TEXCOORD<n>} 语义。
-     * 本方法先构建变量名→语义映射，再按 inputNames 顺序输出，
-     * 确保与 native 层 inputElements 顺序一一对应。
-     */
-    private static List<String> extractHlslSemanticNames(String vertexHlsl,
-        List<String> inputNames) {
-        // 扫描 HLSL，收集每个输入变量的语义名（变量名 → 语义）。
-        // spvc 输出格式：TypeName VarName : SEMANTIC;
-        java.util.Map<String, String> varToSemantic = new java.util.LinkedHashMap<>();
-        Pattern p = Pattern.compile(
-            "[\\w<>\\*\\s]+?\\b([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*([A-Za-z_][A-Za-z0-9]*)\\s*;");
-        Matcher m = p.matcher(vertexHlsl);
-        while (m.find()) {
-            String varName = m.group(1);
-            String semantic = m.group(2);
-            if (!varToSemantic.containsKey(varName)) {
-                varToSemantic.put(varName, semantic);
-            }
-        }
-        // 按 inputNames 顺序（= vertex format 顺序）返回语义
-        List<String> result = new ArrayList<>();
-        for (String name : inputNames) {
-            String semantic = varToSemantic.get(name);
-            if (semantic != null) {
-                result.add(semantic);
-            } else {
-                // spvc 未为该变量生成语义（罕见）：fallback 到 TEXCOORD<location>
-                result.add("TEXCOORD" + result.size());
-            }
-        }
-        // 诊断：每管线打印一次（stderr 可被 PCL 启动器捕获）
-        System.err.printf("[dx12-java] extractSems: inputs=%d extracted=%d %s%n",
-            inputNames.size(), result.size(), result);
-        return result;
     }
 
     /** 镜像官方 addToBindGroup：按 shader 声明的 UBO/sampler 顺序收集绑定。 */

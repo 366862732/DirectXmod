@@ -15,6 +15,7 @@ import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.spvc.Spvc;
+import org.lwjgl.util.spvc.SpvcHlslVertexAttributeRemap;
 import org.lwjgl.util.spvc.SpvcReflectedResource;
 /**
  * 镜像官方 {@code com.mojang.blaze3d.vulkan.glsl.IntermediaryShaderModule}。
@@ -275,6 +276,25 @@ public record Dx12IntermediaryShaderModule(
                     "Couldn't set HLSL point coord compat");
                 throwIfError(Spvc.spvc_compiler_install_compiler_options(compiler, options),
                     "Couldn't install compiler options");
+                // Fix S2：为顶点着色器输入注入 D3D12 语义，避免 spvc 后端不生成正确语义导致
+                // CreateGraphicsPipelineState E_INVALIDARG。location 0 → POSITION，其余 → TEXCOORD<n>。
+                if (isVertex && !this.inputs.isEmpty()) {
+                    int inputIdx = 0;
+                    int prevLoc = -1;
+                    for (SpvVariable input : this.inputs) {
+                        int loc = this.spirv.asIntBuffer().get(input.locationOffset());
+                        if (loc != prevLoc) {
+                            String semantic = (inputIdx == 0) ? "POSITION" : ("TEXCOORD" + (inputIdx - 1));
+                            SpvcHlslVertexAttributeRemap remap = SpvcHlslVertexAttributeRemap.calloc(stack);
+                            remap.location(loc);
+                            remap.semantic(stack.UTF8(semantic));
+                            throwIfError(Spvc.spvc_compiler_hlsl_add_vertex_attribute_remap(
+                                compiler, remap, 1), "Couldn't add vertex attribute remap");
+                            ++inputIdx;
+                            prevLoc = loc;
+                        }
+                    }
+                }
                 int compileResult = Spvc.spvc_compiler_compile(compiler, pointer);
                 if (compileResult != 0) {
                     // P6 诊断：附加 SPIRV-Cross 内部错误描述（如具体哪个 builtin/指令不支持），
@@ -289,8 +309,8 @@ public record Dx12IntermediaryShaderModule(
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")) {
                     System.err.println("[dx12-java] [" + name + "] RAW spvc HLSL:\n" + hlsl);
                 }
-                // spvc HLSL 后端会根据 SPIR-V location 装饰自动为输入变量
-                // 生成 TEXCOORD<n> 语义，无需手动注入。直接使用原生输出。
+                // Fix S2：语义通过 spvc_compiler_hlsl_add_vertex_attribute_remap 在编译前注入，
+                // 确保 spvc HLSL 后端输出正确的 D3D12 语义（POSITION/TEXCOORD<n>）。
                 String result = hlsl;
                 // P7 诊断：打印 raw spvc 输出，确认语义已正确生成
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")) {
