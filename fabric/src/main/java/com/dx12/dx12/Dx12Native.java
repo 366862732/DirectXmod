@@ -278,6 +278,9 @@ public final class Dx12Native {
     /** Destroy a surface created by {@link #dx12CreateSurface}. */
     public static native void dx12DestroySurface(long surface);
 
+    /** P6 诊断：返回当前 active surface 的 native handle（用于 readback 游戏实际渲染画面）。 */
+    public static native long dx12GetActiveSurfaceHandle();
+
     // -----------------------------------------------------------------------
     // P6: render pass 内 draw 命令录制
     // -----------------------------------------------------------------------

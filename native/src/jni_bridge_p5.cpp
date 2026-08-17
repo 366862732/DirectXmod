@@ -251,6 +251,14 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroySurface(
     destroySurface(toSurface(surface));
 }
 
+// P6 诊断：返回当前 active surface 的 native handle（用于 readback 游戏实际画面）。
+// getActiveSurface() 在 acquireSurface 时被设置为最近创建/acquire 的 surface。
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetActiveSurfaceHandle(
+    JNIEnv*, jclass) {
+    Dx12Surface* s = getActiveSurface();
+    return s ? static_cast<jlong>(reinterpret_cast<uintptr_t>(s)) : 0L;
+}
+
 // P6 诊断：读回当前 back buffer 采样像素，返回 Java int[]（[r,g,b,a] × 9）。
 // 用 JNI 直接传值进 Java，避免 fprintf(stderr) 被 PCL 启动器丢弃。
 JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePixels(
@@ -282,6 +290,9 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePix
     ID3D12Resource* bb = s->backBuffers[(size_t)idx].Get();
     D3D12_RESOURCE_DESC bd = bb->GetDesc();
     UINT w = (UINT)bd.Width, h = bd.Height;
+    // P6 诊断：打印当前读回的 surface 地址和尺寸，确认是哪个 surface
+    std::fprintf(stderr, "[dx12] readback surf=0x%p idx=%d w=%u h=%u scFmt=%d\n",
+        (void*)s, idx, w, h, (int)s->swapChainDesc.Format);
 
     // 复用 staging + allocator（静态缓存）
     static ComPtr<ID3D12Resource> staging;
@@ -358,7 +369,9 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePix
     int xs[3] = { 0, (int)w / 2, (int)w - 1 };
     int ys[3] = { 0, (int)h / 2, (int)h - 1 };
     jintArray arr = env->NewIntArray(36);  // 9 pixels × 4 components
-    if (arr) {
+    if (!arr) {
+        std::fprintf(stderr, "[dx12] readback: NewIntArray(36) failed\n");
+    } else {
         jint* pixels = env->GetIntArrayElements(arr, nullptr);
         for (int yi = 0; yi < 3; ++yi) {
             for (int xi = 0; xi < 3; ++xi) {
