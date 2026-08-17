@@ -88,6 +88,10 @@ public class Dx12Backend implements GpuBackend {
                 device.close();
                 throw t;
             }
+            // P6 诊断：自测阶段用嵌入 GLSL 填充了 pipeline cache，且 DIAG 绿色覆盖已生效。
+            // 必须在返回给游戏前清除，否则 getOrCompilePipeline 会命中自测缓存条目，
+            // 导致真实游戏 shader 从未被编译，屏幕显示的是自测阶段的嵌入 shader 输出（紫色）。
+            device.clearPipelineCache();
             return new GpuDevice(device, criticalShaderLoader);
         } catch (Throwable t) {
             LOGGER.error("[dx12] D3D12 self-test failed", t);
