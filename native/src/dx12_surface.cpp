@@ -14,6 +14,14 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+// Diagnostic: fill backbuffer red instead of copying src texture.
+// Uncomment to test whether the backbuffer通路 itself works.
+// 屏幕变红 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
+// NOTE: 当前禁用（DIAG_CLEAR 路径在 IMMEDIATE 模式下会残留 COPY_DEST 状态，
+// 导致 Present() 的 DXGI 内部命令列表触发验证 ERROR，引起红黑闪烁）。
+// 启用方式：改为 #define DIAG_CLEAR_BACKBUFFER_TO_RED 1 并重新编译。
+#define DIAG_CLEAR_BACKBUFFER_TO_RED 0
+
 #include <string>
 #include <vector>
 #include <thread>
@@ -65,6 +73,9 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     sd.Width = 1;                    // 占位；configure() 时 ResizeBuffers 到实际尺寸
     sd.Height = 1;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // 与 MC RGBA8 中间纹理同族，CopyTextureRegion 可直接拷贝
+    // P3.1 诊断：打印 SwapChain 格式，确认不是深度/单通道格式
+    dbgLog("configureSurface: swapchain format=DXGI_FORMAT_R8G8B8A8_UNORM (scFmt=%d)",
+        (int)DXGI_FORMAT_R8G8B8A8_UNORM);
     sd.Stereo = FALSE;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -323,6 +334,36 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = dst;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    // Diagnostic: 用纯红色填充 Backbuffer，验证 backbuffer 通路是否工作。
+    // 屏幕变红 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
+#if DIAG_CLEAR_BACKBUFFER_TO_RED
+    D3D12_RESOURCE_BARRIER clearBarrier{};
+    clearBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    clearBarrier.Transition.pResource = dst;
+    clearBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cmd->ResourceBarrier(1, &clearBarrier);
+    float redColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
+    cmd->ClearRenderTargetView(rtv, redColor, 0, nullptr);
+    clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cmd->ResourceBarrier(1, &clearBarrier);
+    dbgLog("DIAG_CLEAR_BACKBUFFER_TO_RED: backbuffer filled red, w=%u h=%u", w, h);
+    // P11：与 #else 路径保持一致——源纹理显式回切 COMMON，避免残留 COPY_SOURCE
+    // 状态导致下一帧 beginRenderPass 的 COMMON→RENDER_TARGET barrier 错配（ERROR）。
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+    // backbuffer 需回退到 PRESENT，否则下一帧 beginRenderPass 按 COMMON/PRESENT
+    // 写 StateBefore 会与实际的 COPY_DEST 错配（ERROR）。
+    D3D12_RESOURCE_BARRIER backToPresent{};
+    backToPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    backToPresent.Transition.pResource = dst;
+    backToPresent.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    backToPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    backToPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cmd->ResourceBarrier(1, &backToPresent);
+#else
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->ResourceBarrier(1, &barrier);
@@ -349,6 +390,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     // GPU 状态错乱 → TDR 冻结）。与 dbgReadbackTexturePixels 的
     // COMMON→COPY_SOURCE→COMMON 显式配对同一模式。
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+#endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。
     D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
@@ -376,6 +418,19 @@ void presentSurface(Dx12Surface* s) {
     UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
     UINT flags = (s->presentMode == 3) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
+    // P3.2 诊断：每帧检查 Backbuffer 格式和尺寸是否与窗口匹配
+    if (!s->backBuffers.empty()) {
+        ID3D12Resource* bb = s->backBuffers[(size_t)s->currentImageIndex >= 0 ? (size_t)s->currentImageIndex : 0].Get();
+        if (bb) {
+            D3D12_RESOURCE_DESC bbDesc = bb->GetDesc();
+            if ((s->currentImageIndex + 1) % 30 == 0) {
+                dbgLogInfo("presentSurface: idx=%d sync=%u suboptimal=%d bbFmt=%d bbW=%llu bbH=%llu winW=%u winH=%u",
+                    (int)s->currentImageIndex, syncInterval, (int)s->suboptimal,
+                    (int)bbDesc.Format, (unsigned long long)bbDesc.Width, (unsigned long long)bbDesc.Height,
+                    (unsigned)s->width, (unsigned)s->height);
+            }
+        }
+    }
     if ((s->currentImageIndex + 1) % 30 == 0) {
         dbgLogInfo("presentSurface: idx=%d sync=%u suboptimal=%d",
             (int)s->currentImageIndex, syncInterval, (int)s->suboptimal);
