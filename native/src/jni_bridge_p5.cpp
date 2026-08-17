@@ -291,8 +291,8 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePix
     D3D12_RESOURCE_DESC bd = bb->GetDesc();
     UINT w = (UINT)bd.Width, h = bd.Height;
     // P6 诊断：打印当前读回的 surface 地址和尺寸，确认是哪个 surface
-    std::fprintf(stderr, "[dx12] readback surf=0x%p idx=%d w=%u h=%u scFmt=%d\n",
-        (void*)s, idx, w, h, (int)s->swapChainDesc.Format);
+    std::fprintf(stderr, "[dx12] readback surf=0x%p idx=%d w=%u h=%u\n",
+        (void*)s, idx, w, h);
 
     // 复用 staging + allocator（静态缓存）
     static ComPtr<ID3D12Resource> staging;
