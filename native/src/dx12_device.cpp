@@ -1704,6 +1704,19 @@ bool endRenderPass(CommandContext* ctx, std::string& err) {
     if (ctx->activeDepthTarget) {
         transitionTextureTo(ctx, ctx->activeDepthTarget, D3D12_RESOURCE_STATE_COMMON);
     }
+    // P6 诊断：记录 endRenderPass 前绑定的颜色附件，便于确认渲染目标正确性。
+    if (ctx->activeColorTargets.size() > 0) {
+        for (Dx12Object* tex : ctx->activeColorTargets) {
+            if (tex && tex->resource) {
+                auto desc = tex->resource->GetDesc();
+                dbgLog("endRenderPass colorAttach tex=%p dims=%ux%u fmt=%d touched=%d",
+                    (void*)tex, (UINT)desc.Width, (UINT)desc.Height,
+                    (int)tex->dxgiFormat,
+                    (int)std::distance(ctx->activeColorTargets.begin(),
+                        std::find(ctx->activeColorTargets.begin(), ctx->activeColorTargets.end(), tex)));
+            }
+        }
+    }
     ctx->activeColorTargets.clear();
     ctx->activeColorTargetsTouched.clear();
     ctx->activeDepthTarget = nullptr;

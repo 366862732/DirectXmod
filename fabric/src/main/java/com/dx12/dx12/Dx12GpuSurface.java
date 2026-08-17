@@ -65,37 +65,6 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         if (!Dx12Native.dx12AcquireSurface(this.handle)) {
             throw new SurfaceException("Failed to acquire DX12 back buffer");
         }
-        // P6 诊断：每 ~30 帧读回本 surface 的 back buffer 3x3 像素。
-        // 直接使用 this.handle（自身 swapchain），不依赖 gActiveSurface 全局指针。
-        if (this.handle != 0L && ++debugReadbackCounter % 30 == 0) {
-            int[] rb = Dx12Native.dx12ReadbackSurfacePixels(this.handle);
-            if (rb == null) {
-                System.err.println("[dx12-java] [DIAG] surface rb NULL (handle=" + Long.toHexString(this.handle) + ")");
-            } else {
-                // C++ 返回 [r,g,b,a]×9 = 36 个元素：顺序为 row-major 的左上→右上，左中→右中，左下→右下
-                // 格式串改为精确对应：rb[0..3]=TL, rb[4..6]=TC?, 实际用 rb[0..3]=TL, rb[4..7]=TM, rb[8..11]=TR 等
-                int len = rb.length;
-                System.err.printf("[dx12-java] [DIAG] surface rb ARRAY_LEN=%d handle=0x%08X%n", len, (int)(this.handle & 0xFFFFFFFFL));
-                if (len >= 4) {
-                    System.err.printf("  TL(%d,%d,%d,%d) TM(%d,%d,%d,%d) TR(%d,%d,%d,%d)%n",
-                        rb[0], rb[1], rb[2], rb[3],
-                        rb[4], rb[5], rb[6], rb[7],
-                        rb[8], rb[9], rb[10], rb[11]);
-                }
-                if (len >= 12) {
-                    System.err.printf("  ML(%d,%d,%d,%d) MC(%d,%d,%d,%d) MR(%d,%d,%d,%d)%n",
-                        rb[12], rb[13], rb[14], rb[15],
-                        rb[16], rb[17], rb[18], rb[19],
-                        rb[20], rb[21], rb[22], rb[23]);
-                }
-                if (len >= 24) {
-                    System.err.printf("  BL(%d,%d,%d,%d) BM(%d,%d,%d,%d) BR(%d,%d,%d,%d)%n",
-                        rb[24], rb[25], rb[26], rb[27],
-                        rb[28], rb[29], rb[30], rb[31],
-                        rb[32], rb[33], rb[34], rb[35]);
-                }
-            }
-        }
     }
 
     @Override
@@ -106,6 +75,52 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         Dx12GpuTexture tex = (Dx12GpuTexture) ((Dx12GpuTextureView) textureView).texture();
         this.lastColorTextureHandle = tex.handle();
         Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle());
+        // P6 诊断：blit 后从颜色纹理读回 3x3 像素（waitIdle 保证 GPU 已完成）。
+        // 直接读 lastColorTextureHandle（shader 输出目标），而非 surface back buffer（被 blit 覆盖前可能含旧数据）。
+        if (this.lastColorTextureHandle != 0L && ++debugReadbackCounter % 30 == 0) {
+            int[] rb = Dx12Native.dx12ReadbackTexturePixels(this.lastColorTextureHandle);
+            if (rb == null) {
+                System.err.println("[dx12-java] [DIAG] colorTex rb NULL handle=0x"
+                    + Long.toHexString(this.lastColorTextureHandle & 0xFFFFFFFFL));
+            } else {
+                int len = rb.length;
+                System.err.printf("[dx12-java] [DIAG] colorTex rb ARRAY_LEN=%d handle=0x%08X%n",
+                    len, (int)(this.lastColorTextureHandle & 0xFFFFFFFFL));
+                if (len >= 4)
+                    System.err.printf("  TL(%d,%d,%d,%d) TM(%d,%d,%d,%d) TR(%d,%d,%d,%d)%n",
+                        rb[0], rb[1], rb[2], rb[3],
+                        rb[4], rb[5], rb[6], rb[7],
+                        rb[8], rb[9], rb[10], rb[11]);
+                if (len >= 12)
+                    System.err.printf("  ML(%d,%d,%d,%d) MC(%d,%d,%d,%d) MR(%d,%d,%d,%d)%n",
+                        rb[12], rb[13], rb[14], rb[15],
+                        rb[16], rb[17], rb[18], rb[19],
+                        rb[20], rb[21], rb[22], rb[23]);
+                if (len >= 24)
+                    System.err.printf("  BL(%d,%d,%d,%d) BM(%d,%d,%d,%d) BR(%d,%d,%d,%d)%n",
+                        rb[24], rb[25], rb[26], rb[27],
+                        rb[28], rb[29], rb[30], rb[31],
+                        rb[32], rb[33], rb[34], rb[35]);
+            }
+            // P6 诊断：额外读回 back buffer，确认 blit 是否将绿色写入 swapchain。
+            // 若 backbuffer 绿色但纹理黑色 → 问题在渲染 pass；若两者都黑 → 问题在 blit/present。
+            int[] bb = Dx12Native.dx12ReadbackSurfacePixels(this.handle);
+            if (bb != null && bb.length >= 12) {
+                System.err.printf("[dx12-java] [DIAG] backbuf rb ARRAY_LEN=%d%n", bb.length);
+                System.err.printf("  TL(%d,%d,%d,%d) TM(%d,%d,%d,%d) TR(%d,%d,%d,%d)%n",
+                    bb[0], bb[1], bb[2], bb[3],
+                    bb[4], bb[5], bb[6], bb[7],
+                    bb[8], bb[9], bb[10], bb[11]);
+                System.err.printf("  ML(%d,%d,%d,%d) MC(%d,%d,%d,%d) MR(%d,%d,%d,%d)%n",
+                    bb[12], bb[13], bb[14], bb[15],
+                    bb[16], bb[17], bb[18], bb[19],
+                    bb[20], bb[21], bb[22], bb[23]);
+                System.err.printf("  BL(%d,%d,%d,%d) BM(%d,%d,%d,%d) BR(%d,%d,%d,%d)%n",
+                    bb[24], bb[25], bb[26], bb[27],
+                    bb[28], bb[29], bb[30], bb[31],
+                    bb[32], bb[33], bb[34], bb[35]);
+            }
+        }
     }
 
     @Override

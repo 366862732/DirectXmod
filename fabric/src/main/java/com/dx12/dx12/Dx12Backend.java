@@ -385,18 +385,19 @@ public class Dx12Backend implements GpuBackend {
             }
             // P6 诊断：GPU 完成后读回 color texture 确认写入成功（区分 blit 问题 vs PSO 问题）。
             // 必须在 present() 之前读回，否则 swapchain 已翻页，读回的是未写入的下一帧 back buffer。
+            // 注意：使用 texture.handle() 而非 dx.getColorTextureHandle()，因为后者是静态字段，
+            // 会被游戏 surface 覆盖。self-test 的 texture 是独立的 64x64 纹理。
             try {
                 java.lang.reflect.Field f = GpuSurface.class.getDeclaredField("backend");
                 f.setAccessible(true);
                 if (f.get(surface) instanceof Dx12GpuSurface dx) {
-                    long handle = dx.getColorTextureHandle();
-                    if (handle != 0L) {
-                        int[] r = Dx12Native.dx12ReadbackTexturePixels(handle);
-                        if (r != null && r.length >= 12) {
-                            System.err.printf("[dx12-java] selfTest rbTex center=RGBA(%d,%d,%d,%d) black=%d%n",
-                                r[4], r[5], r[6], r[7],
-                                (r[0]==0&&r[1]==0&&r[2]==0&&r[3]==0) ? 1 : 0);
-                        }
+                    // 直接用 self-test 创建的 texture handle（非静态字段）
+                    long handle = ((Dx12GpuTexture) texture).handle();
+                    int[] r = Dx12Native.dx12ReadbackTexturePixels(handle);
+                    if (r != null && r.length >= 12) {
+                        System.err.printf("[dx12-java] selfTest rbTex center=RGBA(%d,%d,%d,%d) black=%d%n",
+                            r[4], r[5], r[6], r[7],
+                            (r[0]==0&&r[1]==0&&r[2]==0&&r[3]==0) ? 1 : 0);
                     }
                     int[] bb = Dx12Native.dx12ReadbackSurfacePixels(dx.getHandle());
                     if (bb != null && bb.length >= 12) {
