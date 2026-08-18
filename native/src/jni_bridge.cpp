@@ -113,4 +113,29 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12UnmapBuffer(
     dx12mc::unmapBuffer(fromHandle(buffer));
 }
 
+JNIEXPORT jstring JNICALL Java_com_dx12_dx12_Dx12Native_dx12EnumerateAdapters(
+    JNIEnv* env, jclass) {
+    return toJString(env, dx12mc::enumerateAdaptersJson());
+}
+
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetQueueHandle(
+    JNIEnv*, jclass) {
+    return static_cast<jlong>(dx12mc::getQueueHandle());
+}
+
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetDeviceHandle(
+    JNIEnv*, jclass) {
+    return static_cast<jlong>(dx12mc::getDeviceHandle());
+}
+
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateHiddenWindow(
+    JNIEnv*, jclass, jint width, jint height) {
+    return static_cast<jlong>(dx12mc::createHiddenWindow(width, height));
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyHiddenWindow(
+    JNIEnv*, jclass, jlong hwnd) {
+    dx12mc::destroyHiddenWindow(static_cast<uintptr_t>(hwnd));
+}
+
 }  // extern "C"

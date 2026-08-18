@@ -20,7 +20,7 @@
 // NOTE: 当前禁用（DIAG_CLEAR 路径在 IMMEDIATE 模式下会残留 COPY_DEST 状态，
 // 导致 Present() 的 DXGI 内部命令列表触发验证 ERROR，引起红黑闪烁）。
 // 启用方式：改为 #define DIAG_CLEAR_BACKBUFFER_TO_RED 1 并重新编译。
-#define DIAG_CLEAR_BACKBUFFER_TO_RED 0
+#define DIAG_CLEAR_BACKBUFFER_TO_RED 1
 
 #include <string>
 #include <vector>
@@ -268,6 +268,7 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         err = "surface not created";
         return false;
     }
+    dbgLog("acquireSurface: enter surface=%p", (void*)s);
     s->currentImageIndex = (int)s->swapChain->GetCurrentBackBufferIndex();
     if (s->currentImageIndex < 0 ||
         s->currentImageIndex >= (int)s->backBuffers.size()) {
@@ -281,8 +282,9 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     // 因为只在真正需要重用时才等，且等的是已提交的 blit 命令而非当前帧）。
     {
         UINT64 needed = s->surfaceFences.empty() ? 0 : s->surfaceFences[(size_t)s->currentImageIndex];
-        if (needed > 0) {
-            UINT64 cv = deviceContextForJni().queueFence->GetCompletedValue();
+        DeviceContext& ctx = deviceContextForJni();
+        if (needed > 0 && ctx.queueFence) {
+            UINT64 cv = ctx.queueFence->GetCompletedValue();
             if (cv < needed) {
                 dbgLog("acquireSurface: wait fence idx=%d needed=%llu cv=%llu",
                     s->currentImageIndex, (unsigned long long)needed, (unsigned long long)cv);
@@ -312,23 +314,25 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         err = "no acquired back buffer";
         return false;
     }
-    if (!srcTex || !srcTex->resource) {
-        err = "null source texture";
-        return false;
-    }
     if (!ctx->listOpen) {
         err = "command list not open (call dx12BeginCommandList first)";
         return false;
+    }
+    // srcTex 为 null 时仅做纯红色 clear（无 copy），用于渲染循环自检。
+    if (!srcTex || !srcTex->resource) {
+        srcTex = nullptr;  // 标记为无源纹理，走纯 clear 路径
     }
 
     ID3D12GraphicsCommandList* cmd = ctx->commandList.Get();
     ID3D12Resource* dst = s->backBuffers[(size_t)s->currentImageIndex].Get();
     UINT w = s->width;
     UINT h = s->height;
+    dbgLog("blitSurface: cmd=%p dst=%p idx=%d w=%u h=%u srcTex=%p",
+        (void*)cmd, (void*)dst, s->currentImageIndex, w, h, (void*)srcTex);
 
     // 源纹理可能是本帧渲染 pass 的输出（RENDER_TARGET/DEPTH_WRITE），或刚
     // 上传完的 COMMON；按跟踪状态过渡到 COPY_SOURCE 再拷贝。
-    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -344,16 +348,19 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cmd->ResourceBarrier(1, &clearBarrier);
+    dbgLog("blitSurface: after clear barrier transition");
     float redColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
+    dbgLog("blitSurface: rtv ptr=%p idx=%d", (void*)rtv.ptr, s->currentImageIndex);
     cmd->ClearRenderTargetView(rtv, redColor, 0, nullptr);
+    dbgLog("blitSurface: after ClearRenderTargetView");
     clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->ResourceBarrier(1, &clearBarrier);
     dbgLog("DIAG_CLEAR_BACKBUFFER_TO_RED: backbuffer filled red, w=%u h=%u", w, h);
     // P11：与 #else 路径保持一致——源纹理显式回切 COMMON，避免残留 COPY_SOURCE
     // 状态导致下一帧 beginRenderPass 的 COMMON→RENDER_TARGET barrier 错配（ERROR）。
-    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+    if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
     // backbuffer 需回退到 PRESENT，否则下一帧 beginRenderPass 按 COMMON/PRESENT
     // 写 StateBefore 会与实际的 COPY_DEST 错配（ERROR）。
     D3D12_RESOURCE_BARRIER backToPresent{};
@@ -393,16 +400,19 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
 #endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。
-    D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
-    // P17 诊断：检查本 command list 是否有过任何 draw 写入
-    // （endRenderPass 后 activeColorTargetsTouched 已被清空，改用 persist 字段）
-    bool srcWasWritten = ctx->colorTargetsWritten;
-    dbgLog("blitSurface: ctx=%p ctxW=%d src=%p -> backbuf=%ux%u",
-        (void*)ctx, (int)ctx->colorTargetsWritten, (void*)srcTex, w, h);
-    dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu fmt=%d wasWritten=%d -> backbuf=%ux%u",
-        (void*)srcTex, (unsigned long long)srcDesc.Width,
-        (unsigned long long)srcDesc.Height, (int)srcTex->dxgiFormat,
-        (int)srcWasWritten, w, h);
+    // srcTex 为 null 时（纯 clear 路径）跳过诊断日志，避免解引用空指针。
+    if (srcTex && srcTex->resource) {
+        D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
+        bool srcWasWritten = ctx->colorTargetsWritten;
+        dbgLog("blitSurface: ctx=%p ctxW=%d src=%p -> backbuf=%ux%u",
+            (void*)ctx, (int)ctx->colorTargetsWritten, (void*)srcTex, w, h);
+        dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu fmt=%d wasWritten=%d -> backbuf=%ux%u",
+            (void*)srcTex, (unsigned long long)srcDesc.Width,
+            (unsigned long long)srcDesc.Height, (int)srcTex->dxgiFormat,
+            (int)srcWasWritten, w, h);
+    } else {
+        dbgLog("blitSurface: srcTex=null (pure red clear), no src diagnostic");
+    }
     // 记录本帧 blit 写入的 back buffer 下标（present 后 currentImageIndex=-1，
     // readback 必须用此值才能读到真实画面）。
     s->lastBlitIndex = s->currentImageIndex;

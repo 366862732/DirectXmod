@@ -281,6 +281,21 @@ public final class Dx12Native {
     /** P6 诊断：返回当前 active surface 的 native handle（用于 readback 游戏实际渲染画面）。 */
     public static native long dx12GetActiveSurfaceHandle();
 
+    /** 枚举所有 D3D12 支持的适配器，返回 JSON 数组字符串。 */
+    public static native String dx12EnumerateAdapters();
+
+    /** 返回当前已创建设备的全局命令队列 COM 指针（long）。0 表示未初始化。 */
+    public static native long dx12GetQueueHandle();
+
+    /** 返回当前已创建设备的全局设备 COM 指针（long）。0 表示未初始化。 */
+    public static native long dx12GetDeviceHandle();
+
+    /** 创建一个隐藏的 Win32 窗口，返回 HWND（用于测试渲染循环）。0 表示失败。 */
+    public static native long dx12CreateHiddenWindow(int width, int height);
+
+    /** 销毁隐藏窗口。 */
+    public static native void dx12DestroyHiddenWindow(long hwnd);
+
     // -----------------------------------------------------------------------
     // P6: render pass 内 draw 命令录制
     // -----------------------------------------------------------------------

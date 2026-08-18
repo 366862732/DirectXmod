@@ -437,6 +437,41 @@ DeviceContext& deviceContextForJni() {
     return gCtx;
 }
 
+uintptr_t getDeviceHandle() {
+    return reinterpret_cast<uintptr_t>(gCtx.device.Get());
+}
+
+uintptr_t getQueueHandle() {
+    return reinterpret_cast<uintptr_t>(gCtx.queue.Get());
+}
+
+uintptr_t createHiddenWindow(int width, int height) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance      = GetModuleHandleW(nullptr);
+    wc.lpszClassName  = L"Dx12HiddenTest";
+    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)32512);  // IDC_ARROW
+    if (!RegisterClassW(&wc)) return 0;
+    HWND hwnd = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        L"Dx12HiddenTest",
+        L"DX12 Render Test",
+        WS_POPUP,
+        0, 0, width, height,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) { UnregisterClassW(L"Dx12HiddenTest", wc.hInstance); return 0; }
+    ShowWindow(hwnd, SW_HIDE);
+    UpdateWindow(hwnd);
+    return reinterpret_cast<uintptr_t>(hwnd);
+}
+
+void destroyHiddenWindow(uintptr_t hwnd) {
+    if (hwnd) {
+        DestroyWindow(reinterpret_cast<HWND>(hwnd));
+        UnregisterClassW(L"Dx12HiddenTest", GetModuleHandleW(nullptr));
+    }
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err) {
     if (gNextRtv >= kRtvHeapSize) {
         err = "RTV descriptor heap exhausted";
@@ -2866,6 +2901,58 @@ void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const ch
     dbgLog("rbBuf[%s] off=%lld len=%d heap=%d floats=[%s] hex=[%s]",
         tag, offset, len, (int)buf->heapType, fs.c_str(), hs.c_str());
     unmapRes->Unmap(0, nullptr);
+}
+
+// 枚举所有 D3D12 支持的适配器，返回 JSON 字符串
+std::string enumerateAdaptersJson() {
+    std::string result = "[";
+    bool first = true;
+    try {
+        ComPtr<IDXGIFactory4> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+            return "[{\"error\":\"CreateDXGIFactory1 failed\"}]";
+        }
+        for (UINT i = 0; ; ++i) {
+            ComPtr<IDXGIAdapter> adapter;
+            if (FAILED(factory->EnumAdapters(i, &adapter))) break;
+            DXGI_ADAPTER_DESC desc{};
+            HRESULT hr = adapter->GetDesc(&desc);
+            if (FAILED(hr)) continue;
+            // 只返回支持 D3D12 的适配器
+            ComPtr<ID3D12Device> probe;
+            hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0,
+                IID_PPV_ARGS(&probe));
+            if (FAILED(hr)) continue;
+            if (!first) result += ",";
+            first = false;
+            char nameBuf[256] = {};
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                nameBuf, sizeof(nameBuf), nullptr, nullptr);
+            long long vramGb = (long long)(desc.DedicatedVideoMemory / (1024LL * 1024 * 1024));
+            result += "{\"name\":\"";
+            result += nameBuf;
+            result += "\",\"luid\":\"";
+            char luidBuf[32];
+            snprintf(luidBuf, sizeof(luidBuf), "%08X%08X",
+                desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart);
+            result += luidBuf;
+            result += "\",\"vid\":0x";
+            char vidBuf[16];
+            snprintf(vidBuf, sizeof(vidBuf), "%08X", desc.VendorId);
+            result += vidBuf;
+            result += "\",\"did\":0x";
+            char didBuf[16];
+            snprintf(didBuf, sizeof(didBuf), "%08X", desc.DeviceId);
+            result += didBuf;
+            result += "\",\"vram_gb\":";
+            result += std::to_string(vramGb);
+            result += "}";
+        }
+    } catch (...) {
+        return "[{\"error\":\"exception during enumeration\"}]";
+    }
+    result += "]";
+    return result;
 }
 
 }  // namespace dx12mc

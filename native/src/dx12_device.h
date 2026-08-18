@@ -131,6 +131,15 @@ void destroyDevice();
 // JNI 层访问设备上下文（读 adapterName/featureLevel）。
 DeviceContext& deviceContextForJni();
 
+// 返回设备/队列的原始 COM 指针（用于 Java 侧持有句柄）。
+uintptr_t getDeviceHandle();
+uintptr_t getQueueHandle();
+
+// 创建一个隐藏的 Win32 窗口（用于测试渲染循环）；返回 HWND (uintptr_t)。
+uintptr_t createHiddenWindow(int width, int height);
+// 销毁隐藏的 Win32 窗口。
+void destroyHiddenWindow(uintptr_t hwnd);
+
 // ---------------------------------------------------------------------------
 // 资源创建（返回 new 的 Dx12Object*，句柄 = 指针；失败返回 nullptr + err）
 // ---------------------------------------------------------------------------
@@ -489,5 +498,9 @@ bool deviceWaitIdle(std::string& err);
 // 自检：创建 texture/buffer/sampler/view 各一，验证资源层可用后销毁。
 // 返回描述字符串（成功/失败明细）。
 std::string runResourceSelfTest();
+
+// 枚举所有 D3D12 适配器，返回 JSON 数组字符串：
+// [{"name":"...","luid":0x...,"vid":0x...,"did":0x...,"vram_gb":N,...},...]
+std::string enumerateAdaptersJson();
 
 }  // namespace dx12mc
