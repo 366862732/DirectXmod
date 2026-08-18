@@ -41,6 +41,9 @@ dependencies {
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
     implementation files('libs/modmenu-20.0.1.jar')
+
+    // Pure-Java D3D12 backend (Java 26 Foreign Function & Memory API)
+    // No external native bindings needed — uses java.lang.foreign directly.
 }
 
 processResources {
