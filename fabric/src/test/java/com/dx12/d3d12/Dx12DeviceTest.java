@@ -1,46 +1,37 @@
 package com.dx12.d3d12;
 
+import org.junit.jupiter.api.Test;
 import java.util.List;
+import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Standalone test for pure-Java D3D12 device creation via JNA.
- */
 public class Dx12DeviceTest {
 
-    public static void main(String[] args) {
-        System.out.println("=== DirectX12 Pure-Java Device Test ===");
-        System.out.println();
-
-        // Step 1: Enumerate adapters
+    @Test
+    void testEnumerateAdapters() throws Exception {
         System.out.println("[1] Enumerating DXGI adapters...");
         List<Dx12AdapterInfo> adapters = Dx12Device.enumerateAdapters();
-        System.out.println("    Found " + adapters.size() + " adapter(s)");
-        for (int i = 0; i < adapters.size(); i++) {
-            Dx12AdapterInfo info = adapters.get(i);
-            long vramGib = info.dedicatedVideoMemory() / (1024L * 1024 * 1024);
-            System.out.println("    [" + i + "] " + info.name()
-                + " (VRAM: " + vramGib + " GiB)");
-        }
-        if (adapters.isEmpty()) {
-            System.err.println("    ERROR: No D3D12 adapters found!");
-            System.exit(1);
-        }
+        assertFalse(adapters.isEmpty(), "Should find at least one D3D12 adapter");
+        var info = adapters.getFirst();
+        assertNotNull(info.name(), "Adapter name should not be empty");
+        System.out.printf("  Found: %s | LUID=0x%s | Vid=0x%s Did=0x%s VRAM=%d GiB%n",
+            info.name(),
+            Long.toHexString(info.luid()),
+            Integer.toHexString(info.vendorId()),
+            Integer.toHexString(info.deviceId()),
+            info.dedicatedVideoMemory() / (1024L * 1024 * 1024));
+    }
 
-        // Step 2: Create D3D12 device
-        System.out.println();
+    @Test
+    void testCreateDevice() throws Exception {
         System.out.println("[2] Creating D3D12 device...");
-        try (Dx12Device device = Dx12Device.create()) {
-            System.out.println("    Device created successfully (ptr=" + device.getDevicePointer() + ")");
-            System.out.println("    Device created successfully");
+        var adapters = Dx12Device.enumerateAdapters();
+        if (adapters.isEmpty()) {
+            System.out.println("  No adapters found, skipping device creation");
+            return;
         }
-
-        // Step 3: Re-enumerate after device creation
-        System.out.println();
-        System.out.println("[3] Verification — re-enumerating adapters...");
-        List<Dx12AdapterInfo> afterCreate = Dx12Device.enumerateAdapters();
-        System.out.println("    Adapters after device create: " + afterCreate.size());
-
-        System.out.println();
-        System.out.println("=== Test PASSED ===");
+        try (var device = Dx12Device.create()) {
+            assertNotNull(device, "Device should not be null");
+            System.out.printf("  Device created successfully (ptr=%s)%n", device.getDevicePointer());
+        }
     }
 }

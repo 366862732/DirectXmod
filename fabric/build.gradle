@@ -42,8 +42,8 @@ dependencies {
 
     implementation files('libs/modmenu-20.0.1.jar')
 
-    // Pure-Java D3D12 backend (Java 26 Foreign Function & Memory API)
-    // No external native bindings needed — uses java.lang.foreign directly.
+    // Pure-Java D3D12 backend via JNA
+    implementation "net.java.dev.jna:jna:5.17.0"
 }
 
 processResources {
@@ -61,6 +61,11 @@ java {
     withSourcesJar()
     sourceCompatibility = JavaVersion.VERSION_25
     targetCompatibility = JavaVersion.VERSION_25
+}
+
+// Enable native access for JNA on Java 26+
+tasks.withType(Test).configureEach {
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
 }
 
 jar {

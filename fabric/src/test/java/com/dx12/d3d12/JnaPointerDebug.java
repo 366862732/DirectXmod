@@ -2,88 +2,89 @@ package com.dx12.d3d12;
 
 import com.sun.jna.*;
 import com.sun.jna.ptr.PointerByReference;
+import java.lang.reflect.*;
 
-/** Minimal debug test: compare JNA Pointer.getLong vs direct read. */
+/** Debug: understand what type of object CreateDXGIFactory1 returns. */
 public class JnaPointerDebug {
     interface DxgiLib extends Library {
         DxgiLib INSTANCE = Native.load("dxgi", DxgiLib.class);
         int CreateDXGIFactory1(Pointer riid, PointerByReference ppFactory);
     }
 
-    private static final byte[] IID_IDXGIFactory1 = makeGuid(0x770AAE78L, 0xF26F, 0x4DBA,
-        (byte)0xA8,(byte)0x29,(byte)0x25,(byte)0x3C,(byte)0x83,(byte)0xD1,(byte)0xB3,(byte)0x87);
+    private static final byte[] IID_IDXGIFactory4 = makeGuid(0x1BC6EA02L, 0xEF36, 0x464F,
+        (byte)0xBF,(byte)0x0C,(byte)0x21,(byte)0xCA,(byte)0x39,(byte)0xE5,(byte)0x16,(byte)0x8A);
 
     public static void main(String[] args) throws Exception {
-        System.out.println("=== JNA Pointer Debug ===\n");
+        System.out.println("=== Deep Pointer Debug ===\n");
 
         PointerByReference ref = new PointerByReference();
-        int hr = DxgiLib.INSTANCE.CreateDXGIFactory1(writeGuidBytes(IID_IDXGIFactory1), ref);
+        int hr = DxgiLib.INSTANCE.CreateDXGIFactory1(writeGuidBytes(IID_IDXGIFactory4), ref);
         System.out.printf("CreateDXGIFactory1 hr=0x%s%n", Integer.toHexString(hr));
 
         Pointer p1 = ref.getValue();
-        long rawAddr = Pointer.nativeValue(p1);
-        System.out.printf("p1=%s  rawAddr=0x%s%n", p1, Long.toHexString(rawAddr));
+        System.out.printf("p1 class: %s%n", p1.getClass().getName());
+        System.out.printf("p1 toString: %s%n", p1.toString());
+        System.out.printf("p1 hashCode: %d%n", p1.hashCode());
 
-        // Compare: p1.getLong() vs direct ByteBuffer read via Memory copy
-        // Method 1: p1.getLong(offset)
-        System.out.println("\n  Via p1.getLong():");
-        for (int i = 0; i < 20; i++) {
-            System.out.printf("    [%d] = 0x%s%n", i, Long.toHexString(p1.getLong(i * 8)));
+        // Check if it's a proxy
+        System.out.println("\n  Is proxy?");
+        System.out.printf("    instanceof Library: %b%n", p1 instanceof Library);
+        System.out.printf("    instanceof Pointer: %b%n", p1 instanceof Pointer);
+
+        // Check parent class
+        Class<?> c = p1.getClass();
+        while (c != null) {
+            System.out.printf("    class: %s%n", c.getName());
+            c = c.getSuperclass();
         }
 
-        // Method 2: Use Memory as a scratch buffer, then read from it
-        // But we need to COPY data from rawAddr into the Memory first
-        // Use Memory.getByteArray to read from p1
-        Memory scratch = new Memory(160);
-        // p1 is a Pointer to the COM object; we can read directly from it
-        // Let's try reading the first 160 bytes into a byte array
-        byte[] data = p1.getByteArray(0, 160);
-        System.out.println("\n  Via p1.getByteArray():");
-        for (int i = 0; i < 20; i++) {
-            long val = java.nio.ByteBuffer.wrap(data, i * 8, 8).getLong(0);
-            System.out.printf("    [%d] = 0x%s%n", i, Long.toHexString(val));
-        }
-
-        // Method 3: Use scratch Memory and copy
-        scratch.write(0, data, 0, data.length);
-        System.out.println("\n  Via scratch Memory.getLong():");
-        for (int i = 0; i < 20; i++) {
-            System.out.printf("    [%d] = 0x%s%n", i, Long.toHexString(scratch.getLong(i * 8)));
-        }
-
-        // Now try calling EnumAdapters via QueryInterface path
-        // First, QueryInterface to get IDXGIFactory4
-        byte[] iidFactory4 = makeGuid(0x1BC6EA02L, 0xEF36, 0x464F,
-            (byte)0xBF,(byte)0x0C,(byte)0x21,(byte)0xCA,(byte)0x39,(byte)0xE5,(byte)0x16,(byte)0x8A);
-        PointerByReference qref = new PointerByReference();
-        int qhr = callQueryInterface(p1, writeGuidBytes(iidFactory4), qref);
-        System.out.printf("\n  QueryInterface(IDXGIFactory4) hr=0x%s out=%s%n",
-            Integer.toHexString(qhr), qref.getValue());
-
-        if (qhr == 0 && qref.getValue() != null && !qref.getValue().equals(Pointer.NULL)) {
-            Pointer factory4 = new Pointer(Pointer.nativeValue(qref.getValue()));
-            System.out.println("  VTable at IDXGIFactory4 ptr:");
-            for (int i = 0; i < 30; i++) {
-                long val = factory4.getLong(i * 8);
-                System.out.printf("    [%d] = 0x%s%n", i, Long.toHexString(val));
+        // Try reading vtable via reflection to get the raw address field
+        System.out.println("\n  Raw address field:");
+        for (Field f : Pointer.class.getDeclaredFields()) {
+            f.setAccessible(true);
+            try {
+                Object val = f.get(p1);
+                System.out.printf("    %s = %s (type=%s)%n", f.getName(), val, val != null ? val.getClass().getName() : "null");
+            } catch (Exception e) {
+                System.out.printf("    %s = ERROR: %s%n", f.getName(), e.getMessage());
             }
-            // EnumAdapters is at idx 7 (IDXGIFactory base)
-            PointerByReference eeref = new PointerByReference();
-            int ehr = callQueryInterface(factory4, writeGuidBytes(iidFactory4), eeref);
-            System.out.printf("  QI on factory4 for Factory4: hr=0x%s out=%s%n",
-                Integer.toHexString(ehr), eeref.getValue());
+        }
+
+        // Read vtable
+        long rawAddr = Pointer.nativeValue(p1);
+        System.out.printf("\n  nativeValue: 0x%s%n", Long.toHexString(rawAddr));
+
+        System.out.println("  VTable via getLong:");
+        for (int i = 0; i < 30; i++) {
+            long val = p1.getLong(i * 8);
+            System.out.printf("    [%2d] = 0x%016x%n", i, val);
+        }
+
+        // Try creating a NEW Pointer from the raw address
+        System.out.println("\n  Creating new Pointer from raw address:");
+        Pointer p2 = new Pointer(rawAddr);
+        System.out.printf("  p2 class: %s%n", p2.getClass().getName());
+        System.out.printf("  p2 nativeValue: 0x%s%n", Long.toHexString(Pointer.nativeValue(p2)));
+        System.out.println("  VTable via p2.getLong:");
+        for (int i = 0; i < 30; i++) {
+            long val = p2.getLong(i * 8);
+            System.out.printf("    [%2d] = 0x%016x%n", i, val);
+        }
+
+        // Try calling QI through p2
+        System.out.println("\n  Calling QI via p2:");
+        try {
+            long qiAddr = p2.getLong(0);
+            System.out.printf("    QI addr: 0x%s%n", Long.toHexString(qiAddr));
+            Function qiFn = Function.getFunction(new Pointer(qiAddr));
+            PointerByReference qref = new PointerByReference();
+            int qhr = qiFn.invokeInt(new Object[]{p2, writeGuidBytes(IID_IDXGIFactory4), qref});
+            System.out.printf("    QI hr=0x%s out=%s%n", Integer.toHexString(qhr), qref.getValue());
+        } catch (Throwable t) {
+            System.out.printf("    QI threw: %s%n", t.getMessage());
         }
 
         System.out.println("\nDone.");
-    }
-
-    static int callQueryInterface(Pointer object, Pointer riid, PointerByReference ppvObject) throws Exception {
-        Pointer vtable = object;
-        long fnAddr = vtable.getLong(0); // QI is at index 0
-        if (fnAddr == 0) throw new RuntimeException("Null QI vtable entry");
-        Function fn = Function.getFunction(new Pointer(fnAddr));
-        Object result = fn.invoke(int.class, object, riid, ppvObject);
-        return ((Number) result).intValue();
     }
 
     static byte[] makeGuid(long a, long b, long c, byte d0, byte d1, byte d2, byte d3, byte d4, byte d5, byte d6, byte d7) {
