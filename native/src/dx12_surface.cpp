@@ -14,13 +14,13 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
-// Diagnostic: fill backbuffer red instead of copying src texture.
+// Diagnostic: fill backbuffer with colored clear instead of copying src texture.
 // Uncomment to test whether the backbuffer通路 itself works.
-// 屏幕变红 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
-// NOTE: 当前禁用（DIAG_CLEAR 路径在 IMMEDIATE 模式下会残留 COPY_DEST 状态，
-// 导致 Present() 的 DXGI 内部命令列表触发验证 ERROR，引起红黑闪烁）。
-// 启用方式：改为 #define DIAG_CLEAR_BACKBUFFER_TO_RED 1 并重新编译。
-#define DIAG_CLEAR_BACKBUFFER_TO_RED 1
+// 屏幕变绿 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
+// 启用方式：改为 #define DIAG_CLEAR_BACKBUFFER_TO_GREEN 1 并重新编译。
+// 注意：DIAG_CLEAR 路径仅应在 selfTestSurface / testRenderLoop 中临时启用。
+// 游戏正常流程必须保持为 0，否则每帧清屏会覆盖渲染内容。
+#define DIAG_CLEAR_BACKBUFFER_TO_GREEN 0
 
 #include <string>
 #include <vector>
@@ -340,7 +340,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     // Diagnostic: 用纯红色填充 Backbuffer，验证 backbuffer 通路是否工作。
     // 屏幕变红 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
-#if DIAG_CLEAR_BACKBUFFER_TO_RED
+#if DIAG_CLEAR_BACKBUFFER_TO_GREEN
     D3D12_RESOURCE_BARRIER clearBarrier{};
     clearBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     clearBarrier.Transition.pResource = dst;
@@ -349,15 +349,15 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cmd->ResourceBarrier(1, &clearBarrier);
     dbgLog("blitSurface: after clear barrier transition");
-    float redColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    float greenColor[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
     dbgLog("blitSurface: rtv ptr=%p idx=%d", (void*)rtv.ptr, s->currentImageIndex);
-    cmd->ClearRenderTargetView(rtv, redColor, 0, nullptr);
+    cmd->ClearRenderTargetView(rtv, greenColor, 0, nullptr);
     dbgLog("blitSurface: after ClearRenderTargetView");
     clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->ResourceBarrier(1, &clearBarrier);
-    dbgLog("DIAG_CLEAR_BACKBUFFER_TO_RED: backbuffer filled red, w=%u h=%u", w, h);
+    dbgLog("DIAG_CLEAR_BACKBUFFER_TO_GREEN: backbuffer filled green, w=%u h=%u", w, h);
     // P11：与 #else 路径保持一致——源纹理显式回切 COMMON，避免残留 COPY_SOURCE
     // 状态导致下一帧 beginRenderPass 的 COMMON→RENDER_TARGET barrier 错配（ERROR）。
     if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
@@ -371,6 +371,18 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     backToPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &backToPresent);
 #else
+    // srcTex 为 null 时（纯状态转换路径）：只做 PRESENT↔COPY_DEST barrier，
+    // 不拷贝内容。用于 self-test / render loop 自检，验证 backbuffer 通路可用。
+    if (!srcTex) {
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd->ResourceBarrier(1, &barrier);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cmd->ResourceBarrier(1, &barrier);
+        dbgLog("blitSurface: srcTex=null — no-copy pass-through");
+        return true;
+    }
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->ResourceBarrier(1, &barrier);
@@ -391,11 +403,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &barrier);
-    // P11：源纹理显式回切 COMMON。上方是"显式进入" COPY_SOURCE（非隐式提升），
-    // 显式进入的状态不会随命令列表完成 decay，若残留到下一 command list，
-    // 其 beginRenderPass/blit 按 COMMON 写 Before 状态就会错配（验证 ERROR →
-    // GPU 状态错乱 → TDR 冻结）。与 dbgReadbackTexturePixels 的
-    // COMMON→COPY_SOURCE→COMMON 显式配对同一模式。
+    // P11：源纹理显式回切 COMMON。
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
 #endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小

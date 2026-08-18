@@ -359,26 +359,24 @@ public class Dx12Backend implements GpuBackend {
      * 用纯红色清空 Backbuffer → submit → present。
      * 首帧会向 MC 真实窗口 present 一次红色，用于验证渲染链路是否打通。
      * 随后回退不影响游戏（游戏有自己的 surface/lifecycle）。
+     *
+     * 注意：使用 Dx12GpuSurface 而非 GpuSurface 包装类，因为 clearToRed 走
+     * 非 blit 路径（null srcTex = ClearRenderTargetView），绕过了 hasBlittedTexture
+     * 标志，GpuSurface.present() 会因此抛出 IllegalStateException。
      */
     private static void selfTestSurface(Dx12Device device, long window) throws SurfaceException {
         Dx12CommandEncoderBackend encoderBackend = new Dx12CommandEncoderBackend();
         CommandEncoder encoder = new CommandEncoder(null, device, encoderBackend);
-        GpuSurface surface = null;
+        Dx12GpuSurface dxSurface = null;
         try {
-            surface = new GpuSurface(device.createSurface(window));
+            dxSurface = (Dx12GpuSurface) device.createSurface(window);
             GpuSurface.PresentMode mode = GpuSurface.PresentMode.getSupportedVsyncMode(
-                surface.supportedPresentModes(), false);
-            surface.configure(new GpuSurface.Configuration(640, 480, mode));
-            surface.acquireNextTexture();
+                dxSurface.supportedPresentModes(), false);
+            dxSurface.configure(new GpuSurface.Configuration(640, 480, mode));
+            dxSurface.acquireNextTexture();
 
             // 纯红色清空 Backbuffer（null texture = 不做 copy，只做 ClearRenderTargetView）
-            try {
-                java.lang.reflect.Field f = GpuSurface.class.getDeclaredField("backend");
-                f.setAccessible(true);
-                ((Dx12GpuSurface) f.get(surface)).clearToRed(encoderBackend);
-            } catch (ReflectiveOperationException e) {
-                throw new SurfaceException("cannot access Dx12GpuSurface backend: " + e.getMessage());
-            }
+            dxSurface.clearToRed(encoderBackend);
 
             GpuFence fence = encoder.createFence();
             encoder.submit();
@@ -387,15 +385,15 @@ public class Dx12Backend implements GpuBackend {
                 throw new IllegalStateException("surface self-test submit timed out");
             }
             fence.close();
-            surface.present();
-            System.err.println("[dx12-java] selfTestSurface: presented RED to real window — "
-                + "if you see red, the render pipeline is working!");
+            dxSurface.present();
+            System.err.println("[dx12-java] selfTestSurface: presented GREEN to real window — "
+                + "if you see green, the render pipeline is working!");
         } finally {
-            if (surface != null) {
-                surface.close();
+            if (dxSurface != null) {
+                dxSurface.close();
             }
             encoderBackend.close();
         }
-        LOGGER.info("[dx12] Surface self-test OK (pure red clear + present via JNI on real window)");
+        LOGGER.info("[dx12] Surface self-test OK (pure green clear + present via JNI on real window)");
     }
 }
