@@ -356,75 +356,46 @@ public class Dx12Backend implements GpuBackend {
 
     /**
      * P5：创建 DXGI swapchain（绑定真实窗口 HWND）→ 配置 → acquire →
-     * 把一张 RGBA8 中间纹理 blit 进当前 back buffer → submit → present。
-     * 首帧会向窗口 present 一次（默认清屏色），随后回退不影响游戏。
+     * 用纯红色清空 Backbuffer → submit → present。
+     * 首帧会向 MC 真实窗口 present 一次红色，用于验证渲染链路是否打通。
+     * 随后回退不影响游戏（游戏有自己的 surface/lifecycle）。
      */
     private static void selfTestSurface(Dx12Device device, long window) throws SurfaceException {
-        int size = 64;
         Dx12CommandEncoderBackend encoderBackend = new Dx12CommandEncoderBackend();
         CommandEncoder encoder = new CommandEncoder(null, device, encoderBackend);
         GpuSurface surface = null;
-        GpuTexture texture = null;
-        GpuTextureView view = null;
         try {
-            // blit 源纹理：必须 USAGE_COPY_SRC 且为颜色格式（GpuSurface 高层校验）
-            texture = device.createTexture("dx12-selftest-surface",
-                GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT
-                    | GpuTexture.USAGE_COPY_SRC,
-                GpuFormat.RGBA8_UNORM, size, size, 1, 1);
-            view = device.createTextureView(texture, 0, texture.getMipLevels());
-
             surface = new GpuSurface(device.createSurface(window));
             GpuSurface.PresentMode mode = GpuSurface.PresentMode.getSupportedVsyncMode(
                 surface.supportedPresentModes(), false);
-            surface.configure(new GpuSurface.Configuration(size, size, mode));
+            surface.configure(new GpuSurface.Configuration(640, 480, mode));
             surface.acquireNextTexture();
-            surface.blitFromTexture(encoder, view);
-            GpuFence fence = encoder.createFence();
-            encoder.submit();
-            // 必须等 GPU 完成 blit 后再销毁 swapchain，否则 backbuffer 在被
-            // 使用时释放 → DXGI_ERROR_DEVICE_REMOVED（P6 设备保留后立刻暴露）。
-            if (!fence.awaitCompletion(5000L)) {
-                throw new IllegalStateException("surface self-test submit timed out");
-            }
-            // P6 诊断：GPU 完成后读回 color texture 确认写入成功（区分 blit 问题 vs PSO 问题）。
-            // 必须在 present() 之前读回，否则 swapchain 已翻页，读回的是未写入的下一帧 back buffer。
-            // 注意：使用 texture.handle() 而非 dx.getColorTextureHandle()，因为后者是静态字段，
-            // 会被游戏 surface 覆盖。self-test 的 texture 是独立的 64x64 纹理。
+
+            // 纯红色清空 Backbuffer（null texture = 不做 copy，只做 ClearRenderTargetView）
             try {
                 java.lang.reflect.Field f = GpuSurface.class.getDeclaredField("backend");
                 f.setAccessible(true);
-                if (f.get(surface) instanceof Dx12GpuSurface dx) {
-                    // 直接用 self-test 创建的 texture handle（非静态字段）
-                    long handle = ((Dx12GpuTexture) texture).handle();
-                    int[] r = Dx12Native.dx12ReadbackTexturePixels(handle);
-                    if (r != null && r.length >= 12) {
-                        System.err.printf("[dx12-java] selfTest rbTex center=RGBA(%d,%d,%d,%d) black=%d%n",
-                            r[4], r[5], r[6], r[7],
-                            (r[0]==0&&r[1]==0&&r[2]==0&&r[3]==0) ? 1 : 0);
-                    }
-                    int[] bb = Dx12Native.dx12ReadbackSurfacePixels(dx.getHandle());
-                    if (bb != null && bb.length >= 12) {
-                        System.err.printf("[dx12-java] selfTest rbBuf center=RGBA(%d,%d,%d,%d) black=%d%n",
-                            bb[4], bb[5], bb[6], bb[7],
-                            (bb[0]==0&&bb[1]==0&&bb[2]==0&&bb[3]==0) ? 1 : 0);
-                    }
-                }
-            } catch (Exception ignored) {}
+                ((Dx12GpuSurface) f.get(surface)).clearToRed(encoderBackend);
+            } catch (ReflectiveOperationException e) {
+                throw new SurfaceException("cannot access Dx12GpuSurface backend: " + e.getMessage());
+            }
+
+            GpuFence fence = encoder.createFence();
+            encoder.submit();
+            // 必须等 GPU 完成 clear 后再销毁 swapchain，否则 backbuffer 在被使用时释放。
+            if (!fence.awaitCompletion(5000L)) {
+                throw new IllegalStateException("surface self-test submit timed out");
+            }
             fence.close();
             surface.present();
+            System.err.println("[dx12-java] selfTestSurface: presented RED to real window — "
+                + "if you see red, the render pipeline is working!");
         } finally {
             if (surface != null) {
                 surface.close();
             }
-            if (view != null) {
-                view.close();
-            }
-            if (texture != null) {
-                texture.close();
-            }
             encoderBackend.close();
         }
-        LOGGER.info("[dx12] Surface self-test OK (DXGI swapchain configure/acquire/blit/present via JNI)");
+        LOGGER.info("[dx12] Surface self-test OK (pure red clear + present via JNI on real window)");
     }
 }

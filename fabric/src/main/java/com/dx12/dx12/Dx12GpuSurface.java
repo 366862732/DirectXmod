@@ -123,6 +123,14 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         }
     }
 
+    /**
+     * 纯红色清空当前 back buffer（不依赖源纹理，用于渲染循环自检）。
+     * 需要调用方先 acquireNextTexture()，本方法记录命令后返回。
+     */
+    public void clearToRed(Dx12CommandEncoderBackend encoder) {
+        Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, 0L);
+    }
+
     @Override
     public void present() {
         Dx12Native.dx12PresentSurface(handle);
