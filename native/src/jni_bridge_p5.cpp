@@ -96,6 +96,12 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12PresentSurface(
     // OCCLUDED/MODE_CHANGED 导致 MC 误判 suboptimal 的根因）。
 }
 
+// 返回当前 acquire 的 back buffer 原始资源指针，供 Java 侧直接 blit/readback。
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetBackBufferHandle(
+    JNIEnv*, jclass, jlong surface) {
+    return (jlong)getBackBufferHandle(toSurface(surface));
+}
+
 // P6 诊断：读回指定纹理 3x3 采样像素，返回 Java int[]（[r,g,b,a] × 9）。
 // 用此函数直接读 render pass 的 colorTexture，判断渲染写入是否成功。
 JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackTexturePixels(

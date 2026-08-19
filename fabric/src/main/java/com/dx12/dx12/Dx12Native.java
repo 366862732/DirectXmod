@@ -266,6 +266,9 @@ public final class Dx12Native {
     /** Present the current back buffer (vsync follows the configured mode). */
     public static native void dx12PresentSurface(long surface);
 
+    /** 返回当前 acquire 的 back buffer 原始资源指针，用于 blit/readback（不依赖缓存）。 */
+    public static native long dx12GetBackBufferHandle(long surface);
+
     /** Whether the last present reported a suboptimal status. */
     public static native boolean dx12IsSurfaceSuboptimal(long surface);
 

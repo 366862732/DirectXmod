@@ -136,9 +136,12 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         Dx12Native.dx12PresentSurface(handle);
     }
 
-    /** P6 诊断：供 Dx12Backend.selfTestSurface 在 fence 完成后读取 color texture。 */
+    /** P6 诊断：供 Dx12Backend.selfTestSurface 在 fence 完成后读取 color texture。
+     * 优先使用 dx12GetBackBufferHandle 获取当前 acquire 的 back buffer，
+     * 避免使用缓存的 lastColorTextureHandle（可能是旧渲染 pass 的残留）。 */
     public long getColorTextureHandle() {
-        return lastColorTextureHandle;
+        long bb = Dx12Native.dx12GetBackBufferHandle(handle);
+        return bb != 0 ? bb : lastColorTextureHandle;
     }
 
     /** P6 诊断：供 Dx12Backend.selfTestSurface 在 fence 完成后读取 back buffer。 */

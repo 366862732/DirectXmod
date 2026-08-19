@@ -21,6 +21,9 @@
 // 注意：DIAG_CLEAR 路径仅应在 selfTestSurface / testRenderLoop 中临时启用。
 // 游戏正常流程必须保持为 0，否则每帧清屏会覆盖渲染内容。
 #define DIAG_CLEAR_BACKBUFFER_TO_GREEN 0
+// P20: 启用后每 30 帧在 blit 后读回源纹理像素，诊断着色器输出颜色。
+// 结论：纯绿 = shader 正确；全黑 = shader 未写入或深度/裁剪问题；旧数据 = 渲染 pass 未执行。
+#define DIAG_READBACK_COLOR_TEX 1
 
 #include <string>
 #include <vector>
@@ -304,6 +307,15 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     return true;
 }
 
+// 返回当前 acquire 的 back buffer 原始 ID3D12Resource 指针。
+uintptr_t getBackBufferHandle(Dx12Surface* s) {
+    if (!s || s->currentImageIndex < 0 ||
+        s->currentImageIndex >= (int)s->backBuffers.size()) {
+        return 0ULL;
+    }
+    return reinterpret_cast<uintptr_t>(s->backBuffers[(size_t)s->currentImageIndex].Get());
+}
+
 bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     std::string& err) {
     if (!ctx || !ctx->commandList) {
@@ -405,6 +417,16 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     cmd->ResourceBarrier(1, &barrier);
     // P11：源纹理显式回切 COMMON。
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+#ifdef DIAG_READBACK_COLOR_TEX
+    // P20 诊断：blit 后读回源纹理中心像素，确认 shader 输出颜色。
+    // 仅每 ~30 帧执行（deviceWaitIdle 同步开销）。
+    {
+        static int rbCount = 0;
+        if (++rbCount % 30 == 0) {
+            dbgReadbackTexturePixels(srcTex, "colorTex-after-render");
+        }
+    }
+#endif
 #endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。

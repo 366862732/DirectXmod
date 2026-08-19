@@ -479,6 +479,9 @@ void destroySurface(Dx12Surface* s);
 // P6 诊断：把当前 back buffer 读回 CPU 并打印 3x3 采样点 RGBA（每 ~60 帧调用
 // 一次，内部先等 GPU 空闲；用于确认画面实际颜色/内容——纯色=渲染未生效）。
 bool readbackSurfacePixels(Dx12Surface* s, std::string& err);
+// 返回当前 acquire 的 back buffer 原始 ID3D12Resource 指针（uintptr_t），
+// 供 Java 侧直接用于 blit 源或 readback（避免使用缓存的旧 lastColorTextureHandle）。
+uintptr_t getBackBufferHandle(Dx12Surface* s);
 // P6 诊断：读回任意纹理 3x3 采样点 RGBA（tag 标注来源，如 blit 源=渲染目标，
 // 用于区分 draw 未写入 vs blit 丢失）。
 void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag);
