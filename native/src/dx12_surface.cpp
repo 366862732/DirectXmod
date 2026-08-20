@@ -353,6 +353,18 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     // 源纹理可能是本帧渲染 pass 的输出（RENDER_TARGET/DEPTH_WRITE），或刚
     // 上传完的 COMMON；按跟踪状态过渡到 COPY_SOURCE 再拷贝。
     if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+#ifdef DIAG_READBACK_COLOR_TEX
+    // P20 诊断：在 CopyTextureRegion 之前读回源纹理像素，确认 shader 输出颜色。
+    // 必须在拷贝前执行——CopyTextureRegion 是"读源写目标"原子操作，拷贝后源
+    // 内容已不可读；且后续帧可能复用该纹理导致 COMMON→COPY_SOURCE barrier 错配。
+    // 仅每 ~30 帧执行（deviceWaitIdle 同步开销）。
+    {
+        static int rbCount = 0;
+        if (++rbCount % 30 == 0) {
+            dbgReadbackTexturePixels(srcTex, "colorTex-before-copy");
+        }
+    }
+#endif
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -418,23 +430,21 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     dstLoc.SubresourceIndex = 0;
 
     D3D12_BOX srcBox{0, 0, 0, w, h, 1};
+    // P22 诊断：拷贝前打印 srcTex 状态，区分"shader 未写入"vs"读回时机错误"
+    {
+        D3D12_RESOURCE_DESC sd = srcTex->resource->GetDesc();
+        dbgLog("blitSurface:before-copy src=%p w=%llu h=%llu fmt=%d colorTargetsWritten=%d",
+            (void*)srcTex, (unsigned long long)sd.Width, (unsigned long long)sd.Height,
+            (int)srcTex->dxgiFormat, (int)ctx->colorTargetsWritten);
+    }
     cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);
+    dbgLog("blitSurface:after-copy src=%p -> dst=%p", (void*)srcTex, (void*)dst);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &barrier);
     // P11：源纹理显式回切 COMMON。
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
-#ifdef DIAG_READBACK_COLOR_TEX
-    // P20 诊断：blit 后读回源纹理中心像素，确认 shader 输出颜色。
-    // 仅每 ~30 帧执行（deviceWaitIdle 同步开销）。
-    {
-        static int rbCount = 0;
-        if (++rbCount % 30 == 0) {
-            dbgReadbackTexturePixels(srcTex, "colorTex-after-render");
-        }
-    }
-#endif
 #endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。

@@ -40,6 +40,9 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private static final int USAGE_UNIFORM = 0x80;
     private static final int USAGE_UNIFORM_TEXEL_BUFFER = 0x100;
 
+    /** DEBUG: true 时强制所有 pass 使用 withoutDepth PSO（禁用深度测试/写入），用于排查黑屏是否由深度问题导致。 */
+    private static final boolean DEBUG_DISABLE_DEPTH_TEST = false;
+
     private final @Nullable Dx12Device device;
     private final long ctx;
     private final @Nullable RenderArea renderArea;
