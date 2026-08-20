@@ -250,6 +250,12 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndRenderPass(
     }
 }
 
+JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetActiveColorTexture(
+    JNIEnv*, jclass, jlong ctx) {
+    return (jlong)getActiveColorTextureHandle(
+        reinterpret_cast<dx12mc::CommandContext*>(ctx));
+}
+
 // ---------------------------------------------------------------------------
 // P3：timestamp query pool
 // ---------------------------------------------------------------------------

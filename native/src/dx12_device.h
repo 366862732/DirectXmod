@@ -482,6 +482,10 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err);
 // 返回当前 acquire 的 back buffer 原始 ID3D12Resource 指针（uintptr_t），
 // 供 Java 侧直接用于 blit 源或 readback（避免使用缓存的旧 lastColorTextureHandle）。
 uintptr_t getBackBufferHandle(Dx12Surface* s);
+// 返回当前 command context 的渲染 pass 中第一个活跃颜色附件的纹理句柄；
+// 若不在渲染 pass 中则返回 0。用于替代缓存的 lastColorTextureHandle，
+// 避免 resize 后句柄指向旧纹理的问题。
+uintptr_t getActiveColorTextureHandle(CommandContext* ctx);
 // P6 诊断：读回任意纹理 3x3 采样点 RGBA（tag 标注来源，如 blit 源=渲染目标，
 // 用于区分 draw 未写入 vs blit 丢失）。
 void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag);

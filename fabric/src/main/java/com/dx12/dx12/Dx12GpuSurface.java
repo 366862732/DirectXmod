@@ -103,10 +103,13 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
                         rb[32], rb[33], rb[34], rb[35]);
             }
             // P6 诊断：额外读回 back buffer，确认 blit 是否将绿色写入 swapchain。
-            // 若 backbuffer 绿色但纹理黑色 → 问题在渲染 pass；若两者都黑 → 问题在 blit/present。
-            int[] bb = Dx12Native.dx12ReadbackSurfacePixels(this.handle);
+            // 用 dx12GetActiveSurfaceHandle() 读游戏实际 surface（而非 this.handle，
+            // 后者在 resize 后可能指向已失效的旧 self-test surface）。
+            long gameSurface = Dx12Native.dx12GetActiveSurfaceHandle();
+            int[] bb = Dx12Native.dx12ReadbackSurfacePixels(gameSurface != 0 ? gameSurface : this.handle);
             if (bb != null && bb.length >= 12) {
-                System.err.printf("[dx12-java] [DIAG] backbuf rb ARRAY_LEN=%d%n", bb.length);
+                System.err.printf("[dx12-java] [DIAG] backbuf rb ARRAY_LEN=%d surface=0x%08X%n",
+                    bb.length, (int)((gameSurface != 0 ? gameSurface : this.handle) & 0xFFFFFFFFL));
                 System.err.printf("  TL(%d,%d,%d,%d) TM(%d,%d,%d,%d) TR(%d,%d,%d,%d)%n",
                     bb[0], bb[1], bb[2], bb[3],
                     bb[4], bb[5], bb[6], bb[7],

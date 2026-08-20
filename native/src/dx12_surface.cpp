@@ -316,6 +316,14 @@ uintptr_t getBackBufferHandle(Dx12Surface* s) {
     return reinterpret_cast<uintptr_t>(s->backBuffers[(size_t)s->currentImageIndex].Get());
 }
 
+// 返回当前渲染 pass 中第一个活跃颜色附件的纹理句柄（在 pass 内调用有效）。
+uintptr_t getActiveColorTextureHandle(CommandContext* ctx) {
+    if (!ctx || !ctx->inRenderPass || ctx->activeColorTargets.empty()) {
+        return 0ULL;
+    }
+    return reinterpret_cast<uintptr_t>(ctx->activeColorTargets[0]->resource.Get());
+}
+
 bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     std::string& err) {
     if (!ctx || !ctx->commandList) {

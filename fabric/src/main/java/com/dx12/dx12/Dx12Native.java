@@ -269,6 +269,12 @@ public final class Dx12Native {
     /** 返回当前 acquire 的 back buffer 原始资源指针，用于 blit/readback（不依赖缓存）。 */
     public static native long dx12GetBackBufferHandle(long surface);
 
+    /**
+     * 返回当前 command context 渲染 pass 中第一个活跃颜色附件的纹理句柄。
+     * 若在 pass 外或无颜色附件则返回 0。用于替代缓存的 lastColorTextureHandle。
+     */
+    public static native long dx12GetActiveColorTexture(long ctx);
+
     /** Whether the last present reported a suboptimal status. */
     public static native boolean dx12IsSurfaceSuboptimal(long surface);
 

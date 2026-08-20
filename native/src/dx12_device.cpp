@@ -1690,13 +1690,13 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         // P21 修复：vanilla 从不通过 RenderPassDescriptor 传递 depth clear value
         // （总是 OptionalDouble.empty()），pre-clear 发生在另一个 command list 上，
         // 无法保证清除本 pass 使用的 depth texture。因此只要有 depth attachment，
-        // 就无条件 clear depth=0.0，确保 depth test 不被旧数据拦截。
-        if (!depthClearFlag) depthClearValue = 0.0;
+        // 就无条件 clear depth=1.0（远平面），确保默认 LESS 比较下所有片段通过。
+        if (!depthClearFlag) depthClearValue = 1.0;
         ctx->commandList->ClearDepthStencilView(cpu,
             D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
             (FLOAT)depthClearValue, 0, 0, nullptr);
         dbgLog("beginRenderPass depth clear=%s val=%.3f",
-            depthClearFlag ? "explicit" : "auto-fallback");
+            depthClearFlag ? "explicit" : "auto-fallback(1.0)", (FLOAT)depthClearValue);
     }
 
     ctx->commandList->OMSetRenderTargets((UINT)rtvs.size(),
