@@ -1063,10 +1063,18 @@ bool deviceWaitIdle(std::string& err) {
         return false;
     }
     dbgLog("deviceWaitIdle: enter");
-    // 用队列级 fence 等待：本地 fence(value=1) 在队列已提交更多工作时
-    // 会立即完成（不真实等待），导致后续 ResizeBuffers 看到 DWM 仍持有
-    // backbuffer 引用而失败（DXGI_ERROR_NOT_CURRENTLY_AVAILABLE）。
-    UINT64 fv = ++gCtx.queueFenceValue;
+    // 关键：先读当前已完成值，再信号一个绝对高于它的值。
+    // 原逻辑 fv = ++gCtx.queueFenceValue 存在竞态——若 GPU 已处理到更高的 fence
+    // 值（Java 线程在 awaitCompletion 后提交更多帧），fv 会低于已完成值，
+    // GetCompletedValue() >= fv 导致 while 循环立即退出，后续 ResizeBuffers
+    // 看到 DWM 仍持有 backbuffer 引用而失败（DXGI_ERROR_INVALID_CALL）。
+    UINT64 cv = gCtx.queueFence->GetCompletedValue();
+    UINT64 fv = cv + 1;
+    // 防御：若 fv 已等于或超过 queueFenceValue（说明有并发提交更新了计数器），
+    // 继续递增直到 fv > queueFenceValue，保证我们等待的值是尚未被 GPU 处理过的。
+    while (fv <= gCtx.queueFenceValue) {
+        ++fv;
+    }
     if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), fv))) {
         err = "deviceWaitIdle: Signal failed";
         return false;
@@ -1086,7 +1094,7 @@ bool deviceWaitIdle(std::string& err) {
         }
     }
     CloseHandle(evt);
-    dbgLog("deviceWaitIdle: done");
+    dbgLog("deviceWaitIdle: done (waited for fv=%llu)", (unsigned long long)fv);
     return true;
 }
 

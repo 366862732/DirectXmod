@@ -25,6 +25,10 @@ import org.lwjgl.util.shaderc.Shaderc;
  */
 @Environment(EnvType.CLIENT)
 public class Dx12ShaderCompiler implements AutoCloseable {
+    // P20 诊断：所有 pipeline 强制输出纯绿色，区分"管线问题"vs"数据问题"。
+    // 默认关闭（DX12_DIAG_GREEN=1 开启），避免正常游戏时闪绿屏。
+    private static final boolean DIAG_GREEN = "1".equals(System.getenv("DX12_DIAG_GREEN"));
+
     private final long shaderCompiler;
     private final long shaderOptions;
     private final ShaderDefines globalDefines;
@@ -102,24 +106,23 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
-        // P6 诊断：所有 pipeline 强制输出纯绿色，区分"管线问题"vs"数据问题"
-        // 去掉管线名过滤，覆盖 core/terrain 等主渲染管线（之前只覆盖 gui/panorama）。
-        // 屏幕变绿 => 管线通路正常，问题在 shader 数据（纹理绑定/UBO/culling 等）；
-        // 仍黑屏 => 管线根本问题（draw 未提交/状态错配/swapchain 等）。
-        String loc = pipeline.getLocation().toString();
-        System.err.println("[dx12-java] [DIAG] " + loc
-            + " frag before= " + fragmentHlsl.length() + " bytes");
-        String oldLenStr = String.valueOf(fragmentHlsl.length());
-        fragmentHlsl = stripFragMainAndReplace(fragmentHlsl);
-        System.err.println("[dx12-java] [DIAG] " + loc
-            + " frag after= " + fragmentHlsl.length() + " bytes"
-            + " changed=" + (fragmentHlsl.length() != Integer.parseInt(oldLenStr)));
-        // 打印修改后 shader 的前 120 字符，确认 GREEN 注入已生效
-        String head = fragmentHlsl.length() > 120
-            ? fragmentHlsl.substring(0, 120) + "..."
-            : fragmentHlsl;
-        System.err.println("[dx12-java] [DIAG] " + loc + " frag head=" + head);
-        System.err.println("[dx12-java] [DIAG] " + loc + " frag forced GREEN (all pipelines)");
+        if (DIAG_GREEN) {
+            // P6 诊断：强制输出纯绿色，区分"管线问题"vs"数据问题"
+            // 屏幕变绿 => 管线通路正常，问题在 shader 数据；仍黑屏 => 管线根本问题。
+            String loc = pipeline.getLocation().toString();
+            System.err.println("[dx12-java] [DIAG] " + loc
+                + " frag before= " + fragmentHlsl.length() + " bytes");
+            String oldLenStr = String.valueOf(fragmentHlsl.length());
+            fragmentHlsl = stripFragMainAndReplace(fragmentHlsl);
+            System.err.println("[dx12-java] [DIAG] " + loc
+                + " frag after= " + fragmentHlsl.length() + " bytes"
+                + " changed=" + (fragmentHlsl.length() != Integer.parseInt(oldLenStr)));
+            String head = fragmentHlsl.length() > 120
+                ? fragmentHlsl.substring(0, 120) + "..."
+                : fragmentHlsl;
+            System.err.println("[dx12-java] [DIAG] " + loc + " frag head=" + head);
+            System.err.println("[dx12-java] [DIAG] " + loc + " frag forced GREEN (all pipelines)");
+        }
         // Fix S2：语义名称由 toHlsl() 通过 spvc_compiler_hlsl_add_vertex_attribute_remap 注入，
         // 此处直接按 vertex format 位置生成：location 0 → POSITION，其余 → TEXCOORD<n>。
         List<String> semanticNames = new ArrayList<>();

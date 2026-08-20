@@ -151,6 +151,8 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     // ResizeBuffers 前必须等 GPU 完全空闲：FLIP model 下 backbuffer 仍被
     // 上一帧命令队列引用时，ResizeBuffers 返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
     // (0x887A0001)——游戏启动/窗口调整时多次 configure 失败即此原因。
+    // deviceWaitIdle 现已确保等待一个绝对高于 GPU 已完成值的 fence，
+    // 避免提前返回导致 DWM 仍持有 backbuffer 引用而失败（DXGI_ERROR_INVALID_CALL）。
     // 镜像官方 VulkanGpuSurface 调整 swapchain 前的 waitIdle 语义。
     if (!deviceWaitIdle(err)) {
         err = "deviceWaitIdle before ResizeBuffers failed: " + err;

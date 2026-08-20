@@ -46,6 +46,7 @@ public final class Dx12Native {
             String verbose = System.getenv("DX12_LOG_VERBOSE");
             System.out.println("[dx12] Native library loaded from: " + dllPath);
             System.out.println("[dx12] 高频调试日志已关闭，如需开启请设置环境变量 DX12_LOG_VERBOSE=1");
+            System.out.println("[dx12] 诊断 GREEN 着色器注入已关闭，如需开启请设置环境变量 DX12_DIAG_GREEN=1");
         } catch (Exception e) {
             System.err.println("[dx12] Failed to load native library: " + e.getMessage());
         }
