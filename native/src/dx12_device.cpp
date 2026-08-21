@@ -642,6 +642,10 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
         dbgLogInfo("createTexture: RTA handle=%p w=%d h=%d layers=%d mips=%d fmt=%d usage=0x%x",
             (void*)obj.get(), width, height, depthOrLayers, mipLevels, format, usage);
     }
+    if (usage & 16) {  // CUBEMAP_COMPATIBLE
+        dbgLogInfo("createTexture: CUBE handle=%p w=%d h=%d layers=%d fmt=%d usage=0x%x",
+            (void*)obj.get(), width, height, depthOrLayers, format, usage);
+    }
     return obj.release();
 }
 
@@ -763,6 +767,10 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         srv.TextureCube.MipLevels = (UINT)std::max(1, mipLevels);
         srv.TextureCube.MostDetailedMip = (UINT)std::max(0, baseMipLevel);
+        dbgLog("createTextureView: CUBE srv slot=%d fmt=%d mip=%d most=%d layers=%d",
+            slot, (int)texture->dxgiFormat, (int)srv.TextureCube.MipLevels,
+            (int)srv.TextureCube.MostDetailedMip,
+            (int)texture->resource->GetDesc().DepthOrArraySize);
     } else {
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Texture2D.MipLevels = (UINT)std::max(1, mipLevels);

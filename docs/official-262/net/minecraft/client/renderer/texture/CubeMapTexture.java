@@ -59,7 +59,9 @@ extends ReloadableTexture {
         int width = image.getWidth();
         int height = image.getHeight() / 6;
         this.close();
-        this.texture = device.createTexture(this.resourceId()::toString, 21, GpuFormat.RGBA8_UNORM, width, height, 6, 1);
+        this.texture = device.createTexture(this.resourceId()::toString,
+            GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST,
+            GpuFormat.RGBA8_UNORM, width, height, 6, 1);
         this.textureView = device.createTextureView(this.texture);
         GpuBufferSlice stagingBuffer = device.createCommandEncoder().transientMemory().uploadStaging(image.getPixelBytes(), 1L, 16);
         for (int i = 0; i < 6; ++i) {
