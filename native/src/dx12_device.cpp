@@ -643,8 +643,8 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
             (void*)obj.get(), width, height, depthOrLayers, mipLevels, format, usage);
     }
     if (usage & 16) {  // CUBEMAP_COMPATIBLE
-        dbgLogInfo("createTexture: CUBE handle=%p w=%d h=%d layers=%d fmt=%d usage=0x%x",
-            (void*)obj.get(), width, height, depthOrLayers, format, usage);
+        dbgLog("createTexture: CUBE handle=%p w=%d h=%d layers=%d mips=%d fmt=%d usage=0x%x",
+            (void*)obj.get(), width, height, depthOrLayers, mipLevels, format, usage);
     }
     return obj.release();
 }
@@ -1520,6 +1520,11 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
     transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
 
     UINT subresource = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    if (dstTex->usage & 16) {  // CUBEMAP_COMPATIBLE：确认 6 个面是否逐一上传
+        dbgLog("copyBufferToTexture: CUBE dst=%p mip=%d layer=%d subres=%u srcOff=%lld srcW=%d srcH=%d w=%d h=%d rowBytes=%u aligned=%d",
+            (void*)dstTex, mip, layer, subresource, (long long)srcOffset,
+            srcWidth, srcHeight, w, h, srcRowBytes, (int)aligned);
+    }
     if (aligned) {
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = srcBuf->resource.Get();
@@ -1717,16 +1722,21 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         hasDsv = true;
         ctx->activeDepthTarget = depthView;
         transitionTextureTo(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        // P21 修复：vanilla 从不通过 RenderPassDescriptor 传递 depth clear value
-        // （总是 OptionalDouble.empty()），pre-clear 发生在另一个 command list 上，
-        // 无法保证清除本 pass 使用的 depth texture。因此只要有 depth attachment，
-        // 就无条件 clear depth=1.0（远平面），确保默认 LESS 比较下所有片段通过。
-        if (!depthClearFlag) depthClearValue = 1.0;
-        ctx->commandList->ClearDepthStencilView(cpu,
-            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            (FLOAT)depthClearValue, 0, 0, nullptr);
-        dbgLog("beginRenderPass depth clear=%s val=%.3f",
-            depthClearFlag ? "explicit" : "auto-fallback(1.0)", (FLOAT)depthClearValue);
+        // reverse-Z 修复：Minecraft 26.x 使用反向深度（depthFunc=GREATER_EQUAL），
+        // 深度 clear 值为 0.0（远平面）。vanilla 在创建主渲染 pass 前已通过
+        // clearDepthTexture(..., 0.0) pre-clear（同一 command encoder，顺序有保证），
+        // 主 pass 的 depth attachment clearValue 为 empty → depthClearFlag=0（LOAD）。
+        // 原 P21 在 LOAD 时无条件回退 clear=1.0，覆盖了 pre-clear 的 0.0，导致
+        // GREATER_EQUAL 深度测试丢弃几乎所有片元 → 全黑屏。
+        // 正确行为：LOAD 不 clear（保持 pre-clear 值），仅显式 CLEAR 时 clear。
+        if (depthClearFlag) {
+            ctx->commandList->ClearDepthStencilView(cpu,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                (FLOAT)depthClearValue, 0, 0, nullptr);
+            dbgLog("beginRenderPass depth clear=explicit val=%.3f", (FLOAT)depthClearValue);
+        } else {
+            dbgLog("beginRenderPass depth load (no clear)");
+        }
     }
 
     ctx->commandList->OMSetRenderTargets((UINT)rtvs.size(),
@@ -2493,6 +2503,10 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 // 采样前必须显式 transition 到 SHADER_RESOURCE，否则 D3D12 在
                 // COMMON 状态采样是未定义行为（NVIDIA 驱动静默返回黑）→ 全黑屏。
                 if (b.view->sourceTexture) {
+                    if (b.view->sourceTexture->usage & 16) {
+                        dbgLog("pushDesc SRV: CUBE view=%p srcTex=%p -> SHADER_RESOURCE",
+                            (void*)b.view, (void*)b.view->sourceTexture);
+                    }
                     transitionTextureTo(ctx, b.view->sourceTexture,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
