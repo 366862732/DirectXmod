@@ -571,9 +571,9 @@ namespace {
 bool hasDepthAspect(int fmt) { return fmt == 51 || fmt == 52 || fmt == 53 || fmt == 54; }
 
 D3D12_HEAP_TYPE pickBufferHeapType(int usage) {
-    if (usage & 2) return D3D12_HEAP_TYPE_UPLOAD;     // MAP_WRITE
-    if (usage & 1) return D3D12_HEAP_TYPE_READBACK;   // MAP_READ（无 MAP_WRITE）
-    return D3D12_HEAP_TYPE_DEFAULT;
+    if (usage & 2) return D3D12_HEAP_TYPE_UPLOAD;     // MAP_WRITE → CPU 直接写入
+    if (usage & 1) return D3D12_HEAP_TYPE_READBACK;   // MAP_READ（无 MAP_WRITE）→ CPU 直接读回
+    return D3D12_HEAP_TYPE_DEFAULT;                   // uniform/vertex → GPU 专属，copy 上传
 }
 
 D3D12_RESOURCE_STATES initialStateFor(D3D12_HEAP_TYPE heap) {
@@ -2223,8 +2223,16 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     auto buildPso = [&](DXGI_FORMAT dsvFormat, bool depthEnable,
         D3D12_DEPTH_WRITE_MASK depthWrite, D3D12_COMPARISON_FUNC depthFunc,
         ComPtr<ID3D12PipelineState>& out, std::string& e) -> bool {
+        // P19：DX12_DBG_DISABLE_DEPTH=1 时强制关闭深度测试，用于排查黑屏是否由深度配置错误导致。
+        static bool forceNoDepth = []() -> bool {
+            const char* v = std::getenv("DX12_DBG_DISABLE_DEPTH");
+            return v && *v;
+        }();
         D3D12_DEPTH_STENCIL_DESC ds{};
-        ds.DepthEnable = depthEnable;
+        ds.DepthEnable = depthEnable && !forceNoDepth;
+        if (forceNoDepth && depthEnable) {
+            dbgLog("buildPso: depth test forcibly DISABLED (DX12_DBG_DISABLE_DEPTH=1)");
+        }
         ds.DepthWriteMask = depthWrite;
         ds.DepthFunc = depthFunc;
         ds.StencilEnable = FALSE;
@@ -2341,11 +2349,16 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     D3D12_COMPARISON_FUNC depthFunc = desc.hasDepth
         ? toD3d12Compare((uint8_t)desc.depthCompareOp) : D3D12_COMPARISON_FUNC_ALWAYS;
 
-    // 始终同时创建两个 PSO：withDepth（DSV=D32_FLOAT，depthEnable=true）和
+    // 始终同时创建两个 PSO：withDepth（DSV=D32_FLOAT）和
     // withoutDepth（DSV=UNKNOWN，depthEnable=false），以支持运行时 hasDepth 与
     // 编译时 desc.hasDepth 不一致的场景（如 pipeline/gui 编译时无深度，但渲染
     // pass 请求 hasDepth=true）。
-    if (!buildPso(DXGI_FORMAT_D32_FLOAT, true, depthWrite, depthFunc,
+    // 关键：withDepth 的 depthEnable/depthFunc 必须跟随 desc.hasDepth，
+    // 否则无深度管线（如 GUI）会被强制开启深度测试并拿到无效 depthFunc（如 8）→ 全黑。
+    bool wDepthEnable = desc.hasDepth;
+    D3D12_COMPARISON_FUNC wDepthFunc = desc.hasDepth
+        ? toD3d12Compare((uint8_t)desc.depthCompareOp) : D3D12_COMPARISON_FUNC_ALWAYS;
+    if (!buildPso(DXGI_FORMAT_D32_FLOAT, wDepthEnable, depthWrite, wDepthFunc,
         pipeline->withDepth, err)) {
         return nullptr;
     }
@@ -2482,6 +2495,12 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 if (i == 0 && ((++ubDbg % 60) == 1)) {
                     dbgReadbackBufferBytes(b.buffer, b.offset,
                         (int)std::min<long long>(b.length, 128), "ubo");
+                }
+                // P18：单独诊断 Projection buffer（binding index 1），确认投影矩阵数据是否写入。
+                static int projDbg = 0;
+                if (i == 1 && ((++projDbg % 60) == 1)) {
+                    dbgReadbackBufferBytes(b.buffer, b.offset,
+                        (int)std::min<long long>(b.length, 64), "proj");
                 }
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};

@@ -1,7 +1,7 @@
-# DirectXmod
+# DirectXMod (gl4dx12)
 
-> **一个 Minecraft 26.2+ Fabric 模组的 DirectX 12 后端实现。**
-> 通过实现 Minecraft 官方的 `GpuBackend` / `GpuDeviceBackend` 接口，用预编译的 C++ DLL（`dx12_mc.dll`）替代原生 OpenGL 渲染路径，使 Minecraft 使用 D3D12 直接渲染游戏画面，同时保留 Mod 扩展点（AA 设置、ModMenu 集成）。
+> **Minecraft 26.2 Fabric 模组的原生 D3D12 渲染后端。**
+> 通过实现 Minecraft 官方的 `GpuBackend` / `GpuDeviceBackend` 接口，用 C++ 原生 DLL（`dx12_mc.dll`）替代 OpenGL/Vulkan 渲染路径，使 Minecraft 使用 D3D12 直接渲染游戏画面，同时保留 Mod 扩展点（AA 设置、ModMenu 集成）。
 
 ## 概述
 
@@ -12,13 +12,13 @@
 - **Mixin 注入**：仅需 1 个 Mixin（`PreferredGraphicsApiMixin`）将 D3D12 设为首选 API，Minecraft 原生渲染管线直接驱动我们的后端
 - **官方 GpuBackend 接口**：完整实现 `GpuBackend` / `GpuDeviceBackend` / `CommandEncoderBackend` / `RenderPassBackend` / `GpuSurfaceBackend` 等官方接口
 - **零自定义渲染循环**：不复写 `RenderSystem`，完全接管 Minecraft 官方的渲染流程
-- **Shaderc + Spvc 编译链**：GLSL → SPIR-V（shaderc）→ HLSL SM5.1（spvc）→ DXBC（原生 D3DCompile）
+- **Shaderc + Spvc 编译链**：GLSL → SPIR-V（shaderc）→ HLSL SM5.1（spvc）→ DXBC（D3DCompile）
 - **资源安全**：所有 D3D12 资源通过 Java 包装类（`Dx12Gpu*`）管理，随 Minecraft 生命周期自动释放
 - **配置界面**：Fx12Config 持久化配置，Dx12SettingsScreen 设置界面，ModMenu 集成
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
 
-### 当前阶段：P0-P17 全部完成，shader 渲染全链路已通（2026-08-16）
+### 当前阶段：P0-P18 全部完成，GUI 标题界面可正常渲染（2026-08-21）
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -32,6 +32,7 @@
 | **P15: 日志分级系统** | ✅ 已完成 | GameRenderer 调试插桩 + 分级日志 (log4j2) |
 | **P16: renderLevel 诊断** | ✅ 已完成 | 帧计数/advanceGameTime/pause/native submit+present 日志 |
 | **P17: 绘制目标跟踪** | ✅ 已完成 | Draw target tracking + GPU 同步修复 + 调试日志 |
+| **P18: Surface fence** | ✅ 已完成 | per-backbuffer fence 追踪，避免 acquire 重用未完成的 back buffer |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线编译 + surface blit + buffer copy + texture readback 全部通过 |
 
 ## 项目结构
@@ -47,46 +48,59 @@ dx12-lib-template-26.1.2/
 │   │   ├── gui/
 │   │   │   └── Dx12SettingsScreen.java # AA 模式设置 GUI（None/FXAA/SMAA/TAA）
 │   │   ├── mixin/
-│   │   │   └── PreferredGraphicsApiMixin.java  # 将 D3D12 设为首选图形 API
+│   │   │   ├── PreferredGraphicsApiMixin.java  # 将 D3D12 设为首选图形 API
+│   │   │   ├── GameRendererRenderDebugMixin.java  # P16/P17: renderLevel 诊断
+│   │   │   └── BufferBuilderMixin.java          # P17: 绘制目标跟踪插桩
 │   │   └── dx12/                    # D3D12 后端核心实现（镜像官方 Vulkan 后端）
 │   │       ├── Dx12Native.java        # JNI 桥接层（66 native 方法，335 行）
-│   │       ├── Dx12Backend.java       # GpuBackend 实现：窗口/设备创建 + 4 轮自测 + GameRenderer 插桩（414 行）
-│   │       ├── Dx12Device.java        # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存 + 诊断状态（566 行）
-│   │       ├── Dx12ShaderCompiler.java    # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，198 行）
+│   │       ├── Dx12Backend.java       # GpuBackend 实现：窗口/设备创建 + 4 轮自测
+│   │       ├── Dx12Device.java        # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存
+│   │       ├── Dx12ShaderCompiler.java  # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，760 行）
 │   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息（spvc 语义注入，355 行）
 │   │       ├── Dx12CompiledShader.java    # 编译产物（HLSL 源码 + 绑定列表）
 │   │       ├── Dx12CompiledRenderPipeline.java  # 编译后的渲染管线
 │   │       ├── Dx12BindGroupEntry.java    # 管线绑定条目（UBO/SRV/TexelBuffer）
-│   │       ├── Dx12GpuSurface.java      # DXGI swapchain（P5 交换链层 + P17 绘制目标跟踪，106 行）
-│   │       ├── Dx12CommandEncoderBackend.java   # 命令编码层（P3 submit/copy/clear，342 行）
-│   │       ├── Dx12RenderPassBackend.java     # 渲染通道层（P6 draw 全链路 + P17 绘制跟踪，393 行）
+│   │       ├── Dx12GpuSurface.java      # DXGI swapchain（P5+P17，130 行）
+│   │       ├── Dx12CommandEncoderBackend.java   # 命令编码层（P3，342 行）
+│   │       ├── Dx12RenderPassBackend.java     # 渲染通道层（P6+P17，393 行）
 │   │       ├── Dx12TransientMemory.java     # 瞬时内存管理（per-frame 缓冲回收，209 行）
-│   │   ├── Dx12GpuTexture.java        # D3D12 纹理资源包装（47 行）
-│   │   ├── Dx12GpuTextureView.java    # D3D12 纹理视图（SRV，43 行）
-│   │   ├── Dx12GpuBuffer.java         # D3D12 缓冲区资源包装（61 行）
-│   │   ├── Dx12GpuSampler.java        # D3D12 采样器包装（86 行）
-│   │   └── Dx12GpuQueryPool.java      # D3D12 GPU 时间戳查询池（72 行）
+│   │       ├── Dx12GpuTexture.java        # D3D12 纹理资源包装（47 行）
+│   │       ├── Dx12GpuTextureView.java    # D3D12 纹理视图（SRV，43 行）
+│   │       ├── Dx12GpuBuffer.java         # D3D12 缓冲区资源包装（61 行）
+│   │       ├── Dx12GpuSampler.java        # D3D12 采样器包装（86 行）
+│   │       └── Dx12GpuQueryPool.java      # D3D12 GPU 时间戳查询池（72 行）
+│   │   └── d3d12/                      # 实验性纯 Java D3D12 封装（暂未接入生产）
+│   │       ├── Dx12Device.java            # 适配器枚举 + 设备工厂
+│   │       ├── Dx12DeviceContext.java     # 完整上下文（device+queue+surface）
+│   │       ├── Dx12AdapterInfo.java       # 适配器信息
+│   │       └── Dx12Exception.java         # 异常包装
+│   ├── src/test/java/com/dx12/d3d12/
+│   │   └── Dx12DeviceTest.java          # 单元测试（渲染循环验证）
 │   ├── src/main/resources/
 │   │   ├── fabric.mod.json         # Fabric 模组描述（client + modmenu entrypoints）
-│   │   ├── gl4dx12.mixins.json     # Mixin 配置（1 个 mixin）
+│   │   ├── gl4dx12.mixins.json     # Mixin 配置（3 个 mixin）
 │   │   └── assets/dx12mod/icon.png # 模组图标（16x16）
 │   ├── libs/
 │   │   └── modmenu-20.0.1.jar     # ModMenu 本地依赖（MC 26.2）
 │   ├── build.gradle                # Gradle 构建配置 (loom 1.15.5)
 │   └── gradle.properties           # 版本参数
-├── native/                          # D3D12 原生层（C++17）
+├── native/                          # D3D12 原生层（C++17，MSVC + CMake）
 │   ├── src/
-│   │   ├── dx12_device.cpp         # D3D12 设备/资源创建 + 渲染通道 + 时间戳（2670 行）
-│   │   ├── dx12_device.h           # DX12DeviceHandle 结构体定义（367 行）
-│   │   ├── dx12_surface.cpp        # DXGI swapchain + blit + present + 诊断读回（469 行）
+│   │   ├── dx12_device.cpp         # D3D12 设备/资源/命令/管线/Draw（~3000 行）
+│   │   ├── dx12_device.h           # 公共头文件（367 行，定义 DeviceContext/CommandContext 等）
+│   │   ├── dx12_surface.cpp        # DXGI swapchain + blit + present + 读回诊断（~470 行）
 │   │   ├── jni_bridge.cpp          # JNI 入口（112 行）
-│   │   ├── jni_bridge_p3.cpp       # P3 命令层 native（submit/fence/copy/timestamp，293 行）
-│   │   ├── jni_bridge_p4.cpp       # P4 管线编译 native（D3DCompile DXBC，168 行）
-│   │   ├── jni_bridge_p5.cpp       # P5 交换链 native + 诊断读回（376 行）
-│   │   └── jni_bridge_p6.cpp       # P6 绘制 native（draw 全链路，156 行）
+│   │   ├── jni_bridge_p3.cpp       # P3 命令层 native（293 行）
+│   │   ├── jni_bridge_p4.cpp       # P4 管线编译 native（168 行）
+│   │   ├── jni_bridge_p5.cpp       # P5 交换链 + 读回 native（376 行）
+│   │   └── jni_bridge_p6.cpp       # P6 绘制 native（156 行）
 │   ├── CMakeLists.txt              # CMake 构建配置
-│   └── build/bin/Release/dx12_mc.dll  # 预编译 DLL（174KB，从 JAR 提取部署）
-└── 步骤.md                         # 详细开发步骤文档
+│   └── build/bin/Release/dx12_mc.dll  # 预编译 DLL（从 JAR 提取部署）
+├── docs/
+│   ├── official-262/               # Minecraft 26.2 官方源码参考
+│   ├── code-review-deep.md         # 深度代码审查报告（BUG-01 ~ BUG-17）
+│   └── 步骤.md                     # 详细开发步骤文档
+└── debug.log                       # 运行时诊断日志
 ```
 
 ## 架构设计
@@ -157,17 +171,20 @@ Dx12CompiledRenderPipeline (handle ≠ 0 表示成功)
 
 ### Mixin 注入点
 
-唯一 Mixin `PreferredGraphicsApiMixin` 在 Minecraft 初始化阶段修改图形 API 偏好：
+三个 Mixin 在 Minecraft 初始化/渲染阶段修改行为：
 
 ```java
-// PreferredGraphicsApiMixin.java
+// PreferredGraphicsApiMixin.java — 强制 D3D12 为首选
 @Mixin(GdxApplicationParameters.class)
 public abstract class PreferredGraphicsApiMixin {
     @Overwrite
     public String getPreferredGraphicsApi() {
-        return "D3D12";  // 强制使用 D3D12 而非 OpenGL/Vulkan
+        return "D3D12";
     }
 }
+
+// GameRendererRenderDebugMixin.java — P16/P17 渲染诊断
+// BufferBuilderMixin.java — P17 绘制目标跟踪
 ```
 
 Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Backend`。
@@ -183,24 +200,27 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P4 管线层** | GLSL→SPIR-V(HLSL→DXBC 编译，Pipeline cache (IdentityHashMap)，Shader source cache (HashMap) |
 | **P5 交换链** | Dx12GpuSurface: DXGI flip-model swapchain, 支持 IMMEDIATE/MERCHANTABILITY/RALAXED present mode |
 | **P6 Draw 全链路** | Dx12RenderPassBackend: setPipeline + pushDescriptors(UBO/SRV/TexelBuffer) + draw/drawIndexed/drawIndirect |
+| **P15 日志分级** | GameRenderer 调试插桩 + 分级日志 (log4j2) |
+| **P16 renderLevel 诊断** | 帧计数器（每 30 帧）+ advanceGameTime/pause/native submit+present 日志 |
+| **P17 绘制目标跟踪** | activeColorTargetsTouched 向量 + dbgReadbackSurfacePixels() 3×3 采样诊断读回 |
+| **P18 Surface Fence** | per-backbuffer fence 追踪，acquireSurface 前检查 back buffer 是否仍被 GPU 使用 |
 | **Shader 编译自检** | 内嵌 core/gui + core/position_tex_color 的 GLSL 源码，createDevice 时资源包未加载也可编译 |
-| **4 轮自测** | Java资源(self-test)→命令层→管线→Surface 逐轮验证，任何失败立即终止并回退 OpenGL |
+| **4 轮自测** | Java 资源(self-test)→命令层→管线→Surface 逐轮验证，任何失败立即终止并回退 OpenGL |
 | **D3D12 资源管理** | AutoCloseable 模式，close() 时释放所有 D3D12 句柄 |
 | **ModMenu 集成** | Dx12Config + Dx12SettingsScreen + ModMenuApi entrypoint |
 | **AA 模式持久化** | Properties 格式存储到 `config/gl4dx12.properties`，4 种模式 (None/FXAA/SMAA/TAA) |
-| **P15 日志分级** | `dbgLogInfo`/`dbgLogDebug` + `DX12_LOG_VERBOSE` 环境变量 + `%TEMP%\dx12-native.log` |
-| **P16 renderLevel 诊断** | 帧计数器（每 30 帧）+ `advanceGameTime`/`isPaused`/`willRenderLevel` 决策摘要 |
-| **P17 绘制目标跟踪** | `activeColorTargetsTouched` 向量 + `dbgReadbackSurfacePixels()` 3×3 采样诊断读回 |
+| **退出看门狗** | Dx12Mod: Render thread 消失后 20s 内强制 System.exit(1)，防止启动器卡死 |
 
 ## 关键设计原则
 
 - **Mixin 仅修改 API 选择**：不复写任何渲染逻辑，完全依赖 Minecraft 官方 `RenderSystem` 调用我们的后端
 - **镜像官方 Vulkan 后端**：每个 Java 类都对应官方 `com.mojang.blaze3d.vulkan.Vulkan*` 的等价实现
-- **资源安全释放**：所有 `AutoCloseable`，close 时销毁所有 D3D12 句柄，防止资源泄漏
+- **资源安全释放**：所有 `AutoCloseable`，close() 时销毁所有 D3D12 句柄，防止资源泄漏
 - **自测驱动开发**：4 轮自测（资源/命令/管线/Surface）在 `createDevice()` 中逐轮验证，失败即终止
 - **Lazy shared encoder**：`createCommandEncoder()` 返回同一实例（镜像官方语义），避免每帧新建 CommandContext 导致的命令丢失
 - **Shader cache**：Pipeline cache (IdentityHashMap) + Shader source cache (HashMap)，同一 shader 只编译一次
-- **DLL 版本隔离**：每次加载都从 JAR 重新提取，确保 DLL 与 JAR 版本一致
+- **DLL 版本隔离**：每次启动从 JAR 重新提取，确保 DLL 与 JAR 版本一致
+- **诊断开关**：`DX12_LOG_VERBOSE=1` 开启详细日志，`DX12_DIAG_GREEN=1` 开启绿色着色器诊断
 
 ## 调试与验证
 
@@ -247,26 +267,19 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **3. 管线** | core/gui + core/position_tex_color 全链路编译（GLSL→SPIR-V→HLSL→DXBC→PSO） | shaderc/spvc/D3DCompile 编译失败 |
 | **4. Surface** | swapchain 创建 → configure → acquire → blit → submit → present | HWND 无效、DXGI 创建 swapchain 失败 |
 
-## 已知问题与解决方案
+## 已知问题
 
-| 问题 | 原因 | 解决方案 | 状态 |
-|------|------|----------|------|
-| **GPU TDR 超时（~2s 后崩溃）** | GL + D3D12 同窗口共存导致 WDDM 驱动级冲突 | **1 个 Mixin**：设置 `D3D12` 为首选 API，Minecraft 不再初始化 GL 后端 | ✅ 已修复 |
-| **DLL 版本不匹配** | 旧版 `dx12_mc.dll` 与新版 Java 层 JNI 签名不一致 | 每次启动从 JAR 重新提取到 `{user.dir}/dx12mod/` | ✅ 已修复 |
-| **RootSignature 未设置（UMD AV）** | `setPipeline` 只调 `SetPipelineState`，未调 `SetGraphicsRootSignature` | 补 `SetGraphicsRootSignature(pipeline->rootSignature.Get())` | ✅ 已修复 (cd1e029) |
-| **命令列表拓扑未设置** | D3D12 初始 topology=UNDEFINED，draw 被 GPU 丢弃 | `setPipeline` 补 `IASetPrimitiveTopology(toPrimitiveTopology(topology))` | ✅ 已修复 |
-| **顶点语义硬编码** | `InputElement.semanticName` 硬编码为 `TEXCOORD`，不匹配 HLSL 输入 | 从 pipeline binding 反射提取 SPVC semantic name | ✅ 已修复 (88a9253) |
-| **GUI 纯红显示** | 顶点属性与 HLSL 输入语义不匹配 → 顶点数据被丢弃 | 修复 `dx12CreateGraphicsPipeline` 语义映射（`POSITION→SV_Position` 等） | ✅ 已修复 (cb653a7) |
-| **HLSL static/const 误判** | 解析变量声明时将 `static`/`const` 误认为类型前缀 | 重构为按类型关键字列表扫描；支持 `const` 修饰符检测 | ✅ 已修复 (86b5f7c/784d331) |
-| **Descriptor heap 耗尽** | SRV/Sampler heap 未释放旧 handle → 堆空间耗尽 | `createGraphicsPipeline` 成功后释放旧 handle | ✅ 已修复 (85ea7cf) |
-| **命令编码器共享导致渲染异常** | 每帧新建 CommandContext 导致命令丢失 | 懒加载共享单例 encoder（镜像官方语义） | ✅ 已修复 |
-| **GPU idle 等待** | 连续 submit 导致 GPU 等待时间过长 | 新增 `d3d12mc_gpu_idle_wait_ms`（默认 2ms） | ✅ 已修复 (85ea7cf) |
-| **D3D12 适配器不匹配** | 原生层创建的 D3D12 device 与 Java 层预期的适配器不一致 | 修复适配器选择逻辑，确保跨层一致 | ✅ 已修复 (d688fce) |
-| **顶点缓冲 stride 错误** | 顶点格式 stride 计算不正确导致渲染异常 | 修复 stride 计算，完善部署流程 | ✅ 已修复 (dcaff2a) |
-| **顶点缓冲 nan 值** | 顶点数据含 NaN 导致 PSO 创建失败 | 修复顶点数据初始化，确保有效 float 值 | ✅ 已修复 (9e494b8) |
-| **交换链窗口模式竞态** | 窗口模式切换时 DXGI ResizeBuffers 竞态 | 修复窗口消息处理，添加 jar 更新脚本 | ✅ 已修复 (715895e) |
-| **语义指针悬空** | HLSL 语义名称指针在函数返回后失效 | 修复字符串生命周期，使用 std::string 替代裸指针 | ✅ 已修复 (e81bfa9) |
-| **Dx12GpuSurface blit 修复** | `blitFromTexture` 传入了 texture view handle 而非 texture handle | 改为 `((Dx12GpuTextureView)textureView).texture().handle()` | 🔧 未提交 |
+| 问题 | 严重度 | 说明 | 状态 |
+|------|--------|------|------|
+| **语义名索引错位** | 🔴 高 | `buildNativeDesc` 中 `semanticNames` 补齐逻辑与 spvc `toHlsl()` 基准不一致，含 4+ 顶点属性的管线可能 `E_INVALIDARG` | 🔧 待修 |
+| **`createFence` 使用全局队列 fence** | 🟠 中 | 多 encoder 场景下 fence 可能由其他 encoder 的 submit 提前完成 | 🔧 待修 |
+| **临时 encoder 与全局 fence 竞争** | 🟠 中 | `createBuffer(data)` 的临时 submit 会递增全局 `queueFenceValue`，可能与 `StagedVertexBuffer` fence 竞态 | 🔧 待修 |
+| **诊断消息与实际不符** | 🟡 低 | `Dx12Backend.java` self-test 日志说"GREEN"但实际走 no-copy pass-through（srcTex=null），不调用 clear | 🔧 待修 |
+| **每 30 帧 GPU 同步读回** | 🟡 低 | `readbackSurfacePixels` 在主线程调用 `deviceWaitIdle()`，造成轻微卡顿 | ⚠️ 已知 |
+| **静态 command list/allocator 不释放** | 🟡 低 | readback/staging 路径使用函数静态 `ComPtr`，进程存活期间不释放 | ⚠️ 已知 |
+| **`ensureDevice` 无幂等保护** | 🟡 低 | 中途创建失败后重试会泄漏首次创建的所有 D3D12 资源 | ⚠️ 已知 |
+| **`d3d12` 包是未使用的实验代码** | 🔵 低 | `com.dx12.d3d12.*` 是 JNA 迁移探索的半成品，仍通过 JNI 调用，`close()` 是空操作 | ⚠️ 待清理 |
+| **大量调试日志残留** | 🔵 低 | `getStackTrace()`/高频打印散落在渲染路径，影响性能 | ⚠️ 待清理 |
 
 ## 技术栈
 
@@ -277,11 +290,11 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | API | Fabric API | 0.156.0+26.2 |
 | Mixin | SpongePowered Mixin | 0.8.7 (via Fabric 0.17.3) |
 | 模组浏览器 | ModMenu | 20.0.1 |
-| 语言 | Java | 26 |
-| 原生层 | C++ D3D12 | dx12_mc.dll（预编译） |
+| 语言 | Java | 25 |
+| 原生层 | C++ D3D12 (JNI) | dx12_mc.dll（预编译） |
 | Shader 编译 | shaderc (GLSL→SPIR-V) | LWJGL shaderc |
 | Shader 反射 | spvc (SPIR-V→HLSL) | LWJGL spvc |
-| 语言 | Rust | — (已移除) |
+| 依赖 | JNA | 5.17.0（预留，暂未用于生产） |
 
 ## 路线图
 
@@ -296,50 +309,36 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P4: 管线编译层** | ✅ | shaderc SPIR-V → spvc 反射/rebind → HLSL → D3DCompile DXBC |
 | **P5: 交换链层** | ✅ | Dx12GpuSurface: DXGI flip-model swapchain |
 | **P6: Draw 全链路** | ✅ | Dx12RenderPassBackend: setPipeline + pushDescriptors + draw |
+| **P15-P18: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface per-backbuffer fence |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线 + surface blit + buffer copy + texture readback |
-
-### P15-P17: 调试诊断增强 ✅ 已完成
-
-| 阶段 | 状态 | 说明 |
-|------|------|------|
-| **P15: 日志分级系统** | ✅ | GameRenderer 调试插桩 + log4j2 分级日志 |
-| **P16: renderLevel 诊断** | ✅ | 帧计数/advanceGameTime/pause/native submit+present 日志 |
-| **P17: 绘制目标跟踪** | ✅ | Draw target tracking + GPU 同步修复 + 调试日志 |
 
 ### 🔜 后续优化
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
 | **完整 Shader 支持** | 🔴 P0 | 当前自检 core/gui + core/position_tex_color，需支持 terrain/entity/particle 等全量 shader |
+| **语义名索引修复** | 🔴 P0 | BUG-01：`buildNativeDesc` 与 spvc 语义基准不一致，导致 4+ 属性管线崩溃 |
 | **多帧并行命令队列** | P0 | 当前共享单例 encoder + fence 等待，可升级到三缓冲 |
+| **清理 d3d12 实验包** | P1 | 移除未使用的 `com.dx12.d3d12` 包和未完成的 JNA 迁移探索 |
+| **诊断日志降级** | P1 | 将高频 `getStackTrace()`/readback 改为条件日志（环境变量控制） |
 | **性能基准测试** | P1 | 对比 GL/Vulkan/D3D12 的 FPS、内存占用、GPU 利用率 |
+| **天空盒渲染** | 🟠 P1 | 简单着色器即可 |
+| **实体渲染** | 🟠 P1 | 模型加载 + 骨骼动画 |
+| **粒子系统** | 🟡 P2 | 点精灵 (point sprites) |
 
 ### 🎯 最终目标
 
 | 阶段 | 目标 | 状态 |
 |------|------|------|
 | **过渡方案** | 通过 GpuBackend 接口完全接管 Minecraft 渲染（当前阶段） | ✅ 已完成 |
-| **性能优化** | 完整 shader 支持 + descriptor 优化 + 帧并行提交 | 🔜 进行中 |
+| **性能优化** | 完整 shader 支持 + descriptor 优化 + 帧并行提交 + 诊断降级 | 🔜 进行中 |
 | **正式发行** | 通过官方渠道发布为 Minecraft 26.2+ 的 D3D12 后端模组 | 🔜 待实现 |
 
 ---
 
 ## 贡献指南
 
-### 参与方式
-
 > 暂时不接受任何贡献
-
-### 当前可认领的任务
-
-| 任务 | 优先级 | 说明 |
-|------|--------|------|
-| **完整 Shader 支持** | 🔴 P0 | 编译所有 Minecraft 官方 shader（terrain, entity, particle 等） |
-| **天空盒渲染** | 🟠 P1 | 简单着色器即可 |
-| **实体渲染** | 🟠 P1 | 模型加载 + 骨骼动画 |
-| **粒子系统** | 🟡 P2 | 点精灵 (point sprites) |
-
----
 
 ## 许可证
 
