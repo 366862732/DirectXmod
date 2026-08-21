@@ -785,6 +785,7 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
     obj->cpuHandle = cpu;
     obj->gpuHandle = gpu;
     obj->descSlot = slot;  // 销毁时归还 SRV 槽位
+    obj->sourceTexture = texture;  // 采样前据此 transition 底层纹理状态
     return obj.release();
 }
 
@@ -1188,6 +1189,19 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
 bool endCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "endCommandList: null ctx"; return false; }
     if (!ctx->listOpen) return true;  // 幂等
+    // 采样纹理在本 list 内被 transition 到 SHADER_RESOURCE 后，命令列表结束时
+    // 必须回切 COMMON，保持"列表结束一切资源回 COMMON"的约定。否则下一
+    // command list 在 beginCommandList 清空 resourceState 后按 COMMON 写 Before
+    // 状态，与 GPU 上遗留的 SHADER_RESOURCE 错配 → 每帧验证 ERROR
+    // （"Before state ... does not match ... preceding ResourceBarrier"）。
+    for (auto& kv : ctx->resourceState) {
+        if (kv.second & (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                         | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
+            resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
+                D3D12_RESOURCE_STATE_COMMON);
+            kv.second = D3D12_RESOURCE_STATE_COMMON;
+        }
+    }
     HRESULT hr = ctx->commandList->Close();
     if (FAILED(hr)) {
         // P6 诊断：Close 返回 E_INVALIDARG 通常是 debug layer 的验证错误
@@ -2474,6 +2488,14 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     dbgLog("pushDesc[%u] INVALID view", (unsigned)i);
                     err = "pushDescriptors: missing view for SRV entry " + std::to_string(i);
                     return false;
+                }
+                // 关键修复：普通纹理（字体/logo/panorama 等）上传后处于 COMMON，
+                // 采样前必须显式 transition 到 SHADER_RESOURCE，否则 D3D12 在
+                // COMMON 状态采样是未定义行为（NVIDIA 驱动静默返回黑）→ 全黑屏。
+                if (b.view->sourceTexture) {
+                    transitionTextureTo(ctx, b.view->sourceTexture,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
                 gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);

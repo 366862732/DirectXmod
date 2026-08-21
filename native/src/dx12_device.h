@@ -119,6 +119,9 @@ struct Dx12Object {
     // P6：描述符堆槽位索引（TextureView → SRV 槽位；Sampler → sampler 槽位；
     // -1 = 未占用）。销毁时归还 free-list 复用，防止长会话 SRV 堆耗尽。
     int descSlot = -1;
+    // TextureView 指向的底层 Texture（采样前需 transition 到
+    // PIXEL_SHADER_RESOURCE；Texture/Buffer 恒为 nullptr）。
+    Dx12Object* sourceTexture = nullptr;
 };
 
 // ---------------------------------------------------------------------------

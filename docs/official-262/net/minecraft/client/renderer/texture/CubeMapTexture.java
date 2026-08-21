@@ -60,7 +60,7 @@ extends ReloadableTexture {
         int height = image.getHeight() / 6;
         this.close();
         this.texture = device.createTexture(this.resourceId()::toString,
-            GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST,
+            GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_CUBEMAP_COMPATIBLE,
             GpuFormat.RGBA8_UNORM, width, height, 6, 1);
         this.textureView = device.createTextureView(this.texture);
         GpuBufferSlice stagingBuffer = device.createCommandEncoder().transientMemory().uploadStaging(image.getPixelBytes(), 1L, 16);
