@@ -380,7 +380,7 @@ public class Dx12Device implements GpuDeviceBackend {
         List<int[]> elements = new ArrayList<>();
         int attribLocation = 0;
         VertexFormat[] bindings = pipeline.getVertexFormatBindings();
-        if (bindings == null || bindings.length == 0 || pipeline.getLocation().toString().contains("gui")) {
+        if (bindings == null || bindings.length == 0) {
             LOGGER.warn("[dx12-java] {}: formatBindings={} inputs={}",
                 pipeline.getLocation(), bindings == null ? "null" : bindings.length, vertexShaderInputs);
             if (bindings != null) {
