@@ -431,8 +431,7 @@ public class Dx12Device implements GpuDeviceBackend {
         while (semanticNames.size() < inputElements.size()) {
             semanticNames.add("TEXCOORD" + semanticNames.size());
         }
-        // P21 诊断：打印 semanticNames 最终列表和 inputElements 数量，
-        // 检测 BUG-01（semanticNames 补齐超出 HLSL 实际输入数量导致 E_INVALIDARG / 黑屏）。
+        // P21 diagnóstico: validar que semanticNames e inputElements estão alinhados após BUG-01 fix.
         System.err.println("[dx12-java] [DIAG] " + pipeline.getLocation()
             + " inputElems=" + inputElements.size()
             + " sems=" + java.util.Arrays.toString(semanticNames.toArray()));

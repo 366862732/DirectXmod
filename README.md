@@ -18,7 +18,7 @@
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
 
-### 当前阶段：P0-P18 全部完成，GUI 标题界面可正常渲染（2026-08-21）
+### 当前阶段：P0-P18 全部完成，BUG-01 语义名索引修复，GUI + terrain/entity/particle 管线编译通（2026-08-23）
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -271,7 +271,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 | 问题 | 严重度 | 说明 | 状态 |
 |------|--------|------|------|
-| **语义名索引错位** | 🔴 高 | `buildNativeDesc` 中 `semanticNames` 补齐逻辑与 spvc `toHlsl()` 基准不一致，含 4+ 顶点属性的管线可能 `E_INVALIDARG` | 🔧 待修 |
+| **语义名索引错位** | ✅ 已修复 | BUG-01：`semanticNames` 现基于 `vertex.inputs().size()`（spvc remap 基准）生成，与 `toHlsl()` 对齐 | ✅ 已修 |
 | **`createFence` 使用全局队列 fence** | 🟠 中 | 多 encoder 场景下 fence 可能由其他 encoder 的 submit 提前完成 | 🔧 待修 |
 | **临时 encoder 与全局 fence 竞争** | 🟠 中 | `createBuffer(data)` 的临时 submit 会递增全局 `queueFenceValue`，可能与 `StagedVertexBuffer` fence 竞态 | 🔧 待修 |
 | **诊断消息与实际不符** | 🟡 低 | `Dx12Backend.java` self-test 日志说"GREEN"但实际走 no-copy pass-through（srcTex=null），不调用 clear | 🔧 待修 |
@@ -317,7 +317,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
 | **完整 Shader 支持** | 🔴 P0 | 当前自检 core/gui + core/position_tex_color，需支持 terrain/entity/particle 等全量 shader |
-| **语义名索引修复** | 🔴 P0 | BUG-01：`buildNativeDesc` 与 spvc 语义基准不一致，导致 4+ 属性管线崩溃 |
+| **语义名索引修复** | ✅ 已完成 | BUG-01 fix: `semanticNames` 改用 `vertex.inputs().size()` 与 spvc remap 基准对齐 |
 | **多帧并行命令队列** | P0 | 当前共享单例 encoder + fence 等待，可升级到三缓冲 |
 | **清理 d3d12 实验包** | P1 | 移除未使用的 `com.dx12.d3d12` 包和未完成的 JNA 迁移探索 |
 | **诊断日志降级** | P1 | 将高频 `getStackTrace()`/readback 改为条件日志（环境变量控制） |

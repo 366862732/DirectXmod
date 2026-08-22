@@ -1764,8 +1764,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
                 (int)tex->dxgiFormat,
                 cc ? (double)cc[0] : 0.0, cc ? (double)cc[1] : 0.0,
                 cc ? (double)cc[2] : 0.0, cc ? (double)cc[3] : 0.0);
-            ctx->activeColorTargets.push_back(tex);
-            ctx->activeColorTargetsTouched.push_back(false);
+            // BUG-01 fix：diag loop 只打印日志，不再重复 push_back（主循环 L1701 已添加）。
         }
     }
     return true;

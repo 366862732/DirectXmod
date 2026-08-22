@@ -103,10 +103,17 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         }
         this.pipeline = compiled;
         this.anyDescriptorDirty = true;
-        boolean ok = Dx12Native.dx12SetPipeline(this.ctx, compiled.handle(), this.hasDepth);
+        // P22：desc.hasDepth 来自渲染 pass（是否有 depth attachment），但 PSO 变体选择
+        // 应基于管线本身是否有 DepthStencilState。GUI 管线没有 depthStencilState，
+        // 即使 pass 有 depth attachment 也不该启用深度测试（否则 withDepth PSO 的
+        // GREATER_EQUAL 测试会丢弃所有 fragment → 黑屏）。
+        boolean pipelineHasDepth = compiled.info().getDepthStencilState() != null;
+        boolean useDepth = this.hasDepth && pipelineHasDepth;
+        boolean ok = Dx12Native.dx12SetPipeline(this.ctx, compiled.handle(), useDepth);
         System.err.println("[dx12-java] setPipeline: " + pipeline.getLocation()
                 + " pso=" + Long.toHexString(compiled.handle())
-                + " hasDepth=" + this.hasDepth + " ok=" + ok);
+                + " passHasDepth=" + this.hasDepth + " pipelineHasDepth=" + pipelineHasDepth
+                + " useDepth=" + useDepth + " ok=" + ok);
         if (!ok) {
             throw new IllegalStateException("dx12SetPipeline failed for " + pipeline.getLocation());
         }

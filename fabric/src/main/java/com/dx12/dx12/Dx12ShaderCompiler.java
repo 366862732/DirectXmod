@@ -124,9 +124,10 @@ public class Dx12ShaderCompiler implements AutoCloseable {
             System.err.println("[dx12-java] [DIAG] " + loc + " frag forced GREEN (all pipelines)");
         }
         // Fix S2：语义名称由 toHlsl() 通过 spvc_compiler_hlsl_add_vertex_attribute_remap 注入，
-        // 此处直接按 vertex format 位置生成：location 0 → POSITION，其余 → TEXCOORD<n>。
+        // 基准 é vertex.inputs() (SPIR-V unique inputs após rebind), não vertexInputNames (formato).
+        // BUG-01 fix: usar vertex.inputs().size() garante alinhamento com spvc remap count.
         List<String> semanticNames = new ArrayList<>();
-        for (int i = 0; i < vertexInputNames.size(); ++i) {
+        for (int i = 0; i < vertex.inputs().size(); ++i) {
             semanticNames.add(i == 0 ? "POSITION" : ("TEXCOORD" + (i - 1)));
         }
         return new Dx12CompiledShader(vertexHlsl, fragmentHlsl, entries, vertexInputNames, semanticNames);
