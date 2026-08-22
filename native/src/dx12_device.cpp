@@ -72,9 +72,14 @@ constexpr UINT kDsvHeapSize = 256;
 // 堆创建失败 → ensureDevice 半初始化 → createSampler 解引用 null 堆 AV）。
 constexpr UINT kSamplerHeapSize = 2048;
 
-// P6：瞬时描述符堆（drawHeap）每帧半区容量 + 总数（ring x2，配合双 allocator）
+// P6：瞬时描述符堆（drawHeap）每帧半区容量 + 总数（ring x4，配合三帧飞行）
+// 注意：D3D12 root signature 的 descriptor table 从 heapBase 绝对寻址，
+// GPU 命令列表在提交后仍会持续读取这些描述符直到 fence 完成。
+// 三帧飞行（N、N+1、N+2 同时在空中），需要 4 个半区确保帧 N+2 写时
+// 不会覆盖帧 N（GPU 仍在读）所使用的半区。
 constexpr UINT kDrawHeapPerFrame = 32768;
-constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * 2;
+constexpr UINT kDrawHeapSections = 4;
+constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * kDrawHeapSections;
 
 // 从 free-list 复用或从堆尾分配一个 SRV 槽位；失败填充 err 返回 -1。
 int allocSrvSlot(std::string& err) {
@@ -386,7 +391,7 @@ bool ensureDevice(std::string& errorOut) {
             kDsvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.dsvHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
             kSamplerHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.samplerHeap) ||
-        // P6：瞬时 draw 描述符堆（ring x2，两帧在飞行时安全交替）
+        // P6：瞬时 draw 描述符堆（ring x4，支持三帧飞行）
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             kDrawHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.drawHeap)) {
         errorOut = "CreateDescriptorHeap failed";
@@ -1173,9 +1178,9 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     // submit 阻塞等待 GPU 完成（见 submitCommandList），此处清空 resourceState
     // 后一切资源视为初始态是正确且保守的（D3D12 驱动会按实际 GPU 状态纠正）。
     ctx->resourceState.clear();
-    // P6：draw 瞬时描述符 ring 半区（fenceValue%2 与 allocator 同步交替；
-    // 帧 N+2 重写帧 N 半区时，帧 N 的 GPU 工作已完成）
-    ctx->drawHeapSlotBase = (UINT)(ctx->fenceValue % 2) * kDrawHeapPerFrame;
+    // P20 fix：使用 4 个半区（ring x4）确保三帧飞行时安全交替。
+    // fenceValue % 4 保证帧 N+2 写入的半区 ≠ 帧 N/N+1 GPU 正在读的半区。
+    ctx->drawHeapSlotBase = (UINT)(ctx->fenceValue % kDrawHeapSections) * kDrawHeapPerFrame;
     ctx->nextDrawSlot = 0;
     // RTV/DSV 是 CPU-only 描述符堆：命令列表提交时驱动已捕获描述符内容，
     // 双 allocator + value-2 完成等待保证旧命令已结束，可每帧从 0 复用。
