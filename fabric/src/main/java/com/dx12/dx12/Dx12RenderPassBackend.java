@@ -183,6 +183,12 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     buffers[i] = ((Dx12GpuBuffer) buffer).handle();
                     offsets[i] = value.offset();
                     lengths[i] = value.length();
+                    // P20：诊断 binding 的 buffer 句柄、offset 和长度
+                    if (System.err instanceof java.io.PrintStream) {
+                        System.err.printf("[dx12-java] pushDesc binding[%d]: name=%s type=UNIFORM buf=%x off=%d len=%d heapType=?%n",
+                            i, entry.name(), buffers[i], (int)offsets[i], (int)lengths[i]);
+                        System.err.flush();
+                    }
                 }
                 case SAMPLED_IMAGE -> {
                     TextureViewAndSampler texture = this.textures.get(entry.name());

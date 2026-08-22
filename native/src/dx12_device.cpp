@@ -2492,13 +2492,14 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     return false;
                 }
                 static int ubDbg = 0;
-                if (i == 0 && ((++ubDbg % 60) == 1)) {
+                if (i == 1 && ((++ubDbg % 60) == 1)) {
+                    // 诊断：读取 DynamicTransforms UBO（binding[1]），非 binding[0]
                     dbgReadbackBufferBytes(b.buffer, b.offset,
                         (int)std::min<long long>(b.length, 128), "ubo");
                 }
-                // P18：单独诊断 Projection buffer（binding index 1），确认投影矩阵数据是否写入。
+                // P18：单独诊断 Projection buffer（binding index 0），确认投影矩阵数据是否写入。
                 static int projDbg = 0;
-                if (i == 1 && ((++projDbg % 60) == 1)) {
+                if (i == 0 && ((++projDbg % 60) == 1)) {
                     dbgReadbackBufferBytes(b.buffer, b.offset,
                         (int)std::min<long long>(b.length, 64), "proj");
                 }
@@ -2509,6 +2510,18 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 cbvSize = (cbvSize + 255) & ~255ULL;
                 if (cbvSize == 0) cbvSize = 256;
                 cbv.SizeInBytes = (UINT)cbvSize;
+                // P20：诊断 CBV 地址（每帧首 pushDescriptors 打印）
+                static UINT64 lastPdFrame = 0;
+                if ((UINT64)ctx->fenceValue != lastPdFrame) {
+                    lastPdFrame = (UINT64)ctx->fenceValue;
+                    dbgLog("pushDesc CBV[%u]: bufGVA=%llx off=%lld cbvLoc=%llx cbvSize=%llu heap=%d",
+                        (unsigned)i,
+                        (unsigned long long)b.buffer->resource->GetGPUVirtualAddress(),
+                        (long long)b.offset,
+                        (unsigned long long)cbv.BufferLocation,
+                        (unsigned long long)cbvSize,
+                        (int)b.buffer->heapType);
+                }
                 gCtx.device->CreateConstantBufferView(&cbv, dst);
                 break;
             }
@@ -2562,10 +2575,21 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 return false;
         }
     }
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += base;
+    // P20 fix：根描述符表绑定必须固定指向 heap 起始处（D3D12 root signature 的
+    // descriptor table 从 handle 0 开始寻址），不能用 ring-buffer 偏移 base。
+    // 否则每帧在 two-half ring buffer 之间跳变 → shader 读到错误描述符 → 黑屏。
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot =
+        gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
     ctx->nextDrawSlot += count;
-    ctx->commandList->SetGraphicsRootDescriptorTable(0, gpu);
+    // P20：诊断 root descriptor table 绑定地址（固定 heapBase，不含 base 偏移）
+    static UINT64 lastGpuFrame = 0;
+    if ((UINT64)ctx->fenceValue != lastGpuFrame) {
+        lastGpuFrame = (UINT64)ctx->fenceValue;
+        dbgLog("pushDesc SET_ROOT_TABLE: heapBase=%llx cpuWriteBase=%llx slotCount=%u",
+            (unsigned long long)gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart().ptr,
+            (unsigned long long)base, (unsigned)count);
+    }
+    ctx->commandList->SetGraphicsRootDescriptorTable(0, gpuRoot);
     return true;
 }
 
