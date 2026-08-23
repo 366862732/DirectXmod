@@ -5,7 +5,11 @@
     "client": [
         "PreferredGraphicsApiMixin",
         "BufferBuilderMixin",
-        "GameRendererRenderDebugMixin"
+        "GameRendererRenderDebugMixin",
+        "MinecraftRunDebugMixin",
+        "MinecraftRunTickDebugMixin",
+        "MinecraftSetLevelDebugMixin",
+        "MinecraftResourceLoadDebugMixin"
     ],
     "injectors": {
         "defaultRequire": 1

@@ -31,9 +31,17 @@ public class GameRendererRenderDebugMixin {
 
     @Inject(method = "render", at = @At("HEAD"), remap = false)
     private void dx12_renderDebug(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
+        // Always print on every frame so we can confirm GameRenderer.render() fires
         boolean resourcesLoaded = this.minecraft.isGameLoadFinished();
         boolean levelNotNull = this.minecraft.level != null;
         long gameTime = levelNotNull ? this.minecraft.level.getGameTime() : -1L;
+        System.err.println("[DX12] GameRenderer.render() called frame=" + dx12_renderFrameCount
+            + " window=" + (this.minecraft.getWindow().getWidth() + "x" + this.minecraft.getWindow().getHeight())
+            + " level=" + (levelNotNull ? "non-null" : "NULL")
+            + " paused=" + this.minecraft.isPaused()
+            + " resourcesLoaded=" + resourcesLoaded);
+        System.err.flush();
+
         int rlInt = resourcesLoaded ? 1 : 0;
         int lnInt = levelNotNull ? 1 : 0;
 

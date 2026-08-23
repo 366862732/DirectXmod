@@ -28,6 +28,9 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     // P20 诊断：所有 pipeline 强制输出纯绿色，区分"管线问题"vs"数据问题"。
     // 默认关闭（DX12_DIAG_GREEN=1 开启），避免正常游戏时闪绿屏。
     private static final boolean DIAG_GREEN = "1".equals(System.getenv("DX12_DIAG_GREEN"));
+    // 诊断白色输出：验证管线通路（尤其 mojang_logo 管线）。
+    // DX12_DIAG_WHITE=1 强制 fragment shader 输出纯白色，屏幕变白=管线通，仍红=纹理/上传问题。
+    private static final boolean DIAG_WHITE = "1".equals(System.getenv("DX12_DIAG_WHITE"));
 
     private final long shaderCompiler;
     private final long shaderOptions;
@@ -106,14 +109,16 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
-        if (DIAG_GREEN) {
-            // P6 诊断：强制输出纯绿色，区分"管线问题"vs"数据问题"
-            // 屏幕变绿 => 管线通路正常，问题在 shader 数据；仍黑屏 => 管线根本问题。
+        if (DIAG_GREEN || DIAG_WHITE) {
+            // P6 诊断：强制输出纯绿/纯白，区分"管线问题"vs"数据问题"
+            // 屏幕变绿/白 => 管线通路正常，问题在纹理数据；仍红 => 管线根本问题。
             String loc = pipeline.getLocation().toString();
             System.err.println("[dx12-java] [DIAG] " + loc
                 + " frag before= " + fragmentHlsl.length() + " bytes");
             String oldLenStr = String.valueOf(fragmentHlsl.length());
-            fragmentHlsl = stripFragMainAndReplace(fragmentHlsl);
+            fragmentHlsl = DIAG_GREEN
+                ? stripFragMainAndReplace(fragmentHlsl)
+                : stripFragMainAndWhite(fragmentHlsl);
             System.err.println("[dx12-java] [DIAG] " + loc
                 + " frag after= " + fragmentHlsl.length() + " bytes"
                 + " changed=" + (fragmentHlsl.length() != Integer.parseInt(oldLenStr)));
@@ -121,7 +126,8 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 ? fragmentHlsl.substring(0, 120) + "..."
                 : fragmentHlsl;
             System.err.println("[dx12-java] [DIAG] " + loc + " frag head=" + head);
-            System.err.println("[dx12-java] [DIAG] " + loc + " frag forced GREEN (all pipelines)");
+            System.err.println("[dx12-java] [DIAG] " + loc
+                + " frag forced " + (DIAG_GREEN ? "GREEN" : "WHITE") + " (all pipelines)");
         }
         // Fix S2：语义名称由 toHlsl() 通过 spvc_compiler_hlsl_add_vertex_attribute_remap 注入，
         // 基准 é vertex.inputs() (SPIR-V unique inputs após rebind), não vertexInputNames (formato).
@@ -215,6 +221,43 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 sb.append("void frag_main() { fragColor = float4(0.0, 1.0, 0.0, 1.0); }\n");
                 i++;
                 // 继续读行直到平衡所有括号
+                while (i < lines.length && braceCount > 0) {
+                    for (char c : lines[i].toCharArray()) {
+                        if (c == '{') braceCount++;
+                        else if (c == '}') braceCount--;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            sb.append(lines[i]).append('\n');
+            i++;
+        }
+        return sb.toString();
+    }
+
+    /** 同 stripFragMainAndReplace，但输出纯白色（用于诊断 mojang_logo 管线）。 */
+    private static String stripFragMainAndWhite(String hlsl) {
+        String[] lines = hlsl.split("\n", -1);
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < lines.length) {
+            String trimmed = lines[i].trim();
+            if (trimmed.matches("void\\s+frag_main\\(\\).*")) {
+                int braceCount = 0;
+                for (char c : lines[i].toCharArray()) {
+                    if (c == '{') braceCount++;
+                    else if (c == '}') braceCount--;
+                }
+                while (braceCount <= 0 && i + 1 < lines.length) {
+                    i++;
+                    for (char c : lines[i].toCharArray()) {
+                        if (c == '{') braceCount++;
+                        else if (c == '}') braceCount--;
+                    }
+                }
+                sb.append("void frag_main() { fragColor = float4(1.0, 1.0, 1.0, 1.0); }\n");
+                i++;
                 while (i < lines.length && braceCount > 0) {
                     for (char c : lines[i].toCharArray()) {
                         if (c == '{') braceCount++;

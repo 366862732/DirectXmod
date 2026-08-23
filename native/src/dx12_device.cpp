@@ -1699,6 +1699,9 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
         rtvs.push_back(cpu);
         ctx->activeColorTargets.push_back(tex);
+        dbgLog("beginRenderPass color[%d] tex=%p rtv=%p dims=%ux%u fmt=%d",
+            i, (void*)tex, (void*)cpu.ptr, (UINT)tex->resource->GetDesc().Width,
+            (UINT)tex->resource->GetDesc().Height, (int)tex->dxgiFormat);
         transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (colorClearFlags && colorClearFlags[i] && clearColors) {
             const float* c = clearColors + i * 4;
@@ -2436,11 +2439,24 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long lon
     DBG_LOG_DEBUG("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
         slot, (void*)buffer, (long long)buffer->size, (long long)offset,
         (int)stride, (int)effectiveStride, (int)buffer->heapType);
-    // P6 诊断：每 60 次读回顶点 buffer 前 128 字节（确认数据是否真正写入）。
+    // P6 诊断：每次读回顶点 buffer 前 16 floats（128 字节），确认数据是否真正写入。
     static int vbDbg = 0;
     if ((++vbDbg % 60) == 1) {
         dbgReadbackBufferBytes(buffer, offset < 0 ? 0 : offset, 128, "vb");
     }
+#ifdef DIAG_READBACK_COLOR_TEX
+    // P20 诊断：每次 drawIndexed 立即读回顶点前 16 floats，不依赖频率计数。
+    // 与 beginRenderPass color target 日志配合，确认顶点数据非零。
+    {
+        static bool vb_done = false;
+        if (!vb_done) {
+            vb_done = true;
+            dbgLog("setVB[diag]: reading vertex buffer first 16 floats (%lld bytes)",
+                (long long)std::min<long long>(buffer->size - offset, 128));
+            dbgReadbackBufferBytes(buffer, offset < 0 ? 0 : offset, 128, "vb_once");
+        }
+    }
+#endif
     return true;
 }
 
@@ -2546,6 +2562,18 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     transitionTextureTo(ctx, b.view->sourceTexture,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+#ifdef DIAG_READBACK_COLOR_TEX
+                    // P20 诊断：首次 SRV 绑定读回纹理像素，确认纹理内容是否非空。
+                    // deviceWaitIdle 开销大，仅首次执行（static 标志）。
+                    {
+                        static bool srk_done = false;
+                        if (!srk_done) {
+                            srk_done = true;
+                            dbgLog("pushDesc SRV[0]: reading back sourceTexture pixels (may block)");
+                            dbgReadbackTexturePixels(b.view->sourceTexture, "srv_tex_readback");
+                        }
+                    }
+#endif
                 }
                 gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -2630,6 +2658,19 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
         (unsigned long long)ctx->fenceValue, (int)ctx->colorTargetsWritten);
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
+#ifdef DIAG_READBACK_COLOR_TEX
+    // P20 诊断：drawIndexed 后立即读回 color target，确认绘制是否写入像素。
+    // 只执行一次（static 标志），避免每帧 deviceWaitIdle 的开销。
+    {
+        static bool dr_done = false;
+        if (!dr_done && !ctx->activeColorTargets.empty()) {
+            dr_done = true;
+            Dx12Object* ct = ctx->activeColorTargets[0];
+            dbgLog("drawIdx[diag]: reading back activeColorTarget[0] after draw");
+            dbgReadbackTexturePixels(ct, "color_after_draw");
+        }
+    }
+#endif
     return true;
 }
 
