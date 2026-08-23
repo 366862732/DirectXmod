@@ -157,7 +157,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             System.err.println("[dx12-java] pushDescriptors: SKIP (pipeline null or invalid)");
             return;
         }
-        List<Dx12BindGroupEntry> bindings = pipeline.bindings();
+        List<Dx12BindGroupEntry> bindings = pipeline.buildBindings();
         int count = bindings.size();
         if (count == 0) {
             System.err.println("[dx12-java] pushDescriptors: SKIP (0 bindings)");

@@ -308,12 +308,12 @@ public class Dx12Device implements GpuDeviceBackend {
         if (vertexShader == Dx12IntermediaryShaderModule.INVALID) {
             LOGGER.error("[dx12-java] {} COMPILE FAILED (vertex): shader {} invalid",
                 pipeName, pipeline.getVertexShader());
-            return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
         }
         if (fragmentShader == Dx12IntermediaryShaderModule.INVALID) {
             LOGGER.error("[dx12-java] {} COMPILE FAILED (fragment): shader {} invalid",
                 pipeName, pipeline.getFragmentShader());
-            return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
         }
         try {
             Dx12CompiledShader compiled = this.getOrCreateCompiler()
@@ -323,14 +323,14 @@ public class Dx12Device implements GpuDeviceBackend {
             if (handle == 0) {
                 LOGGER.error("[dx12-java] {} COMPILE FAILED (native): dx12CreateGraphicsPipeline returned 0",
                     pipeName);
-                return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
+                return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
             }
             LOGGER.info("[dx12-java] {} COMPILE OK (handle={})", pipeName, handle);
             return new Dx12CompiledRenderPipeline(pipeline, handle,
-                compiled.entries(), compiled.vertexHlsl(), compiled.fragmentHlsl());
+                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl());
         } catch (ShaderCompileException e) {
             LOGGER.error("[dx12-java] {} COMPILE FAILED (compile): {}", pipeName, e.getMessage());
-            return new Dx12CompiledRenderPipeline(pipeline, 0L, List.of(), "", "");
+            return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
         }
     }
 

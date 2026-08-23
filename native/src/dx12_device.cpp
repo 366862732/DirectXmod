@@ -2494,6 +2494,17 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
             (unsigned long long)ctx->fenceValue, count,
             (void*)(count > 0 ? (void*)bindings[0].buffer : nullptr),
             (void*)(count > 0 ? (void*)bindings[0].view : nullptr));
+        // P21 诊断：打印每个 binding 的 buffer/offset，定位 UBO shader 读取偏移
+        for (UINT j = 0; j < count && j < 8; ++j) {
+            const DrawBinding& bj = bindings[j];
+            const char* tname = bj.type == 0 ? "CBV" : bj.type == 1 ? "SRV" : bj.type == 2 ? "BUF" : "?";
+            dbgLog("pushDesc BIND[%u]: type=%s buf=%p off=%lld len=%lld view=%p heap=%d",
+                (unsigned)j, tname,
+                (void*)(bj.buffer ? bj.buffer : nullptr),
+                (long long)bj.offset, (long long)bj.length,
+                (void*)(bj.view ? bj.view : nullptr),
+                (int)(bj.buffer ? bj.buffer->heapType : -1));
+        }
     }
     SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
@@ -2541,6 +2552,14 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                         (unsigned long long)cbv.BufferLocation,
                         (unsigned long long)cbvSize,
                         (int)b.buffer->heapType);
+                    // P21：额外诊断 binding[1]（DynamicTransforms UBO）的 offset，确认 shader 读取位置
+                    if (i == 0 && count > 1) {
+                        const DrawBinding& b1 = bindings[1];
+                        dbgLog("pushDesc UBO_BIND[1]: bufGVA=%llx off=%lld len=%lld heap=%d",
+                            (unsigned long long)b1.buffer ? (unsigned long long)b1.buffer->resource->GetGPUVirtualAddress() : 0ULL,
+                            (long long)b1.offset, (long long)b1.length,
+                            (int)(b1.buffer ? b1.buffer->heapType : -1));
+                    }
                 }
                 gCtx.device->CreateConstantBufferView(&cbv, dst);
                 break;
