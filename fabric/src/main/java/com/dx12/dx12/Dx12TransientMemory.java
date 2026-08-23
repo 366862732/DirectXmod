@@ -4,8 +4,8 @@ import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.systems.TransientMemory;
 import java.nio.ByteBuffer;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
 import net.fabricmc.api.EnvType;
@@ -15,30 +15,45 @@ import net.fabricmc.api.Environment;
  * D3D12-backed {@link TransientMemory}, mirroring the official
  * {@code VulkanTransientMemory} lifecycle.
  *
- * P3 simplification: every allocation creates a fresh D3D12 committed buffer
+ * <p>P3 simplification: every allocation creates a fresh D3D12 committed buffer
  * (no block allocator yet). Buffers allocated during one frame are retained for
  * {@link #FRAMES_IN_FLIGHT} frames (matching the native double-buffered submit)
  * and released on {@link #rotate()}, which the encoder calls on every
  * {@code submit()}.
  *
- * <ul>
- *   <li>{@code allocateStaging} -> UPLOAD heap buffer (MAP_WRITE | COPY_SRC)</li>
- *   <li>{@code allocateGpu} -> DEFAULT heap buffer (usage | COPY_DST)</li>
- *   <li>{@code allocateGpuMapped} -> UPLOAD heap buffer (MAP_WRITE | usage)</li>
- *   <li>{@code upload*} -> staging write + {@code CopyBufferRegion} into a GPU buffer</li>
- * </ul>
+ * <p>{@code allocateGpuMapped} uses a ring buffer of 3 UPLOAD heap buffers
+ *（镜像 {@code MappableRingBuffer} 的 3 路轮换）：每帧 rotate() 切换到下一路，
+ * 当前路的 offset 在该帧内单调递增。这保证了每帧 DynamicUniforms 等使用
+ * allocateGpuMapped 的代码都能拿到新的独立偏移，而非复用同一缓冲起始处。
  */
 @Environment(EnvType.CLIENT)
 public class Dx12TransientMemory implements TransientMemory {
     static final int FRAMES_IN_FLIGHT = 2;
+    /** allocateGpuMapped ring buffer 路数（镜像 MappableRingBuffer.BUFFER_COUNT=3）。 */
+    private static final int UBO_RING_COUNT = 3;
+    /** 每路 allocateGpuMapped 缓冲大小（4KB，足够容纳多组 std140 uniform 块）。 */
+    private static final long UBO_RING_BLOCK_SIZE = 4096L;
 
     private final long ctx;
     private final Deque<List<Dx12GpuBuffer>> frames = new ArrayDeque<>();
     private List<Dx12GpuBuffer> frame = new ArrayList<>();
     private boolean closed;
 
+    // allocateGpuMapped ring buffer
+    private final Dx12GpuBuffer[] uboRing = new Dx12GpuBuffer[UBO_RING_COUNT];
+    /** 当前正在写入的 ring buffer 路索引。 */
+    private int uboRingIdx = 0;
+    /** 当前路的已用字节数（从 0 开始单调递增，达到 BLOCK_SIZE 时 rotate）。 */
+    private long uboRingOffset = 0;
+
     Dx12TransientMemory(long ctx) {
         this.ctx = ctx;
+        // 预分配 3 路 UPLOAD 缓冲（同 MappableRingBuffer 构造时的 3 个 buffer）
+        for (int i = 0; i < UBO_RING_COUNT; i++) {
+            uboRing[i] = new Dx12GpuBuffer(
+                GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, UBO_RING_BLOCK_SIZE);
+            register(uboRing[i]);
+        }
     }
 
     private void register(Dx12GpuBuffer buffer) {
@@ -73,11 +88,20 @@ public class Dx12TransientMemory implements TransientMemory {
     @Override
     public GpuBufferSlice.MappedView allocateGpuMapped(long size, long alignment,
         @GpuBuffer.Usage int usage, long minimumAllocation, long elementSize) {
-        Dx12GpuBuffer buffer = new Dx12GpuBuffer(
-            usage | GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_DST
-                | GpuBuffer.USAGE_COPY_SRC, size);
-        this.register(buffer);
-        return buffer.map(0, size, false, true);
+        // 镜像 VulkanTransientMemory.allocateGpuMapped：在 ring buffer 当前路中分配，
+        // 超过BLOCK_SIZE时自动切换到下一路（rotate）。
+        // 与 MappableRingBuffer 语义对齐：每帧 rotate() 后切换到新路径，旧路径供 GPU 读取。
+        long remaining = UBO_RING_BLOCK_SIZE - uboRingOffset;
+        if (size > remaining) {
+            // 当前路剩余空间不足，切换到下一路
+            uboRingIdx = (uboRingIdx + 1) % UBO_RING_COUNT;
+            uboRingOffset = 0;
+            remaining = UBO_RING_BLOCK_SIZE;
+        }
+        Dx12GpuBuffer buf = uboRing[uboRingIdx];
+        long offset = uboRingOffset;
+        uboRingOffset += size;
+        return buf.map(offset, size, false, true);
     }
 
     @Override
@@ -171,6 +195,9 @@ public class Dx12TransientMemory implements TransientMemory {
      * Called by the encoder on every {@code submit()}: retire this frame's
      * buffers (keep {@link #FRAMES_IN_FLIGHT} frames alive, matching the native
      * fence wait of value-2) and release the oldest frame.
+     *
+     * <p>同时 rotate allocateGpuMapped ring buffer：切换至下一路，使新帧的 uniform
+     * 写入不会覆盖仍在被 GPU 读取的旧帧数据。
      */
     void rotate() {
         if (this.closed) {
@@ -183,6 +210,9 @@ public class Dx12TransientMemory implements TransientMemory {
                 buffer.close();
             }
         }
+        // Rotate the UBO ring buffer：每帧切到下一路，确保不同帧的 uniform 数据不重叠。
+        this.uboRingIdx = (this.uboRingIdx + 1) % UBO_RING_COUNT;
+        this.uboRingOffset = 0;
     }
 
     void close() {

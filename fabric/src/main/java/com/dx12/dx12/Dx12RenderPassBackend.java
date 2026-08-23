@@ -55,6 +55,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private boolean anyDescriptorDirty = false;
     private final Map<String, GpuBufferSlice> uniforms = new HashMap<>();
     private final Map<String, TextureViewAndSampler> textures = new HashMap<>();
+    /** P22：帧计数，用于每帧打印一次 DynamicTransforms offset 诊断（确认 ring buffer rotate 生效）。 */
+    private int frameCount = 0;
 
     private record TextureViewAndSampler(Dx12GpuTextureView view, Dx12GpuSampler sampler) {
     }
@@ -152,6 +154,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             return;
         }
         this.anyDescriptorDirty = false;
+        // P22：每进入一次 pushDescriptors 视为一帧的新绘制批次
+        this.frameCount++;
         Dx12CompiledRenderPipeline pipeline = this.pipeline;
         if (pipeline == null || !pipeline.isValid()) {
             System.err.println("[dx12-java] pushDescriptors: SKIP (pipeline null or invalid)");
@@ -196,6 +200,13 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                             i, entry.name(), buffers[i], (int)offsets[i], (int)lengths[i]);
                         System.err.flush();
                     }
+                    // P22：打印 DynamicTransforms 的 offset，验证 ring buffer rotate 是否生效
+                    if ("DynamicTransforms".equals(entry.name())
+                        && System.err instanceof java.io.PrintStream) {
+                        System.err.printf("[dx12-java] pushDesc DynamicTransforms: frame=%d off=%d buf=%x%n",
+                            frameCount, (int)offsets[i], buffers[i]);
+                        System.err.flush();
+                    }
                 }
                 case SAMPLED_IMAGE -> {
                     TextureViewAndSampler texture = this.textures.get(entry.name());
@@ -207,6 +218,12 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     }
                     types[i] = 1;
                     views[i] = texture.view().handle();
+                    // P22：打印 Sampler0 view handle，验证纹理视图是否正常传递
+                    if ("Sampler0".equals(entry.name()) && System.err instanceof java.io.PrintStream) {
+                        System.err.printf("[dx12-java] pushDesc Sampler0: frame=%d view=%x closed=%b%n",
+                            frameCount, views[i], texture.view().isClosed());
+                        System.err.flush();
+                    }
                 }
                 case TEXEL_BUFFER -> {
                     GpuBufferSlice value = requireUniform(entry.name());
