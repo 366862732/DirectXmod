@@ -2607,17 +2607,18 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 return false;
         }
     }
-    // P20 fix：根描述符表绑定必须固定指向 heap 起始处（D3D12 root signature 的
-    // descriptor table 从 handle 0 开始寻址），不能用 ring-buffer 偏移 base。
-    // 否则每帧在 two-half ring buffer 之间跳变 → shader 读到错误描述符 → 黑屏。
+    // gpuRoot 必须指向本帧实际写入位置（ring buffer 偏移 base），
+    // 而不是 heap 起始处。否则多帧飞环时每帧的命令列表都把根表绑定到
+    // 同一 GPU 地址（heap start），导致 GPU 读到前帧残留的描述符 → 黑屏。
     D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot =
         gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
+    gpuRoot.ptr += base;
     ctx->nextDrawSlot += count;
-    // P20：诊断 root descriptor table 绑定地址（固定 heapBase，不含 base 偏移）
+    // P20：诊断 root descriptor table 绑定地址（指向本帧写入位置）
     static UINT64 lastGpuFrame = 0;
     if ((UINT64)ctx->fenceValue != lastGpuFrame) {
         lastGpuFrame = (UINT64)ctx->fenceValue;
-        dbgLog("pushDesc SET_ROOT_TABLE: heapBase=%llx cpuWriteBase=%llx slotCount=%u",
+        dbgLog("pushDesc SET_ROOT_TABLE: heapBase=%llx writeBase=%llx slotCount=%u",
             (unsigned long long)gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart().ptr,
             (unsigned long long)base, (unsigned)count);
     }

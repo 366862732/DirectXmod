@@ -1,9 +1,7 @@
 package com.dx12.mixin;
 
 import net.minecraft.client.Minecraft;
-import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -15,24 +13,34 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Minecraft.class)
 public class MinecraftRunTickDebugMixin {
 
-    @Shadow(remap = false) private boolean gameLoadFinished;
-
     @Inject(method = "runTick", at = @At("HEAD"), remap = false)
     private void dx12_runTickDebug(boolean advanceGameTime, CallbackInfo ci) {
         Minecraft mc = (Minecraft) (Object) this;
-        // Access level field via reflection (no @Shadow needed for nullable)
-        java.lang.reflect.Field levelField;
+        java.lang.reflect.Field levelField, tickCountField, loadField;
         Object level = null;
+        long tickCount = 0L;
+        boolean gameLoadFinished = false;
         try {
             levelField = Minecraft.class.getDeclaredField("level");
             levelField.setAccessible(true);
             level = levelField.get(mc);
         } catch (Exception ignored) {}
+        try {
+            tickCountField = Minecraft.class.getDeclaredField("clientTickCount");
+            tickCountField.setAccessible(true);
+            tickCount = tickCountField.getLong(mc);
+        } catch (Exception ignored) {}
+        try {
+            loadField = Minecraft.class.getDeclaredField("gameLoadFinished");
+            loadField.setAccessible(true);
+            gameLoadFinished = loadField.getBoolean(mc);
+        } catch (Exception ignored) {}
         String levelStr = (level != null) ? "non-null" : "NULL";
-        System.err.println("[dx12-debug] runTick frame=" + mc.clientTickCount
+        System.err.println("[dx12-debug] runTick tick=" + tickCount
             + " gameLoadFinished=" + gameLoadFinished
             + " level=" + levelStr
             + " pause=" + mc.isPaused());
         System.err.flush();
     }
 }
+
