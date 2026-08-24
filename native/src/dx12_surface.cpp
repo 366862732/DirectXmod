@@ -439,6 +439,10 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         // 2. 绑定 RTV 和根签名
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
         cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        // 确保 blit 管线已初始化（首帧调用时 initBlitPipeline 尚未运行）
+        std::string blitErr;
+        initBlitPipeline(blitErr);
+        if (!blitErr.empty()) { err = "blitSurface: " + blitErr; return false; }
         const BlitPipeline* bp = getBlitPipeline();
         cmd->SetGraphicsRootSignature(bp->rootSig.Get());
         cmd->SetPipelineState(bp->pso.Get());

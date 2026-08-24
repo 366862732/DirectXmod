@@ -31,13 +31,43 @@ public final class Dx12Native {
             Files.createDirectories(dllDir);
             Path dllPath = dllDir.resolve(libName);
 
-            // Always extract from JAR to guarantee the deployed DLL matches this build.
-            try (InputStream in = Dx12Native.class.getResourceAsStream("/" + libName)) {
-                if (in != null) {
-                    Files.copy(in, dllPath, StandardCopyOption.REPLACE_EXISTING);
-                } else {
-                    System.err.println("[dx12] " + libName + " not found in JAR resources");
-                    return;
+            // 若本地 dx12mod/dx12_mc.dll 比 JAR 资源更新，则跳过提取，直接使用本地文件。
+            // 开发时可快速部署新 DLL 而无需重建 JAR。
+            boolean useJarDll = true;
+            if (Files.exists(dllPath)) {
+                try (InputStream in = Dx12Native.class.getResourceAsStream("/" + libName)) {
+                    if (in != null) {
+                        byte[] jarBytes = in.readAllBytes();
+                        long jarModified = -1;
+                        java.net.URL loc = Dx12Native.class.getProtectionDomain()
+                                .getCodeSource().getLocation();
+                        if (loc.getProtocol().equals("jar")) {
+                            String path = loc.getPath();
+                            int ex = path.indexOf('!');
+                            if (ex > 0) path = path.substring(5, ex);
+                            java.util.zip.ZipFile zf = new java.util.zip.ZipFile(path);
+                            java.util.Enumeration<?> ents = zf.entries();
+                            while (ents.hasMoreElements()) {
+                                java.util.zip.ZipEntry e = (java.util.zip.ZipEntry) ents.nextElement();
+                                if (e.getName().equals(libName)) { jarModified = e.getTime(); break; }
+                            }
+                            zf.close();
+                        }
+                        if (jarModified >= 0 && dllPath.toFile().lastModified() > jarModified) {
+                            useJarDll = false;
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            if (useJarDll) {
+                try (InputStream in = Dx12Native.class.getResourceAsStream("/" + libName)) {
+                    if (in != null) {
+                        Files.copy(in, dllPath, StandardCopyOption.REPLACE_EXISTING);
+                    } else {
+                        System.err.println("[dx12] " + libName + " not found in JAR resources");
+                        return;
+                    }
                 }
             }
 

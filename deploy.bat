@@ -59,13 +59,16 @@ if "%do_dll%"=="1" (
 if "%do_jar%"=="1" (
     echo [3/3] Building JAR...
     cd /d "%FABRIC%"
-    .\gradlew.bat jar
+    .\gradlew.bat --no-daemon jar
     if %errorlevel% neq 0 ( echo ERROR: JAR build failed & pause & exit /b 1 )
     if not exist "%BUILD_JAR%" ( echo ERROR: JAR not found & pause & exit /b 1 )
     echo       Copying to game mods/...
     if exist "%MC_JAR%" del /F "%MC_JAR%" >nul
     copy /Y "%BUILD_JAR%" "%MC_JAR%" >nul
-    if %errorlevel% neq 0 ( echo WARNING: game mods copy failed (game may be running) )
+    if %errorlevel% neq 0 (
+        echo WARNING: game mods copy failed (game may be running)
+        echo         Skipping game mods update — restart game to pick up JAR.
+    )
     echo       JAR OK
 )
 

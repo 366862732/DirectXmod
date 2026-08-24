@@ -3166,9 +3166,11 @@ void initBlitPipeline(std::string& err) {
         samRange.RegisterSpace = 0;
         samRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
+        D3D12_DESCRIPTOR_RANGE ranges[] = { srvRange, samRange };
+
         D3D12_ROOT_DESCRIPTOR_TABLE table{};
         table.NumDescriptorRanges = 2;
-        table.pDescriptorRanges = &srvRange;
+        table.pDescriptorRanges = ranges;
 
         D3D12_ROOT_PARAMETER param{};
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
