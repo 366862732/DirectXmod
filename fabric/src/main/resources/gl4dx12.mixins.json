@@ -9,7 +9,9 @@
         "MinecraftRunDebugMixin",
         "MinecraftRunTickDebugMixin",
         "MinecraftSetLevelDebugMixin",
-        "MinecraftResourceLoadDebugMixin"
+        "MinecraftResourceLoadDebugMixin",
+        "ClientPacketListenerLoginDebugMixin",
+        "MinecraftDoWorldLoadDebugMixin"
     ],
     "injectors": {
         "defaultRequire": 1

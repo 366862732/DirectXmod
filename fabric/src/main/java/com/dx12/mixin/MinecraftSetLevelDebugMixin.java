@@ -10,6 +10,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * Injected at Minecraft.setLevel() to log whenever a world level is set.
  * This is the key transition point: once this fires, renderLevel() becomes possible.
+ *
+ * P0 DEBUG: If this mixin never fires, setLevel() is genuinely not called.
+ * Possible causes:
+ *   1. The login packet (ClientboundLoginPacket) is never received
+ *   2. handleLogin() path is bypassed (e.g. direct level assignment)
+ *   3. Mixin injection fails silently (check gl4dx12.mixins.json registration)
  */
 @Mixin(Minecraft.class)
 public class MinecraftSetLevelDebugMixin {

@@ -16,10 +16,12 @@ public class MinecraftRunTickDebugMixin {
     @Inject(method = "runTick", at = @At("HEAD"), remap = false)
     private void dx12_runTickDebug(boolean advanceGameTime, CallbackInfo ci) {
         Minecraft mc = (Minecraft) (Object) this;
-        java.lang.reflect.Field levelField, tickCountField, loadField;
+        java.lang.reflect.Field levelField, tickCountField, loadField, pendingField, serverField;
         Object level = null;
         long tickCount = 0L;
         boolean gameLoadFinished = false;
+        Object pendingConnection = null;
+        Object singleplayerServer = null;
         try {
             levelField = Minecraft.class.getDeclaredField("level");
             levelField.setAccessible(true);
@@ -35,11 +37,23 @@ public class MinecraftRunTickDebugMixin {
             loadField.setAccessible(true);
             gameLoadFinished = loadField.getBoolean(mc);
         } catch (Exception ignored) {}
+        try {
+            pendingField = Minecraft.class.getDeclaredField("pendingConnection");
+            pendingField.setAccessible(true);
+            pendingConnection = pendingField.get(mc);
+        } catch (Exception ignored) {}
+        try {
+            serverField = Minecraft.class.getDeclaredField("singleplayerServer");
+            serverField.setAccessible(true);
+            singleplayerServer = serverField.get(mc);
+        } catch (Exception ignored) {}
         String levelStr = (level != null) ? "non-null" : "NULL";
         System.err.println("[dx12-debug] runTick tick=" + tickCount
             + " gameLoadFinished=" + gameLoadFinished
             + " level=" + levelStr
-            + " pause=" + mc.isPaused());
+            + " pause=" + mc.isPaused()
+            + " pendingConn=" + (pendingConnection != null ? "present" : "null")
+            + " singleplayerServer=" + (singleplayerServer != null ? "present" : "null"));
         System.err.flush();
     }
 }
