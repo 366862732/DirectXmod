@@ -903,14 +903,45 @@ bool needTransition(D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
     return true;
 }
 
+// 将 D3D12_RESOURCE_STATES 转为可读名称，用于诊断日志。
+static const char* stateNameFor(D3D12_RESOURCE_STATES s) {
+    switch (s) {
+        case D3D12_RESOURCE_STATE_COMMON:                         return "COMMON";
+        case D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER:     return "VB_CB";
+        case D3D12_RESOURCE_STATE_INDEX_BUFFER:                   return "IB";
+        case D3D12_RESOURCE_STATE_RENDER_TARGET:                  return "RT";
+        case D3D12_RESOURCE_STATE_UNORDERED_ACCESS:               return "UA";
+        case D3D12_RESOURCE_STATE_DEPTH_WRITE:                    return "DEPTH_W";
+        case D3D12_RESOURCE_STATE_DEPTH_READ:                     return "DEPTH_R";
+        case D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE:      return "NPSR";
+        case D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:          return "PSR";
+        case D3D12_RESOURCE_STATE_STREAM_OUT:                     return "SO";
+        case D3D12_RESOURCE_STATE_COPY_DEST:                      return "COPY_D";
+        case D3D12_RESOURCE_STATE_COPY_SOURCE:                    return "COPY_S";
+        case D3D12_RESOURCE_STATE_RESOLVE_DEST:                   return "RESOLVE_D";
+        case D3D12_RESOURCE_STATE_RESOLVE_SOURCE:                 return "RESOLVE_S";
+        case D3D12_RESOURCE_STATE_PRESENT:                        return "PRESENT";
+        case D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT:              return "INDIRECT";
+        default: return "???";
+    }
+}
+
 void resourceBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
     D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    // D3D12 要求 StateBefore != StateAfter；相同状态发出 barrier 会触发
+    // ID3D12CommandList::ResourceBarrier 验证 ERROR（0x80004005）。
+    // 此处做保护性跳过，并记录诊断日志。
+    if (from == to) {
+        dbgLog("resourceBarrier: SKIP (from==to=%s) res=%p", stateNameFor(from), (void*)res);
+        return;
+    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = res;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = from;
     b.Transition.StateAfter = to;
+    dbgLog("resourceBarrier: %p %s -> %s", (void*)res, stateNameFor(from), stateNameFor(to));
     list->ResourceBarrier(1, &b);
 }
 
