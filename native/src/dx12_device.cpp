@@ -1219,6 +1219,20 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
             kv.second = D3D12_RESOURCE_STATE_COMMON;
         }
     }
+    // PRESENT 状态清理：blitSurface 通过 transitionTo 将 back buffer 跟踪为 PRESENT。
+    // 若不清理，beginCommandList 清空 resourceState 后按 COMMON 写 StateBefore，
+    // 而 GPU 实际在 PRESENT → 下一帧 blitSurface 的 PRESENT→RENDER_TARGET barrier
+    // 被 driver 视为冗余（PRESENT→PRESENT）并剥离 → GPU 停在 PRESENT → Present()
+    // 触发 Internal DXGI CommandList PRESENT_SOURCE 验证 ERROR。
+    // 回切到 COMMON 后，beginCommandList 清空 tracking，新帧以 COMMON 锚点开始，
+    // 与 GPU 实际状态一致。
+    for (auto& kv : ctx->resourceState) {
+        if (kv.second == D3D12_RESOURCE_STATE_PRESENT) {
+            resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
+                D3D12_RESOURCE_STATE_COMMON);
+            kv.second = D3D12_RESOURCE_STATE_COMMON;
+        }
+    }
     HRESULT hr = ctx->commandList->Close();
     if (FAILED(hr)) {
         // P6 诊断：Close 返回 E_INVALIDARG 通常是 debug layer 的验证错误

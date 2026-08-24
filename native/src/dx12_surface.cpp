@@ -432,9 +432,11 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     //   7. 源纹理 → COMMON（下一帧准备）
     {
         // 1. PRESENT → RENDER_TARGET
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        cmd->ResourceBarrier(1, &barrier);
+        // 使用 transitionTo 而非裸 barrier：将 dst 纳入 ctx->resourceState 跟踪，
+        // 使 endCommandList 的 PRESENT 清理循环能正确回切到 COMMON。
+        // 初始锚点用 COMMON（flip model 下实际为 PRESENT，但 PRESENT→RENDER_TARGET
+        // 与 COMMON→RENDER_TARGET 等价，driver 会忽略冗余 PRESENT→PRESENT barrier）。
+        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         // 2. 绑定 RTV 和根签名
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
@@ -460,9 +462,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         dbgLog("blitSurface: drawIndexed done");
 
         // 6. RENDER_TARGET → PRESENT
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        cmd->ResourceBarrier(1, &barrier);
+        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 
         // 7. 源纹理 → COMMON（为下一帧 beginRenderPass 准备）
         if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);

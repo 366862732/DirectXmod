@@ -270,6 +270,11 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
 void transitionTextureTo(CommandContext* ctx, Dx12Object* tex,
     D3D12_RESOURCE_STATES to);
 
+// 底层过渡：直接接受 ID3D12Resource*，用于 swapchain back buffer 等
+// 不在 Dx12Object 包装中的资源。blitSurface 用它跟踪 back buffer 状态。
+void transitionTo(CommandContext* ctx, ID3D12Resource* res,
+    D3D12_RESOURCE_STATES fromInitial, D3D12_RESOURCE_STATES to);
+
 // clear 颜色纹理（整纹理，RENDER_ATTACHMENT）。
 bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     float r, float g, float b, float a, std::string& err);

@@ -40,16 +40,34 @@ public abstract class BufferBuilderMixin {
     @Shadow private int vertexSize;
 
     /**
-     * Zeros bytes 12..vertexSize-1 at the end of {@code addVertex(x,y,z)},
-     * eliminating NaN in position.w and all trailing floats while preserving xyz.
+     * Zeros bytes 12..15 of each vertex slot: the unwritten w component after
+     * putVec3f(x,y,z) writes only offsets 0/4/8. Native side expands RGB32_FLOAT
+     * to R32G32B32A32_FLOAT (16 bytes), reading .xyz and leaving .w as -nan.
      * TAIL injection ensures beginVertex() has already set vertexPointer.
      */
     @Inject(method = "addVertex(FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;",
-            at = @At("TAIL"), remap = true)
+            at = @At("TAIL"), remap = false)
     private void gl4dx12$zeroVertexTail(float x, float y, float z,
             CallbackInfoReturnable<com.mojang.blaze3d.vertex.VertexConsumer> cir) {
-        if (vertexPointer > 0L && vertexSize > 12) {
-            MemoryUtil.memSet(vertexPointer + 12, 0, vertexSize - 12);
+        if (vertexPointer > 0L) {
+            MemoryUtil.memSet(vertexPointer + 12, 0, 4);
+        }
+    }
+
+    /**
+     * Same tail-zeroing for the 11-argument overload:
+     * {@code addVertex(x,y,z, color, u, v, overlay, light, nx, ny, nz)}.
+     * This overload is used by most block/entity tessellators. The 3-arg version
+     * is only reached when no per-vertex attributes are set.
+     */
+    @Inject(method = "addVertex(FFFIIFFFF)V",
+            at = @At("TAIL"), remap = false)
+    private void gl4dx12$zeroVertexTailFull(float x, float y, float z,
+            int color, float u, float v, int overlay, int light,
+            float nx, float ny, float nz,
+            CallbackInfoReturnable<com.mojang.blaze3d.vertex.VertexConsumer> cir) {
+        if (vertexPointer > 0L) {
+            MemoryUtil.memSet(vertexPointer + 12, 0, 4);
         }
     }
 }
