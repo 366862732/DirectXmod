@@ -417,36 +417,52 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         dbgLog("blitSurface: srcTex=null — no-copy pass-through");
         return true;
     }
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    cmd->ResourceBarrier(1, &barrier);
 
-    D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-    srcLoc.pResource = srcTex->resource.Get();
-    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    srcLoc.SubresourceIndex = 0;
-
-    D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-    dstLoc.pResource = dst;
-    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dstLoc.SubresourceIndex = 0;
-
-    D3D12_BOX srcBox{0, 0, 0, w, h, 1};
-    // P22 诊断：拷贝前打印 srcTex 状态，区分"shader 未写入"vs"读回时机错误"
+    // P22: Draw-based blit（全屏四边形）— 绕过 CopyTextureRegion 格式不兼容问题。
+    // srcTex 格式（如 R32G32B32A32_FLOAT）与 backbuffer（R8G8B8A8_UNORM）不同，
+    // CopyTextureRegion 静默失败；改用 GPU 光栅器采样+格式转换。
+    //
+    // 步骤：
+    //   1. PRESENT → RENDER_TARGET（backbuffer）
+    //   2. OMSetRenderTargets + SetGraphicsRootSignature + SetPipelineState
+    //   3. 源纹理 → PIXEL_SHADER_RESOURCE（采样前必须过渡）
+    //   4. 在 srvHeap 分配 SRV 槽位，绑定到根描述符表
+    //   5. 绑定顶点/索引缓冲，DrawIndexedInstanced(6,1,0,0,0)
+    //   6. RENDER_TARGET → PRESENT（backbuffer）
+    //   7. 源纹理 → COMMON（下一帧准备）
     {
-        D3D12_RESOURCE_DESC sd = srcTex->resource->GetDesc();
-        dbgLog("blitSurface:before-copy src=%p w=%llu h=%llu fmt=%d colorTargetsWritten=%d",
-            (void*)srcTex, (unsigned long long)sd.Width, (unsigned long long)sd.Height,
-            (int)srcTex->dxgiFormat, (int)ctx->colorTargetsWritten);
-    }
-    cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);
-    dbgLog("blitSurface:after-copy src=%p -> dst=%p", (void*)srcTex, (void*)dst);
+        // 1. PRESENT → RENDER_TARGET
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        cmd->ResourceBarrier(1, &barrier);
 
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    cmd->ResourceBarrier(1, &barrier);
-    // P11：源纹理显式回切 COMMON。
-    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+        // 2. 绑定 RTV 和根签名
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        const BlitPipeline* bp = getBlitPipeline();
+        cmd->SetGraphicsRootSignature(bp->rootSig.Get());
+        cmd->SetPipelineState(bp->pso.Get());
+        dbgLog("blitSurface: set blit rootSig=%p pso=%p",
+            (void*)bp->rootSig.Get(), (void*)bp->pso.Get());
+
+        // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
+        if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) return false;
+
+        // 5. 绑定顶点/索引缓冲并绘制
+        cmd->IASetVertexBuffers(0, 1, &bp->vbView);
+        cmd->IASetIndexBuffer(&bp->ibView);
+        dbgLog("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
+        cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        dbgLog("blitSurface: drawIndexed done");
+
+        // 6. RENDER_TARGET → PRESENT
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cmd->ResourceBarrier(1, &barrier);
+
+        // 7. 源纹理 → COMMON（为下一帧 beginRenderPass 准备）
+        if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+    }
 #endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。

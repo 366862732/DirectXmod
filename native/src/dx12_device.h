@@ -21,6 +21,7 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,11 @@ void setLogLevel(int level);
 #else
 #define DBG_LOG_DEBUG(...) ((void)0)
 #endif
+
+// ---------------------------------------------------------------------------
+// P22: 前向声明（DeviceContext 使用 std::unique_ptr<BlitPipeline>，需完整类型）
+// ---------------------------------------------------------------------------
+struct BlitPipeline;
 
 // ---------------------------------------------------------------------------
 // 设备上下文（进程内单例，Java 侧首次调用 dx12CreateDevice 时创建）
@@ -99,6 +105,9 @@ struct DeviceContext {
 
     // 诊断（调试层）：设备移除时 GetDeviceRemovedReason + InfoQueue 消息定位根因
     ComPtr<ID3D12InfoQueue> infoQueue;
+
+    // P22: blit 全屏四边形管线（懒初始化，device 级单例）
+    std::unique_ptr<BlitPipeline> blitPipeline;
 };
 
 // ---------------------------------------------------------------------------
@@ -381,6 +390,28 @@ struct PipelineDesc {
 // 创建管线（D3DCompile + root signature + 双 PSO）；失败返回 nullptr + err。
 Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err);
 void destroyPipeline(Dx12Pipeline* pipeline);
+
+// ---------------------------------------------------------------------------
+// P22: Blit 管线（全屏四边形绘制，绕过 CopyTextureRegion 格式不兼容问题）
+// 源纹理（R32G32B32A32_FLOAT 等）→ backbuffer（R8G8B8A8_UNORM），由 GPU
+// 光栅器自动做格式转换，无需手动 resolve。
+// ---------------------------------------------------------------------------
+struct BlitPipeline {
+    ComPtr<ID3D12RootSignature> rootSig;       // SRV(t0) + sampler(s0)
+    ComPtr<ID3D12PipelineState> pso;           // noDepth, noBlend, noCull
+    ComPtr<ID3D12Resource> vertBuf;            // 4 vertices, R32G32 + R32G32
+    ComPtr<ID3D12Resource> idxBuf;             // 6 indices, R16_UINT
+    D3D12_VERTEX_BUFFER_VIEW vbView{};
+    D3D12_INDEX_BUFFER_VIEW ibView{};
+};
+
+// 懒初始化 blit 管线（线程安全：第一次调用创建，后续直接返回）。
+void initBlitPipeline(std::string& err);
+const BlitPipeline* getBlitPipeline();
+// P22: 在 srvHeap 为 srcTex 分配 SRV 槽位并设置根描述符表（srvGpu 已绑定）。
+// 调用方无需关心 srvHeap 内部细节。
+bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
+    ID3D12GraphicsCommandList* cmd, std::string& err);
 
 // ---------------------------------------------------------------------------
 // Draw 命令录制（P6）：渲染 pass 内的 draw 全链路。

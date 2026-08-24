@@ -59,7 +59,7 @@ if "%do_dll%"=="1" (
 if "%do_jar%"=="1" (
     echo [3/3] Building JAR...
     cd /d "%FABRIC%"
-    .\gradlew.bat build -x test
+    .\gradlew.bat jar
     if %errorlevel% neq 0 ( echo ERROR: JAR build failed & pause & exit /b 1 )
     if not exist "%BUILD_JAR%" ( echo ERROR: JAR not found & pause & exit /b 1 )
     echo       Copying to game mods/...

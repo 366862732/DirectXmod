@@ -3120,4 +3120,300 @@ std::string enumerateAdaptersJson() {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// P22: Blit 管线（全屏四边形，绕过 CopyTextureRegion 格式不兼容）
+// ---------------------------------------------------------------------------
+namespace {
+
+// VS: 把 2D 位置直接作为 SV_Position 输出；texcoord 透传给 PS。
+static const char kBlitVS[] =
+    "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
+    "VS_OUT main(float2 pos : POSITION, float2 tc : TEXCOORD0) {\n"
+    "    VS_OUT o;\n"
+    "    o.pos = float4(pos, 0.0f, 1.0f);\n"
+    "    o.tc = tc;\n"
+    "    return o;\n"
+    "}\n";
+
+// PS: 对源纹理线性采样，输出到 backbuffer；GPU 光栅器自动处理格式转换。
+static const char kBlitPS[] =
+    "Texture2D<float4> srcTex : register(t0, space0);\n"
+    "SamplerState sampler : register(s0, space0);\n"
+    "float4 main(VS_OUT IN) : SV_Target {\n"
+    "    return srcTex.Sample(sampler, IN.tc);\n"
+    "}\n";
+
+}  // namespace
+
+void initBlitPipeline(std::string& err) {
+    if (!ensureDevice(err)) return;
+    if (gCtx.blitPipeline) return;  // 已初始化
+
+    ComPtr<ID3D12RootSignature> rootSig;
+    {
+        // 两个 descriptor range：SRV(t0), sampler(s0)
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_DESCRIPTOR_RANGE samRange{};
+        samRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        samRange.NumDescriptors = 1;
+        samRange.BaseShaderRegister = 0;
+        samRange.RegisterSpace = 0;
+        samRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_DESCRIPTOR_TABLE table{};
+        table.NumDescriptorRanges = 2;
+        table.pDescriptorRanges = &srvRange;
+
+        D3D12_ROOT_PARAMETER param{};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param.DescriptorTable = table;
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC staticSam{};
+        staticSam.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSam.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSam.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSam.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSam.MipLODBias = 0.0f;
+        staticSam.MaxAnisotropy = 1;
+        staticSam.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        staticSam.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSam.MinLOD = 0.0f;
+        staticSam.MaxLOD = D3D12_FLOAT32_MAX;
+        staticSam.ShaderRegister = 0;
+        staticSam.RegisterSpace = 0;
+        staticSam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+        rsDesc.NumParameters = 1;
+        rsDesc.pParameters = &param;
+        rsDesc.NumStaticSamplers = 1;
+        rsDesc.pStaticSamplers = &staticSam;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> rsBlob, rsErr;
+        HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+            &rsBlob, &rsErr);
+        if (FAILED(hr)) {
+            err = "initBlitPipeline: SerializeRootSignature hr=0x" + hrText(hr);
+            return;
+        }
+        hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+            rsBlob->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+        if (FAILED(hr)) {
+            err = "initBlitPipeline: CreateRootSignature hr=0x" + hrText(hr);
+            return;
+        }
+    }
+
+    // 编译 VS / PS
+    ComPtr<ID3DBlob> vsBlob, psBlob, errs;
+    std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
+    std::vector<uint8_t> psBytes(kBlitPS, kBlitPS + sizeof(kBlitPS));
+    if (!compileShaderBytecode(vsBytes, "blit_vs", "vs_5_1", vsBlob, err)) return;
+    if (!compileShaderBytecode(psBytes, "blit_ps", "ps_5_1", psBlob, err)) return;
+
+    // 创建 PSO
+    ComPtr<ID3D12PipelineState> pso;
+    {
+        D3D12_INPUT_ELEMENT_DESC ie[2] = {};
+        ie[0].SemanticName = "POSITION";
+        ie[0].SemanticIndex = 0;
+        ie[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+        ie[0].InputSlot = 0;
+        ie[0].AlignedByteOffset = 0;
+        ie[0].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        ie[0].InstanceDataStepRate = 0;
+
+        ie[1].SemanticName = "TEXCOORD";
+        ie[1].SemanticIndex = 0;
+        ie[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+        ie[1].InputSlot = 0;
+        ie[1].AlignedByteOffset = 8;
+        ie[1].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        ie[1].InstanceDataStepRate = 0;
+
+        D3D12_RENDER_TARGET_BLEND_DESC rtBlend{};
+        rtBlend.BlendEnable = FALSE;
+        rtBlend.LogicOpEnable = FALSE;
+        rtBlend.SrcBlend = D3D12_BLEND_ONE;
+        rtBlend.DestBlend = D3D12_BLEND_ZERO;
+        rtBlend.BlendOp = D3D12_BLEND_OP_ADD;
+        rtBlend.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rtBlend.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rtBlend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rtBlend.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rtBlend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_BLEND_DESC blendDesc{};
+        blendDesc.AlphaToCoverageEnable = FALSE;
+        blendDesc.IndependentBlendEnable = FALSE;
+        blendDesc.RenderTarget[0] = rtBlend;
+
+        D3D12_RASTERIZER_DESC rasterDesc{};
+        rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
+        rasterDesc.CullMode = D3D12_CULL_MODE_NONE;   // 全屏 quad，无背面剔除
+        rasterDesc.FrontCounterClockwise = FALSE;
+        rasterDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+        rasterDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+        rasterDesc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+        rasterDesc.DepthClipEnable = TRUE;
+        rasterDesc.MultisampleEnable = FALSE;
+        rasterDesc.AntialiasedLineEnable = FALSE;
+
+        D3D12_DEPTH_STENCIL_DESC dsDesc{};
+        dsDesc.DepthEnable = FALSE;
+        dsDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        dsDesc.StencilEnable = FALSE;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = rootSig.Get();
+        psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.InputLayout = { ie, 2 };
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psoDesc.NumRenderTargets = 1;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;  // 匹配 backbuffer
+        psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        psoDesc.SampleDesc.Count = 1;
+        psoDesc.BlendState = blendDesc;
+        psoDesc.RasterizerState = rasterDesc;
+        psoDesc.DepthStencilState = dsDesc;
+        psoDesc.Flags = D3D12_PIPELINE_STATE_FLAGS(0);
+
+        HRESULT hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc,
+            IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) {
+            err = "initBlitPipeline: CreateGraphicsPipelineState hr=0x" + hrText(hr);
+            return;
+        }
+    }
+
+    // 顶点缓冲：4 顶点，R32G32(position) + R32G32(texcoord)，upload heap
+    {
+        struct Vertex { float x, y; float u, v; };
+        Vertex verts[4] = {
+            {-1.0f, -1.0f, 0.0f, 1.0f},   // bottom-left
+            { 1.0f, -1.0f, 1.0f, 1.0f},   // bottom-right
+            {-1.0f,  1.0f, 0.0f, 0.0f},   // top-left
+            { 1.0f,  1.0f, 1.0f, 0.0f},   // top-right
+        };
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = sizeof(verts);
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        HRESULT hr = gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&gCtx.blitPipeline->vertBuf));
+        if (FAILED(hr)) { err = "initBlitPipeline: vertBuf create hr=0x" + hrText(hr); return; }
+        void* p = nullptr;
+        hr = gCtx.blitPipeline->vertBuf->Map(0, nullptr, &p);
+        if (SUCCEEDED(hr) && p) {
+            std::memcpy(p, verts, sizeof(verts));
+            gCtx.blitPipeline->vertBuf->Unmap(0, nullptr);
+        }
+        gCtx.blitPipeline->vbView.BufferLocation =
+            gCtx.blitPipeline->vertBuf->GetGPUVirtualAddress();
+        gCtx.blitPipeline->vbView.SizeInBytes = sizeof(verts);
+        gCtx.blitPipeline->vbView.StrideInBytes = sizeof(Vertex);
+    }
+
+    // 索引缓冲：2 个三角形（顺时针，CullMode=NONE，顺序无关）
+    {
+        uint16_t idxs[6] = {0, 1, 2, 1, 3, 2};
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = sizeof(idxs);
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        HRESULT hr = gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&gCtx.blitPipeline->idxBuf));
+        if (FAILED(hr)) { err = "initBlitPipeline: idxBuf create hr=0x" + hrText(hr); return; }
+        void* p = nullptr;
+        hr = gCtx.blitPipeline->idxBuf->Map(0, nullptr, &p);
+        if (SUCCEEDED(hr) && p) {
+            std::memcpy(p, idxs, sizeof(idxs));
+            gCtx.blitPipeline->idxBuf->Unmap(0, nullptr);
+        }
+        gCtx.blitPipeline->ibView.BufferLocation =
+            gCtx.blitPipeline->idxBuf->GetGPUVirtualAddress();
+        gCtx.blitPipeline->ibView.SizeInBytes = sizeof(idxs);
+        gCtx.blitPipeline->ibView.Format = DXGI_FORMAT_R16_UINT;
+    }
+
+    gCtx.blitPipeline->rootSig = rootSig;
+    gCtx.blitPipeline->pso = pso;
+    dbgLog("initBlitPipeline: done rootSig=%p pso=%p",
+        (void*)rootSig.Get(), (void*)pso.Get());
+}
+
+const BlitPipeline* getBlitPipeline() {
+    return gCtx.blitPipeline.get();
+}
+
+bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
+    ID3D12GraphicsCommandList* cmd, std::string& err) {
+    if (!srcTex || !srcTex->resource) {
+        err = "blitBindSourceTexture: null or invalid srcTex";
+        return false;
+    }
+    // 源纹理过渡到 PIXEL_SHADER_RESOURCE（采样必需）。
+    transitionTextureTo(ctx, srcTex,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // 在 srvHeap 分配 SRV 槽位并创建描述符。
+    std::string srvErr;
+    int srvSlot = allocSrvSlot(srvErr);
+    if (srvSlot < 0) {
+        err = "blitBindSourceTexture: allocSrvSlot failed: " + srvErr;
+        return false;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = gCtx.srvCpuHeap->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr += (SIZE_T)srvSlot * gCtx.srvInc;
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = gCtx.srvHeap->GetGPUDescriptorHandleForHeapStart();
+    srvGpu.ptr += (SIZE_T)srvSlot * gCtx.srvInc;
+
+    DXGI_FORMAT viewFmt = srcTex->resource->GetDesc().Format;
+    switch (viewFmt) {
+        case DXGI_FORMAT_D32_FLOAT:            viewFmt = DXGI_FORMAT_R32_FLOAT; break;
+        case DXGI_FORMAT_D16_UNORM:            viewFmt = DXGI_FORMAT_R16_UNORM; break;
+        default: break;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = viewFmt;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    gCtx.device->CreateShaderResourceView(srcTex->resource.Get(), &srvDesc, srvCpu);
+    // srvHeap 是 SHADER_VISIBLE 堆，CPU handle 与 GPU handle 指向同一描述符；
+    // CreateShaderResourceView 只接受 CPU 句柄。
+
+    // 绑定根描述符表（Offset=APPEND → 自动使用 srvGpu）。
+    cmd->SetGraphicsRootDescriptorTable(0, srvGpu);
+    dbgLog("blitBindSourceTexture: srvSlot=%d srvGpu=%llx",
+        srvSlot, (unsigned long long)srvGpu.ptr);
+    return true;
+}
+
 }  // namespace dx12mc
