@@ -904,6 +904,8 @@ bool needTransition(D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
 }
 
 // 将 D3D12_RESOURCE_STATES 转为可读名称，用于诊断日志。
+// 注意：D3D12_RESOURCE_STATE_PRESENT 和 D3D12_RESOURCE_STATE_COMMON 在此 SDK
+// 版本中均为 0（flip model 下等价），不可同时作为独立 case。
 static const char* stateNameFor(D3D12_RESOURCE_STATES s) {
     switch (s) {
         case D3D12_RESOURCE_STATE_COMMON:                         return "COMMON";
@@ -920,7 +922,6 @@ static const char* stateNameFor(D3D12_RESOURCE_STATES s) {
         case D3D12_RESOURCE_STATE_COPY_SOURCE:                    return "COPY_S";
         case D3D12_RESOURCE_STATE_RESOLVE_DEST:                   return "RESOLVE_D";
         case D3D12_RESOURCE_STATE_RESOLVE_SOURCE:                 return "RESOLVE_S";
-        case D3D12_RESOURCE_STATE_PRESENT:                        return "PRESENT";
         case D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT:              return "INDIRECT";
         default: return "???";
     }
