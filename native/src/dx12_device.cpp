@@ -1207,6 +1207,18 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
             kv.second = D3D12_RESOURCE_STATE_COMMON;
         }
     }
+    // copy 操作（copyBufferToBuffer 等）会把源/目的缓冲区留在 COPY_SOURCE /
+    // COPY_DEST；若不显式回切，下一帧 beginCommandList 清空 resourceState 后
+    // 按 INITIAL（DEFAULT=COMMON）写 Before，GPU 实际仍在 COPY_SOURCE → 验证
+    // ERROR（与上方 SHADER_RESOURCE 清理是同一类问题）。
+    for (auto& kv : ctx->resourceState) {
+        if (kv.second == D3D12_RESOURCE_STATE_COPY_SOURCE
+            || kv.second == D3D12_RESOURCE_STATE_COPY_DEST) {
+            resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
+                D3D12_RESOURCE_STATE_COMMON);
+            kv.second = D3D12_RESOURCE_STATE_COMMON;
+        }
+    }
     HRESULT hr = ctx->commandList->Close();
     if (FAILED(hr)) {
         // P6 诊断：Close 返回 E_INVALIDARG 通常是 debug layer 的验证错误
