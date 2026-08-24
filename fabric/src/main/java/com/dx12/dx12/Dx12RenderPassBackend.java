@@ -305,6 +305,14 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                 + " (pipeline=" + (pipeline != null ? pipeline.info().getLocation() : "null")
                 + "), vertexFormatBindings is empty or slot out of range");
         }
+        // P22 诊断：记录顶点缓冲大小，用于排查 SizeInBytes 不足问题
+        long bufSize = buffer.size();
+        long vbOffset = vertexBuffer.offset();
+        long vbRemaining = bufSize - vbOffset;
+        System.err.printf("[dx12-java] setVB slot=%d stride=%d bufSize=%d offset=%d remaining=%d pipeline=%s%n",
+            slot, stride, (int)bufSize, (int)vbOffset, (int)vbRemaining,
+            pipeline != null ? pipeline.info().getLocation() : "null");
+        System.err.flush();
         if (!Dx12Native.dx12SetVertexBuffer(this.ctx, slot,
             ((Dx12GpuBuffer) buffer).handle(), vertexBuffer.offset(), stride)) {
             throw new IllegalStateException("dx12SetVertexBuffer failed");
@@ -330,9 +338,12 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         int vertexOffset, int firstInstance) {
         // P17 诊断：记录每次 drawIndexed 调用（含参数），验证 GUI pass 是否有实际 draw
         if (System.err instanceof java.io.PrintStream) {
+            // 尝试获取当前绑定的顶点缓冲信息
+            int neededVerts = indexCount; // 最坏情况：每个 index 引用一个独立顶点
             System.err.println("[dx12-java] drawIndexed pipeline=" + pipeline.info().getLocation()
                 + " count=" + indexCount + " inst=" + instanceCount
                 + " first=" + firstIndex + " base=" + vertexOffset
+                + " neededVerts~=" + neededVerts
                 + (indexCount == 0 ? " [ZERO-COUNT!]" : ""));
             System.err.flush();
         }
@@ -389,6 +400,13 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             }
             this.setIndexBuffer(indexBuffer, indexType);
             this.setVertexBuffer(draw.slot(), draw.vertexBuffer().slice());
+            // P22 诊断：打印每个 Draw 的顶点缓冲信息，用于排查 SizeInBytes 不足
+            GpuBufferSlice vbSlice = draw.vertexBuffer().slice();
+            long vbBufSize = vbSlice.buffer().size();
+            System.err.printf("[dx12-java] drawMulti slot=%d idxCount=%d vbBufSize=%d vbOff=%d vbLen=%d pipeline=%s%n",
+                draw.slot(), draw.indexCount(), (int)vbBufSize, (int)vbSlice.offset(), (int)vbSlice.length(),
+                this.pipeline.info().getLocation());
+            System.err.flush();
             this.pushDescriptors();
             this.drawIndexed(draw.indexCount(), 1, draw.firstIndex(), draw.baseVertex(), 0);
         }
@@ -396,6 +414,13 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void draw(int vertexCount, int instanceCount, int firstVertex, int firstInstance) {
+        // P22 诊断：记录非索引 draw（DrawInstanced 路径）
+        if (System.err instanceof java.io.PrintStream) {
+            System.err.println("[dx12-java] draw (non-indexed) pipeline=" + pipeline.info().getLocation()
+                + " vertCount=" + vertexCount + " inst=" + instanceCount
+                + " first=" + firstVertex);
+            System.err.flush();
+        }
         this.pushDescriptors();
         if (!Dx12Native.dx12Draw(this.ctx, vertexCount, instanceCount, firstVertex, firstInstance)) {
             throw new IllegalStateException("dx12Draw failed");

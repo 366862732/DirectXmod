@@ -4,6 +4,7 @@ import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.systems.TransientMemory;
 import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -144,6 +145,8 @@ public class Dx12TransientMemory implements TransientMemory {
         if (total == 0) {
             throw new IllegalArgumentException("Cannot upload zero bytes");
         }
+        // P22: 在写入前检测 NaN/Infinity，定位污染源（BufferBuilder 未初始化尾部浮点）。
+        checkForNanInfinity(data, "upload");
         Dx12GpuBuffer staging = new Dx12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, total);
         this.register(staging);
@@ -168,6 +171,7 @@ public class Dx12TransientMemory implements TransientMemory {
         if (total == 0) {
             return List.of();
         }
+        checkForNanInfinity(data, "multiUpload");
         Dx12GpuBuffer staging = new Dx12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, total);
         this.register(staging);
@@ -189,6 +193,43 @@ public class Dx12TransientMemory implements TransientMemory {
             offset += length;
         }
         return result;
+    }
+
+    /**
+     * 检查所有 input buffers 的 float 值是否含 NaN 或 Infinity。
+     * 在上传到 GPU 之前调用，定位污染源。
+     */
+    private static void checkForNanInfinity(List<ByteBuffer> data, String method) {
+        for (int bi = 0; bi < data.size(); bi++) {
+            ByteBuffer buf = data.get(bi);
+            if (buf.remaining() < 4) continue;
+            // 使用 FloatBuffer 视图逐 float 检测（不修改原始 buffer position）
+            FloatBuffer fb = buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
+            while (fb.hasRemaining()) {
+                float v = fb.get();
+                if (Float.isNaN(v) || Float.isInfinite(v)) {
+                    System.err.printf("[dx12-java] NaN/Inf detected in %s: buffer[%d] floatIdx=%d value=%s%n",
+                        method, bi, fb.position() - 1,
+                        Float.isNaN(v) ? "NaN" : "Infinity");
+                    System.err.flush();
+                    // 打印周围几个 float 帮助定位
+                    int savedPos = fb.position();
+                    int start = Math.max(0, savedPos - 4);
+                    int end = Math.min(fb.capacity(), savedPos + 4);
+                    fb.position(start);
+                    StringBuilder sb = new StringBuilder("  context: ");
+                    for (int i = start; i < end; i++) {
+                        if (i > start) sb.append(',');
+                        float fv = fb.get();
+                        sb.append(Float.isNaN(fv) ? "NaN" : String.format("%.4f", fv));
+                    }
+                    System.err.println(sb);
+                    System.err.flush();
+                    fb.position(savedPos);
+                    return; // 只报一次
+                }
+            }
+        }
     }
 
     /**

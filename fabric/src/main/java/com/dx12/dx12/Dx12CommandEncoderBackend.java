@@ -213,6 +213,13 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void copyToBuffer(GpuBufferSlice source, GpuBufferSlice target) {
+        // P22 诊断：记录 copyToBuffer 参数，排查缓冲区大小不足
+        if (System.err instanceof java.io.PrintStream) {
+            System.err.printf("[dx12-java] copyToBuf srcBuf=%x srcOff=%d srcLen=%d dstBuf=%x dstOff=%d%n",
+                bufferHandle(source.buffer()), (int)source.offset(), (int)source.length(),
+                bufferHandle(target.buffer()), (int)target.offset());
+            System.err.flush();
+        }
         Dx12Native.dx12CopyBuffer(this.ctx, bufferHandle(source.buffer()), source.offset(),
             bufferHandle(target.buffer()), target.offset(), source.length());
     }
