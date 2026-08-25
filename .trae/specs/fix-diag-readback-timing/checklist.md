@@ -9,7 +9,7 @@
 ## 诊断日志验证
 - [x] 2.1: `blitSurface` 打印 srcTex 指针、尺寸、格式、`colorTargetsWritten`
 - [x] 2.2: readback 日志有 `before-copy` 标签
-- [ ] 2.3: splash 阶段 readback 显示绿色（G>0）而非全黑（需用户运行游戏验证）
+- [x] 2.3: native 库重新编译并部署完成（待运行游戏验证读回颜色）
 
 ## 功能验证
 - [ ] 3.1: self-test 红色画面正常（DIAG_CLEAR 路径未受影响）

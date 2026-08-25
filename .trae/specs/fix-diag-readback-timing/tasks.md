@@ -9,7 +9,8 @@
 - [x] Task 2: 添加读回前后诊断日志
   - [x] 在 `blitSurface` 中 `CopyTextureRegion` 前后添加日志：打印 `srcTex` 指针、尺寸、格式、`ctx->colorTargetsWritten` 值
   - [x] 在 readback 日志中增加 `before-copy` 标签以区分读回时机
-  - [ ] 重新编译并运行游戏，确认 readback 日志显示绿色值（R≈0, G>0, B≈0, A>0）
+  - [x] 重新编译 native 库并部署到游戏目录
+  - [ ] 运行游戏，确认 splash 阶段 readback 日志显示绿色值（R≈0, G>0, B≈0, A>0）
 
 - [ ] Task 3: 验证修复效果
   - [ ] 确认 splash 阶段 readback 显示绿色（G 分量显著非零）
