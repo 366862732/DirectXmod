@@ -139,7 +139,7 @@ public class Dx12Backend implements GpuBackend {
     private static void selfTestCommandLayer(Dx12Device device) {
         int size = 256;
         GpuBuffer src = device.createBuffer(() -> "dx12-selftest-src",
-            GpuBuffer.USAGE_COPY_DST, size);
+            GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_COPY_SRC, size);
         GpuBuffer dst = device.createBuffer(() -> "dx12-selftest-dst",
             GpuBuffer.USAGE_MAP_READ, size);
         ByteBuffer data = ByteBuffer.allocate(size);
@@ -173,8 +173,25 @@ public class Dx12Backend implements GpuBackend {
             // Buffer readback: every byte must survive the copy.
             try (GpuBufferSlice.MappedView view = dst.map(0, size, true, false)) {
                 ByteBuffer read = view.data();
+                System.err.println("[dx12-java] self-test: reading dst readback, size=" + size
+                    + " dst.usage=" + Integer.toBinaryString(dst.usage()));
+                System.err.flush();
                 for (int i = 0; i < size; ++i) {
-                    if ((read.get(i) & 0xFF) != (i & 0xFF)) {
+                    int actual = read.get(i) & 0xFF;
+                    int expected = i & 0xFF;
+                    if (actual != expected) {
+                        // Dump surrounding bytes for diagnosis
+                        System.err.printf("[dx12-java] mismatch at %d: expected=0x%02X actual=0x%02X",
+                            i, expected, actual);
+                        int start = Math.max(0, i - 8);
+                        int end = Math.min(size, i + 8);
+                        System.err.print(" neighbors=[");
+                        for (int j = start; j < end; j++) {
+                            if (j > start) System.err.print(',');
+                            System.err.printf("0x%02X", read.get(j) & 0xFF);
+                        }
+                        System.err.println("]");
+                        System.err.flush();
                         throw new IllegalStateException("buffer copy readback mismatch at " + i);
                     }
                 }

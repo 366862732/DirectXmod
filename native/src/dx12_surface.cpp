@@ -360,7 +360,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     // 必须在拷贝前执行——CopyTextureRegion 是"读源写目标"原子操作，拷贝后源
     // 内容已不可读；且后续帧可能复用该纹理导致 COMMON→COPY_SOURCE barrier 错配。
     // 仅每 ~30 帧执行（deviceWaitIdle 同步开销）。
-    {
+    // 注意：srcTex 可能在 self-test 路径中为 null（纯 clear），需先判断。
+    if (srcTex) {
         static int rbCount = 0;
         if (++rbCount % 30 == 0) {
             dbgReadbackTexturePixels(srcTex, "colorTex-before-copy");
