@@ -30,7 +30,17 @@ public abstract class BufferBuilderMixin {
     @Inject(method = "putVec3f(JFFF)V", at = @At("TAIL"), remap = false)
     private static void gl4dx12$zeroWComponent(long ptr, float x, float y, float z,
             CallbackInfo ci) {
+        // 诊断：记录每次调用，确认注入生效
         if (ptr > 0L) {
+            // 打印前几个浮点值帮助定位污染源
+            float before = MemoryUtil.memGetFloat(ptr + 12);
+            if (Float.isNaN(before) || Float.isInfinite(before)) {
+                System.err.printf(
+                    "[dx12-java] [BufferBuilderMixin] NaN in w at ptr=%x x=%.4f y=%.4f z=%.4f prevW=%s%n",
+                    ptr, x, y, z,
+                    Float.isNaN(before) ? "NaN" : "Inf");
+                System.err.flush();
+            }
             MemoryUtil.memSet(ptr + 12, 0, 4);
         }
     }

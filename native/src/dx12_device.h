@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dx12mc {
@@ -217,6 +218,10 @@ struct CommandContext {
     // 执行结束后所有提升状态已隐式 decay 回 COMMON，故每个新 list 一切资源
     // 都从初始态开始。绝不在 list 内显式回退 COMMON（D3D12 禁止）。
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState;
+    // 本 command list 内被 transition 到 COPY_SOURCE 的 UPLOAD heap staging buffer。
+    // endCommandList 必须将它们回切 GENERIC_READ（而非 COMMON），因为下一帧
+    // beginCommandList 以 GENERIC_READ 为初始态假设，GPU 实际状态必须匹配。
+    std::unordered_set<ID3D12Resource*> stagingCopySourceResources;
 
     // P6：当前绑定的管线，用于 setVertexBuffer 查找修正 stride
     Dx12Pipeline* currentPipeline = nullptr;

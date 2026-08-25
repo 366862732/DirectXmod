@@ -895,11 +895,12 @@ std::string runResourceSelfTest() {
 namespace {
 
 // initialStateFor 已在 P2 资源层匿名 namespace 中定义（同一翻译单元内不得重复）。
-// GENERIC_READ 已包含 COPY_SOURCE 等只读状态，无需 transition；
-// COPY_DEST（READBACK 初始态）无需 transition。
+// 注意：UPLOAD heap 的 staging buffer 初始态为 GENERIC_READ，但 CopyBuffer/CopyTexture
+// 操作要求源资源必须显式处于 COPY_SOURCE。不能将 GENERIC_READ 视为 COPY_SOURCE 的等价
+// 状态而跳过 barrier——D3D12 Debug Layer 会报 "Before state must be COPY_SOURCE" 错误。
+// from==to 的冗余跳过由 transitionTo/resourceBarrier 内部保护。
 bool needTransition(D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
     if (from == to) return false;
-    if (from == D3D12_RESOURCE_STATE_GENERIC_READ) return false;
     return true;
 }
 
@@ -1086,11 +1087,21 @@ void transitionTo(CommandContext* ctx, ID3D12Resource* res,
     m[res] = to;
 }
 
-// buffer 按跟踪状态过渡（不回落初始状态）。
+// buffer 按跟踪状态过渡（不回落初始状态）。UPLOAD heap staging buffer 被
+// transition 到 COPY_SOURCE 时，同时记录到 stagingCopySourceResources，
+// 以便 endCommandList 将其回切 GENERIC_READ（而非 COMMON）。
 void transitionBufferTo(CommandContext* ctx, Dx12Object* buf,
     D3D12_RESOURCE_STATES to) {
     if (!buf || !buf->resource) return;
     transitionTo(ctx, buf->resource.Get(), initialStateFor(buf->heapType), to);
+    // 记录 staging buffer 的 COPY_SOURCE 状态，供 endCommandList 回切到 GENERIC_READ。
+    if (buf->heapType == D3D12_HEAP_TYPE_UPLOAD && to == D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        auto& m = ctx->resourceState;
+        auto it = m.find(buf->resource.Get());
+        if (it != m.end() && it->second == D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            ctx->stagingCopySourceResources.insert(buf->resource.Get());
+        }
+    }
 }
 
 // texture 按跟踪状态过渡（初始锚点 COMMON；不回落 COMMON）。
@@ -1244,17 +1255,25 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
     }
     // copy 操作（copyBufferToBuffer 等）会把源/目的缓冲区留在 COPY_SOURCE /
     // COPY_DEST；若不清理，下一帧 beginCommandList 清空 resourceState 后
-    // 按 INITIAL（DEFAULT=COMMON）写 Before，GPU 实际仍在 COPY_SOURCE/COPY_DEST
-    // → 验证 ERROR（与上方 SHADER_RESOURCE 清理是同一类问题）。
-    for (auto& kv : ctx->resourceState) {
-        if (kv.second == D3D12_RESOURCE_STATE_COPY_SOURCE
-            || kv.second == D3D12_RESOURCE_STATE_COPY_DEST) {
-            if (kv.second != D3D12_RESOURCE_STATE_COMMON)
-                resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
-                    D3D12_RESOURCE_STATE_COMMON);
-            kv.second = D3D12_RESOURCE_STATE_COMMON;
+    // 按 INITIAL 写 Before，GPU 实际仍在 COPY_SOURCE/COPY_DEST → 验证 ERROR。
+    //
+    // UPLOAD heap staging buffer（COPY_SOURCE）必须回切 GENERIC_READ（初始态），
+    // 因为 beginCommandList 以 GENERIC_READ 为假设值。其他 COPY_SOURCE/COPY_DEST
+    // 资源回切 COMMON。
+    for (auto it = ctx->resourceState.begin(); it != ctx->resourceState.end(); ) {
+        D3D12_RESOURCE_STATES target = D3D12_RESOURCE_STATE_COMMON;
+        if (it->second == D3D12_RESOURCE_STATE_COPY_SOURCE
+            && ctx->stagingCopySourceResources.count(it->first)) {
+            target = D3D12_RESOURCE_STATE_GENERIC_READ;
+        }
+        if (it->second == target) {
+            it = ctx->resourceState.erase(it);
+        } else {
+            resourceBarrier(ctx->commandList.Get(), it->first, it->second, target);
+            it = ctx->resourceState.erase(it);
         }
     }
+    ctx->stagingCopySourceResources.clear();
     HRESULT hr = ctx->commandList->Close();
     if (FAILED(hr)) {
         // P6 诊断：Close 返回 E_INVALIDARG 通常是 debug layer 的验证错误
