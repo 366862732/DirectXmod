@@ -1231,37 +1231,27 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
     // command list 在 beginCommandList 清空 resourceState 后按 COMMON 写 Before
     // 状态，与 GPU 上遗留的 SHADER_RESOURCE 错配 → 每帧验证 ERROR
     // （"Before state ... does not match ... preceding ResourceBarrier"）。
-    for (auto& kv : ctx->resourceState) {
-        if (kv.second & (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+    for (auto it = ctx->resourceState.begin(); it != ctx->resourceState.end(); ) {
+        if (it->second & (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                          | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
-            resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
-                D3D12_RESOURCE_STATE_COMMON);
-            kv.second = D3D12_RESOURCE_STATE_COMMON;
+            if (it->second != D3D12_RESOURCE_STATE_COMMON)
+                resourceBarrier(ctx->commandList.Get(), it->first, it->second,
+                    D3D12_RESOURCE_STATE_COMMON);
+            it = ctx->resourceState.erase(it);
+        } else {
+            ++it;
         }
     }
     // copy 操作（copyBufferToBuffer 等）会把源/目的缓冲区留在 COPY_SOURCE /
-    // COPY_DEST；若不显式回切，下一帧 beginCommandList 清空 resourceState 后
-    // 按 INITIAL（DEFAULT=COMMON）写 Before，GPU 实际仍在 COPY_SOURCE → 验证
-    // ERROR（与上方 SHADER_RESOURCE 清理是同一类问题）。
+    // COPY_DEST；若不清理，下一帧 beginCommandList 清空 resourceState 后
+    // 按 INITIAL（DEFAULT=COMMON）写 Before，GPU 实际仍在 COPY_SOURCE/COPY_DEST
+    // → 验证 ERROR（与上方 SHADER_RESOURCE 清理是同一类问题）。
     for (auto& kv : ctx->resourceState) {
         if (kv.second == D3D12_RESOURCE_STATE_COPY_SOURCE
             || kv.second == D3D12_RESOURCE_STATE_COPY_DEST) {
-            resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
-                D3D12_RESOURCE_STATE_COMMON);
-            kv.second = D3D12_RESOURCE_STATE_COMMON;
-        }
-    }
-    // PRESENT 状态清理：blitSurface 通过 transitionTo 将 back buffer 跟踪为 PRESENT。
-    // 若不清理，beginCommandList 清空 resourceState 后按 COMMON 写 StateBefore，
-    // 而 GPU 实际在 PRESENT → 下一帧 blitSurface 的 PRESENT→RENDER_TARGET barrier
-    // 被 driver 视为冗余（PRESENT→PRESENT）并剥离 → GPU 停在 PRESENT → Present()
-    // 触发 Internal DXGI CommandList PRESENT_SOURCE 验证 ERROR。
-    // 回切到 COMMON 后，beginCommandList 清空 tracking，新帧以 COMMON 锚点开始，
-    // 与 GPU 实际状态一致。
-    for (auto& kv : ctx->resourceState) {
-        if (kv.second == D3D12_RESOURCE_STATE_PRESENT) {
-            resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
-                D3D12_RESOURCE_STATE_COMMON);
+            if (kv.second != D3D12_RESOURCE_STATE_COMMON)
+                resourceBarrier(ctx->commandList.Get(), kv.first, kv.second,
+                    D3D12_RESOURCE_STATE_COMMON);
             kv.second = D3D12_RESOURCE_STATE_COMMON;
         }
     }

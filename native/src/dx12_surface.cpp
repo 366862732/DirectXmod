@@ -379,7 +379,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     clearBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     clearBarrier.Transition.pResource = dst;
     clearBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cmd->ResourceBarrier(1, &clearBarrier);
     dbgLog("blitSurface: after clear barrier transition");
@@ -405,10 +405,10 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     backToPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &backToPresent);
 #else
-    // srcTex 为 null 时（纯状态转换路径）：只做 PRESENT↔COPY_DEST barrier，
+    // srcTex 为 null 时（纯状态转换路径）：只做 COMMON↔COPY_DEST barrier，
     // 不拷贝内容。用于 self-test / render loop 自检，验证 backbuffer 通路可用。
     if (!srcTex) {
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         cmd->ResourceBarrier(1, &barrier);
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -627,7 +627,7 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = bb;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->ResourceBarrier(1, &b);
 

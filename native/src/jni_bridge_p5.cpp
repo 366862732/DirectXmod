@@ -337,7 +337,7 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePix
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = bb;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->ResourceBarrier(1, &b);
     D3D12_TEXTURE_COPY_LOCATION src{};
