@@ -6,6 +6,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -1500,14 +1501,32 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
         srcOffset + size > src->size || dstOffset + size > dst->size) {
         err = "copyBufferToBuffer: range out of bounds"; return false;
     }
+    // P23：UPLOAD heap staging buffer 可能含 NaN（BufferBuilder position.w 未初始化）。
+    // 在 transition/copy 之前先 map 并清零，确保 GPU 拿到的是干净数据。
+    int nanCount = 0;
+    if (src->heapType == D3D12_HEAP_TYPE_UPLOAD && size >= 16) {
+        void* ptr = nullptr;
+        if (SUCCEEDED(src->resource->Map(0, nullptr, &ptr))) {
+            float* f = (float*)((uint8_t*)ptr + srcOffset);
+            int n = std::min((int)(size / 4), 256);  // 最多检查前 256 个 float
+            for (int i = 0; i < n; ++i) {
+                if (std::isnan(f[i]) || std::isinf(f[i])) {
+                    f[i] = 0.0f;
+                    ++nanCount;
+                }
+            }
+            src->resource->Unmap(0, nullptr);
+            if (nanCount > 0) {
+                dbgLog("copyBuf: SANITIZED %d NaN/Inf in UPLOAD src=%p off=%lld size=%lld",
+                    nanCount, (void*)src, (long long)srcOffset, (long long)size);
+            }
+        }
+    }
     transitionBufferTo(ctx, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
     ctx->commandList->CopyBufferRegion(dst->resource.Get(), (UINT64)dstOffset,
         src->resource.Get(), (UINT64)srcOffset, (UINT64)size);
-    // P6 诊断：dump UPLOAD staging 内容（真实数据源头）。DEFAULT 堆 dst 在
-    // submit 前读回是旧数据（假象），只有 staging（UPLOAD，CPU 可读）才有
-    // Java 刚写入的真实顶点/UBO 数据。MVP 矩阵若全 0 → 顶点变换后全在原点
-    // → 全部被裁剪 → 画面只剩 clear 色。
+    // P6 诊断：dump UPLOAD staging 内容（真实数据源头）。
     if (src->heapType == D3D12_HEAP_TYPE_UPLOAD && size >= 16) {
         void* ptr = nullptr;
         if (SUCCEEDED(src->resource->Map(0, nullptr, &ptr))) {

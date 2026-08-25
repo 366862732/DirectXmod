@@ -225,6 +225,8 @@ public class Dx12TransientMemory implements TransientMemory {
                     }
                     System.err.println(sb);
                     System.err.flush();
+                    // 打印调用栈，定位污染源
+                    Thread.dumpStack();
                     fb.position(savedPos);
                     return; // 只报一次
                 }

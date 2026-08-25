@@ -144,6 +144,30 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void setUniform(String name, GpuBufferSlice value) {
+        // P22 诊断：检查 uniform 数据是否含 NaN/Inf（投影矩阵等异常值会污染着色器）
+        if (value != null && value.length() >= 4) {
+            try (GpuBufferSlice.MappedView mv = value.buffer().map(value.offset(),
+                    Math.min(value.length(), 64L), true, false)) {
+                java.nio.FloatBuffer fb = mv.data().order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
+                int limit = (int) Math.min(fb.remaining(), 16);
+                for (int i = 0; i < limit; i++) {
+                    if (fb.hasRemaining()) {
+                        float fv = fb.get();
+                        if (Float.isNaN(fv) || Float.isInfinite(fv)) {
+                            long bufId = (value.buffer() instanceof Dx12GpuBuffer b)
+                                ? b.handle() : 0L;
+                            System.err.printf(
+                                "[dx12-java] NaN uniform '%s' buf=%x idx=%d val=%s%n",
+                                name, bufId, i,
+                                Float.isNaN(fv) ? "NaN" : "Inf");
+                            System.err.flush();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // map 失败（如 READONLY buffer）时忽略
+            }
+        }
         this.uniforms.put(name, value);
         this.anyDescriptorDirty = true;
     }
