@@ -370,6 +370,28 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **正式发行** | 通过官方渠道发布为 Minecraft 26.2+ 的 D3D12 后端模组 | 🔜 待实现 |
 
 ---
+### 如何编译
+先安装cmake，然后执行以下命令编译项目：
+```bash
+//在此之前先删除native目录下的 build 目录,确保编译的dll是最新的
+cd native
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+编译的产物在这个路径下：
+```bash
+\native\build\bin\Release\dx12_mc.dll
+``` 
+把它复制到\fabric\src\main\resources下如有直接覆盖即可
+安装Gradle，然后执行以下命令编译：
+```bash
+cd fabric
+gradlew clean build
+```
+在这里找到你编译的模组文件
+```bash
+\fabric\build\libs\gl4dx12-0.1.0.jar
+```
 
 ## 贡献指南
 
