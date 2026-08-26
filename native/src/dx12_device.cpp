@@ -942,7 +942,7 @@ void resourceBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
     // ID3D12CommandList::ResourceBarrier 验证 ERROR（0x80004005）。
     // 此处做保护性跳过，并记录诊断日志。
     if (from == to) {
-        dbgLog("resourceBarrier: SKIP (from==to=%s) res=%p", stateNameFor(from), (void*)res);
+        DBG_LOG_DEBUG("resourceBarrier: SKIP (from==to=%s) res=%p", stateNameFor(from), (void*)res);
         return;
     }
     D3D12_RESOURCE_BARRIER b{};
@@ -951,7 +951,10 @@ void resourceBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = from;
     b.Transition.StateAfter = to;
-    dbgLog("resourceBarrier: %p %s -> %s", (void*)res, stateNameFor(from), stateNameFor(to));
+    // P27：resourceBarrier 在加载期可被调用数万次（上传纹理回切 COMMON），
+    // 逐条 dbgLog 写文件曾拖死主线程（加载条冻结 4.7s+、窗口未响应）。
+    // 降级为 DBG_LOG_DEBUG（DX12_LOG_VERBOSE=1 才输出）。
+    DBG_LOG_DEBUG("resourceBarrier: %p %s -> %s", (void*)res, stateNameFor(from), stateNameFor(to));
     list->ResourceBarrier(1, &b);
 }
 
@@ -1547,7 +1550,7 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
                 snprintf(b, sizeof(b), " %.2f", f[i]);
                 fs += b;
             }
-            dbgLog("copyBuf: src=%p(UPLOAD) dst=%p off=%lld size=%lld floats=[%s ]",
+            DBG_LOG_DEBUG("copyBuf: src=%p(UPLOAD) dst=%p off=%lld size=%lld floats=[%s ]",
                 (void*)src, (void*)dst, (long long)srcOffset, (long long)size, fs.c_str());
             src->resource->Unmap(0, nullptr);
         }
@@ -1622,7 +1625,7 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
 
     UINT subresource = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
     if (dstTex->usage & 16) {  // CUBEMAP_COMPATIBLE：确认 6 个面是否逐一上传
-        dbgLog("copyBufferToTexture: CUBE dst=%p mip=%d layer=%d subres=%u srcOff=%lld srcW=%d srcH=%d w=%d h=%d rowBytes=%u aligned=%d",
+        DBG_LOG_DEBUG("copyBufferToTexture: CUBE dst=%p mip=%d layer=%d subres=%u srcOff=%lld srcW=%d srcH=%d w=%d h=%d rowBytes=%u aligned=%d",
             (void*)dstTex, mip, layer, subresource, (long long)srcOffset,
             srcWidth, srcHeight, w, h, srcRowBytes, (int)aligned);
     }
@@ -1798,7 +1801,9 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
         rtvs.push_back(cpu);
         ctx->activeColorTargets.push_back(tex);
-        dbgLog("beginRenderPass color[%d] tex=%p rtv=%p dims=%ux%u fmt=%d",
+        // P27：beginRenderPass 加载期可调用数千次，逐条 dbgLog 写文件拖死主线程，
+        // 降级为 DBG_LOG_DEBUG（DX12_LOG_VERBOSE=1 才输出）。
+        DBG_LOG_DEBUG("beginRenderPass color[%d] tex=%p rtv=%p dims=%ux%u fmt=%d",
             i, (void*)tex, (void*)cpu.ptr, (UINT)tex->resource->GetDesc().Width,
             (UINT)tex->resource->GetDesc().Height, (int)tex->dxgiFormat);
         transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1840,9 +1845,10 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
             ctx->commandList->ClearDepthStencilView(cpu,
                 D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                 (FLOAT)depthClearValue, 0, 0, nullptr);
-            dbgLog("beginRenderPass depth clear=explicit val=%.3f", (FLOAT)depthClearValue);
+            // P27：降级（数千次 pass 调用 × 高频写文件）。
+            DBG_LOG_DEBUG("beginRenderPass depth clear=explicit val=%.3f", (FLOAT)depthClearValue);
         } else {
-            dbgLog("beginRenderPass depth load (no clear)");
+            DBG_LOG_DEBUG("beginRenderPass depth load (no clear)");
         }
     }
 
@@ -1854,14 +1860,15 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
     ctx->commandList->RSSetScissorRects(1, &scissor);
     ctx->inRenderPass = 1;
     // P6 诊断：确认渲染 pass 绑定的附件（blit 源纹理应出现在 color[0]）。
-    dbgLog("beginRenderPass: ctx=%p colorCount=%d area=%d,%d %dx%d depth=%s",
+    // P27：降级为 DBG_LOG_DEBUG（数千次 pass 调用 × 高频写文件拖死主线程）。
+    DBG_LOG_DEBUG("beginRenderPass: ctx=%p colorCount=%d area=%d,%d %dx%d depth=%s",
         (void*)ctx, colorCount, x, y, w, h, depthView ? "yes" : "no");
     for (int i = 0; i < colorCount; ++i) {
         if (colorViews[i]) {
             auto* tex = colorViews[i];
             auto desc = tex->resource->GetDesc();
             const float* cc = clearColors ? (clearColors + i * 4) : nullptr;
-            dbgLog("beginRenderPass color[%d] tex=%p dims=%ux%u fmt=%d clear=(%.3f,%.3f,%.3f,%.3f)",
+            DBG_LOG_DEBUG("beginRenderPass color[%d] tex=%p dims=%ux%u fmt=%d clear=(%.3f,%.3f,%.3f,%.3f)",
                 i, (void*)tex, (UINT)desc.Width, (UINT)desc.Height,
                 (int)tex->dxgiFormat,
                 cc ? (double)cc[0] : 0.0, cc ? (double)cc[1] : 0.0,
@@ -1891,11 +1898,12 @@ bool endRenderPass(CommandContext* ctx, std::string& err) {
         transitionTextureTo(ctx, ctx->activeDepthTarget, D3D12_RESOURCE_STATE_COMMON);
     }
     // P6 诊断：记录 endRenderPass 前绑定的颜色附件，便于确认渲染目标正确性。
+    // P27：降级为 DBG_LOG_DEBUG（数千次 pass 调用 × 高频写文件拖死主线程）。
     if (ctx->activeColorTargets.size() > 0) {
         for (Dx12Object* tex : ctx->activeColorTargets) {
             if (tex && tex->resource) {
                 auto desc = tex->resource->GetDesc();
-                dbgLog("endRenderPass colorAttach tex=%p dims=%ux%u fmt=%d touched=%d",
+                DBG_LOG_DEBUG("endRenderPass colorAttach tex=%p dims=%ux%u fmt=%d touched=%d",
                     (void*)tex, (UINT)desc.Width, (UINT)desc.Height,
                     (int)tex->dxgiFormat,
                     (int)std::distance(ctx->activeColorTargets.begin(),
@@ -2501,10 +2509,8 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
     D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
     ctx->commandList->IASetPrimitiveTopology(topo);
-    // P6 诊断：dbgLog 双写（stderr + %TEMP%\dx12-native.log）。fprintf 只写
-    // stderr 不进文件（PCL 启动器不捕获原生 stderr），setPipeline 是否被调用
-    // 曾是完全的观测盲区。
-    dbgLog("setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d",
+    // P27：setPipeline 每 draw 调用一次（可上万次/帧），降级为 DEBUG 日志。
+    DBG_LOG_DEBUG("setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d",
         (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth,
         (int)pipeline->topology, (int)topo);
     return true;
@@ -2757,12 +2763,13 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
         passCount = 0;
     }
     passCount++;
+    // P27：drawIndexed 每 draw 一次（重帧上万次），降级为 DEBUG 日志。
     if (indexCount == 0) {
-        dbgLog("drawIndexed[%llu] PASS#%d: ZERO-COUNT (skip) topo=%d",
+        DBG_LOG_DEBUG("drawIndexed[%llu] PASS#%d: ZERO-COUNT (skip) topo=%d",
             (unsigned long long)ctx->fenceValue, passCount,
             (int)(ctx->currentPipeline ? ctx->currentPipeline->topology : -1));
     } else {
-        dbgLog("drawIndexed[%llu] PASS#%d: count=%u inst=%u first=%d base=%d topo=%d",
+        DBG_LOG_DEBUG("drawIndexed[%llu] PASS#%d: count=%u inst=%u first=%d base=%d topo=%d",
             (unsigned long long)ctx->fenceValue, passCount, indexCount, instanceCount,
             startIndexLocation, baseVertexLocation,
             (int)(ctx->currentPipeline ? ctx->currentPipeline->topology : -1));
@@ -2773,7 +2780,7 @@ bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCou
             ctx->activeColorTargetsTouched[i] = true;
     }
     ctx->colorTargetsWritten = true;
-    dbgLog("drawIndexed[%llu] colorTargetsWritten -> %d",
+    DBG_LOG_DEBUG("drawIndexed[%llu] colorTargetsWritten -> %d",
         (unsigned long long)ctx->fenceValue, (int)ctx->colorTargetsWritten);
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount,
         startIndexLocation, baseVertexLocation, startInstanceLocation);
