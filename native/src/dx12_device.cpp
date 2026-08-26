@@ -3234,9 +3234,11 @@ void initBlitPipeline(std::string& err) {
     if (!ensureDevice(err)) return;
     if (gCtx.blitPipeline) return;  // 已初始化
 
+    auto bp = std::make_unique<BlitPipeline>();
+
     ComPtr<ID3D12RootSignature> rootSig;
     {
-        // 两个 descriptor range：SRV(t0), sampler(s0)
+        // 单个 descriptor table：SRV(t0) + static sampler(s0)
         D3D12_DESCRIPTOR_RANGE srvRange{};
         srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRange.NumDescriptors = 1;
@@ -3244,17 +3246,10 @@ void initBlitPipeline(std::string& err) {
         srvRange.RegisterSpace = 0;
         srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        D3D12_DESCRIPTOR_RANGE samRange{};
-        samRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-        samRange.NumDescriptors = 1;
-        samRange.BaseShaderRegister = 0;
-        samRange.RegisterSpace = 0;
-        samRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-        D3D12_DESCRIPTOR_RANGE ranges[] = { srvRange, samRange };
+        D3D12_DESCRIPTOR_RANGE ranges[] = { srvRange };
 
         D3D12_ROOT_DESCRIPTOR_TABLE table{};
-        table.NumDescriptorRanges = 2;
+        table.NumDescriptorRanges = 1;
         table.pDescriptorRanges = ranges;
 
         D3D12_ROOT_PARAMETER param{};
@@ -3406,18 +3401,17 @@ void initBlitPipeline(std::string& err) {
         rd.Flags = D3D12_RESOURCE_FLAG_NONE;
         HRESULT hr = gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
             &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-            IID_PPV_ARGS(&gCtx.blitPipeline->vertBuf));
+            IID_PPV_ARGS(&bp->vertBuf));
         if (FAILED(hr)) { err = "initBlitPipeline: vertBuf create hr=0x" + hrText(hr); return; }
         void* p = nullptr;
-        hr = gCtx.blitPipeline->vertBuf->Map(0, nullptr, &p);
+        hr = bp->vertBuf->Map(0, nullptr, &p);
         if (SUCCEEDED(hr) && p) {
             std::memcpy(p, verts, sizeof(verts));
-            gCtx.blitPipeline->vertBuf->Unmap(0, nullptr);
+            bp->vertBuf->Unmap(0, nullptr);
         }
-        gCtx.blitPipeline->vbView.BufferLocation =
-            gCtx.blitPipeline->vertBuf->GetGPUVirtualAddress();
-        gCtx.blitPipeline->vbView.SizeInBytes = sizeof(verts);
-        gCtx.blitPipeline->vbView.StrideInBytes = sizeof(Vertex);
+        bp->vbView.BufferLocation = bp->vertBuf->GetGPUVirtualAddress();
+        bp->vbView.SizeInBytes = sizeof(verts);
+        bp->vbView.StrideInBytes = sizeof(Vertex);
     }
 
     // 索引缓冲：2 个三角形（顺时针，CullMode=NONE，顺序无关）
@@ -3433,22 +3427,22 @@ void initBlitPipeline(std::string& err) {
         rd.Flags = D3D12_RESOURCE_FLAG_NONE;
         HRESULT hr = gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
             &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-            IID_PPV_ARGS(&gCtx.blitPipeline->idxBuf));
+            IID_PPV_ARGS(&bp->idxBuf));
         if (FAILED(hr)) { err = "initBlitPipeline: idxBuf create hr=0x" + hrText(hr); return; }
         void* p = nullptr;
-        hr = gCtx.blitPipeline->idxBuf->Map(0, nullptr, &p);
+        hr = bp->idxBuf->Map(0, nullptr, &p);
         if (SUCCEEDED(hr) && p) {
             std::memcpy(p, idxs, sizeof(idxs));
-            gCtx.blitPipeline->idxBuf->Unmap(0, nullptr);
+            bp->idxBuf->Unmap(0, nullptr);
         }
-        gCtx.blitPipeline->ibView.BufferLocation =
-            gCtx.blitPipeline->idxBuf->GetGPUVirtualAddress();
-        gCtx.blitPipeline->ibView.SizeInBytes = sizeof(idxs);
-        gCtx.blitPipeline->ibView.Format = DXGI_FORMAT_R16_UINT;
+        bp->ibView.BufferLocation = bp->idxBuf->GetGPUVirtualAddress();
+        bp->ibView.SizeInBytes = sizeof(idxs);
+        bp->ibView.Format = DXGI_FORMAT_R16_UINT;
     }
 
-    gCtx.blitPipeline->rootSig = rootSig;
-    gCtx.blitPipeline->pso = pso;
+    bp->rootSig = rootSig;
+    bp->pso = pso;
+    gCtx.blitPipeline = std::move(bp);
     dbgLog("initBlitPipeline: done rootSig=%p pso=%p",
         (void*)rootSig.Get(), (void*)pso.Get());
 }

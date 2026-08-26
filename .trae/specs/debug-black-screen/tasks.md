@@ -42,6 +42,22 @@
   - [x] 已在 configureSurface 中添加日志（Retry/ok 日志）
   - [ ] 确认窗口尺寸变化时正确调用且无错误
 
+## 第四阶段：修复 Blit 根签名与管线分配（2026-08-26 根因定位）
+
+根因：`D3D12SerializeRootSignature` 每帧返回 E_INVALIDARG（0x80070057），`initBlitPipeline` 设置 err → `blitSurface` 提前 return false → backbuffer 永不被绘制 → 黑屏。
+E_INVALIDARG 原因：根描述符表同时包含 SRV(t0) 与 SAMPLER(s0) 两种类型 range（D3D12 禁止混用），且 table 的 sampler range 与 static sampler(s0) 寄存器冲突。
+
+- [x] Task 4.1: 移除 `initBlitPipeline` 根签名 descriptor table 中的 SAMPLER range，仅保留 SRV(t0)；static sampler(s0) 继续提供采样器
+  - [x] 修改 `dx12_device.cpp` 第 3247-3252 行：删除 `samRange`
+  - [x] `table.NumDescriptorRanges = 1`，`ranges[] = { srvRange }`
+- [x] Task 4.2: 分配 `gCtx.blitPipeline`（dx12_device.h:111 只声明未分配，写 `->vertBuf` 会 null 解引用）
+  - [x] `initBlitPipeline` 内改用本地 `std::unique_ptr<BlitPipeline> bp` 构建全部成员
+  - [x] 成功后 `gCtx.blitPipeline = std::move(bp);`
+- [x] Task 4.3: `blitSurface` 失败路径补 dbgLog（initBlitPipeline / blitBindSourceTexture 失败时输出错误字符串）
+- [x] Task 4.4: 重新编译 native DLL（VS 18 2026），同步 resources/ 与 dx12mod/
+- [x] Task 4.5: 重建 JAR 并部署到 deploy/
+- [ ] Task 4.6: 用户运行游戏，确认日志出现 `blitSurface: set blit rootSig` / `drawIndexed done`，画面不再黑屏
+
 ## 清理与回归
 
 - [ ] 移除所有诊断代码，恢复原有实现

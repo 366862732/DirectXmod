@@ -445,7 +445,10 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         // 确保 blit 管线已初始化（首帧调用时 initBlitPipeline 尚未运行）
         std::string blitErr;
         initBlitPipeline(blitErr);
-        if (!blitErr.empty()) { err = "blitSurface: " + blitErr; return false; }
+        if (!blitErr.empty()) {
+            dbgLog("blitSurface: initBlitPipeline FAILED: %s", blitErr.c_str());
+            err = "blitSurface: " + blitErr; return false;
+        }
         const BlitPipeline* bp = getBlitPipeline();
         cmd->SetGraphicsRootSignature(bp->rootSig.Get());
         cmd->SetPipelineState(bp->pso.Get());
@@ -453,7 +456,10 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
             (void*)bp->rootSig.Get(), (void*)bp->pso.Get());
 
         // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
-        if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) return false;
+        if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) {
+            dbgLog("blitSurface: blitBindSourceTexture FAILED: %s", err.c_str());
+            return false;
+        }
 
         // 5. 绑定顶点/索引缓冲并绘制
         cmd->IASetVertexBuffers(0, 1, &bp->vbView);
