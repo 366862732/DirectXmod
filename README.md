@@ -9,7 +9,7 @@
 
 ### 核心特点
 
-- **Mixin 注入**：7 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载全链路诊断（见 [Mixin 注入点](#mixin-注入点)）
+- **Mixin 注入**：9 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载/世界加载全链路诊断（见 [Mixin 注入点](#mixin-注入点)）
 - **官方 GpuBackend 接口**：完整实现 `GpuBackend` / `GpuDeviceBackend` / `CommandEncoderBackend` / `RenderPassBackend` / `GpuSurfaceBackend` 等官方接口
 - **零自定义渲染循环**：不复写 `RenderSystem`，完全接管 Minecraft 官方的渲染流程
 - **Shaderc + Spvc 编译链**：GLSL → SPIR-V（shaderc）→ HLSL SM5.1（spvc）→ DXBC（D3DCompile）
@@ -18,7 +18,7 @@
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
 
-### 当前阶段：P0-P22 全部完成，BUG-01 语义名修复，描述符绑定修复，黑屏根因（level=null）诊断中（2026-08-23）
+### 当前阶段：P0-P22 全部完成，BUG-01 语义名修复，描述符绑定修复，黑屏根因（level=null）诊断中（2026-08-26）
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -58,20 +58,22 @@ dx12-lib-template-26.1.2/
 │   │   │   ├── MinecraftRunDebugMixin.java             # P19: Minecraft.run() 入口诊断
 │   │   │   ├── MinecraftRunTickDebugMixin.java         # P19: runTick 每帧 level/gameLoadFinished/pause
 │   │   │   ├── MinecraftSetLevelDebugMixin.java        # P19: setLevel() 调用诊断
-│   │   │   └── MinecraftResourceLoadDebugMixin.java    # P19: onResourceLoadFinished/onGameLoadFinished
+│   │   │   ├── MinecraftResourceLoadDebugMixin.java    # P19: onResourceLoadFinished/onGameLoadFinished
+│   │   │   ├── MinecraftDoWorldLoadDebugMixin.java     # P0: doWorldLoad() 入口诊断
+│   │   │   └── ClientPacketListenerLoginDebugMixin.java  # P0: handleLogin() 登录包诊断
 │   │   └── dx12/                    # D3D12 后端核心实现（镜像官方 Vulkan 后端）
-│   │       ├── Dx12Native.java               # JNI 桥接层（66 native 方法，335 行）
-│   │       ├── Dx12Backend.java              # GpuBackend 实现：窗口/设备创建 + 4 轮自测
-│   │       ├── Dx12Device.java               # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存
-│   │       ├── Dx12ShaderCompiler.java       # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，760 行）
-│   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息（spvc 语义注入，355 行）
+│   │       ├── Dx12Native.java               # JNI 桥接层（60 native 方法，318 行）
+│   │       ├── Dx12Backend.java              # GpuBackend 实现：窗口/设备创建 + 4 轮自测（361 行）
+│   │       ├── Dx12Device.java               # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存（519 行）
+│   │       ├── Dx12ShaderCompiler.java       # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，246 行）
+│   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息（spvc 语义注入，337 行）
 │   │       ├── Dx12CompiledShader.java       # 编译产物（HLSL 源码 + 绑定列表）
 │   │       ├── Dx12CompiledRenderPipeline.java  # 编译后的渲染管线
 │   │       ├── Dx12BindGroupEntry.java       # 管线绑定条目（UBO/SRV/TexelBuffer）
-│   │       ├── Dx12GpuSurface.java           # DXGI swapchain（P5+P17，130 行）
-│   │       ├── Dx12CommandEncoderBackend.java    # 命令编码层（P3，342 行）
-│   │       ├── Dx12RenderPassBackend.java        # 渲染通道层（P6+P17，393 行）
-│   │       ├── Dx12TransientMemory.java          # 瞬时内存管理（per-frame 缓冲回收，209 行）
+│   │       ├── Dx12GpuSurface.java           # DXGI swapchain（P5+P17，144 行）
+│   │       ├── Dx12CommandEncoderBackend.java    # 命令编码层（P3，313 行）
+│   │       ├── Dx12RenderPassBackend.java        # 渲染通道层（P6+P17，432 行）
+│   │       ├── Dx12TransientMemory.java          # 瞬时内存管理（per-frame 缓冲回收，238 行）
 │   │       ├── Dx12GpuTexture.java             # D3D12 纹理资源包装（view 引用计数，68 行）
 │   │       ├── Dx12GpuTextureView.java         # D3D12 纹理视图（SRV，延迟销毁，43 行）
 │   │       ├── Dx12GpuBuffer.java              # D3D12 缓冲区资源包装（61 行）
@@ -86,7 +88,7 @@ dx12-lib-template-26.1.2/
 │   │   └── Dx12DeviceTest.java           # 单元测试（渲染循环验证）
 │   ├── src/main/resources/
 │   │   ├── fabric.mod.json           # Fabric 模组描述（client + modmenu entrypoints）
-│   │   ├── gl4dx12.mixins.json       # Mixin 配置（7 个 mixin）
+│   │   ├── gl4dx12.mixins.json       # Mixin 配置（9 个 mixin）
 │   │   ├── dx12_mc.dll               # 原生 DLL（从 JAR 提取，运行时替换到 {user.dir}）
 │   │   └── assets/dx12mod/icon.png   # 模组图标（16x16）
 │   ├── libs/
@@ -95,9 +97,9 @@ dx12-lib-template-26.1.2/
 │   └── gradle.properties             # 版本参数
 ├── native/                          # D3D12 原生层（C++17，MSVC + CMake）
 │   ├── src/
-│   │   ├── dx12_device.cpp           # D3D12 设备/资源/命令/管线/Draw（~3000 行）
-│   │   ├── dx12_device.h             # 公共头文件（460 行，定义 DeviceContext/CommandContext 等）
-│   │   ├── dx12_surface.cpp          # DXGI swapchain + blit + present + 读回诊断（~470 行）
+│   │   ├── dx12_device.cpp           # D3D12 设备/资源/命令/管线/Draw（3067 行）
+│   │   ├── dx12_device.h             # 公共头文件（347 行，定义 DeviceContext/CommandContext 等）
+│   │   ├── dx12_surface.cpp          # DXGI swapchain + blit + present + 读回诊断（551 行）
 │   │   ├── jni_bridge.cpp            # JNI 入口（112 行）
 │   │   ├── jni_bridge_p3.cpp         # P3 命令层 native（293 行）
 │   │   ├── jni_bridge_p4.cpp         # P4 管线编译 native（168 行）
@@ -181,7 +183,7 @@ Dx12CompiledRenderPipeline (handle ≠ 0 表示成功)
 
 ### Mixin 注入点
 
-7 个 Mixin 覆盖从 API 选择到世界加载的完整诊断链路：
+9 个 Mixin 覆盖从 API 选择到世界加载的完整诊断链路：
 
 ```java
 // PreferredGraphicsApiMixin.java — 强制 D3D12 为首选
@@ -210,6 +212,12 @@ public abstract class PreferredGraphicsApiMixin {
 
 // MinecraftResourceLoadDebugMixin.java — P19: 资源加载完成
 //   inject: onResourceLoadFinished/onGameLoadFinished → 确认游戏加载流程
+
+// MinecraftDoWorldLoadDebugMixin.java — P0: 世界加载入口
+//   inject: Minecraft.doWorldLoad() HEAD → 确认世界加载路径是否进入（黑屏根因排查）
+
+// ClientPacketListenerLoginDebugMixin.java — P0: 登录包接收
+//   inject: ClientPacketListener.handleLogin() HEAD → 确认服务端登录包是否到达（黑屏根因排查）
 ```
 
 Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Backend`。
