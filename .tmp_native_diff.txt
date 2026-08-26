@@ -1,0 +1,1 @@
+﻿     ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler锛圫HADER_VISIBLE锛?     ComPtr<ID3D12DescriptorHeap> drawHeap;     // P6锛氭瘡甯х灛鏃?CBV/SRV 鎻忚堪绗︼紙SHADER_VISIBLE锛宺ing x2锛?

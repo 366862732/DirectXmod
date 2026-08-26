@@ -54,7 +54,8 @@ void flushPendingDeletes() {
 
 // 描述符堆槽位分配（P2 简单递增；P3 渲染层再做槽位回收）
 UINT gNextSrv = 0;
-UINT gNextRtv = 0;
+UINT gNextRtv = 0;        // 持久 RTV 槽位（surface backbuffer 用，不随帧清零）
+UINT gNextFrameRtv = 0;   // P24：帧级瞬态 RTV 槽位（beginRenderPass/clearColorTexture）
 UINT gNextDsv = 0;
 UINT gNextSampler = 0;
 
@@ -67,6 +68,9 @@ UINT gNextSampler = 0;
 // 覆盖长期会话的泄漏兜底。
 constexpr UINT kSrvHeapSize = 65536;
 constexpr UINT kRtvHeapSize = 2048;
+// P24：帧级瞬态 RTV 堆容量。单帧 render pass 附件 + clear 数量远小于 256；
+// 每帧从 0 复用（submit 阻塞等待 GPU 完成，CPU 侧重写描述符安全）。
+constexpr UINT kFrameRtvHeapSize = 256;
 constexpr UINT kDsvHeapSize = 256;
 // 注意：D3D12 对 SAMPLER 描述符堆有硬上限 2048（所有 feature level），
 // 扩到此值即为最大；再大 CreateDescriptorHeap 直接失败（曾设为 4096 导致
@@ -308,7 +312,7 @@ bool ensureDevice(std::string& errorOut) {
     // null，此 guard 若只看 device 会短路返回 true，后续 createSampler/
     // createTextureView 解引用 null 堆 → 原生 AV。堆全建成功才视为初始化完成。
     if (gCtx.device && gCtx.srvHeap && gCtx.srvCpuHeap && gCtx.rtvHeap &&
-        gCtx.dsvHeap && gCtx.samplerHeap && gCtx.drawHeap) return true;
+        gCtx.frameRtvHeap && gCtx.dsvHeap && gCtx.samplerHeap && gCtx.drawHeap) return true;
 
     // 诊断：先启用 D3D12 调试层（Win10/11 自带；失败则无调试层继续）。
     // 启用后非法 API 调用 / 描述符越界等会写入 InfoQueue，设备移除时可读回定位。
@@ -388,6 +392,9 @@ bool ensureDevice(std::string& errorOut) {
             kSrvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.srvCpuHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
             kRtvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.rtvHeap) ||
+        // P24：帧级瞬态 RTV 专用堆（与 backbuffer 持久 RTV 分离，见 beginRenderPass）
+        !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            kFrameRtvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.frameRtvHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
             kDsvHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.dsvHeap) ||
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
@@ -556,17 +563,17 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
     }
 }
 
-// 顶点输入布局格式：RGB32_* 用精确三分量格式（DXGI 仅对 32 位三分量提供
-// R32G32B32_* 输入格式；纹理用途的 toDxgiFormat 会把 RGB32 加宽成 RGBA32，
-// 但输入布局加宽会导致与 shader 语义分量数不匹配，PSO 创建失败）。
-//
-// 注意：R32G32B32_FLOAT/UINT/SINT 在 D3D12 中不是合法的顶点输入格式，
-// 必须回退到 R32G32B32A32_* 变体。shader 使用 .xyz 提取三个分量，.w 忽略。
+// 顶点输入布局格式：RGB32_* 使用精确三分量格式。
+// R32G32B32_FLOAT/UINT/SINT 在 D3D11/D3D12 中都是合法的顶点输入格式
+// （仅不能用于纹理/RT 采样）。P25 fix：此前把 RGB32_FLOAT 加宽成 RGBA32_FLOAT，
+// 导致 POSITION 元素吃掉 16 字节（offset0-15），与 offset=12 的 TEXCOORD 重叠，
+// position.w 读到 TEXCOORD/未初始化内存 → NaN → 齐次裁剪丢弃全部三角形 → 黑屏。
+// 用精确三分量后 D3D12 自动为 HLSL float4 语义补 w=1.0。
 DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
     switch (gpuFormat) {
-        case 36: return DXGI_FORMAT_R32G32B32A32_UINT;    // RGB32_UINT → RGBA32_UINT
-        case 37: return DXGI_FORMAT_R32G32B32A32_SINT;    // RGB32_SINT → RGBA32_SINT
-        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT;   // RGB32_FLOAT → RGBA32_FLOAT
+        case 36: return DXGI_FORMAT_R32G32B32_UINT;     // RGB32_UINT
+        case 37: return DXGI_FORMAT_R32G32B32_SINT;     // RGB32_SINT
+        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT
         default: return toDxgiFormat(gpuFormat);
     }
 }
@@ -1228,7 +1235,10 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     ctx->nextDrawSlot = 0;
     // RTV/DSV 是 CPU-only 描述符堆：命令列表提交时驱动已捕获描述符内容，
     // 双 allocator + value-2 完成等待保证旧命令已结束，可每帧从 0 复用。
-    gNextRtv = 0;
+    // P24：仅帧级瞬态堆（frameRtvHeap/dsvHeap）每帧清零；rtvHeap 上的
+    // backbuffer RTV 由 allocRtvHandle 持久分配，绝不能覆盖（曾致 blit 把
+    // 颜色纹理当 RT 绑定 → 黑屏）。
+    gNextFrameRtv = 0;
     gNextDsv = 0;
     ID3D12DescriptorHeap* drawHeaps[] = { gCtx.drawHeap.Get() };
     ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
@@ -1554,10 +1564,11 @@ bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     if (!(tex->usage & 8)) {  // RENDER_ATTACHMENT
         err = "clearColorTexture: texture lacks RENDER_ATTACHMENT"; return false;
     }
-    if (gNextRtv >= kRtvHeapSize) { err = "clearColorTexture: rtv heap exhausted"; return false; }
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextRtv * gCtx.rtvInc;
-    ++gNextRtv;
+    // P24：帧级瞬态 RTV（frameRtvHeap），每帧从 0 复用，不与 backbuffer RTV 冲突。
+    if (gNextFrameRtv >= kFrameRtvHeapSize) { err = "clearColorTexture: frame rtv heap exhausted"; return false; }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
+    ++gNextFrameRtv;
     gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = { r, g, b, a };
@@ -1777,10 +1788,13 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         if (tex->kind != Dx12Object::Kind::Texture || !(tex->usage & 8)) {
             err = "beginRenderPass: invalid color attachment (needs RENDER_ATTACHMENT)"; return false;
         }
-        if (gNextRtv >= kRtvHeapSize) { err = "beginRenderPass: rtv heap exhausted"; return false; }
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += (SIZE_T)gNextRtv * gCtx.rtvInc;
-        ++gNextRtv;
+        // P24：帧级瞬态 RTV（frameRtvHeap），每帧从 0 复用，不与 backbuffer RTV
+        // 冲突。此前共用 rtvHeap + gNextRtv 导致每帧覆盖 surface 的 backbuffer RTV，
+        // blit 的 OMSetRenderTargets 绑到颜色纹理 → 资源状态 0xC0 错误 → 黑屏。
+        if (gNextFrameRtv >= kFrameRtvHeapSize) { err = "beginRenderPass: frame rtv heap exhausted"; return false; }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
+        ++gNextFrameRtv;
         gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
         rtvs.push_back(cpu);
         ctx->activeColorTargets.push_back(tex);
@@ -3072,8 +3086,11 @@ void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const ch
     void* ptr = nullptr;
     ID3D12Resource* unmapRes = nullptr;
     if (buf->heapType == D3D12_HEAP_TYPE_UPLOAD) {
-        // UPLOAD：CPU 已写可见，直接 Map 读。
-        if (FAILED(buf->resource->Map(0, nullptr, &ptr))) return;
+        // UPLOAD：CPU 已写可见，直接 Map 读。P26 fix：必须带 offset 的 D3D12_RANGE，
+        // 否则 Map 返回的指针恒指向缓冲区基址，offset>0 时读到错误位置
+        // （日志 rbBuf[ubo] off=256 读到 base 内容 → 误判 UBO 为垃圾）。
+        D3D12_RANGE range{ (SIZE_T)offset, (SIZE_T)(offset + len) };
+        if (FAILED(buf->resource->Map(0, &range, &ptr))) return;
         unmapRes = buf->resource.Get();
     } else {
         std::string err;
@@ -3221,11 +3238,13 @@ static const char kBlitVS[] =
     "}\n";
 
 // PS: 对源纹理线性采样，输出到 backbuffer；GPU 光栅器自动处理格式转换。
+// 注意：'sampler' 是 HLSL 保留字，不能作变量名；PS 单独编译，须自带 VS_OUT 定义。
 static const char kBlitPS[] =
+    "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float4> srcTex : register(t0, space0);\n"
-    "SamplerState sampler : register(s0, space0);\n"
+    "SamplerState blitSampler : register(s0, space0);\n"
     "float4 main(VS_OUT IN) : SV_Target {\n"
-    "    return srcTex.Sample(sampler, IN.tc);\n"
+    "    return srcTex.Sample(blitSampler, IN.tc);\n"
     "}\n";
 
 }  // namespace
@@ -3364,6 +3383,8 @@ void initBlitPipeline(std::string& err) {
         psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;  // 匹配 backbuffer
         psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
         psoDesc.SampleDesc.Count = 1;
+        psoDesc.SampleMask = UINT_MAX;   // P25 fix：漏设 SampleMask → 0 → sample-mask 测试
+                                          // 丢弃所有片元（dx12-native.log 632 行 WARNING）
         psoDesc.BlendState = blendDesc;
         psoDesc.RasterizerState = rasterDesc;
         psoDesc.DepthStencilState = dsDesc;
@@ -3462,17 +3483,21 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
         | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    // 在 srvHeap 分配 SRV 槽位并创建描述符。
-    std::string srvErr;
-    int srvSlot = allocSrvSlot(srvErr);
-    if (srvSlot < 0) {
-        err = "blitBindSourceTexture: allocSrvSlot failed: " + srvErr;
+    // P24 fix（黑屏根因之一）：SRV 必须写入命令列表当前设置的堆。
+    // 此前在 srvHeap 分配 SRV 并直接 SetGraphicsRootDescriptorTable，但
+    // beginCommandList 只 SetDescriptorHeaps({drawHeap}) → 每帧验证错误
+    // "descriptor heap containing handle is different from currently set
+    // descriptor heap"（dx12-native.log 658 行），根表绑定无效。
+    // 改为复用 pushDescriptors 的机制：把 SRV 写到本帧 drawHeap 瞬态槽位，
+    // root table 绑定该槽位的 GPU 句柄（与命令列表当前堆一致）。
+    if (ctx->nextDrawSlot + 1 > kDrawHeapPerFrame) {
+        err = "blitBindSourceTexture: draw descriptor heap exhausted for this frame";
         return false;
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = gCtx.srvCpuHeap->GetCPUDescriptorHandleForHeapStart();
-    srvCpu.ptr += (SIZE_T)srvSlot * gCtx.srvInc;
-    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = gCtx.srvHeap->GetGPUDescriptorHandleForHeapStart();
-    srvGpu.ptr += (SIZE_T)srvSlot * gCtx.srvInc;
+    SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr += base;
+    ctx->nextDrawSlot += 1;
 
     DXGI_FORMAT viewFmt = srcTex->resource->GetDesc().Format;
     switch (viewFmt) {
@@ -3487,13 +3512,13 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     srvDesc.Texture2D.MipLevels = 1;
     srvDesc.Texture2D.MostDetailedMip = 0;
     gCtx.device->CreateShaderResourceView(srcTex->resource.Get(), &srvDesc, srvCpu);
-    // srvHeap 是 SHADER_VISIBLE 堆，CPU handle 与 GPU handle 指向同一描述符；
-    // CreateShaderResourceView 只接受 CPU 句柄。
 
-    // 绑定根描述符表（Offset=APPEND → 自动使用 srvGpu）。
+    // 绑定根描述符表（表 0 = blit 的 SRV；drawHeap 已是命令列表当前设置的堆）。
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
+    srvGpu.ptr += base;
     cmd->SetGraphicsRootDescriptorTable(0, srvGpu);
-    dbgLog("blitBindSourceTexture: srvSlot=%d srvGpu=%llx",
-        srvSlot, (unsigned long long)srvGpu.ptr);
+    dbgLog("blitBindSourceTexture: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
+        ctx->drawHeapSlotBase, ctx->nextDrawSlot, (unsigned long long)srvGpu.ptr);
     return true;
 }
 

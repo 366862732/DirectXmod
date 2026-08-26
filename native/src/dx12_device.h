@@ -75,7 +75,11 @@ struct DeviceContext {
     // 的源必须是 CPU-only 堆——texture view 的 cpuHandle 指向这里（供
     // pushDescriptors 复制到 drawHeap），srvHeap 的 GPU 句柄仍供直接绑定用。
     ComPtr<ID3D12DescriptorHeap> srvCpuHeap;
-    ComPtr<ID3D12DescriptorHeap> rtvHeap;      // RTV
+    ComPtr<ID3D12DescriptorHeap> rtvHeap;      // RTV（持久：surface backbuffer RTV）
+    // P24 fix：帧级瞬态 RTV 专用堆。beginRenderPass/clearColorTexture 每帧从
+    // 0 号槽复用，避免覆盖 rtvHeap 上持久化的 backbuffer RTV——曾致 blit 把
+    // 颜色纹理当 RT 绑定（资源状态 0xC0 不是 RENDER_TARGET）→ 全程黑屏。
+    ComPtr<ID3D12DescriptorHeap> frameRtvHeap; // 帧级瞬态 RTV（每帧从 0 复用）
     ComPtr<ID3D12DescriptorHeap> dsvHeap;      // DSV
     ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler（SHADER_VISIBLE）
     ComPtr<ID3D12DescriptorHeap> drawHeap;     // P6：每帧瞬时 CBV/SRV 描述符（SHADER_VISIBLE，ring x2）

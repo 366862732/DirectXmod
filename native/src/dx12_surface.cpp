@@ -406,16 +406,15 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     backToPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     cmd->ResourceBarrier(1, &backToPresent);
 #else
-    // srcTex 为 null 时（纯状态转换路径）：只做 COMMON↔COPY_DEST barrier，
-    // 不拷贝内容。用于 self-test / render loop 自检，验证 backbuffer 通路可用。
+    // srcTex 为 null 时（首次/自检路径）：backbuffer 内容未定义（驱动常显示
+    // 红/杂色），用纯黑 clear 兜底避免启动红屏，再回切 PRESENT。
     if (!srcTex) {
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        cmd->ResourceBarrier(1, &barrier);
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        cmd->ResourceBarrier(1, &barrier);
-        dbgLog("blitSurface: srcTex=null — no-copy pass-through");
+        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
+        float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        cmd->ClearRenderTargetView(rtv, black, 0, nullptr);
+        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        dbgLog("blitSurface: srcTex=null — clear backbuffer to black");
         return true;
     }
 

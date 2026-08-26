@@ -3,6 +3,7 @@ package com.dx12.dx12;
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 
@@ -41,6 +42,12 @@ public class Dx12GpuBuffer extends GpuBuffer {
         if (data == null) {
             throw new IllegalStateException("dx12MapBuffer returned null");
         }
+        // P26 fix：NewDirectByteBuffer 默认 BIG_ENDIAN，而 D3D12 期望小端字节序。
+        // MC 的 DynamicUniformStorage.writeUniform 通过 Std140Builder.putFloat 写入
+        // 该 buffer，若不加显式小端，UBO 内容会以 BIG_ENDIAN 写入（日志 rbBuf[ubo]
+        // 读到 hex=[3F 80 00 00] 即大端 1.0f），HLSL 按小端读取后矩阵全垃圾，
+        // 顶点被变换到裁剪区外 → colorTex 全黑。这里统一强制 LITTLE_ENDIAN。
+        data.order(ByteOrder.LITTLE_ENDIAN);
         return new GpuBufferSlice.MappedView(this.slice(offset, length), data,
             () -> Dx12Native.dx12UnmapBuffer(this.handle));
     }

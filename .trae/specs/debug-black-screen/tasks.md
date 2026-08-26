@@ -56,7 +56,41 @@ E_INVALIDARG 原因：根描述符表同时包含 SRV(t0) 与 SAMPLER(s0) 两种
 - [x] Task 4.3: `blitSurface` 失败路径补 dbgLog（initBlitPipeline / blitBindSourceTexture 失败时输出错误字符串）
 - [x] Task 4.4: 重新编译 native DLL（VS 18 2026），同步 resources/ 与 dx12mod/
 - [x] Task 4.5: 重建 JAR 并部署到 deploy/
-- [ ] Task 4.6: 用户运行游戏，确认日志出现 `blitSurface: set blit rootSig` / `drawIndexed done`，画面不再黑屏
+- [x] Task 4.6: 用户运行游戏，确认日志出现 `blitSurface: set blit rootSig` / `drawIndexed done`，画面不再黑屏
+  - 注：blit 链路已打通（drawIndexed done 出现），但画面仍黑 → 进入第五阶段
+
+## 第五阶段：描述符堆/资源状态修复（P24，2026-08-26 黑屏直接根因）
+
+根因（dx12-native.log 658/659 行两类每帧 D3D12 验证 ERROR + 代码交叉验证）：
+
+1. **Bug B（黑屏直接根因）——backbuffer RTV 被每帧覆盖**：`configureSurface` 调 `allocRtvHandle` 从 `rtvHeap` 槽 0 起创建 backbuffer RTV（存 `s->rtvHandles`）；`beginCommandList` 每帧 `gNextRtv = 0`；`beginRenderPass`/`clearColorTexture` 从槽 0 起分配瞬态 RTV → 覆盖 backbuffer RTV → blit 的 `OMSetRenderTargets(s->rtvHandles[idx])` 实际绑到本帧颜色纹理 → 验证错误 "Resource state (0xC0) is invalid for use as a render target"（659 行）→ 场景画进颜色纹理，真实 backbuffer 从未被写入 → 窗口全程黑。
+2. **Bug A（伴生）——blit SRV 堆未设置**：`blitBindSourceTexture` 在 `srvHeap` 分配 SRV 并直接绑根表，但 `beginCommandList` 只 `SetDescriptorHeaps({drawHeap})` → 每帧 "descriptor heap containing handle is different from currently set descriptor heap"（658 行），根表绑定无效。
+
+修复：
+
+- [x] Task 5.1: 新增帧级瞬态 RTV 堆 `gCtx.frameRtvHeap`（kFrameRtvHeapSize=256）
+  - [x] `dx12_device.h` DeviceContext 新增 `frameRtvHeap` 成员
+  - [x] `dx12_device.cpp` 新增 `gNextFrameRtv` 计数 + `kFrameRtvHeapSize` 常量
+  - [x] `ensureDevice` 守卫 + 创建堆
+- [x] Task 5.2: `beginCommandList` 不再清零 `gNextRtv`，改清零 `gNextFrameRtv`（backbuffer RTV 持久保留）
+- [x] Task 5.3: `beginRenderPass`/`clearColorTexture` 改从 `frameRtvHeap` + `gNextFrameRtv` 分配瞬态 RTV
+- [x] Task 5.4: `blitBindSourceTexture` 的 SRV 改写入当前命令列表 drawHeap 瞬态槽位（复用 `ctx->drawHeapSlotBase + ctx->nextDrawSlot`），root table 绑定 drawHeap GPU 句柄
+- [x] Task 5.5: native 重新编译通过（零 error）
+- [x] Task 5.6: 用户部署后确认日志不再出现 `InfoQueue[ERROR]`（658/659 行两类），P24 两类 ERROR 均已消失（新日志验证）
+
+## 第六阶段：blit SampleMask + 顶点格式修复（P25，2026-08-26 第六轮黑屏根因）
+
+第六轮日志（dx12-native.log）确认 P24 生效（两类 ERROR 消失、rtv 句柄稳定），但画面仍黑。新增两条铁证：
+
+1. **Bug C（blit 不写 backbuffer）**：`dx12-native.log` 632 行
+   `InfoQueue[WARNING] ID3D12Device::CreateGraphicsPipelineState: Sample Mask is 0, preventing blend operations for all samples.`
+   → `initBlitPipeline` 的 PSO desc 漏设 `SampleMask`（零初始化 = 0）→ blit 全屏四边形所有片元被 sample-mask 测试丢弃 → backbuffer 永不被写入 → 黑屏。
+   - [x] Task 6.1: `initBlitPipeline` 的 psoDesc 补 `psoDesc.SampleMask = UINT_MAX;`（场景管线 buildPso 早已正确设置）
+2. **Bug D（场景纹理全黑）**：`游戏日志` copyBuf 1639 行 GUI 顶点数据每个顶点 `w=-nan`（`98.00 202.00 0.00 -nan`）→ 齐次除法 NaN → 三角形全被裁剪 → colorTex 只有 clear 值。
+   根因：`toDxgiVertexFormat` 把 `RGB32_FLOAT`(46) 展开为 `R32G32B32A32_FLOAT`(16B)，而 MC GUI 顶点实际 stride=16（pos.xyz 12B + 附加 4B），TEXCOORD offset=12 与 POSITION.w 重叠 → POSITION 读到 TEXCOORD/未初始化内存（NaN）。`R32G32B32_FLOAT` 本就是合法 D3D12 顶点输入格式（`dxgiByteSize` 已支持 12B）。
+   - [x] Task 6.2: `toDxgiVertexFormat` 改为精确三分量（46→R32G32B32_FLOAT，36→R32G32B32_UINT，37→R32G32B32_SINT），修正错误注释。D3D12 自动为 HLSL float4 语义补 w=1.0；correctedStride 计算（12+4=16、12+8+4=24）不受影响
+- [x] Task 6.3: native 重新编译通过（零 error）
+- [ ] Task 6.4: 用户部署后验证：日志不再出现 `Sample Mask is 0` WARNING；场景 readback 非黑；画面正常显示
 
 ## 清理与回归
 
