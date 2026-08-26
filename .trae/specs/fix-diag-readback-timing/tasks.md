@@ -21,8 +21,16 @@
   - [x] 修复：`GpuBuffer.USAGE_COPY_DST` → `GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_COPY_SRC`
   - [x] 重新构建 JAR 并部署
 
+- [x] Task 6: 修复 native NaN 清洗导致的数据损坏（真正的 mismatch 根因）
+  - [x] 二次运行日志确认：USAGE 修复后字节 0-251 拷贝正确，但 252 仍 mismatch——定位到 native `copyBufferToBuffer` 的 P23 NaN 清洗块
+  - [x] 根因：self-test 数据 `(i & 0xFF)` 在字节 252-255 = 0xFC,0xFD,0xFE,0xFF，按小端 float 读恰为 NaN；P23 块把 NaN 改写为 0.0f → 拷贝后 252-255 变全零 → readback mismatch
+  - [x] 修复：P23 块改为「只检测不修改」（`dbgLogDebug` 输出，默认静默），拷贝保持字节精确
+  - [x] Java `checkForNanInfinity` 改为进程内仅提示一次、去掉 `Thread.dumpStack()`，避免合法字节模式误报刷屏
+  - [x] native 重新编译（VS 18 2026 generator），DLL 203264 bytes 部署到 resources/ 与 dx12mod/
+  - [x] JAR 重建（1273763 bytes）并部署到 deploy/，内嵌 DLL 验证 = 203264 bytes
+
 - [ ] Task 4: 验证修复效果
-  - [ ] 确认 self-test 全部通过（resource + command layer + pipeline + surface）
+  - [ ] 确认 self-test 全部通过（resource + command layer + pipeline + surface），不再回退 GL
   - [ ] 确认 splash 阶段渲染画面正常
   - [ ] 确认无 D3D12 validation errors
 
@@ -33,5 +41,6 @@
 # Task Dependencies
 - Task 2 depends on Task 1
 - Task 3 独立（可同时完成）
-- Task 4 depends on Task 2 + Task 3
+- Task 6 独立（定位到与 Task 3 不同的根因）
+- Task 4 depends on Task 2 + Task 3 + Task 6
 - Task 5 depends on Task 4

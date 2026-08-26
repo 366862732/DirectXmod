@@ -198,8 +198,12 @@ public class Dx12TransientMemory implements TransientMemory {
     /**
      * 检查所有 input buffers 的 float 值是否含 NaN 或 Infinity。
      * 在上传到 GPU 之前调用，定位污染源。
+     *
+     * <p>注意：某些合法数据（如 self-test 的 0xFC,0xFD,0xFE,0xFF 字节模式）按
+     * float 读恰为 NaN，因此这里仅提示一次，避免逐帧刷屏，也不应阻断上传。
      */
     private static void checkForNanInfinity(List<ByteBuffer> data, String method) {
+        if (nanWarned) return;
         for (int bi = 0; bi < data.size(); bi++) {
             ByteBuffer buf = data.get(bi);
             if (buf.remaining() < 4) continue;
@@ -208,31 +212,19 @@ public class Dx12TransientMemory implements TransientMemory {
             while (fb.hasRemaining()) {
                 float v = fb.get();
                 if (Float.isNaN(v) || Float.isInfinite(v)) {
-                    System.err.printf("[dx12-java] NaN/Inf detected in %s: buffer[%d] floatIdx=%d value=%s%n",
+                    System.err.printf("[dx12-java] NaN/Inf detected in %s: buffer[%d] floatIdx=%d value=%s (数据未修改；仅提示一次)%n",
                         method, bi, fb.position() - 1,
                         Float.isNaN(v) ? "NaN" : "Infinity");
                     System.err.flush();
-                    // 打印周围几个 float 帮助定位
-                    int savedPos = fb.position();
-                    int start = Math.max(0, savedPos - 4);
-                    int end = Math.min(fb.capacity(), savedPos + 4);
-                    fb.position(start);
-                    StringBuilder sb = new StringBuilder("  context: ");
-                    for (int i = start; i < end; i++) {
-                        if (i > start) sb.append(',');
-                        float fv = fb.get();
-                        sb.append(Float.isNaN(fv) ? "NaN" : String.format("%.4f", fv));
-                    }
-                    System.err.println(sb);
-                    System.err.flush();
-                    // 打印调用栈，定位污染源
-                    Thread.dumpStack();
-                    fb.position(savedPos);
+                    nanWarned = true;
                     return; // 只报一次
                 }
             }
         }
     }
+
+    /** 进程内仅提示一次，避免合法字节模式（如 0xFC..0xFF）被反复误报刷屏。 */
+    private static boolean nanWarned = false;
 
     /**
      * Called by the encoder on every {@code submit()}: retire this frame's

@@ -1501,23 +1501,22 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
         srcOffset + size > src->size || dstOffset + size > dst->size) {
         err = "copyBufferToBuffer: range out of bounds"; return false;
     }
-    // P23：UPLOAD heap staging buffer 可能含 NaN（BufferBuilder position.w 未初始化）。
-    // 在 transition/copy 之前先 map 并清零，确保 GPU 拿到的是干净数据。
-    int nanCount = 0;
+    // P23 诊断：UPLOAD heap staging buffer 可能含 NaN（BufferBuilder position.w 未初始化）。
+    // 注意：拷贝操作必须保持字节精确，绝不能改写源数据——字节模式可能恰好构成 NaN 位形
+    // （例如 0xFC,0xFD,0xFE,0xFF 按小端 float 读即 NaN），改写会导致数据静默损坏
+    // （曾导致 self-test readback mismatch at 252）。这里只统计并记录，不做任何修改。
     if (src->heapType == D3D12_HEAP_TYPE_UPLOAD && size >= 16) {
         void* ptr = nullptr;
         if (SUCCEEDED(src->resource->Map(0, nullptr, &ptr))) {
-            float* f = (float*)((uint8_t*)ptr + srcOffset);
+            const float* f = (const float*)((const uint8_t*)ptr + srcOffset);
             int n = std::min((int)(size / 4), 256);  // 最多检查前 256 个 float
+            int nanCount = 0;
             for (int i = 0; i < n; ++i) {
-                if (std::isnan(f[i]) || std::isinf(f[i])) {
-                    f[i] = 0.0f;
-                    ++nanCount;
-                }
+                if (std::isnan(f[i]) || std::isinf(f[i])) ++nanCount;
             }
             src->resource->Unmap(0, nullptr);
             if (nanCount > 0) {
-                dbgLog("copyBuf: SANITIZED %d NaN/Inf in UPLOAD src=%p off=%lld size=%lld",
+                dbgLogDebug("copyBuf: DETECTED %d NaN/Inf in UPLOAD src=%p off=%lld size=%lld (not modified)",
                     nanCount, (void*)src, (long long)srcOffset, (long long)size);
             }
         }
