@@ -2181,9 +2181,30 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         ie.SemanticName = semanticStore.back().c_str();
         ie.SemanticIndex = semanticIndex;
         ie.Format = toDxgiVertexFormat(el.format);
-        // P26 debug: 打印 format ordinal -> DXGI enum 映射，确认 case 46 分支生效
-        std::fprintf(stderr, "[dx12] DIAG vertex: ord=%d -> dxgi_fmt=%u semantic=%s\n",
-            el.format, (unsigned)ie.Format, ie.SemanticName);
+        // P26 debug: 打印 format ordinal -> DXGI enum + 字符串名
+        auto dxgiFmtName = [](DXGI_FORMAT f) -> const char* {
+            switch(f) {
+                case DXGI_FORMAT_R8_UNORM:            return "R8_UNORM";
+                case DXGI_FORMAT_R8_SNORM:            return "R8_SNORM";
+                case DXGI_FORMAT_R8G8_UNORM:          return "R8G8_UNORM";
+                case DXGI_FORMAT_R8G8_SNORM:          return "R8G8_SNORM";
+                case DXGI_FORMAT_R8G8B8A8_UNORM:      return "R8G8B8A8_UNORM";
+                case DXGI_FORMAT_R8G8B8A8_SNORM:      return "R8G8B8A8_SNORM";
+                case DXGI_FORMAT_R16_UNORM:           return "R16_UNORM";
+                case DXGI_FORMAT_R16G16_UNORM:        return "R16G16_UNORM";
+                case DXGI_FORMAT_R16G16B16A16_UNORM:  return "R16G16B16A16_UNORM";
+                case DXGI_FORMAT_R16G16B16A16_UINT:   return "R16G16B16A16_UINT";
+                case DXGI_FORMAT_R32_UINT:            return "R32_UINT";
+                case DXGI_FORMAT_R32G32_UINT:         return "R32G32_UINT";
+                case DXGI_FORMAT_R32_FLOAT:           return "R32_FLOAT";
+                case DXGI_FORMAT_R32G32_FLOAT:        return "R32G32_FLOAT";
+                case DXGI_FORMAT_R32G32B32_FLOAT:     return "R32G32B32_FLOAT";
+                case DXGI_FORMAT_R32G32B32A32_FLOAT:  return "R32G32B32A32_FLOAT";
+                default:                              return "UNKNOWN";
+            }
+        };
+        std::fprintf(stderr, "[dx12] P26 DIAG: ord=%d -> dxgi_fmt=%u (%s) semantic=%s\n",
+            el.format, (unsigned)ie.Format, dxgiFmtName(ie.Format), ie.SemanticName);
         ie.InputSlot = (UINT)el.binding;
         ie.AlignedByteOffset = (UINT)el.offset;
         if (el.stepRate > 0) {
@@ -2202,38 +2223,71 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         inputLayout.push_back(ie);
     }
     // 修正 stride：Java 侧 getVertexSize() 可能不准确，按 DXGI_FORMAT 实际字节数计算 end-offset。
-    auto dxgiByteSize = [](DXGI_FORMAT fmt) -> UINT {
-        switch (fmt) {
-            case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16u;
-            case DXGI_FORMAT_R32G32B32_FLOAT:    return 12u;
-            case DXGI_FORMAT_R32G32_FLOAT:       return 8u;
-            case DXGI_FORMAT_R32_FLOAT:          return 4u;
-            case DXGI_FORMAT_R16G16B16A16_UNORM: return 8u;
-            case DXGI_FORMAT_R16G16B16A16_SNORM:return 8u;
-            case DXGI_FORMAT_R16G16_FLOAT:       return 8u;
-            case DXGI_FORMAT_R16_UNORM:          return 2u;
-            case DXGI_FORMAT_R16_SNORM:          return 2u;
-            case DXGI_FORMAT_R16_FLOAT:          return 2u;
-            case DXGI_FORMAT_R8G8B8A8_UNORM:     return 4u;
-            case DXGI_FORMAT_R8G8B8A8_SNORM:     return 4u;
-            case DXGI_FORMAT_R8G8B8A8_UINT:      return 4u;
-            case DXGI_FORMAT_R8G8B8A8_SINT:      return 4u;
-            case DXGI_FORMAT_R8G8_UNORM:         return 2u;
-            case DXGI_FORMAT_R8G8_SNORM:         return 2u;
-            case DXGI_FORMAT_R8_UNORM:           return 1u;
-            case DXGI_FORMAT_R8_SNORM:           return 1u;
-            case DXGI_FORMAT_R8_UINT:            return 1u;
-            case DXGI_FORMAT_R8_SINT:            return 1u;
-            case DXGI_FORMAT_R10G10B10A2_UNORM:  return 4u;
-            case DXGI_FORMAT_R10G10B10A2_UINT:   return 4u;
-            case DXGI_FORMAT_R11G11B10_FLOAT:    return 4u;
-            default:                             return 4u;  // fallback
+    // 修正 stride：按 gpuFormat ordinal 直接算字节数，不依赖 DXGI 枚举值（某些 SDK 枚举值非标准）。
+    auto ordinalByteSize = [](int ord) -> UINT {
+        switch (ord) {
+            case 36: return 12u; // RGB32_UINT
+            case 37: return 12u; // RGB32_SINT
+            case 45: return  8u; // RG32_FLOAT
+            case 46: return 12u; // RGB32_FLOAT
+            case 47: return 16u; // RGBA32_FLOAT
+            case 44: return  4u; // R32_FLOAT
+            case 40: return  2u; // R16_FLOAT
+            case 41: return  4u; // RG16_FLOAT
+            case 42: return  8u; // RGB16_FLOAT
+            case 43: return  8u; // RGBA16_FLOAT
+            case 48: return  4u; // RGB10A2_UNORM
+            case 49: return  4u; // RGB10A2_UINT
+            case 50: return  4u; // RG11B10_FLOAT
+            case  0: return  1u; // R8_UNORM
+            case  1: return  1u; // R8_SNORM
+            case  2: return  2u; // RG8_UNORM
+            case  3: return  2u; // RG8_SNORM
+            case  4: return  4u; // RGB8_UNORM
+            case  5: return  4u; // RGB8_SNORM
+            case  6: return  4u; // RGBA8_UNORM
+            case  7: return  4u; // RGBA8_SNORM
+            case  8: return  2u; // R16_UNORM
+            case  9: return  2u; // R16_SNORM
+            case 10: return  4u; // RG16_UNORM
+            case 11: return  4u; // RG16_SNORM
+            case 12: return  8u; // RGB16_UNORM
+            case 13: return  8u; // RGB16_SNORM
+            case 14: return  8u; // RGBA16_UNORM
+            case 15: return  8u; // RGBA16_SNORM
+            case 16: return  1u; // R8_UINT
+            case 17: return  1u; // R8_SINT
+            case 18: return  2u; // RG8_UINT
+            case 19: return  2u; // RG8_SINT
+            case 20: return  4u; // RGB8_UINT
+            case 21: return  4u; // RGB8_SINT
+            case 22: return  4u; // RGBA8_UINT
+            case 23: return  4u; // RGBA8_SINT
+            case 24: return  2u; // R16_UINT
+            case 25: return  2u; // R16_SINT
+            case 26: return  4u; // RG16_UINT
+            case 27: return  4u; // RG16_SINT
+            case 28: return  8u; // RGB16_UINT
+            case 29: return  8u; // RGB16_SINT
+            case 30: return  8u; // RGBA16_UINT
+            case 31: return  8u; // RGBA16_SINT
+            case 32: return  4u; // R32_UINT
+            case 33: return  4u; // R32_SINT
+            case 34: return  8u; // RG32_UINT
+            case 35: return  8u; // RG32_SINT
+            case 38: return 16u; // RGBA32_UINT
+            case 39: return 16u; // RGBA32_SINT
+            case 51: return  4u; // D32_FLOAT
+            case 52: return  4u; // D32_FLOAT_S8
+            case 53: return  4u; // D24_UNORM_S8
+            case 54: return  2u; // D16_UNORM
+            default: return  4u; // fallback
         }
     };
     UINT correctedStride = 0;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
         DXGI_FORMAT dfmt = toDxgiVertexFormat(el.format);
-        UINT sz = dxgiByteSize(dfmt);
+        UINT sz = ordinalByteSize(el.format);
         UINT end = (UINT)el.offset + sz;
         if (end > correctedStride) correctedStride = end;
     }
@@ -2268,8 +2322,8 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             ie.SemanticName = semanticStore.back().c_str();
             ie.SemanticIndex = semanticIndex;
             ie.Format = toDxgiVertexFormat(el.format);
-            // P26 debug
-            std::fprintf(stderr, "[dx12] DIAG vertex2: ord=%d -> dxgi_fmt=%u semantic=%s\n",
+            // P26 debug (second loop)
+            std::fprintf(stderr, "[dx12] P26 DIAG2: ord=%d -> dxgi_fmt=%u semantic=%s\n",
                 el.format, (unsigned)ie.Format, ie.SemanticName);
             ie.InputSlot = (UINT)el.binding;
             ie.AlignedByteOffset = (UINT)el.offset;
