@@ -49,6 +49,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private final int outputWidth;
     private final int outputHeight;
     private final boolean hasDepth;
+    /** P27：本 pass 的 color[0] 纹理 native handle（用于图集合成后 dump 验证）。 */
+    private final long colorTargetHandle;
     private int pushedDebugGroups = 0;
 
     private @Nullable Dx12CompiledRenderPipeline pipeline;
@@ -63,13 +65,38 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     public Dx12RenderPassBackend(@Nullable Dx12Device device, long ctx,
         @Nullable RenderArea renderArea, int outputWidth, int outputHeight,
-        boolean hasDepth) {
+        boolean hasDepth, long colorTargetHandle) {
         this.device = device;
         this.ctx = ctx;
         this.renderArea = renderArea;
         this.outputWidth = outputWidth;
         this.outputHeight = outputHeight;
         this.hasDepth = hasDepth;
+        this.colorTargetHandle = colorTargetHandle;
+    }
+
+    /** P27：当前管线的 location 字符串（如 minecraft:pipeline/animate_sprite_blit）。 */
+    @Nullable
+    public String pipelineLocation() {
+        Dx12CompiledRenderPipeline p = this.pipeline;
+        if (p == null || p.info() == null || p.info().getLocation() == null) {
+            return null;
+        }
+        return p.info().getLocation().toString();
+    }
+
+    /** P27：本 pass 的 color[0] 纹理 native handle。 */
+    public long colorTargetHandle() {
+        return this.colorTargetHandle;
+    }
+
+    /** P27：本 pass 的渲染输出尺寸（用于 dump tag 区分不同图集）。 */
+    public int outputWidth() {
+        return this.outputWidth;
+    }
+
+    public int outputHeight() {
+        return this.outputHeight;
     }
 
     @Override

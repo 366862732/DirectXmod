@@ -246,6 +246,17 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackTexturePix
     return arr;
 }
 
+// P27 诊断：把指定纹理完整 dump 为 BMP + ASCII 缩略图。
+// 复用 dbgReadbackTexturePixels（内部 waitIdle + 独立命令列表拷贝 +
+// dbgDumpPixelsToFile 写 dx12_dump_<tag>.bmp，并在日志打印 ASCII 缩略图）。
+// 注意：调用时纹理应处于 COMMON 状态（render pass 结束后），否则 barrier 验证失败。
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DumpTextureToFile(
+    JNIEnv* env, jclass, jlong texHandle, jstring tag) {
+    const char* ctag = tag ? env->GetStringUTFChars(tag, nullptr) : nullptr;
+    dbgReadbackTexturePixels(toObject(texHandle), ctag ? ctag : "tex");
+    if (ctag) env->ReleaseStringUTFChars(tag, ctag);
+}
+
 JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal(
     JNIEnv* env, jclass, jlong surface) {
     Dx12Surface* s = toSurface(surface);

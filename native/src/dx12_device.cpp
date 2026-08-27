@@ -2709,6 +2709,17 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     dbgReadbackBufferBytes(b.buffer, b.offset,
                         (int)std::min<long long>(b.length, 64), "proj");
                 }
+                // P27 诊断：SpriteAnimationInfo UBO（len=140，图集合成用）定向读回一次，
+                // 验证 ProjectionMatrix/SpriteMatrix/UPadding/VPadding/MipMapLevel 数据。
+                // 放在 transition 之前（首次使用时 buffer 处于 COMMON，读回安全）。
+                static bool spAnimDump = false;
+                if (!spAnimDump && b.length == 140) {
+                    spAnimDump = true;
+                    dbgLog("P27 dump SpriteAnimationInfo UBO: buf=%p off=%lld len=%lld heap=%d",
+                        (void*)b.buffer, (long long)b.offset, (long long)b.length,
+                        (int)b.buffer->heapType);
+                    dbgReadbackBufferBytes(b.buffer, b.offset, 144, "sprite_ubo");
+                }
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
                 cbv.BufferLocation = b.buffer->resource->GetGPUVirtualAddress() + (UINT64)b.offset;

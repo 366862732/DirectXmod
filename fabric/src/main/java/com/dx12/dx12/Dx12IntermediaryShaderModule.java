@@ -306,14 +306,17 @@ public record Dx12IntermediaryShaderModule(
                 long address = pointer.get(0);
                 String hlsl = MemoryUtil.memUTF8(address);
                 // P7 诊断：打印 raw spvc 输出，确认 }}; 来自 spvc 还是注入逻辑
-                if (name.contains("gui") || name.contains("debug") || name.contains("position")) {
+                if (name.contains("gui") || name.contains("debug") || name.contains("position")
+                        || name.contains("animate") || name.contains("sprite")) {
                     System.err.println("[dx12-java] [" + name + "] RAW spvc HLSL:\n" + hlsl);
                 }
                 // Fix S2：语义通过 spvc_compiler_hlsl_add_vertex_attribute_remap 在编译前注入，
                 // 确保 spvc HLSL 后端输出正确的 D3D12 语义（POSITION/TEXCOORD<n>）。
                 String result = hlsl;
                 // P7 诊断：打印 raw spvc 输出，确认语义已正确生成
-                if (name.contains("gui") || name.contains("debug") || name.contains("position")) {
+                // P27：条件同步包含 animate/sprite，确保 animate_sprite_blit 的完整 HLSL 也输出
+                if (name.contains("gui") || name.contains("debug") || name.contains("position")
+                        || name.contains("animate") || name.contains("sprite")) {
                     System.err.println("[dx12-java] [" + name + "] spvc HLSL (no inject):\n" + result);
                 }
                 return result;

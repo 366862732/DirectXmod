@@ -316,6 +316,9 @@ public final class Dx12Native {
     /** P6 诊断：读回任意纹理 3x3 采样像素，返回 int[36]（9像素×RGBA）。为 null 表示失败。 */
     public static native int[] dx12ReadbackTexturePixels(long texHandle);
 
+    /** P27 诊断：把指定纹理完整 dump 为 dx12_dump_<tag>.bmp（工作目录）+ 日志 ASCII 缩略图。 */
+    public static native void dx12DumpTextureToFile(long texHandle, String tag);
+
     /** Destroy a surface created by {@link #dx12CreateSurface}. */
     public static native void dx12DestroySurface(long surface);
 
