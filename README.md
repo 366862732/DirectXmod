@@ -18,7 +18,7 @@
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
 
-### 当前阶段：P0-P22 全部完成，BUG-01 语义名修复，描述符绑定修复，黑屏根因（level=null）诊断中（2026-08-26）
+### 当前阶段：P0-P27 全部完成，BUG-01 semanticNames 修复，P24 SRV 堆修复，黑屏根因（level=null）诊断中（2026-08-27）
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -35,7 +35,11 @@
 | **P18: Surface fence** | ✅ 已完成 | per-backbuffer fence 追踪，acquireSurface 前检查 GPU 占用 |
 | **P20: 描述符表偏移修复** | ✅ 已完成 | pushDescriptors 根描述符表 GPU 地址偏移修正，避免读前帧残留 |
 | **P21: 深度测试修复** | ✅ 已完成 | removeDepthClearAutoFix + reverse-Z 比较函数 + depth PSO 双轨创建 |
-| **P22: 描述符堆扩容** | ✅ 已完成 | drawHeap 从 x2 扩展到 x4 半区，支持三帧并行飞行 |
+| **P22: 描述符堆扩容** | ✅ 已完成 | drawHeap x4 半区，支持三帧并行飞行（fenceValue%4 交替写入） |
+| **P24: 帧级瞬态 RTV/DSV** | ✅ 已完成 | 新增 frameRtvHeap/dsvHeap（每帧从 0 复用），P24 fix：SRV 必须写入命令列表当前设置的堆（黑屏根因之一） |
+| **P25: SampleMask + 纹理格式** | ✅ 已完成 | PSO 补设 SampleMask=UINT_MAX；RGB32_FLOAT 不再加宽成 RGBA32_FLOAT |
+| **P26: upload readback 修复** | ✅ 已完成 | Map 读回必须带 offset 的 D3D12_RANGE，否则读到旧数据 |
+| **P27: 高频日志降级** | ✅ 已完成 | beginRenderPass/setPipeline/drawIndexed 逐条诊断日志降级为 DBG_LOG_DEBUG（数千次/帧不拖死主线程） |
 | **BUG-01: semanticNames 修复** | ✅ 已完成 | `semanticNames` 基于 `vertex.inputs().size()` 补齐，与 spvc 基准对齐 |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线编译 + surface blit + buffer copy + texture readback 全部通过 |
 
@@ -235,7 +239,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P6 Draw 全链路** | Dx12RenderPassBackend: setPipeline + pushDescriptors(UBO/SRV/TexelBuffer) + draw/drawIndexed/drawIndirect |
 | **P15 日志分级** | dbgLog(ERROR/WARN)/dbgLogInfo/INFO)/dbgLogDebug(DEBUG) 三级输出，DX12_LOG_VERBOSE=1 开启详细日志 |
 | **P16 renderLevel 诊断** | 帧计数器（每 30 帧）+ advanceGameTime/pause/native submit+present 日志 |
-| **P17 绘制目标跟踪** | activeColorTargetsTouched 向量 + dbgReadbackSurfacePixels() 3×3 采样诊断读回 |
+| **P17 绘制目标跟踪** | activeColorTargetsTouched 向量 + dbgReadbackSurfacePixels() 每 30 帧采样，dx12ReadbackTexturePixels 读指定纹理 |
 | **P18 Surface Fence** | per-backbuffer fence 追踪，acquireSurface 前检查 back buffer 是否仍被 GPU 使用 |
 | **P20 描述符偏移修复** | pushDescriptors 根描述符表 GPU 地址加偏移，避免读取前帧残留描述符导致黑屏 |
 | **P21 深度测试修复** | 移除 depthClearFlag=0 的无条件 clear=1.0 回退（pre-clear 已由 MC 完成）；修复 reverse-Z 比较函数 |
@@ -258,7 +262,8 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 - **Shader cache**：Pipeline cache (IdentityHashMap) + Shader source cache (HashMap)，同一 shader 只编译一次
 - **DLL 版本隔离**：每次启动从 JAR 重新提取，确保 DLL 与 JAR 版本一致
 - **三帧并行命令**：3 allocator + value-2 完成等待；drawHeap x4 半区防三帧并行冲突
-- **诊断开关**：`DX12_LOG_VERBOSE=1` 开启详细日志，`DX12_DIAG_GREEN=1` 开启绿色着色器诊断
+- **SRV 写当前堆**（P24）：pushDescriptors 将 SRV 写入命令列表当前激活的 drawHeap，避免跨帧描述符错乱（黑屏根因之一）
+- **诊断开关**：`DX12_LOG_VERBOSE=1` 开启详细日志；`DX12_DIAG_GREEN=1` 开启绿色着色器诊断；`DX12_DBG_DISABLE_DEPTH=1` 强制关闭深度测试（排查深度配置问题）
 
 ## 调试与验证
 
@@ -294,10 +299,13 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 ### 额外诊断日志
 
 除上述标准输出外，还支持以下诊断手段：
-- **分级日志**：`DX12_LOG_VERBOSE=1` 开启详细日志，同时写入 `%TEMP%\dx12-native.log`
-- **3×3 采样读回**：`dbgReadbackSurfacePixels()` 返回中心 3×3 像素的 RGBA 数组，用于验证 backbuffer 内容
-- **帧计数器**：每 30 帧打印 submit/present 状态，方便判断渲染循环是否正常工作
-- **pushDescriptors 诊断**：每帧首次 pushDescriptors 打印 binding 数量和 UBO/SRV 指针
+- **额外诊断日志**
+  - **分级日志**：`DX12_LOG_VERBOSE=1` 开启详细日志，同时写入 `%TEMP%\dx12-native.log`
+  - **3×3 采样读回**：`dbgReadbackSurfacePixels()` 每 30 帧采样中心 3×3 像素的 RGBA，用于验证 backbuffer 内容
+  - **纹理读回**：`dbgReadbackTexturePixels(tag)` 读取任意纹理并输出 3×3 采样 + 保存 BMP 文件（`dx12_dump_<tag>.bmp`）
+  - **帧计数器**：每 30 帧打印 submit/present 状态，方便判断渲染循环是否正常工作
+  - **pushDescriptors 诊断**：每帧首次 pushDescriptors 打印 binding 数量和 UBO/SRV 指针
+  - **深/读回诊断**：`dx12ReadbackBufferBytes()` 读回 UBO/CBV 原始字节用于调试；`DX12_DBG_DISABLE_DEPTH=1` 强制关闭深度测试
 
 ### 4 轮自测详解
 
@@ -341,7 +349,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 ## 路线图
 
-### P0-P22: D3D12 后端核心层 ✅ 全部完成
+### P0-P27: D3D12 后端核心层 ✅ 全部完成
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -352,7 +360,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P4: 管线编译层** | ✅ | shaderc SPIR-V → spvc 反射/rebind → HLSL → D3DCompile DXBC |
 | **P5: 交换链层** | ✅ | Dx12GpuSurface: DXGI flip-model swapchain |
 | **P6: Draw 全链路** | ✅ | Dx12RenderPassBackend: setPipeline + pushDescriptors + draw |
-| **P15-P22: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容 |
+| **P15-P27: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级 |
 | **BUG-01: semanticNames** | ✅ | 补齐逻辑与 spvc 基准对齐 |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线 + surface blit + buffer copy + texture readback |
 
@@ -360,7 +368,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 | 任务 | 优先级 | 说明 |
 |------|--------|------|
-| **排查 level=null 根因** | 🔴 P0 | 确认 MinecraftSetLevelDebugMixin 是否触发；检查 mixin 是否干扰世界加载流程 |
+| **排查 level=null 根因** | 🔴 P0 | 确认 MinecraftSetLevelDebugMixin/MinecraftDoWorldLoadDebugMixin/ClientPacketListenerLoginDebugMixin 是否触发；检查 mixin 是否干扰世界加载流程 |
 | **完整 Shader 支持** | 🔴 P0 | terrain/entity/particle 等全量 shader 的 draw call 未验证（目前只有 GUI 层可见） |
 | **BUG-01 重复 push_back 修复** | P2 | 删除 beginRenderPass 诊断循环中的重复 activeColorTargets.push_back |
 | **BUG-02 case 4 补齐** | P3 | toPrimitiveTopology 补全 TRIANGLES case |

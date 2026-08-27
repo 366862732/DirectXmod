@@ -2181,6 +2181,9 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         ie.SemanticName = semanticStore.back().c_str();
         ie.SemanticIndex = semanticIndex;
         ie.Format = toDxgiVertexFormat(el.format);
+        // P26 debug: 打印 format ordinal -> DXGI enum 映射，确认 case 46 分支生效
+        std::fprintf(stderr, "[dx12] DIAG vertex: ord=%d -> dxgi_fmt=%u semantic=%s\n",
+            el.format, (unsigned)ie.Format, ie.SemanticName);
         ie.InputSlot = (UINT)el.binding;
         ie.AlignedByteOffset = (UINT)el.offset;
         if (el.stepRate > 0) {
@@ -2265,6 +2268,9 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             ie.SemanticName = semanticStore.back().c_str();
             ie.SemanticIndex = semanticIndex;
             ie.Format = toDxgiVertexFormat(el.format);
+            // P26 debug
+            std::fprintf(stderr, "[dx12] DIAG vertex2: ord=%d -> dxgi_fmt=%u semantic=%s\n",
+                el.format, (unsigned)ie.Format, ie.SemanticName);
             ie.InputSlot = (UINT)el.binding;
             ie.AlignedByteOffset = (UINT)el.offset;
             if (el.stepRate > 0) {
