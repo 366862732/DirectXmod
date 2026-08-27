@@ -574,7 +574,7 @@ DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
         case 36: return DXGI_FORMAT_R32G32B32_UINT;     // RGB32_UINT (12B)
         case 37: return DXGI_FORMAT_R32G32B32_SINT;     // RGB32_SINT (12B)
         case 45: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT (12B)
-        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT; // RGBA32_FLOAT (16B)
+        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT (12B)
         default: return toDxgiFormat(gpuFormat);
     }
 }
