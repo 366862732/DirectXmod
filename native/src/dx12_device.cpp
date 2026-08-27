@@ -573,8 +573,8 @@ DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
     switch (gpuFormat) {
         case 36: return DXGI_FORMAT_R32G32B32_UINT;     // RGB32_UINT (12B)
         case 37: return DXGI_FORMAT_R32G32B32_SINT;     // RGB32_SINT (12B)
-        case 45: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT (12B)
-        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT (12B)
+        case 45: return DXGI_FORMAT_R32G32_FLOAT;     // RG32_FLOAT (8B)
+        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;  // RGB32_FLOAT (12B)
         default: return toDxgiFormat(gpuFormat);
     }
 }
@@ -2200,6 +2200,15 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
                 case DXGI_FORMAT_R32G32_FLOAT:        return "R32G32_FLOAT";
                 case DXGI_FORMAT_R32G32B32_FLOAT:     return "R32G32B32_FLOAT";
                 case DXGI_FORMAT_R32G32B32A32_FLOAT:  return "R32G32B32A32_FLOAT";
+                case DXGI_FORMAT_R16G16_FLOAT:        return "R16G16_FLOAT";
+                case DXGI_FORMAT_R16_FLOAT:           return "R16_FLOAT";
+                case DXGI_FORMAT_R10G10B10A2_UNORM:   return "R10G10B10A2_UNORM";
+                case DXGI_FORMAT_R11G11B10_FLOAT:     return "R11G11B10_FLOAT";
+                case DXGI_FORMAT_D32_FLOAT:           return "D32_FLOAT";
+                case DXGI_FORMAT_D24_UNORM_S8_UINT:   return "D24_UNORM_S8_UINT";
+                case DXGI_FORMAT_D16_UNORM:           return "D16_UNORM";
+                case DXGI_FORMAT_R8G8B8A8_UINT:       return "R8G8B8A8_UINT";
+                case DXGI_FORMAT_R8G8B8A8_SINT:       return "R8G8B8A8_SINT";
                 default:                              return "UNKNOWN";
             }
         };
