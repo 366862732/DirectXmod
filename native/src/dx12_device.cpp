@@ -549,8 +549,8 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
         case 43: return DXGI_FORMAT_R16G16B16A16_FLOAT;    // RGBA16_FLOAT
         case 44: return DXGI_FORMAT_R32_FLOAT;             // R32_FLOAT
         case 45: return DXGI_FORMAT_R32G32_FLOAT;          // RG32_FLOAT
-        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT;    // RGB32_FLOAT (近似)
-        case 47: return DXGI_FORMAT_R32G32B32A32_FLOAT;    // RGBA32_FLOAT
+        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT (12B)
+        case 47: return DXGI_FORMAT_R32G32B32A32_FLOAT; // RGBA32_FLOAT (16B)
         case 48: return DXGI_FORMAT_R10G10B10A2_UNORM;     // RGB10A2_UNORM
         case 49: return DXGI_FORMAT_R10G10B10A2_UINT;      // RGB10A2_UINT
         case 50: return DXGI_FORMAT_R11G11B10_FLOAT;       // RG11B10_FLOAT
@@ -571,9 +571,10 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
 // 用精确三分量后 D3D12 自动为 HLSL float4 语义补 w=1.0。
 DXGI_FORMAT toDxgiVertexFormat(int gpuFormat) {
     switch (gpuFormat) {
-        case 36: return DXGI_FORMAT_R32G32B32_UINT;     // RGB32_UINT
-        case 37: return DXGI_FORMAT_R32G32B32_SINT;     // RGB32_SINT
-        case 46: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT
+        case 36: return DXGI_FORMAT_R32G32B32_UINT;     // RGB32_UINT (12B)
+        case 37: return DXGI_FORMAT_R32G32B32_SINT;     // RGB32_SINT (12B)
+        case 45: return DXGI_FORMAT_R32G32B32_FLOAT;    // RGB32_FLOAT (12B)
+        case 46: return DXGI_FORMAT_R32G32B32A32_FLOAT; // RGBA32_FLOAT (16B)
         default: return toDxgiFormat(gpuFormat);
     }
 }

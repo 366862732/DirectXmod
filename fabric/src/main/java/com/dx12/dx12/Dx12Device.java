@@ -404,8 +404,11 @@ public class Dx12Device implements GpuDeviceBackend {
             int stepRate = format.getStepRate();
             for (VertexFormatElement element : format.getElements()) {
                 if (!vertexShaderInputs.contains(element.name())) continue;
+                int fmtOrd = element.format().ordinal();
+                System.err.printf("[dx12-java] [DIAG] %s slot[%d] elem: name=%s format=%s ord=%d offset=%d stride=%d%n",
+                    pipeline.getLocation(), i, element.name(), element.format(), fmtOrd, element.offset(), stride);
                 elements.add(new int[] {
-                    attribLocation, i, element.format().ordinal(),
+                    attribLocation, i, fmtOrd,
                     element.offset(), stride, stepRate
                 });
                 attribLocation++;
