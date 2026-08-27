@@ -41,3 +41,6 @@ backup/
 temp_mc_extracted/
 temp_mc_extracted2/
 temp_mc_shaders/
+
+# 图片目录
+图片/

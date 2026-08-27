@@ -99,6 +99,23 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         return this.outputHeight;
     }
 
+    /** P27：本 pass 的 renderArea 目标区域（图集 blit 时为 sprite 在图集中的位置）。 */
+    public int areaX() {
+        return this.renderArea != null ? this.renderArea.x() : 0;
+    }
+
+    public int areaY() {
+        return this.renderArea != null ? this.renderArea.y() : 0;
+    }
+
+    public int areaWidth() {
+        return this.renderArea != null ? this.renderArea.width() : this.outputWidth;
+    }
+
+    public int areaHeight() {
+        return this.renderArea != null ? this.renderArea.height() : this.outputHeight;
+    }
+
     @Override
     public void pushDebugGroup(Supplier<String> label) {
         this.pushedDebugGroups++;

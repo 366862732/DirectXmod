@@ -2712,13 +2712,16 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 // P27 诊断：SpriteAnimationInfo UBO（len=140，图集合成用）定向读回一次，
                 // 验证 ProjectionMatrix/SpriteMatrix/UPadding/VPadding/MipMapLevel 数据。
                 // 放在 transition 之前（首次使用时 buffer 处于 COMMON，读回安全）。
+                // P28：len 用 >=128 匹配（Java 侧 binding length 可能是 140/144/256），
+                // 且把读回窗口扩到 176 字节以覆盖完整 16 float 投影矩阵 + 16 float sprite 矩阵。
                 static bool spAnimDump = false;
-                if (!spAnimDump && b.length == 140) {
+                if (!spAnimDump && b.length >= 128 && b.length <= 256) {
                     spAnimDump = true;
-                    dbgLog("P27 dump SpriteAnimationInfo UBO: buf=%p off=%lld len=%lld heap=%d",
+                    dbgLog("P28 dump SpriteAnimationInfo UBO: buf=%p off=%lld len=%lld heap=%d",
                         (void*)b.buffer, (long long)b.offset, (long long)b.length,
                         (int)b.buffer->heapType);
                     dbgReadbackBufferBytes(b.buffer, b.offset, 144, "sprite_ubo");
+                    dbgReadbackBufferBytes(b.buffer, b.offset + 64, 64, "sprite_ubo2");
                 }
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};

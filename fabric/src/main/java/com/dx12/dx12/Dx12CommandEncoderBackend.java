@@ -40,15 +40,18 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private final List<Runnable> pendingCallbacks = new ArrayList<>();
     private @Nullable Dx12RenderPassBackend currentRenderPass;
     /** P27：图集合成 pass 结束后 dump 图集纹理（定位按钮纹理错乱）。 */
-    private static final int MAX_ATLAS_DUMPS = 4;
+    private static final int MAX_ATLAS_DUMPS = 14;
     private static final java.util.Set<Long> gDumpedAtlas = new java.util.HashSet<>();
     /**
-     * P27: 待 submit 后 dump 的图集 pass。
-     * 注意必须是 static：atlas 上传走一次性 encoder（uploadInitialContents），它的
-     * submit() 与记录 pending 的 submitRenderPass() 可能在不同实例上，实例字段会丢。
-     * submit() 里 dx12Submit 提交 GPU 后执行 dump（deviceWaitIdle 才能读到真实内容）。
+     * P27: 按 ctx 记录待 submit 后 dump 的图集 pass。
+     * 必须按 ctx 分组 + 只消费自己 ctx 的列表：atlas 上传（uploadInitialContents）在
+     * 一次性 encoder 上连续创建多个 blit/interpolate pass，若用单一 pending 会被后续
+     * pass 覆盖；若用全局 static 列表会被其它 encoder 的 submit() 抢消费（此时本 ctx
+     * 命令尚未提交 GPU，读回全 0）。submit() 里 dx12Submit 提交 GPU 后执行 dump，
+     * deviceWaitIdle 才能读到真实内容。
      */
-    private static @Nullable Dx12RenderPassBackend pendingAtlasDump;
+    private static final java.util.Map<Long, java.util.List<Dx12RenderPassBackend>>
+        gPendingAtlasByCtx = new java.util.HashMap<>();
 
     public Dx12CommandEncoderBackend() {
         this(null);
@@ -152,6 +155,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         StackTraceElement[] st = Thread.currentThread().getStackTrace();
         StringBuilder sb = new StringBuilder();
         sb.append("createRenderPass: ").append(w).append('x').append(h)
+            .append(" area=").append(x).append(',').append(y)
             .append(hasDepth ? " depth=yes" : " depth=no").append(" from:");
         int shown = 0;
         for (int i = 3; i < st.length && shown < 6; ++i) {
@@ -178,12 +182,15 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 注意：dx12EndRenderPass 只在命令列表上记录 draw，GPU 要等 submit() 的
         // dx12Submit 才真正执行。因此 dump 必须推迟到 submit() 之后执行，否则
         // dbgReadbackTexturePixels 的 deviceWaitIdle 等待不到未提交的命令，读回全 0。
-        if (pass != null && pendingAtlasDump == null && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
+        if (pass != null && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
             String loc = pass.pipelineLocation();
             if (loc != null && (loc.contains("animate") || loc.contains("sprite"))) {
-                pendingAtlasDump = pass;
-                System.err.println("[dx12-java] P27 pending atlas dump pass=" + loc
-                    + " colorTex=0x" + Long.toHexString(pass.colorTargetHandle()));
+                gPendingAtlasByCtx.computeIfAbsent(this.ctx, k -> new ArrayList<>()).add(pass);
+                System.err.println("[dx12-java] P27 pending atlas dump ctx=0x"
+                    + Long.toHexString(this.ctx)
+                    + " pass=" + loc + " colorTex=0x" + Long.toHexString(pass.colorTargetHandle())
+                    + " area=" + pass.areaX() + "," + pass.areaY()
+                    + " " + pass.areaWidth() + "x" + pass.areaHeight());
                 System.err.flush();
             }
         }
@@ -345,21 +352,27 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         Dx12Native.dx12Submit(this.ctx);
         this.transientMemory.rotate();
         // P27: dx12Submit 已提交 GPU → 现在读回图集才是真实内容（dbgReadbackTexturePixels
-        // 内部 deviceWaitIdle 会等待刚提交的命令完成）。按 color target handle 去重，
-        // 最多 dump MAX_ATLAS_DUMPS 个不同图集；tag 带尺寸区分（如 atlas_512x256）。
-        if (pendingAtlasDump != null) {
-            Dx12RenderPassBackend dumpPass = pendingAtlasDump;
-            pendingAtlasDump = null;
-            long h = dumpPass.colorTargetHandle();
-            if (!gDumpedAtlas.contains(h) && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
-                gDumpedAtlas.add(h);
-                System.err.println("[dx12-java] P27 dump atlas (after submit) pass="
-                    + dumpPass.pipelineLocation()
-                    + " size=" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
-                    + " colorTex=0x" + Long.toHexString(h));
-                System.err.flush();
-                Dx12Native.dx12DumpTextureToFile(h,
-                    "atlas_" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight());
+        // 内部 deviceWaitIdle 会等待刚提交的命令完成）。只消费本 ctx 的 pending 列表：
+        // 别的 encoder 记录的 blit pass 命令尚未提交 GPU，读回全 0（纯黑假象）。
+        // 按 color target handle 去重，最多 dump MAX_ATLAS_DUMPS 个不同图集。
+        List<Dx12RenderPassBackend> atlasPasses = gPendingAtlasByCtx.remove(this.ctx);
+        if (atlasPasses != null && !atlasPasses.isEmpty()) {
+            for (Dx12RenderPassBackend dumpPass : atlasPasses) {
+                long h = dumpPass.colorTargetHandle();
+                if (!gDumpedAtlas.contains(h) && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
+                    gDumpedAtlas.add(h);
+                    System.err.println("[dx12-java] P27 dump atlas (after submit) ctx=0x"
+                        + Long.toHexString(this.ctx)
+                        + " pass=" + dumpPass.pipelineLocation()
+                        + " size=" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
+                        + " lastArea=" + dumpPass.areaX() + "," + dumpPass.areaY()
+                        + " " + dumpPass.areaWidth() + "x" + dumpPass.areaHeight()
+                        + " colorTex=0x" + Long.toHexString(h));
+                    System.err.flush();
+                    Dx12Native.dx12DumpTextureToFile(h,
+                        "atlas_" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
+                        + "_" + Long.toHexString(h & 0xFFFF));
+                }
             }
         }
         // Run callbacks queued by the previous frame's copyTextureToBuffer.

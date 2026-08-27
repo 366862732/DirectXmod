@@ -471,8 +471,16 @@ public class Dx12Device implements GpuDeviceBackend {
             writeDepthState(desc, pipeline.getDepthStencilState());
         }
 
+        // P28：animate_sprite 管线已注入 gl_Position.y 翻转（修正 GL bottom-up
+        // 投影在 D3D12 下的 Y 方向）。翻转会反转三角形绕序（CCW→CW），若仍按
+        // CullMode=BACK + FrontCounterClockwise 剔除，所有三角形被判为背面 →
+        // 图集全黑。blit 不依赖绕序，强制关闭剔除。
+        boolean cull = pipeline.isCull();
+        if (pipeline.getLocation().toString().contains("animate_sprite")) {
+            cull = false;
+        }
         desc.putInt(pipeline.getPrimitiveTopology().ordinal());
-        desc.put((byte) (pipeline.isCull() ? 1 : 0));
+        desc.put((byte) (cull ? 1 : 0));
         desc.putInt(pipeline.getPolygonMode().ordinal());
 
         desc.putInt(inputElements.size());

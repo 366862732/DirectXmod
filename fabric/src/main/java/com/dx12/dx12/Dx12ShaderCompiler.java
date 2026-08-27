@@ -109,6 +109,25 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
+        // P28：animate_sprite 图集合成管线（blit/interpolate）的顶点 shader 用 GL
+        // bottom-up 投影（ortho(0,W,0,H)）配合 vanilla 的 bottom-up sprite 坐标。
+        // D3D12 的 NDC Y 与 GL 相反（NDC -1 在顶部），导致图集内容整体垂直翻转
+        // （dump 证实：所有稀疏图集内容落在 y[H-h..H-1]）。修复：在顶点输出上
+        // 翻转 Y，只作用于图集上传管线，不影响屏幕 GUI（其坐标是 top-down 本就正确）。
+        String pipelineLocation = pipeline.getLocation().toString();
+        if (pipelineLocation.contains("animate_sprite")) {
+            String before = vertexHlsl;
+            vertexHlsl = injectVertexYFlip(vertexHlsl);
+            if (!before.equals(vertexHlsl)) {
+                System.err.println("[dx12-java] [P28] inject Y-flip into " + pipelineLocation
+                    + " vertex HLSL");
+                System.err.flush();
+            } else {
+                System.err.println("[dx12-java] [P28] WARN: no gl_Position assignment found in "
+                    + pipelineLocation + " vertex HLSL, Y-flip NOT injected");
+                System.err.flush();
+            }
+        }
         if (DIAG_GREEN || DIAG_WHITE) {
             // P6 诊断：强制输出纯绿/纯白，区分"管线问题"vs"数据问题"
             // 屏幕变绿/白 => 管线通路正常，问题在纹理数据；仍红 => 管线根本问题。
@@ -143,6 +162,24 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     public void close() {
         Shaderc.shaderc_compile_options_release(this.shaderOptions);
         Shaderc.shaderc_compiler_release(this.shaderCompiler);
+    }
+
+    /**
+     * P28：在 spvc 生成的顶点 HLSL 中，于 {@code gl_Position = ...;} 赋值后插入
+     * {@code gl_Position.y = -gl_Position.y;}，把 GL bottom-up NDC 修正为 D3D12
+     * top-down NDC（图集 blit 专用；ortho 下 w=1，clip 空间直接翻转 Y 即正确）。
+     */
+    private static String injectVertexYFlip(String hlsl) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("(?m)^([ \\t]*gl_Position\\s*=\\s*[^;]+;)$")
+            .matcher(hlsl);
+        if (!m.find()) {
+            return hlsl;
+        }
+        String stmt = m.group(1);
+        String indent = stmt.substring(0, stmt.length() - stmt.stripLeading().length());
+        String injection = stmt + "\n" + indent + "gl_Position.y = -gl_Position.y;";
+        return hlsl.substring(0, m.start()) + injection + hlsl.substring(m.end());
     }
 
     /** 镜像官方 addToBindGroup：按 shader 声明的 UBO/sampler 顺序收集绑定。 */
