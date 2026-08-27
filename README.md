@@ -4,7 +4,9 @@
 > 通过实现 Minecraft 官方的 `GpuBackend` / `GpuDeviceBackend` 接口，用 C++ 原生 DLL（`dx12_mc.dll`）替代 OpenGL/Vulkan 渲染路径，使 Minecraft 使用 D3D12 直接渲染游戏画面，同时保留 Mod 扩展点（AA 设置、ModMenu 集成）。
 
 ## 注意
-此模组不可能能去改变OpenGL/vulkan（官方钦定）庞大的生态，在跑通后会停止除版本适配的任何更新。并使用CC0协议开源。
+> 此模组不可能能去改变OpenGL/vulkan（官方钦定）庞大的生态，在跑通后会停止除版本适配的任何更新。并使用CC0协议开源。
+
+> 鸣谢：爱睡觉的白洲梓 / xiaozi Graphics Development Team
 
 ## 概述
 
