@@ -2781,6 +2781,26 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                             dbgReadbackTexturePixels(b.view->sourceTexture, "srv_tex_readback");
                         }
                     }
+                    // P29 诊断：跟踪字体纹理（256×256 RGBA8）并每 30 帧读回一次，
+                    // 验证字形数据是否正确上传到字体纹理。
+                    {
+                        static Dx12Object* fontTex = nullptr;
+                        static int fontPdFrame = -1;
+                        ID3D12Resource* rsrc = b.view->sourceTexture->resource.Get();
+                        if (rsrc) {
+                            D3D12_RESOURCE_DESC td = rsrc->GetDesc();
+                            if (td.Width == 256 && td.Height == 256 &&
+                                b.view->sourceTexture->dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                                fontTex = b.view->sourceTexture;
+                            }
+                        }
+                        if (fontTex && ((int)ctx->fenceValue - fontPdFrame) >= 30) {
+                            fontPdFrame = (int)ctx->fenceValue;
+                            dbgLog("pushDesc SRV[diag]: periodic font tex readback (fence=%llu)",
+                                (unsigned long long)ctx->fenceValue);
+                            dbgReadbackTexturePixels(fontTex, "font_tex_readback");
+                        }
+                    }
 #endif
                 }
                 gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
@@ -2958,6 +2978,11 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
         case DXGI_FORMAT_R32G32B32A32_UINT:
         case DXGI_FORMAT_R32G32B32A32_SINT:
             bpp = 16; fbFmt = DXGI_FORMAT_R32G32_FLOAT; break;
+        case DXGI_FORMAT_R8_UNORM:
+        case DXGI_FORMAT_R8_UINT:
+        case DXGI_FORMAT_R8_SNORM:
+        case DXGI_FORMAT_R8_SINT:
+            bpp = 1; fbFmt = DXGI_FORMAT_R8_UNORM; break;
         default:
             // 未知格式：按4字节处理（多数常见格式兼容）
             bpp = 4; fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM; break;

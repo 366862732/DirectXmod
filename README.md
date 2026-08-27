@@ -3,6 +3,9 @@
 > **Minecraft 26.2 Fabric 模组的原生 D3D12 渲染后端。**
 > 通过实现 Minecraft 官方的 `GpuBackend` / `GpuDeviceBackend` 接口，用 C++ 原生 DLL（`dx12_mc.dll`）替代 OpenGL/Vulkan 渲染路径，使 Minecraft 使用 D3D12 直接渲染游戏画面，同时保留 Mod 扩展点（AA 设置、ModMenu 集成）。
 
+## 注意
+此模组不可能能去改变OpenGL/vulkan（官方钦定）庞大的生态，在跑通后会停止除版本适配的任何更新。并使用CC0协议开源。
+
 ## 概述
 
 本项目采用 **Mixin 注入** 方式修改 Minecraft 的图形 API 选择逻辑，让游戏改用 D3D12 后端渲染，同时通过 Java 层提供渲染状态同步、配置管理和 Mod 兼容层。
