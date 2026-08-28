@@ -110,28 +110,24 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
-        // P28：animate_sprite 图集合成管线（blit/interpolate）的顶点 shader 用 GL
-        // bottom-up 投影（ortho(0,W,0,H)）配合 vanilla 的 bottom-up sprite 坐标。
-        // D3D12 的 NDC Y 与 GL 相反（NDC -1 在顶部），导致图集内容整体垂直翻转
-        // （dump 证实：所有稀疏图集内容落在 y[H-h..H-1]）。修复：在顶点输出上
-        // 翻转 Y，只作用于图集上传管线，不影响屏幕 GUI（其坐标是 top-down 本就正确）。
-        // P31：flipY 变体——GUI 离屏纹理（物品图集 GuiItemAtlas / PIP 实体纹理，
-        // 颜色附件 usage=13 且带深度附件）以 invertY 正交投影渲染到 D3D12 纹理，
-        // GL 的"双翻转抵消"机制在 D3D12 下失效，导致物品图标不可见 / 实体倒置。
-        // 同样注入 Y-flip（方向与 P28 一致），只作用于离屏 pass 的管线变体，
-        // 不影响主世界渲染方向。
+        // P28/P31：对需要 Y-flip 的管线注入 gl_Position.y 翻转。
+        // animate_sprite（P28）：图集合成管线，始终需要翻转。
+        // entity_cutout/item_cutout（P31 flipY）：仅当 flipY=true 时注入，
+        // 这样同一管线可以有 PN（主世界）和 SN（GUI atlas）两个变体。
         String pipelineLocation = pipeline.getLocation().toString();
-        if (pipelineLocation.contains("animate_sprite") || flipY) {
+        boolean needsYFlip = pipelineLocation.contains("animate_sprite") || flipY;
+        if (needsYFlip) {
             String before = vertexHlsl;
             vertexHlsl = injectVertexYFlip(vertexHlsl);
             if (!before.equals(vertexHlsl)) {
-                System.err.println("[dx12-java] " + (flipY ? "[P31]" : "[P28]")
-                    + " inject Y-flip into " + pipelineLocation + " vertex HLSL"
-                    + (flipY ? " (flipY variant)" : ""));
+                System.err.println("[dx12-java] ["
+                    + (pipelineLocation.contains("animate_sprite") ? "P28" : "P31")
+                    + "] inject Y-flip into " + pipelineLocation + " vertex HLSL");
                 System.err.flush();
             } else {
-                System.err.println("[dx12-java] " + (flipY ? "[P31]" : "[P28]")
-                    + " WARN: no gl_Position assignment found in " + pipelineLocation
+                System.err.println("[dx12-java] ["
+                    + (pipelineLocation.contains("animate_sprite") ? "P28" : "P31")
+                    + "] WARN: no gl_Position assignment found in " + pipelineLocation
                     + " vertex HLSL, Y-flip NOT injected");
                 System.err.flush();
             }

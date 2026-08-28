@@ -75,7 +75,7 @@ public class Dx12Device implements GpuDeviceBackend {
 
     // P4: pipeline + shader caches（镜像官方 VulkanDevice）
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
-    /** P31：flipY 变体管线缓存（GUI 离屏 pass 专用，同一 RenderPipeline 的第二个变体）。 */
+    /** P31：flipY 变体管线缓存（GUI 离屏 pass 专用）。 */
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCacheFlipY = new IdentityHashMap<>();
     private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
     @Nullable
@@ -178,9 +178,19 @@ public class Dx12Device implements GpuDeviceBackend {
     @Override
     public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource) {
+        return precompilePipeline(pipeline, shaderSource, false);
+    }
+
+    /**
+     * P31：预编译管线及其 flipY 变体（用于 entity_cutout/item_cutout 等 GUI 离屏用管线）。
+     */
+    public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
+        @Nullable ShaderSource shaderSource, boolean flipY) {
+        Map<RenderPipeline, Dx12CompiledRenderPipeline> cache =
+            flipY ? this.pipelineCacheFlipY : this.pipelineCache;
         ShaderSource source = shaderSource == null ? this.defaultShaderSource : shaderSource;
-        return this.pipelineCache.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, source, false));
+        return cache.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, source, flipY));
     }
 
     /**
@@ -188,18 +198,17 @@ public class Dx12Device implements GpuDeviceBackend {
      * 渲染 pass setPipeline 时按需编译，使用 createDevice 传入的默认 shader 源。
      */
     public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline) {
-        return this.getOrCompilePipeline(pipeline, false);
+        return this.pipelineCache.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, false));
     }
 
     /**
-     * P31：取（或编译）管线变体。flipY=true 时为 GUI 离屏 pass（物品图集 /
-     * PIP 实体纹理）编译 Y-flip 变体，顶点输出翻转 Y + 关闭背面剔除。
+     * P31：取（或编译）flipY 变体管线。用于 GUI 离屏 pass（invertY ortho 投影），
+     * 顶点 shader 注入 Y-flip + 关闭背面剔除。主世界渲染使用普通变体管线（无翻转）。
      */
-    public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline, boolean flipY) {
-        Map<RenderPipeline, Dx12CompiledRenderPipeline> cache =
-            flipY ? this.pipelineCacheFlipY : this.pipelineCache;
-        return cache.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, flipY));
+    public Dx12CompiledRenderPipeline getOrCompilePipelineWithFlipY(RenderPipeline pipeline) {
+        return this.pipelineCacheFlipY.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, true));
     }
 
     @Override
@@ -313,7 +322,7 @@ public class Dx12Device implements GpuDeviceBackend {
      * desc -> 原生层 D3DCompile + root signature + 双 PSO。任何失败都返回
      * handle=0 的无效管线（isValid()==false），镜像官方 compilePipeline。
      *
-     * @param flipY P31：true 时编译 Y-flip 变体（GUI 离屏 pass 专用）
+     * @param flipY P31：true 时注入 shader Y-flip + 关闭背面剔除（GUI 离屏 pass 专用）。
      */
     private Dx12CompiledRenderPipeline compilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource, boolean flipY) {
@@ -345,7 +354,7 @@ public class Dx12Device implements GpuDeviceBackend {
             LOGGER.info("[dx12-java] {} COMPILE OK (handle={}{})", pipeName, handle,
                 flipY ? ", flipY variant" : "");
             return new Dx12CompiledRenderPipeline(pipeline, handle,
-                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl(), flipY);
+                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl());
         } catch (ShaderCompileException e) {
             LOGGER.error("[dx12-java] {} COMPILE FAILED (compile): {}", pipeName, e.getMessage());
             return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
@@ -490,13 +499,15 @@ public class Dx12Device implements GpuDeviceBackend {
             writeDepthState(desc, pipeline.getDepthStencilState());
         }
 
-        // P28：animate_sprite 管线已注入 gl_Position.y 翻转（修正 GL bottom-up
-        // 投影在 D3D12 下的 Y 方向）。翻转会反转三角形绕序（CCW→CW），若仍按
-        // CullMode=BACK + FrontCounterClockwise 剔除，所有三角形被判为背面 →
-        // 图集全黑。blit 不依赖绕序，强制关闭剔除。
-        // P31：flipY 变体（GUI 离屏 pass）同样注入 Y-flip，绕序反转，同理关闭剔除。
+        // P28/P31：shader 注入 gl_Position.y 翻转会反转三角形绕序（CCW→CW），
+        // 若仍按 CullMode=BACK + FrontCounterClockwise 剔除，所有三角形被判为背面。
+        // animate_sprite：P28，shader 已注入翻转。
+        // entity_cutout/item_cutout：P31 flipY 变体，shader 注入翻转，需关闭剔除。
         boolean cull = pipeline.isCull();
-        if (pipeline.getLocation().toString().contains("animate_sprite") || flipY) {
+        String loc = pipeline.getLocation().toString();
+        boolean needsCullDisable = loc.contains("animate_sprite")
+            || (flipY && (loc.contains("entity_cutout") || loc.contains("item_cutout")));
+        if (needsCullDisable) {
             cull = false;
         }
         desc.putInt(pipeline.getPrimitiveTopology().ordinal());

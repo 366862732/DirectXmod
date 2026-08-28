@@ -20,10 +20,16 @@
 - [ ] Task 3: 修复物品栏显示与人物方向（P31）
   - [x] SubTask 3.1: 诊断物品图标不显示：确认 GUI 图集（items atlas）是否上传/采样成功、GUI textured 管线 draw 是否被录制，定位黑图标根因
   - [x] SubTask 3.2: 修复物品图标渲染（纹理上传/SRV 绑定/采样状态任一环节的修复）
+    - 方案调整：shader Y-flip 方案对带 scissor 的物品图集无效（翻转几何后 scissor 仍按原坐标裁切，内容被裁掉）；
+      改为在 `Dx12RenderPassBackend.enableScissor` 中根据 `flipY` 标志翻转 scissor Y 坐标
+      （`newY = outputHeight - y - height`），保持几何与 scissor 在同一坐标系内。
+      同时关闭 entity_cutout/item_cutout 管线背面剔除（invertY 投影反转三角形绕序）。
   - [x] SubTask 3.3: 诊断人物倒过来：确认 GUI 相机（ortho）下 entity 管线渲染的坐标翻转需求（viewport Y 翻转 vs 投影矩阵修正 vs 着色器注入）
   - [x] SubTask 3.4: 实施修复并保证主世界 3D 渲染方向不变（Y-flip 只影响 GUI 相机渲染）
-  - [ ] SubTask 3.5: 验证：打开物品栏，物品图标正常显示、玩家模型头朝上不颠倒；主世界渲染正常
-    - 改动：`Dx12ShaderCompiler.compile()` 增加 `boolean flipY`；`injectVertexYFlip` 改为循环注入所有 `gl_Position` 赋值；`Dx12Device` 新增 `pipelineCacheFlipY` 缓存 flipY 变体管线；`Dx12RenderPassBackend.setPipeline(pipeline, flipY)` 按 pass 判别结果选取变体；`Dx12CommandEncoderBackend.createRenderPass` 以 `color[0].usage()==13 && depthTexture!=0` 判别 GUI 离屏 pass 并传递 flipY
+  - [x] SubTask 3.5: 验证：打开物品栏，物品图标正常显示、玩家模型头朝上不颠倒；主世界渲染正常
+    - 最终方案：shader Y-flip（entity_cutout/item_cutout 管线）+ enableScissor 中 scissorY = y - height
+      （shader 翻转几何 + scissor 同步翻转，两者在 screen space 中保持一致）
+      cull=false 应用于 animate_sprite / entity_cutout / item_cutout 三类管线
 
 - [ ] Task 4: 修复拉高视距远处全黑（P32）
   - [ ] SubTask 4.1: 诊断：拉高视距后记录区块网格构建/上传/绘制情况（SectionRenderDispatcher draw 数、chunk mesh 上传）、雾参数、深度远平面与 reverse-Z 设置
