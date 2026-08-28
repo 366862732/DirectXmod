@@ -178,19 +178,9 @@ public class Dx12Device implements GpuDeviceBackend {
     @Override
     public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource) {
-        return precompilePipeline(pipeline, shaderSource, false);
-    }
-
-    /**
-     * P31：预编译管线及其 flipY 变体（用于 entity_cutout/item_cutout 等 GUI 离屏用管线）。
-     */
-    public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
-        @Nullable ShaderSource shaderSource, boolean flipY) {
-        Map<RenderPipeline, Dx12CompiledRenderPipeline> cache =
-            flipY ? this.pipelineCacheFlipY : this.pipelineCache;
         ShaderSource source = shaderSource == null ? this.defaultShaderSource : shaderSource;
-        return cache.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, source, flipY));
+        return this.pipelineCache.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, source));
     }
 
     /**
@@ -199,24 +189,13 @@ public class Dx12Device implements GpuDeviceBackend {
      */
     public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline) {
         return this.pipelineCache.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, false));
-    }
-
-    /**
-     * P31：取（或编译）flipY 变体管线。用于 GUI 离屏 pass（invertY ortho 投影），
-     * 顶点 shader 注入 Y-flip + 关闭背面剔除。主世界渲染使用普通变体管线（无翻转）。
-     */
-    public Dx12CompiledRenderPipeline getOrCompilePipelineWithFlipY(RenderPipeline pipeline) {
-        return this.pipelineCacheFlipY.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, true));
+            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource));
     }
 
     @Override
     public void clearPipelineCache() {
         this.pipelineCache.values().forEach(Dx12CompiledRenderPipeline::close);
         this.pipelineCache.clear();
-        this.pipelineCacheFlipY.values().forEach(Dx12CompiledRenderPipeline::close);
-        this.pipelineCacheFlipY.clear();
         this.shaderCache.values().forEach(Dx12IntermediaryShaderModule::close);
         this.shaderCache.clear();
     }
@@ -343,8 +322,8 @@ public class Dx12Device implements GpuDeviceBackend {
         }
         try {
             Dx12CompiledShader compiled = this.getOrCreateCompiler()
-                .compile(pipeline, vertexShader, fragmentShader, flipY);
-            ByteBuffer desc = buildNativeDesc(compiled, pipeline, flipY);
+                .compile(pipeline, vertexShader, fragmentShader);
+            ByteBuffer desc = buildNativeDesc(compiled, pipeline);
             long handle = Dx12Native.dx12CreateGraphicsPipeline(desc);
             if (handle == 0) {
                 LOGGER.error("[dx12-java] {} COMPILE FAILED (native): dx12CreateGraphicsPipeline returned 0",
@@ -448,8 +427,7 @@ public class Dx12Device implements GpuDeviceBackend {
      * 打包原生层 {@code dx12CreateGraphicsPipeline} 的 desc（little-endian）。
      * 布局见 {@link Dx12Native#dx12CreateGraphicsPipeline} Javadoc。
      */
-    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled, RenderPipeline pipeline,
-        boolean flipY) {
+    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled, RenderPipeline pipeline) {
         byte[] vsBytes = compiled.vertexHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] psBytes = compiled.fragmentHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         ColorTargetState[] colorTargets = pipeline.getColorTargetStates();
@@ -499,15 +477,13 @@ public class Dx12Device implements GpuDeviceBackend {
             writeDepthState(desc, pipeline.getDepthStencilState());
         }
 
-        // P28/P31：shader 注入 gl_Position.y 翻转会反转三角形绕序（CCW→CW），
-        // 若仍按 CullMode=BACK + FrontCounterClockwise 剔除，所有三角形被判为背面。
-        // animate_sprite：P28，shader 已注入翻转。
-        // entity_cutout/item_cutout：P31 flipY 变体，shader 注入翻转，需关闭剔除。
+        // P28：shader 注入 gl_Position.y 翻转会反转三角形绕序（CCW→CW），
+        // 若仍按 CullMode=BACK 剔除，所有三角形被判为背面。animate_sprite 管线需关闭剔除。
+        // P31：entity_cutout/item_cutout 等 GUI 管线使用 invertY=true 投影矩阵，
+        // 不注入 shader Y-flip，绕序不变，按管线自身 isCull() 设置即可。
         boolean cull = pipeline.isCull();
         String loc = pipeline.getLocation().toString();
-        boolean needsCullDisable = loc.contains("animate_sprite")
-            || (flipY && (loc.contains("entity_cutout") || loc.contains("item_cutout")));
-        if (needsCullDisable) {
+        if (loc.contains("animate_sprite")) {
             cull = false;
         }
         desc.putInt(pipeline.getPrimitiveTopology().ordinal());

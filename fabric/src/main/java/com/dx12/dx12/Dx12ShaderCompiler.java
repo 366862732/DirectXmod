@@ -110,10 +110,12 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
-        // P28/P31：对需要 Y-flip 的管线注入 gl_Position.y 翻转。
-        // animate_sprite（P28）：图集合成管线，始终需要翻转。
-        // entity_cutout/item_cutout（P31 flipY）：仅当 flipY=true 时注入，
-        // 这样同一管线可以有 PN（主世界）和 SN（GUI atlas）两个变体。
+        // P28：对图集合成管线（animate_sprite）注入 gl_Position.y 翻转。
+        // 该管线用于将 GUI atlas 合成为最终纹理，ortho 下 w=1，clip 空间翻转 Y 即正确。
+        // P31：GUI 离屏渲染（entity_cutout/item_cutout）使用 invertY=true 投影矩阵，
+        // shader Y-flip 补偿 NDC 绕序反转（防止 CULL_BACK 剔除）并修正 PIP 人物方向。
+        // 精确匹配：仅 entity_cutout / item_cutout / entity_cutout_cull / item_cutout_translucent。
+        // 排除 entity_cutout_z_offset 等变体（勿误编译 flipY 管线，影响主世界渲染）。
         String pipelineLocation = pipeline.getLocation().toString();
         boolean needsYFlip = pipelineLocation.contains("animate_sprite") || flipY;
         if (needsYFlip) {
@@ -169,7 +171,7 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     }
 
     /**
-     * P28：在 spvc 生成的顶点 HLSL 中，于每个 {@code gl_Position = ...;} 赋值后插入
+     * P28/P31：在 spvc 生成的顶点 HLSL 中，于每个 {@code gl_Position = ...;} 赋值后插入
      * {@code gl_Position.y = -gl_Position.y;}，把 GL bottom-up NDC 修正为 D3D12
      * top-down NDC（图集 blit 专用；ortho 下 w=1，clip 空间直接翻转 Y 即正确）。
      * P31：实体管线顶点 shader 多为多分支 gl_VertexID 写法，每个分支各有一个
