@@ -747,8 +747,14 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
     if (!texture || texture->kind != Dx12Object::Kind::Texture) {
         err = "createTextureView: invalid texture handle"; return nullptr;
     }
-    if (!(texture->usage & 4)) {  // TEXTURE_BINDING
-        err = "createTextureView: texture lacks TEXTURE_BINDING usage"; return nullptr;
+    // P29：放宽 TEXTURE_BINDING 硬校验。深度/自绘纹理可能只有 RENDER_ATTACHMENT
+    // 而无 TEXTURE_BINDING（如 GuiItemAtlas 的 depth 图集 usage=9，官方 Vulkan 后端
+    // 创建 view 时不校验 usage），D3D12 对未设 DENY_SHADER_RESOURCE 的资源均可创建
+    // SRV，且采样前的状态切换（transitionTo SHADER_RESOURCE）不依赖此位——故降级为
+    // 警告而非硬错误，避免 GuiItemAtlas.<init> 渲染崩溃。
+    if (!(texture->usage & 4)) {
+        dbgLog("createTextureView: texture usage=0x%x lacks TEXTURE_BINDING (fmt=%d) — creating SRV anyway",
+            texture->usage, (int)texture->dxgiFormat);
     }
 
     int slot = allocSrvSlot(err);
@@ -2770,7 +2776,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     transitionTextureTo(ctx, b.view->sourceTexture,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-#ifdef DIAG_READBACK_COLOR_TEX
+#if 1
                     // P20 诊断：首次 SRV 绑定读回纹理像素，确认纹理内容是否非空。
                     // deviceWaitIdle 开销大，仅首次执行（static 标志）。
                     {
@@ -2790,8 +2796,13 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                         if (rsrc) {
                             D3D12_RESOURCE_DESC td = rsrc->GetDesc();
                             if (td.Width == 256 && td.Height == 256 &&
-                                b.view->sourceTexture->dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM) {
-                                fontTex = b.view->sourceTexture;
+                                (b.view->sourceTexture->dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                                 b.view->sourceTexture->dxgiFormat == DXGI_FORMAT_R8_UNORM)) {
+                                if (fontTex != b.view->sourceTexture) {
+                                    fontTex = b.view->sourceTexture;
+                                    dbgLog("pushDesc SRV[diag]: font tex detected fmt=%d",
+                                        (int)b.view->sourceTexture->dxgiFormat);
+                                }
                             }
                         }
                         if (fontTex && ((int)ctx->fenceValue - fontPdFrame) >= 30) {

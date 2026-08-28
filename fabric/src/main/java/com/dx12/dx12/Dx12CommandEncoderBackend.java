@@ -150,23 +150,25 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorClearFlags, clearColors,
             depthTexture, depthClearFlag, depthClearValue, x, y, w, h);
         boolean hasDepth = depthTexture != 0L;
-        // P6 诊断：打印 pass 尺寸 + Java 调用来源，区分 cubeMap 全景 / GUI
-        // before|after blur / 物品图集 / blur effect 的 pass，定位 GUI 主 pass 缺失。
-        StackTraceElement[] st = Thread.currentThread().getStackTrace();
-        StringBuilder sb = new StringBuilder();
-        sb.append("createRenderPass: ").append(w).append('x').append(h)
-            .append(" area=").append(x).append(',').append(y)
-            .append(hasDepth ? " depth=yes" : " depth=no").append(" from:");
-        int shown = 0;
-        for (int i = 3; i < st.length && shown < 6; ++i) {
-            String cn = st[i].getClassName();
-            int dot = cn.lastIndexOf('.');
-            sb.append(' ').append(dot >= 0 ? cn.substring(dot + 1) : cn)
-                .append('.').append(st[i].getMethodName());
-            shown++;
+        // P6 诊断：打印 pass 尺寸 + Java 调用来源（P29：getStackTrace() 开销大，
+        // 仅 DX12_LOG_VERBOSE=1 时输出，避免图集上传时每帧数百次堆栈遍历）。
+        if (Dx12Native.LOG_VERBOSE) {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            sb.append("createRenderPass: ").append(w).append('x').append(h)
+                .append(" area=").append(x).append(',').append(y)
+                .append(hasDepth ? " depth=yes" : " depth=no").append(" from:");
+            int shown = 0;
+            for (int i = 3; i < st.length && shown < 6; ++i) {
+                String cn = st[i].getClassName();
+                int dot = cn.lastIndexOf('.');
+                sb.append(' ').append(dot >= 0 ? cn.substring(dot + 1) : cn)
+                    .append('.').append(st[i].getMethodName());
+                shown++;
+            }
+            System.err.println("[dx12-java] " + sb);
+            System.err.flush();
         }
-        System.err.println("[dx12-java] " + sb);
-        System.err.flush();
         Dx12RenderPassBackend pass = new Dx12RenderPassBackend(this.device, this.ctx,
             area, w, h, hasDepth, colorCount > 0 ? colorTextures[0] : 0L);
         this.currentRenderPass = pass;
@@ -182,7 +184,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 注意：dx12EndRenderPass 只在命令列表上记录 draw，GPU 要等 submit() 的
         // dx12Submit 才真正执行。因此 dump 必须推迟到 submit() 之后执行，否则
         // dbgReadbackTexturePixels 的 deviceWaitIdle 等待不到未提交的命令，读回全 0。
-        if (pass != null && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
+        // P29：dump 含 deviceWaitIdle，整条 P27 链路仅在 DX12_LOG_VERBOSE=1 时启用。
+        if (Dx12Native.LOG_VERBOSE && pass != null && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
             String loc = pass.pipelineLocation();
             if (loc != null && (loc.contains("animate") || loc.contains("sprite"))) {
                 gPendingAtlasByCtx.computeIfAbsent(this.ctx, k -> new ArrayList<>()).add(pass);
@@ -355,23 +358,26 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 内部 deviceWaitIdle 会等待刚提交的命令完成）。只消费本 ctx 的 pending 列表：
         // 别的 encoder 记录的 blit pass 命令尚未提交 GPU，读回全 0（纯黑假象）。
         // 按 color target handle 去重，最多 dump MAX_ATLAS_DUMPS 个不同图集。
-        List<Dx12RenderPassBackend> atlasPasses = gPendingAtlasByCtx.remove(this.ctx);
-        if (atlasPasses != null && !atlasPasses.isEmpty()) {
-            for (Dx12RenderPassBackend dumpPass : atlasPasses) {
-                long h = dumpPass.colorTargetHandle();
-                if (!gDumpedAtlas.contains(h) && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
-                    gDumpedAtlas.add(h);
-                    System.err.println("[dx12-java] P27 dump atlas (after submit) ctx=0x"
-                        + Long.toHexString(this.ctx)
-                        + " pass=" + dumpPass.pipelineLocation()
-                        + " size=" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
-                        + " lastArea=" + dumpPass.areaX() + "," + dumpPass.areaY()
-                        + " " + dumpPass.areaWidth() + "x" + dumpPass.areaHeight()
-                        + " colorTex=0x" + Long.toHexString(h));
-                    System.err.flush();
-                    Dx12Native.dx12DumpTextureToFile(h,
-                        "atlas_" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
-                        + "_" + Long.toHexString(h & 0xFFFF));
+        // P29：dump 含 deviceWaitIdle，仅 verbose 模式启用。
+        if (Dx12Native.LOG_VERBOSE) {
+            List<Dx12RenderPassBackend> atlasPasses = gPendingAtlasByCtx.remove(this.ctx);
+            if (atlasPasses != null && !atlasPasses.isEmpty()) {
+                for (Dx12RenderPassBackend dumpPass : atlasPasses) {
+                    long h = dumpPass.colorTargetHandle();
+                    if (!gDumpedAtlas.contains(h) && gDumpedAtlas.size() < MAX_ATLAS_DUMPS) {
+                        gDumpedAtlas.add(h);
+                        System.err.println("[dx12-java] P27 dump atlas (after submit) ctx=0x"
+                            + Long.toHexString(this.ctx)
+                            + " pass=" + dumpPass.pipelineLocation()
+                            + " size=" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
+                            + " lastArea=" + dumpPass.areaX() + "," + dumpPass.areaY()
+                            + " " + dumpPass.areaWidth() + "x" + dumpPass.areaHeight()
+                            + " colorTex=0x" + Long.toHexString(h));
+                        System.err.flush();
+                        Dx12Native.dx12DumpTextureToFile(h,
+                            "atlas_" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
+                            + "_" + Long.toHexString(h & 0xFFFF));
+                    }
                 }
             }
         }
@@ -382,8 +388,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             callback.run();
         }
         Dx12Native.dx12BeginCommandList(this.ctx);
-        // P15: 每 30 帧打印一次 submit 摘要
-        if ((fenceBefore % 30L) == 0) {
+        // P15: 每 30 帧打印一次 submit 摘要（P29：仅 verbose）
+        if (Dx12Native.LOG_VERBOSE && (fenceBefore % 30L) == 0) {
             System.err.println("[dx12-java] submit: frame=" + fenceBefore
                 + " ctx=" + Long.toHexString(this.ctx));
             System.err.flush();
@@ -391,8 +397,10 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     }
 
     public void close() {
-        System.err.println("[dx12-java] close: begin");
-        System.err.flush();
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] close: begin");
+            System.err.flush();
+        }
         if (this.currentRenderPass != null) {
             Dx12Native.dx12EndRenderPass(this.ctx);
             this.currentRenderPass = null;
@@ -405,11 +413,15 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // dx12DestroyCommandEncoder，保证资源在 fence 等待后安全释放。
         if (this.device == null) {
             Dx12Native.dx12DestroyCommandEncoder(this.ctx);
-            System.err.println("[dx12-java] close: after destroyCommandEncoder");
-            System.err.flush();
+            if (Dx12Native.LOG_VERBOSE) {
+                System.err.println("[dx12-java] close: after destroyCommandEncoder");
+                System.err.flush();
+            }
         }
         this.transientMemory.close();
-        System.err.println("[dx12-java] close: after transientMemory.close");
-        System.err.flush();
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] close: after transientMemory.close");
+            System.err.flush();
+        }
     }
 }

@@ -19,6 +19,13 @@ import java.nio.file.StandardCopyOption;
 public final class Dx12Native {
     private static boolean loaded = false;
 
+    /**
+     * 高频诊断日志开关：设置环境变量 DX12_LOG_VERBOSE=1 开启，默认关闭。
+     * 与 native 侧日志级别同款环境变量；Java 端每帧/每调用的诊断打印均以此门控，
+     * 避免海量 System.err 同步 I/O 拖垮帧率（P29 帧数修复）。
+     */
+    public static final boolean LOG_VERBOSE = "1".equals(System.getenv("DX12_LOG_VERBOSE"));
+
     static {
         loadNativeLibrary();
     }
@@ -73,9 +80,9 @@ public final class Dx12Native {
 
             System.load(dllPath.toAbsolutePath().toString());
             loaded = true;
-            String verbose = System.getenv("DX12_LOG_VERBOSE");
             System.out.println("[dx12] Native library loaded from: " + dllPath);
-            System.out.println("[dx12] 高频调试日志已关闭，如需开启请设置环境变量 DX12_LOG_VERBOSE=1");
+            System.out.println("[dx12] 高频调试日志"
+                + (LOG_VERBOSE ? "已开启 (DX12_LOG_VERBOSE=1)" : "已关闭，如需开启请设置环境变量 DX12_LOG_VERBOSE=1"));
             System.out.println("[dx12] 诊断 GREEN 着色器注入已关闭，如需开启请设置环境变量 DX12_DIAG_GREEN=1");
             System.out.println("[dx12] 诊断 WHITE 着色器注入已关闭，如需开启请设置环境变量 DX12_DIAG_WHITE=1");
         } catch (Exception e) {

@@ -284,7 +284,14 @@ public record Dx12IntermediaryShaderModule(
                     for (SpvVariable input : this.inputs) {
                         int loc = this.spirv.asIntBuffer().get(input.locationOffset());
                         if (loc != prevLoc) {
-                            String semantic = (inputIdx == 0) ? "POSITION" : ("TEXCOORD" + (inputIdx - 1));
+                            // BUG-02 fix: 语义按 SPIR-V location 分配（rebind 后 location 与顶点
+                            // 格式元素顺序一致：0→POSITION, n→TEXCOORD(n-1)），与 Dx12Device
+                            // buildVertexInputElements 的 attribLocation 对齐。原实现按反射顺序
+                            // （GLSL 声明顺序）分配，text.vsh 声明 Position,Color,UV0（格式为
+                            // Position,UV0,Color）→ Color 得 TEXCOORD0、UV0 得 TEXCOORD1，
+                            // 与 input layout 互换：TEXCOORD0 读 UV0 数据、TEXCOORD1 读 Color
+                            // 数据 → 字形采样坐标错误（GUI 文字消失/错乱）。
+                            String semantic = (loc == 0) ? "POSITION" : ("TEXCOORD" + (loc - 1));
                             SpvcHlslVertexAttributeRemap remap = SpvcHlslVertexAttributeRemap.calloc(stack);
                             remap.location(loc);
                             remap.semantic(stack.UTF8(semantic));
@@ -307,7 +314,7 @@ public record Dx12IntermediaryShaderModule(
                 String hlsl = MemoryUtil.memUTF8(address);
                 // P7 诊断：打印 raw spvc 输出，确认 }}; 来自 spvc 还是注入逻辑
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")
-                        || name.contains("animate") || name.contains("sprite")) {
+                        || name.contains("animate") || name.contains("sprite") || name.contains("text")) {
                     System.err.println("[dx12-java] [" + name + "] RAW spvc HLSL:\n" + hlsl);
                 }
                 // Fix S2：语义通过 spvc_compiler_hlsl_add_vertex_attribute_remap 在编译前注入，
@@ -316,7 +323,7 @@ public record Dx12IntermediaryShaderModule(
                 // P7 诊断：打印 raw spvc 输出，确认语义已正确生成
                 // P27：条件同步包含 animate/sprite，确保 animate_sprite_blit 的完整 HLSL 也输出
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")
-                        || name.contains("animate") || name.contains("sprite")) {
+                        || name.contains("animate") || name.contains("sprite") || name.contains("text")) {
                     System.err.println("[dx12-java] [" + name + "] spvc HLSL (no inject):\n" + result);
                 }
                 return result;

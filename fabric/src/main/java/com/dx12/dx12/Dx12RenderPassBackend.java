@@ -9,6 +9,7 @@ import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.systems.RenderPass.RenderArea;
 import com.mojang.blaze3d.systems.RenderPassBackend;
 import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import java.nio.IntBuffer;
 import java.util.Collection;
@@ -156,10 +157,13 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         boolean pipelineHasDepth = compiled.info().getDepthStencilState() != null;
         boolean useDepth = this.hasDepth && pipelineHasDepth;
         boolean ok = Dx12Native.dx12SetPipeline(this.ctx, compiled.handle(), useDepth);
-        System.err.println("[dx12-java] setPipeline: " + pipeline.getLocation()
-                + " pso=" + Long.toHexString(compiled.handle())
-                + " passHasDepth=" + this.hasDepth + " pipelineHasDepth=" + pipelineHasDepth
-                + " useDepth=" + useDepth + " ok=" + ok);
+        // P29：诊断打印仅在 DX12_LOG_VERBOSE=1 时输出，避免每帧同步 I/O。
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] setPipeline: " + pipeline.getLocation()
+                    + " pso=" + Long.toHexString(compiled.handle())
+                    + " passHasDepth=" + this.hasDepth + " pipelineHasDepth=" + pipelineHasDepth
+                    + " useDepth=" + useDepth + " ok=" + ok);
+        }
         if (!ok) {
             throw new IllegalStateException("dx12SetPipeline failed for " + pipeline.getLocation());
         }
@@ -188,8 +192,9 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void setUniform(String name, GpuBufferSlice value) {
-        // P22 诊断：检查 uniform 数据是否含 NaN/Inf（投影矩阵等异常值会污染着色器）
-        if (value != null && value.length() >= 4) {
+        // P22 诊断：检查 uniform 数据是否含 NaN/Inf（投影矩阵等异常值会污染着色器）。
+        // P29：每帧多次 GPU buffer map + 扫描开销大，仅在 DX12_LOG_VERBOSE=1 时执行。
+        if (Dx12Native.LOG_VERBOSE && value != null && value.length() >= 4) {
             try (GpuBufferSlice.MappedView mv = value.buffer().map(value.offset(),
                     Math.min(value.length(), 64L), true, false)) {
                 java.nio.FloatBuffer fb = mv.data().order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
@@ -226,17 +231,17 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         this.frameCount++;
         Dx12CompiledRenderPipeline pipeline = this.pipeline;
         if (pipeline == null || !pipeline.isValid()) {
-            System.err.println("[dx12-java] pushDescriptors: SKIP (pipeline null or invalid)");
+            LOGGER.warn("pushDescriptors: SKIP (pipeline null or invalid)");
             return;
         }
         List<Dx12BindGroupEntry> bindings = pipeline.buildBindings();
         int count = bindings.size();
         if (count == 0) {
-            System.err.println("[dx12-java] pushDescriptors: SKIP (0 bindings)");
+            LOGGER.warn("pushDescriptors: SKIP (0 bindings)");
             return;
         }
-        // P16 诊断：首帧打印 binding 名称列表
-        if (System.err instanceof java.io.PrintStream) {
+        // P16 诊断：首帧打印 binding 名称列表（P29：仅 verbose 模式输出）
+        if (Dx12Native.LOG_VERBOSE && System.err instanceof java.io.PrintStream) {
             StringBuilder sb = new StringBuilder("[dx12-java] pushDesc pipeline=")
                 .append(pipeline.info().getLocation()).append(" count=").append(count);
             for (int i = 0; i < count && i < 8; i++) {
@@ -262,17 +267,15 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     buffers[i] = ((Dx12GpuBuffer) buffer).handle();
                     offsets[i] = value.offset();
                     lengths[i] = value.length();
-                    // P20：诊断 binding 的 buffer 句柄、offset 和长度
-                    if (System.err instanceof java.io.PrintStream) {
+                    // P20：诊断 binding 的 buffer 句柄、offset 和长度（P29：仅 verbose）
+                    // P22：打印 DynamicTransforms 的 offset，验证 ring buffer rotate 是否生效
+                    if (Dx12Native.LOG_VERBOSE && System.err instanceof java.io.PrintStream) {
                         System.err.printf("[dx12-java] pushDesc binding[%d]: name=%s type=UNIFORM buf=%x off=%d len=%d heapType=?%n",
                             i, entry.name(), buffers[i], (int)offsets[i], (int)lengths[i]);
-                        System.err.flush();
-                    }
-                    // P22：打印 DynamicTransforms 的 offset，验证 ring buffer rotate 是否生效
-                    if ("DynamicTransforms".equals(entry.name())
-                        && System.err instanceof java.io.PrintStream) {
-                        System.err.printf("[dx12-java] pushDesc DynamicTransforms: frame=%d off=%d buf=%x%n",
-                            frameCount, (int)offsets[i], buffers[i]);
+                        if ("DynamicTransforms".equals(entry.name())) {
+                            System.err.printf("[dx12-java] pushDesc DynamicTransforms: frame=%d off=%d buf=%x%n",
+                                frameCount, (int)offsets[i], buffers[i]);
+                        }
                         System.err.flush();
                     }
                 }
@@ -286,10 +289,13 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     }
                     types[i] = 1;
                     views[i] = texture.view().handle();
-                    // P22：打印 Sampler0 view handle，验证纹理视图是否正常传递
-                    if ("Sampler0".equals(entry.name()) && System.err instanceof java.io.PrintStream) {
-                        System.err.printf("[dx12-java] pushDesc Sampler0: frame=%d view=%x closed=%b%n",
-                            frameCount, views[i], texture.view().isClosed());
+                    // P22：打印 Sampler0 view handle，验证纹理视图是否正常传递（P29：仅 verbose）
+                    if (Dx12Native.LOG_VERBOSE && "Sampler0".equals(entry.name())
+                        && System.err instanceof java.io.PrintStream) {
+                        GpuTexture tex = texture.view().texture();
+                        System.err.printf("[dx12-java] pushDesc Sampler0: frame=%d view=%x closed=%b fmt=%s w=%d h=%d%n",
+                            frameCount, views[i], texture.view().isClosed(),
+                            tex.getFormat(), tex.getWidth(0), tex.getHeight(0));
                         System.err.flush();
                     }
                 }
@@ -373,14 +379,16 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                 + " (pipeline=" + (pipeline != null ? pipeline.info().getLocation() : "null")
                 + "), vertexFormatBindings is empty or slot out of range");
         }
-        // P22 诊断：记录顶点缓冲大小，用于排查 SizeInBytes 不足问题
-        long bufSize = buffer.size();
-        long vbOffset = vertexBuffer.offset();
-        long vbRemaining = bufSize - vbOffset;
-        System.err.printf("[dx12-java] setVB slot=%d stride=%d bufSize=%d offset=%d remaining=%d pipeline=%s%n",
-            slot, stride, (int)bufSize, (int)vbOffset, (int)vbRemaining,
-            pipeline != null ? pipeline.info().getLocation() : "null");
-        System.err.flush();
+        // P22 诊断：记录顶点缓冲大小，用于排查 SizeInBytes 不足问题（P29：仅 verbose）
+        if (Dx12Native.LOG_VERBOSE) {
+            long bufSize = buffer.size();
+            long vbOffset = vertexBuffer.offset();
+            long vbRemaining = bufSize - vbOffset;
+            System.err.printf("[dx12-java] setVB slot=%d stride=%d bufSize=%d offset=%d remaining=%d pipeline=%s%n",
+                slot, stride, (int)bufSize, (int)vbOffset, (int)vbRemaining,
+                pipeline != null ? pipeline.info().getLocation() : "null");
+            System.err.flush();
+        }
         if (!Dx12Native.dx12SetVertexBuffer(this.ctx, slot,
             ((Dx12GpuBuffer) buffer).handle(), vertexBuffer.offset(), stride)) {
             throw new IllegalStateException("dx12SetVertexBuffer failed");
@@ -404,8 +412,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     @Override
     public void drawIndexed(int indexCount, int instanceCount, int firstIndex,
         int vertexOffset, int firstInstance) {
-        // P17 诊断：记录每次 drawIndexed 调用（含参数），验证 GUI pass 是否有实际 draw
-        if (System.err instanceof java.io.PrintStream) {
+        // P17 诊断：记录每次 drawIndexed 调用（P29：仅 verbose）
+        if (Dx12Native.LOG_VERBOSE && System.err instanceof java.io.PrintStream) {
             // 尝试获取当前绑定的顶点缓冲信息
             int neededVerts = indexCount; // 最坏情况：每个 index 引用一个独立顶点
             System.err.println("[dx12-java] drawIndexed pipeline=" + pipeline.info().getLocation()
@@ -468,13 +476,15 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             }
             this.setIndexBuffer(indexBuffer, indexType);
             this.setVertexBuffer(draw.slot(), draw.vertexBuffer().slice());
-            // P22 诊断：打印每个 Draw 的顶点缓冲信息，用于排查 SizeInBytes 不足
-            GpuBufferSlice vbSlice = draw.vertexBuffer().slice();
-            long vbBufSize = vbSlice.buffer().size();
-            System.err.printf("[dx12-java] drawMulti slot=%d idxCount=%d vbBufSize=%d vbOff=%d vbLen=%d pipeline=%s%n",
-                draw.slot(), draw.indexCount(), (int)vbBufSize, (int)vbSlice.offset(), (int)vbSlice.length(),
-                this.pipeline.info().getLocation());
-            System.err.flush();
+            // P22 诊断：打印每个 Draw 的顶点缓冲信息（P29：仅 verbose）
+            if (Dx12Native.LOG_VERBOSE) {
+                GpuBufferSlice vbSlice = draw.vertexBuffer().slice();
+                long vbBufSize = vbSlice.buffer().size();
+                System.err.printf("[dx12-java] drawMulti slot=%d idxCount=%d vbBufSize=%d vbOff=%d vbLen=%d pipeline=%s%n",
+                    draw.slot(), draw.indexCount(), (int)vbBufSize, (int)vbSlice.offset(), (int)vbSlice.length(),
+                    this.pipeline.info().getLocation());
+                System.err.flush();
+            }
             this.pushDescriptors();
             this.drawIndexed(draw.indexCount(), 1, draw.firstIndex(), draw.baseVertex(), 0);
         }
@@ -482,8 +492,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void draw(int vertexCount, int instanceCount, int firstVertex, int firstInstance) {
-        // P22 诊断：记录非索引 draw（DrawInstanced 路径）
-        if (System.err instanceof java.io.PrintStream) {
+        // P22 诊断：记录非索引 draw（DrawInstanced 路径，P29：仅 verbose）
+        if (Dx12Native.LOG_VERBOSE && System.err instanceof java.io.PrintStream) {
             System.err.println("[dx12-java] draw (non-indexed) pipeline=" + pipeline.info().getLocation()
                 + " vertCount=" + vertexCount + " inst=" + instanceCount
                 + " first=" + firstVertex);

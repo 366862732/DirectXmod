@@ -77,7 +77,8 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle());
         // P6 诊断：blit 后从颜色纹理读回 3x3 像素（waitIdle 保证 GPU 已完成）。
         // 直接读 lastColorTextureHandle（shader 输出目标），而非 surface back buffer（被 blit 覆盖前可能含旧数据）。
-        if (this.lastColorTextureHandle != 0L && ++debugReadbackCounter % 30 == 0) {
+        // P29：读回内部 deviceWaitIdle（每 30 帧同步气泡），仅 DX12_LOG_VERBOSE=1 时启用。
+        if (Dx12Native.LOG_VERBOSE && this.lastColorTextureHandle != 0L && ++debugReadbackCounter % 30 == 0) {
             int[] rb = Dx12Native.dx12ReadbackTexturePixels(this.lastColorTextureHandle);
             if (rb == null) {
                 System.err.println("[dx12-java] [DIAG] colorTex rb NULL handle=0x"
