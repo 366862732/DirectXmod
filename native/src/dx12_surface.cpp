@@ -349,7 +349,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     ID3D12Resource* dst = s->backBuffers[(size_t)s->currentImageIndex].Get();
     UINT w = s->width;
     UINT h = s->height;
-    dbgLog("blitSurface: cmd=%p dst=%p idx=%d w=%u h=%u srcTex=%p",
+    dbgLogDebug("blitSurface: cmd=%p dst=%p idx=%d w=%u h=%u srcTex=%p",
         (void*)cmd, (void*)dst, s->currentImageIndex, w, h, (void*)srcTex);
 
     // 源纹理可能是本帧渲染 pass 的输出（RENDER_TARGET/DEPTH_WRITE），或刚
@@ -383,16 +383,16 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cmd->ResourceBarrier(1, &clearBarrier);
-    dbgLog("blitSurface: after clear barrier transition");
+    dbgLogDebug("blitSurface: after clear barrier transition");
     float greenColor[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
-    dbgLog("blitSurface: rtv ptr=%p idx=%d", (void*)rtv.ptr, s->currentImageIndex);
+    dbgLogDebug("blitSurface: rtv ptr=%p idx=%d", (void*)rtv.ptr, s->currentImageIndex);
     cmd->ClearRenderTargetView(rtv, greenColor, 0, nullptr);
-    dbgLog("blitSurface: after ClearRenderTargetView");
+    dbgLogDebug("blitSurface: after ClearRenderTargetView");
     clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->ResourceBarrier(1, &clearBarrier);
-    dbgLog("DIAG_CLEAR_BACKBUFFER_TO_GREEN: backbuffer filled green, w=%u h=%u", w, h);
+    dbgLogDebug("DIAG_CLEAR_BACKBUFFER_TO_GREEN: backbuffer filled green, w=%u h=%u", w, h);
     // P11：与 #else 路径保持一致——源纹理显式回切 COMMON，避免残留 COPY_SOURCE
     // 状态导致下一帧 beginRenderPass 的 COMMON→RENDER_TARGET barrier 错配（ERROR）。
     if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
@@ -414,7 +414,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         cmd->ClearRenderTargetView(rtv, black, 0, nullptr);
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-        dbgLog("blitSurface: srcTex=null — clear backbuffer to black");
+        dbgLogDebug("blitSurface: srcTex=null — clear backbuffer to black");
         return true;
     }
 
@@ -451,7 +451,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         const BlitPipeline* bp = getBlitPipeline();
         cmd->SetGraphicsRootSignature(bp->rootSig.Get());
         cmd->SetPipelineState(bp->pso.Get());
-        dbgLog("blitSurface: set blit rootSig=%p pso=%p",
+        dbgLogDebug("blitSurface: set blit rootSig=%p pso=%p",
             (void*)bp->rootSig.Get(), (void*)bp->pso.Get());
 
         // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
@@ -463,9 +463,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         // 5. 绑定顶点/索引缓冲并绘制
         cmd->IASetVertexBuffers(0, 1, &bp->vbView);
         cmd->IASetIndexBuffer(&bp->ibView);
-        dbgLog("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
+        dbgLogDebug("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
         cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
-        dbgLog("blitSurface: drawIndexed done");
+        dbgLogDebug("blitSurface: drawIndexed done");
 
         // 6. RENDER_TARGET → PRESENT
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -480,14 +480,14 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     if (srcTex && srcTex->resource) {
         D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
         bool srcWasWritten = ctx->colorTargetsWritten;
-        dbgLog("blitSurface: ctx=%p ctxW=%d src=%p -> backbuf=%ux%u",
+        dbgLogDebug("blitSurface: ctx=%p ctxW=%d src=%p -> backbuf=%ux%u",
             (void*)ctx, (int)ctx->colorTargetsWritten, (void*)srcTex, w, h);
-        dbgLog("blitSurface: src=%p srcW=%llu srcH=%llu fmt=%d wasWritten=%d -> backbuf=%ux%u",
+        dbgLogDebug("blitSurface: src=%p srcW=%llu srcH=%llu fmt=%d wasWritten=%d -> backbuf=%ux%u",
             (void*)srcTex, (unsigned long long)srcDesc.Width,
             (unsigned long long)srcDesc.Height, (int)srcTex->dxgiFormat,
             (int)srcWasWritten, w, h);
     } else {
-        dbgLog("blitSurface: srcTex=null (pure red clear), no src diagnostic");
+        dbgLogDebug("blitSurface: srcTex=null (pure red clear), no src diagnostic");
     }
     // 记录本帧 blit 写入的 back buffer 下标（present 后 currentImageIndex=-1，
     // readback 必须用此值才能读到真实画面）。

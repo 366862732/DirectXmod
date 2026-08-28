@@ -241,9 +241,24 @@ double nowMs() {
 static int gLogLevel = 1; // WARN=1; ERR=0, WARN=1, INFO=2, DEBUG=3
 
 // 诊断插桩：打印到 stderr（PCL 启动器会写入游戏日志；不影响 debug.log）。
-// P12：同时镜像写入 %TEMP%\dx12-native.log——PCL 启动器死锁/游戏异常退出时
+// P12：同时镜像写入独立日志文件——PCL 启动器死锁/游戏异常退出时
 // stderr 重定向的游戏日志丢失，此独立文件随写随刷，进程挂起也能看到卡死点
 // 的最后一条原生调用（fence 等待 / destroy 路径）。
+// P30：镜像写入仅当环境变量 DX12_NATIVE_LOG_FILE 非空时启用；复用 static
+// FILE* 句柄（首次 fopen 后保持打开，进程退出时无需刻意关闭），删除逐行
+// fopen/fclose，避免渲染热路径每次日志的系统调用开销。
+static void mirrorLogToFile(const char* line) {
+    static FILE* s_mirrorFile = nullptr;
+    const char* path = std::getenv("DX12_NATIVE_LOG_FILE");
+    if (!path || !*path) return;  // 未显式启用则不写镜像文件
+    if (!s_mirrorFile) {
+        s_mirrorFile = std::fopen(path, "a");
+        if (!s_mirrorFile) return;
+    }
+    std::fprintf(s_mirrorFile, "%s\n", line);
+    std::fflush(s_mirrorFile);
+}
+
 void dbgLog(const char* fmt, ...) {
     if (gLogLevel < 1) return; // WARN=1, ERR=0
     char line[2048];
@@ -252,15 +267,11 @@ void dbgLog(const char* fmt, ...) {
     std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     double t = nowMs();
-    std::fprintf(stderr, "[dx12][t=%8.1fms] %s\n", t, line);
+    char full[2304];
+    std::snprintf(full, sizeof(full), "[dx12][t=%8.1fms] %s", t, line);
+    std::fprintf(stderr, "%s\n", full);
     fflush(stderr);
-    const char* tmp = std::getenv("TEMP");
-    std::string path = (tmp && *tmp) ? tmp : ".";
-    path += "\\dx12-native.log";
-    if (FILE* f = std::fopen(path.c_str(), "a")) {
-        std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
-        std::fclose(f);
-    }
+    mirrorLogToFile(full);
 }
 void dbgLogInfo(const char* fmt, ...) {
     if (gLogLevel < 2) return; // INFO=2
@@ -270,15 +281,11 @@ void dbgLogInfo(const char* fmt, ...) {
     std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     double t = nowMs();
-    std::fprintf(stderr, "[dx12][t=%8.1fms] %s\n", t, line);
+    char full[2304];
+    std::snprintf(full, sizeof(full), "[dx12][t=%8.1fms] %s", t, line);
+    std::fprintf(stderr, "%s\n", full);
     fflush(stderr);
-    const char* tmp = std::getenv("TEMP");
-    std::string path = (tmp && *tmp) ? tmp : ".";
-    path += "\\dx12-native.log";
-    if (FILE* f = std::fopen(path.c_str(), "a")) {
-        std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
-        std::fclose(f);
-    }
+    mirrorLogToFile(full);
 }
 void dbgLogDebug(const char* fmt, ...) {
     if (gLogLevel < 3) return; // DEBUG=3
@@ -288,15 +295,11 @@ void dbgLogDebug(const char* fmt, ...) {
     std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     double t = nowMs();
-    std::fprintf(stderr, "[dx12][t=%8.1fms] %s\n", t, line);
+    char full[2304];
+    std::snprintf(full, sizeof(full), "[dx12][t=%8.1fms] %s", t, line);
+    std::fprintf(stderr, "%s\n", full);
     fflush(stderr);
-    const char* tmp = std::getenv("TEMP");
-    std::string path = (tmp && *tmp) ? tmp : ".";
-    path += "\\dx12-native.log";
-    if (FILE* f = std::fopen(path.c_str(), "a")) {
-        std::fprintf(f, "[dx12][t=%8.1fms] %s\n", t, line);
-        std::fclose(f);
-    }
+    mirrorLogToFile(full);
 }
 void setLogLevel(int level) {
     gLogLevel = (level < 0) ? 0 : (level > 3) ? 3 : level;
@@ -1137,7 +1140,7 @@ bool deviceWaitIdle(std::string& err) {
         err = "deviceWaitIdle: device not initialized";
         return false;
     }
-    dbgLog("deviceWaitIdle: enter");
+    dbgLogDebug("deviceWaitIdle: enter");
     // 关键：先读当前已完成值，再信号一个绝对高于它的值。
     // 原逻辑 fv = ++gCtx.queueFenceValue 存在竞态——若 GPU 已处理到更高的 fence
     // 值（Java 线程在 awaitCompletion 后提交更多帧），fv 会低于已完成值，
@@ -1169,7 +1172,7 @@ bool deviceWaitIdle(std::string& err) {
         }
     }
     CloseHandle(evt);
-    dbgLog("deviceWaitIdle: done (waited for fv=%llu)", (unsigned long long)fv);
+    dbgLogDebug("deviceWaitIdle: done (waited for fv=%llu)", (unsigned long long)fv);
     return true;
 }
 
@@ -1226,7 +1229,7 @@ void destroyCommandEncoder(CommandContext* ctx) {
 bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "beginCommandList: null ctx"; return false; }
     // P6 诊断：转储上一帧累积的验证错误（Close 成功后不打印不代表无错）。
-    dumpInfoQueueMessages();
+    if (gLogLevel >= 3) dumpInfoQueueMessages();
     DBG_LOG_DEBUG("beginCommandList: fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandList: allocator Reset " + hrText(hr); return false; }
@@ -1314,7 +1317,7 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     UINT64 value = ctx->fenceValue + 1;
     // P15 诊断：每 30 帧打印 submit 摘要（含 fence 值 + queueFence）
     if ((value % 30ULL) == 1) {
-        dbgLog("submitCommandList: frame=%llu ctx=%p queueFence=%llu",
+        dbgLogInfo("submitCommandList: frame=%llu ctx=%p queueFence=%llu",
             (unsigned long long)value, (void*)ctx,
             (unsigned long long)gCtx.queueFenceValue);
     }
@@ -1372,7 +1375,7 @@ bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
             (unsigned long long)ctx->fence->GetCompletedValue());
         return false;
     }
-    dbgLog("waitFence: OK value=%llu", (unsigned long long)value);
+    dbgLogDebug("waitFence: OK value=%llu", (unsigned long long)value);
     return true;
 }
 
@@ -1390,7 +1393,7 @@ bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err) {
         return false;
     }
     UINT64 cv = gCtx.queueFence->GetCompletedValue();
-    dbgLog("waitQFence: value=%llu completed=%llu", (unsigned long long)value,
+    dbgLogDebug("waitQFence: value=%llu completed=%llu", (unsigned long long)value,
         (unsigned long long)cv);
     if (cv >= value) return true;
     HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -2620,11 +2623,6 @@ bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long lon
     DBG_LOG_DEBUG("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
         slot, (void*)buffer, (long long)buffer->size, (long long)offset,
         (int)stride, (int)effectiveStride, (int)buffer->heapType);
-    // P6 诊断：每次读回顶点 buffer 前 16 floats（128 字节），确认数据是否真正写入。
-    static int vbDbg = 0;
-    if ((++vbDbg % 60) == 1) {
-        dbgReadbackBufferBytes(buffer, offset < 0 ? 0 : offset, 128, "vb");
-    }
 #ifdef DIAG_READBACK_COLOR_TEX
     // P20 诊断：每次 drawIndexed 立即读回顶点前 16 floats，不依赖频率计数。
     // 与 beginRenderPass color target 日志配合，确认顶点数据非零。
@@ -2671,7 +2669,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     static int pdFrameCount = 0;
     if ((int)ctx->fenceValue != pdFrameCount) {
         pdFrameCount = (int)ctx->fenceValue;
-        dbgLog("pushDescriptors[%llu]: count=%u firstBuf=%p firstView=%p",
+        dbgLogDebug("pushDescriptors[%llu]: count=%u firstBuf=%p firstView=%p",
             (unsigned long long)ctx->fenceValue, count,
             (void*)(count > 0 ? (void*)bindings[0].buffer : nullptr),
             (void*)(count > 0 ? (void*)bindings[0].view : nullptr));
@@ -2679,7 +2677,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
         for (UINT j = 0; j < count && j < 8; ++j) {
             const DrawBinding& bj = bindings[j];
             const char* tname = bj.type == 0 ? "CBV" : bj.type == 1 ? "SRV" : bj.type == 2 ? "BUF" : "?";
-            dbgLog("pushDesc BIND[%u]: type=%s buf=%p off=%lld len=%lld view=%p heap=%d",
+            dbgLogDebug("pushDesc BIND[%u]: type=%s buf=%p off=%lld len=%lld view=%p heap=%d",
                 (unsigned)j, tname,
                 (void*)(bj.buffer ? bj.buffer : nullptr),
                 (long long)bj.offset, (long long)bj.length,
@@ -2703,32 +2701,6 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
                     return false;
                 }
-                static int ubDbg = 0;
-                if (i == 1 && ((++ubDbg % 60) == 1)) {
-                    // 诊断：读取 DynamicTransforms UBO（binding[1]），非 binding[0]
-                    dbgReadbackBufferBytes(b.buffer, b.offset,
-                        (int)std::min<long long>(b.length, 128), "ubo");
-                }
-                // P18：单独诊断 Projection buffer（binding index 0），确认投影矩阵数据是否写入。
-                static int projDbg = 0;
-                if (i == 0 && ((++projDbg % 60) == 1)) {
-                    dbgReadbackBufferBytes(b.buffer, b.offset,
-                        (int)std::min<long long>(b.length, 64), "proj");
-                }
-                // P27 诊断：SpriteAnimationInfo UBO（len=140，图集合成用）定向读回一次，
-                // 验证 ProjectionMatrix/SpriteMatrix/UPadding/VPadding/MipMapLevel 数据。
-                // 放在 transition 之前（首次使用时 buffer 处于 COMMON，读回安全）。
-                // P28：len 用 >=128 匹配（Java 侧 binding length 可能是 140/144/256），
-                // 且把读回窗口扩到 176 字节以覆盖完整 16 float 投影矩阵 + 16 float sprite 矩阵。
-                static bool spAnimDump = false;
-                if (!spAnimDump && b.length >= 128 && b.length <= 256) {
-                    spAnimDump = true;
-                    dbgLog("P28 dump SpriteAnimationInfo UBO: buf=%p off=%lld len=%lld heap=%d",
-                        (void*)b.buffer, (long long)b.offset, (long long)b.length,
-                        (int)b.buffer->heapType);
-                    dbgReadbackBufferBytes(b.buffer, b.offset, 144, "sprite_ubo");
-                    dbgReadbackBufferBytes(b.buffer, b.offset + 64, 64, "sprite_ubo2");
-                }
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
                 cbv.BufferLocation = b.buffer->resource->GetGPUVirtualAddress() + (UINT64)b.offset;
@@ -2740,7 +2712,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 static UINT64 lastPdFrame = 0;
                 if ((UINT64)ctx->fenceValue != lastPdFrame) {
                     lastPdFrame = (UINT64)ctx->fenceValue;
-                    dbgLog("pushDesc CBV[%u]: bufGVA=%llx off=%lld cbvLoc=%llx cbvSize=%llu heap=%d",
+                    dbgLogDebug("pushDesc CBV[%u]: bufGVA=%llx off=%lld cbvLoc=%llx cbvSize=%llu heap=%d",
                         (unsigned)i,
                         (unsigned long long)b.buffer->resource->GetGPUVirtualAddress(),
                         (long long)b.offset,
@@ -2750,7 +2722,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                     // P21：额外诊断 binding[1]（DynamicTransforms UBO）的 offset，确认 shader 读取位置
                     if (i == 0 && count > 1) {
                         const DrawBinding& b1 = bindings[1];
-                        dbgLog("pushDesc UBO_BIND[1]: bufGVA=%llx off=%lld len=%lld heap=%d",
+                        dbgLogDebug("pushDesc UBO_BIND[1]: bufGVA=%llx off=%lld len=%lld heap=%d",
                             (unsigned long long)b1.buffer ? (unsigned long long)b1.buffer->resource->GetGPUVirtualAddress() : 0ULL,
                             (long long)b1.offset, (long long)b1.length,
                             (int)(b1.buffer ? b1.buffer->heapType : -1));
@@ -2770,7 +2742,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 // COMMON 状态采样是未定义行为（NVIDIA 驱动静默返回黑）→ 全黑屏。
                 if (b.view->sourceTexture) {
                     if (b.view->sourceTexture->usage & 16) {
-                        dbgLog("pushDesc SRV: CUBE view=%p srcTex=%p -> SHADER_RESOURCE",
+                        dbgLogDebug("pushDesc SRV: CUBE view=%p srcTex=%p -> SHADER_RESOURCE",
                             (void*)b.view, (void*)b.view->sourceTexture);
                     }
                     transitionTextureTo(ctx, b.view->sourceTexture,
@@ -2778,8 +2750,8 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 #if 1
                     // P20 诊断：首次 SRV 绑定读回纹理像素，确认纹理内容是否非空。
-                    // deviceWaitIdle 开销大，仅首次执行（static 标志）。
-                    {
+                    // deviceWaitIdle 开销大，仅首次执行（static 标志）。DEBUG 模式（gLogLevel>=3）才启用。
+                    if (gLogLevel >= 3) {
                         static bool srk_done = false;
                         if (!srk_done) {
                             srk_done = true;
@@ -2788,8 +2760,8 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                         }
                     }
                     // P29 诊断：跟踪字体纹理（256×256 RGBA8）并每 30 帧读回一次，
-                    // 验证字形数据是否正确上传到字体纹理。
-                    {
+                    // 验证字形数据是否正确上传到字体纹理。DEBUG 模式（gLogLevel>=3）才启用。
+                    if (gLogLevel >= 3) {
                         static Dx12Object* fontTex = nullptr;
                         static int fontPdFrame = -1;
                         ID3D12Resource* rsrc = b.view->sourceTexture->resource.Get();
@@ -2857,7 +2829,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     static UINT64 lastGpuFrame = 0;
     if ((UINT64)ctx->fenceValue != lastGpuFrame) {
         lastGpuFrame = (UINT64)ctx->fenceValue;
-        dbgLog("pushDesc SET_ROOT_TABLE: heapBase=%llx writeBase=%llx slotCount=%u",
+        dbgLogDebug("pushDesc SET_ROOT_TABLE: heapBase=%llx writeBase=%llx slotCount=%u",
             (unsigned long long)gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart().ptr,
             (unsigned long long)base, (unsigned)count);
     }
@@ -3081,7 +3053,7 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
                 tag, w, h, xs[xi], ys[yi], p[0], p[1], p[2], p[3]);
         }
     }
-    dbgDumpPixelsToFile(base, w, h, pitch, tag);
+    if (gLogLevel >= 3) dbgDumpPixelsToFile(base, w, h, pitch, tag);
     staging->Unmap(0, nullptr);
 }
 

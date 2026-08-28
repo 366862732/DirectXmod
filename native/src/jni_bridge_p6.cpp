@@ -95,18 +95,6 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12PushDescriptors(
     env->GetIntArrayRegion(texelFormats, 0, count, texelArr.data());
     env->GetLongArrayRegion(views, 0, count, viewArr.data());
 
-    // P18 诊断：打印实际从 Java 收到的 binding 数量和类型（定位 count 不一致）
-    {
-        std::fprintf(stderr, "[dx12-jni] dx12PushDescriptors: java_count=%d", (int)count);
-        for (int i = 0; i < (int)count && i < 8; i++) {
-            const char* tname = typesArr[i] == 0 ? "CBV" : typesArr[i] == 1 ? "SRV" : typesArr[i] == 2 ? "BUF" : "?";
-            std::fprintf(stderr, " [%d]=%s(buf=%p view=%p)", i, tname,
-                (void*)bufferArr[i], (void*)viewArr[i]);
-        }
-        std::fprintf(stderr, "\n");
-        std::fflush(stderr);
-    }
-
     std::vector<DrawBinding> bindings((size_t)count);
     for (jsize i = 0; i < count; ++i) {
         bindings[i].type = (uint8_t)typesArr[i];

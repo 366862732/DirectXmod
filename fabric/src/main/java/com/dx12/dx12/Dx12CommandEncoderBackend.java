@@ -150,6 +150,24 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorClearFlags, clearColors,
             depthTexture, depthClearFlag, depthClearValue, x, y, w, h);
         boolean hasDepth = depthTexture != 0L;
+        // P31：GUI 离屏渲染判别——颜色附件 usage==13（COPY_DST|TEXTURE_BINDING|
+        // RENDER_ATTACHMENT，无 COPY_SRC）且带深度附件。GuiItemAtlas / PIP 实体纹理
+        // 满足；Lightmap 同为 usage=13 但无深度附件（排除）；MainTarget/RenderTarget
+        // 为 usage=15（含 COPY_SRC，排除）。命中则该 pass 内所有管线选 Y-flip 变体。
+        boolean flipY = false;
+        if (hasDepth && colorCount > 0) {
+            RenderPassDescriptor.Attachment<Optional<Vector4fc>> first = colorAttachments.get(0);
+            if (first != null && first.textureView() != null
+                && ((Dx12GpuTexture) first.textureView().texture()).usage() == 13) {
+                flipY = true;
+            }
+        }
+        if (flipY && Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] [P31] flipY render pass: "
+                + w + 'x' + h + " area=" + x + ',' + y
+                + " colorTex=0x" + Long.toHexString(colorTextures[0]));
+            System.err.flush();
+        }
         // P6 诊断：打印 pass 尺寸 + Java 调用来源（P29：getStackTrace() 开销大，
         // 仅 DX12_LOG_VERBOSE=1 时输出，避免图集上传时每帧数百次堆栈遍历）。
         if (Dx12Native.LOG_VERBOSE) {
@@ -170,7 +188,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             System.err.flush();
         }
         Dx12RenderPassBackend pass = new Dx12RenderPassBackend(this.device, this.ctx,
-            area, w, h, hasDepth, colorCount > 0 ? colorTextures[0] : 0L);
+            area, w, h, hasDepth, colorCount > 0 ? colorTextures[0] : 0L, flipY);
         this.currentRenderPass = pass;
         return pass;
     }

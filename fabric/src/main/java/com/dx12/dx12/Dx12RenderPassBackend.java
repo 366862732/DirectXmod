@@ -52,6 +52,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private final boolean hasDepth;
     /** P27：本 pass 的 color[0] 纹理 native handle（用于图集合成后 dump 验证）。 */
     private final long colorTargetHandle;
+    /** P31：本 pass 是否为 GUI 离屏渲染（物品图集 / PIP）→ 管线需选 Y-flip 变体。 */
+    private final boolean flipY;
     private int pushedDebugGroups = 0;
 
     private @Nullable Dx12CompiledRenderPipeline pipeline;
@@ -67,6 +69,13 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     public Dx12RenderPassBackend(@Nullable Dx12Device device, long ctx,
         @Nullable RenderArea renderArea, int outputWidth, int outputHeight,
         boolean hasDepth, long colorTargetHandle) {
+        this(device, ctx, renderArea, outputWidth, outputHeight, hasDepth, colorTargetHandle, false);
+    }
+
+    /** P31：多出 flipY——本 pass 是否需用管线 Y-flip 变体（GUI 离屏 pass）。 */
+    public Dx12RenderPassBackend(@Nullable Dx12Device device, long ctx,
+        @Nullable RenderArea renderArea, int outputWidth, int outputHeight,
+        boolean hasDepth, long colorTargetHandle, boolean flipY) {
         this.device = device;
         this.ctx = ctx;
         this.renderArea = renderArea;
@@ -74,6 +83,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         this.outputHeight = outputHeight;
         this.hasDepth = hasDepth;
         this.colorTargetHandle = colorTargetHandle;
+        this.flipY = flipY;
     }
 
     /** P27：当前管线的 location 字符串（如 minecraft:pipeline/animate_sprite_blit）。 */
@@ -143,7 +153,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (device == null) {
             throw new IllegalStateException("No D3D12 device bound to this render pass");
         }
-        Dx12CompiledRenderPipeline compiled = device.getOrCompilePipeline(pipeline);
+        // P31：GUI 离屏 pass（flipY=true）取 Y-flip 变体管线，其余取普通变体。
+        Dx12CompiledRenderPipeline compiled = device.getOrCompilePipeline(pipeline, this.flipY);
         if (compiled == null || !compiled.isValid()) {
             throw new IllegalStateException(
                 "Pipeline " + pipeline.getLocation() + " is not valid (shader compilation failed)");
@@ -161,6 +172,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (Dx12Native.LOG_VERBOSE) {
             System.err.println("[dx12-java] setPipeline: " + pipeline.getLocation()
                     + " pso=" + Long.toHexString(compiled.handle())
+                    + " flipY=" + this.flipY
                     + " passHasDepth=" + this.hasDepth + " pipelineHasDepth=" + pipelineHasDepth
                     + " useDepth=" + useDepth + " ok=" + ok);
         }

@@ -28,17 +28,27 @@ public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline,
     private final Dx12IntermediaryShaderModule fragmentShader; // 用于 buildBindings() 推导
     private final String vertexHlsl;
     private final String fragmentHlsl;
+    /** P31：翻转变体标注——为 GUI 离屏 pass（物品图集 / PIP）编译的 Y-flip 变体管线。 */
+    private final boolean flipY;
 
     public Dx12CompiledRenderPipeline(RenderPipeline info, long handle,
         Dx12IntermediaryShaderModule vertexShader,
         Dx12IntermediaryShaderModule fragmentShader,
         String vertexHlsl, String fragmentHlsl) {
+        this(info, handle, vertexShader, fragmentShader, vertexHlsl, fragmentHlsl, false);
+    }
+
+    public Dx12CompiledRenderPipeline(RenderPipeline info, long handle,
+        Dx12IntermediaryShaderModule vertexShader,
+        Dx12IntermediaryShaderModule fragmentShader,
+        String vertexHlsl, String fragmentHlsl, boolean flipY) {
         this.info = info;
         this.handle = handle;
         this.vertexShader = vertexShader;
         this.fragmentShader = fragmentShader;
         this.vertexHlsl = vertexHlsl;
         this.fragmentHlsl = fragmentHlsl;
+        this.flipY = flipY;
     }
 
     public RenderPipeline info() {
@@ -47,6 +57,11 @@ public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline,
 
     public long handle() {
         return this.handle;
+    }
+
+    /** P31：是否为 Y-flip 变体（仅 GUI 离屏 pass 使用）。 */
+    public boolean flipY() {
+        return this.flipY;
     }
 
     /**

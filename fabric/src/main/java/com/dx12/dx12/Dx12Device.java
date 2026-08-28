@@ -75,6 +75,8 @@ public class Dx12Device implements GpuDeviceBackend {
 
     // P4: pipeline + shader caches（镜像官方 VulkanDevice）
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
+    /** P31：flipY 变体管线缓存（GUI 离屏 pass 专用，同一 RenderPipeline 的第二个变体）。 */
+    private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCacheFlipY = new IdentityHashMap<>();
     private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
     @Nullable
     private Dx12ShaderCompiler glslCompiler;
@@ -177,7 +179,8 @@ public class Dx12Device implements GpuDeviceBackend {
     public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource) {
         ShaderSource source = shaderSource == null ? this.defaultShaderSource : shaderSource;
-        return this.pipelineCache.computeIfAbsent(pipeline, ignored -> this.compilePipeline(pipeline, source));
+        return this.pipelineCache.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, source, false));
     }
 
     /**
@@ -185,14 +188,26 @@ public class Dx12Device implements GpuDeviceBackend {
      * 渲染 pass setPipeline 时按需编译，使用 createDevice 传入的默认 shader 源。
      */
     public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline) {
-        return this.pipelineCache.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource));
+        return this.getOrCompilePipeline(pipeline, false);
+    }
+
+    /**
+     * P31：取（或编译）管线变体。flipY=true 时为 GUI 离屏 pass（物品图集 /
+     * PIP 实体纹理）编译 Y-flip 变体，顶点输出翻转 Y + 关闭背面剔除。
+     */
+    public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline, boolean flipY) {
+        Map<RenderPipeline, Dx12CompiledRenderPipeline> cache =
+            flipY ? this.pipelineCacheFlipY : this.pipelineCache;
+        return cache.computeIfAbsent(pipeline,
+            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, flipY));
     }
 
     @Override
     public void clearPipelineCache() {
         this.pipelineCache.values().forEach(Dx12CompiledRenderPipeline::close);
         this.pipelineCache.clear();
+        this.pipelineCacheFlipY.values().forEach(Dx12CompiledRenderPipeline::close);
+        this.pipelineCacheFlipY.clear();
         this.shaderCache.values().forEach(Dx12IntermediaryShaderModule::close);
         this.shaderCache.clear();
     }
@@ -297,9 +312,11 @@ public class Dx12Device implements GpuDeviceBackend {
      * 编译一条管线：取顶点/片元 shader（缓存）-> GLSL 编译 -> HLSL -> 打包
      * desc -> 原生层 D3DCompile + root signature + 双 PSO。任何失败都返回
      * handle=0 的无效管线（isValid()==false），镜像官方 compilePipeline。
+     *
+     * @param flipY P31：true 时编译 Y-flip 变体（GUI 离屏 pass 专用）
      */
     private Dx12CompiledRenderPipeline compilePipeline(RenderPipeline pipeline,
-        @Nullable ShaderSource shaderSource) {
+        @Nullable ShaderSource shaderSource, boolean flipY) {
         String pipeName = pipeline.getLocation().toString();
         Dx12IntermediaryShaderModule vertexShader = this.getOrCompileShader(
             pipeline.getVertexShader(), ShaderType.VERTEX, pipeline.getShaderDefines(), shaderSource);
@@ -317,17 +334,18 @@ public class Dx12Device implements GpuDeviceBackend {
         }
         try {
             Dx12CompiledShader compiled = this.getOrCreateCompiler()
-                .compile(pipeline, vertexShader, fragmentShader);
-            ByteBuffer desc = buildNativeDesc(compiled, pipeline);
+                .compile(pipeline, vertexShader, fragmentShader, flipY);
+            ByteBuffer desc = buildNativeDesc(compiled, pipeline, flipY);
             long handle = Dx12Native.dx12CreateGraphicsPipeline(desc);
             if (handle == 0) {
                 LOGGER.error("[dx12-java] {} COMPILE FAILED (native): dx12CreateGraphicsPipeline returned 0",
                     pipeName);
                 return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
             }
-            LOGGER.info("[dx12-java] {} COMPILE OK (handle={})", pipeName, handle);
+            LOGGER.info("[dx12-java] {} COMPILE OK (handle={}{})", pipeName, handle,
+                flipY ? ", flipY variant" : "");
             return new Dx12CompiledRenderPipeline(pipeline, handle,
-                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl());
+                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl(), flipY);
         } catch (ShaderCompileException e) {
             LOGGER.error("[dx12-java] {} COMPILE FAILED (compile): {}", pipeName, e.getMessage());
             return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
@@ -421,7 +439,8 @@ public class Dx12Device implements GpuDeviceBackend {
      * 打包原生层 {@code dx12CreateGraphicsPipeline} 的 desc（little-endian）。
      * 布局见 {@link Dx12Native#dx12CreateGraphicsPipeline} Javadoc。
      */
-    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled, RenderPipeline pipeline) {
+    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled, RenderPipeline pipeline,
+        boolean flipY) {
         byte[] vsBytes = compiled.vertexHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] psBytes = compiled.fragmentHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         ColorTargetState[] colorTargets = pipeline.getColorTargetStates();
@@ -475,8 +494,9 @@ public class Dx12Device implements GpuDeviceBackend {
         // 投影在 D3D12 下的 Y 方向）。翻转会反转三角形绕序（CCW→CW），若仍按
         // CullMode=BACK + FrontCounterClockwise 剔除，所有三角形被判为背面 →
         // 图集全黑。blit 不依赖绕序，强制关闭剔除。
+        // P31：flipY 变体（GUI 离屏 pass）同样注入 Y-flip，绕序反转，同理关闭剔除。
         boolean cull = pipeline.isCull();
-        if (pipeline.getLocation().toString().contains("animate_sprite")) {
+        if (pipeline.getLocation().toString().contains("animate_sprite") || flipY) {
             cull = false;
         }
         desc.putInt(pipeline.getPrimitiveTopology().ordinal());
