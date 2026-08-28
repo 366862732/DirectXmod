@@ -2103,7 +2103,7 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         ranges.push_back(r);
         if (b.type == 1) {
             D3D12_STATIC_SAMPLER_DESC s{};
-            s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
             s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;

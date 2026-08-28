@@ -45,6 +45,7 @@
 | **P25: SampleMask + 纹理格式** | ✅ 已完成 | PSO 补设 SampleMask=UINT_MAX；RGB32_FLOAT 不再加宽成 RGBA32_FLOAT |
 | **P26: upload readback 修复** | ✅ 已完成 | Map 读回必须带 offset 的 D3D12_RANGE，否则读到旧数据 |
 | **P27: 高频日志降级** | ✅ 已完成 | beginRenderPass/setPipeline/drawIndexed 逐条诊断日志降级为 DBG_LOG_DEBUG（数千次/帧不拖死主线程） |
+| **P28: 图集渲染与坐标系适配** | ✅ 已完成 | animate_sprite 顶点着色器注入 Y-flip（GL bottom-up → D3D12 top-down）；静态采样器改 POINT（与官方图集上传 NEAREST 语义一致）；图集 dump 验证内容正确、GUI 按钮渲染正常 |
 | **BUG-01: semanticNames 修复** | ✅ 已完成 | `semanticNames` 基于 `vertex.inputs().size()` 补齐，与 spvc 基准对齐 |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线编译 + surface blit + buffer copy + texture readback 全部通过 |
 
@@ -365,7 +366,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P4: 管线编译层** | ✅ | shaderc SPIR-V → spvc 反射/rebind → HLSL → D3DCompile DXBC |
 | **P5: 交换链层** | ✅ | Dx12GpuSurface: DXGI flip-model swapchain |
 | **P6: Draw 全链路** | ✅ | Dx12RenderPassBackend: setPipeline + pushDescriptors + draw |
-| **P15-P27: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级 |
+| **P15-P28: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级/图集渲染与坐标系适配 |
 | **BUG-01: semanticNames** | ✅ | 补齐逻辑与 spvc 基准对齐 |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线 + surface blit + buffer copy + texture readback |
 
