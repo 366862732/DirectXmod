@@ -336,8 +336,11 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void enableScissor(int x, int y, int width, int height) {
-        if (!Dx12Native.dx12SetScissor(this.ctx, x, y, width, height)) {
-            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, y, width, height);
+        // P31：flipY 模式下，shader 已将几何 Y 轴翻转，scissor 坐标需同步翻转以保持裁剪区域对齐。
+        // newW = outputHeight - y - height，使 scissor 原点从左下角转为左上角（与 shader 翻转后一致）。
+        int scissorY = this.flipY ? (this.outputHeight - y - height) : y;
+        if (!Dx12Native.dx12SetScissor(this.ctx, x, scissorY, width, height)) {
+            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, scissorY, width, height);
         }
     }
 

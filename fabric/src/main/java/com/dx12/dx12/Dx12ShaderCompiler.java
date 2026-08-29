@@ -110,12 +110,14 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertex.toHlsl(true);
         String fragmentHlsl = fragment.toHlsl(false);
-        // P28：对图集合成管线（animate_sprite）注入 gl_Position.y 翻转。
-        // 该管线用于将 GUI atlas 合成为最终纹理，ortho 下 w=1，clip 空间翻转 Y 即正确。
-        // 注意：item_cutout 使用透视投影，shader Y-flip 会同时翻转 W 分量导致顶点落出视锥体，
-        // 因此不对 item_cutout 注入 shader Y-flip。背面剔除由 Dx12Device 层关闭处理。
+        // P31：在 GUI 离屏 pass（flipY=true）中，对 entity_cutout / item_cutout / animate_sprite 管线
+        // 注入 gl_Position.y 翻转。shader Y-flip 与 enableScissor 中的 scissorY 翻转配合使用，
+        // 确保几何与 scissor 在同一坐标系内对齐。
+        // 注意：这些管线在 flipY=false 时保持原始着色器，主世界 3D 渲染方向不受影响。
         String pipelineLocation = pipeline.getLocation().toString();
-        boolean needsYFlip = pipelineLocation.contains("animate_sprite");
+        boolean needsYFlip = flipY && (pipelineLocation.contains("animate_sprite")
+            || pipelineLocation.contains("entity_cutout")
+            || pipelineLocation.contains("item_cutout"));
         if (needsYFlip) {
             String before = vertexHlsl;
             vertexHlsl = injectVertexYFlip(vertexHlsl);

@@ -17,7 +17,7 @@
   - [x] SubTask 2.4: `dbgReadbackTexturePixels` 中 `dbgDumpPixelsToFile` BMP 写入移出常规路径（仅显式诊断）
   - [x] SubTask 2.5: 验证：帧渲染期间日志无 `deviceWaitIdle: enter`；`waitQFence` 快速返回；拉高视距后无明显卡顿
 
-- [ ] Task 3: 修复物品栏显示与人物方向（P31）
+- [x] Task 3: 修复物品栏显示与人物方向（P31）
   - [x] SubTask 3.1: 诊断物品图标不显示：确认 GUI 图集（items atlas）是否上传/采样成功、GUI textured 管线 draw 是否被录制，定位黑图标根因
   - [x] SubTask 3.2: 修复物品图标渲染（纹理上传/SRV 绑定/采样状态任一环节的修复）
     - 方案调整：shader Y-flip 方案对带 scissor 的物品图集无效（翻转几何后 scissor 仍按原坐标裁切，内容被裁掉）；

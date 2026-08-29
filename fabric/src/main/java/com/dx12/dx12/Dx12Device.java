@@ -500,12 +500,11 @@ public class Dx12Device implements GpuDeviceBackend {
             writeDepthState(desc, dss);
         }
 
-        // P28：shader 注入 gl_Position.y 翻转会反转三角形绕序（CCW→CW），
-        // 若仍按 CullMode=BACK 剔除，所有三角形被判为背面。animate_sprite 管线需关闭剔除。
-        // P31：item_cutout 使用透视投影，shader Y-flip 不适用，通过关闭背面剔除解决绕序问题。
+        // P31：shader Y-flip 会反转三角形绕序（CCW→CW），若仍按 CullMode=BACK 剔除，所有三角形被判为背面。
+        // animate_sprite / entity_cutout / item_cutout 三类管线在 flipY=true 时均需关闭剔除。
         boolean cull = pipeline.isCull();
         boolean needsCullDisable = loc.contains("animate_sprite")
-            || (flipY && loc.contains("/item_cutout"));
+            || (flipY && (loc.contains("/entity_cutout") || loc.contains("/item_cutout")));
         if (needsCullDisable) {
             cull = false;
             System.err.println("[dx12-java] [P31] cull=false for " + loc + " (flipY=" + flipY + ")");
