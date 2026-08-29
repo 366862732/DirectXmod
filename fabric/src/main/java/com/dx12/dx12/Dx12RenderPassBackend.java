@@ -52,6 +52,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private final boolean hasDepth;
     /** P27：本 pass 的 color[0] 纹理 native handle（用于图集合成后 dump 验证）。 */
     private final long colorTargetHandle;
+    /** P31：是否使用 shader Y-flip 变体管线（GUI 离屏 pass，由 CommandEncoder 根据 texture usage 判断）。 */
+    private final boolean flipY;
     private int pushedDebugGroups = 0;
 
     private @Nullable Dx12CompiledRenderPipeline pipeline;
@@ -66,7 +68,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     public Dx12RenderPassBackend(@Nullable Dx12Device device, long ctx,
         @Nullable RenderArea renderArea, int outputWidth, int outputHeight,
-        boolean hasDepth, long colorTargetHandle) {
+        boolean hasDepth, long colorTargetHandle, boolean flipY) {
         this.device = device;
         this.ctx = ctx;
         this.renderArea = renderArea;
@@ -74,6 +76,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         this.outputHeight = outputHeight;
         this.hasDepth = hasDepth;
         this.colorTargetHandle = colorTargetHandle;
+        this.flipY = flipY;
     }
 
     /** P27：当前管线的 location 字符串（如 minecraft:pipeline/animate_sprite_blit）。 */
@@ -143,9 +146,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (device == null) {
             throw new IllegalStateException("No D3D12 device bound to this render pass");
         }
-        // P31：所有 GUI 离屏 pass（item_cutout/entity_cutout 等）均使用 invertY=true 投影矩阵，
-        // Y 轴方向由投影矩阵处理，无需 shader Y-flip。直接使用标准管线即可。
-        Dx12CompiledRenderPipeline compiled = device.getOrCompilePipeline(pipeline);
+        Dx12CompiledRenderPipeline compiled = device.getOrCompilePipeline(pipeline, this.flipY);
         if (compiled == null || !compiled.isValid()) {
             throw new IllegalStateException(
                 "Pipeline " + pipeline.getLocation() + " is not valid (shader compilation failed)");
@@ -335,7 +336,6 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void enableScissor(int x, int y, int width, int height) {
-        // P31：invertY=true 投影矩阵已处理 Y 轴方向，scissor 坐标无需翻转。
         if (!Dx12Native.dx12SetScissor(this.ctx, x, y, width, height)) {
             LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, y, width, height);
         }

@@ -150,6 +150,20 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorClearFlags, clearColors,
             depthTexture, depthClearFlag, depthClearValue, x, y, w, h);
         boolean hasDepth = depthTexture != 0L;
+        // P31：检测 GUI 离屏 pass——color[0] 为 GUI atlas（usage=15=COPY_DST|COPY_SRC|RENDER_ATTACHMENT|TEXTURE_BINDING）且有 depth attachment。
+        // 此类 pass 使用 invertY=true 投影矩阵，需要 flipY 变体管线。
+        boolean flipY = false;
+        if (hasDepth && colorCount > 0) {
+            RenderPassDescriptor.Attachment<Optional<Vector4fc>> first = colorAttachments.get(0);
+            if (first != null && first.textureView() != null) {
+                int usage = ((Dx12GpuTexture) first.textureView().texture()).usage();
+                if (usage == 15) {
+                    flipY = true;
+                    System.err.println("[dx12-java] [P31] flipY=true for GUI atlas pass (" + w + "x" + h + ")");
+                    System.err.flush();
+                }
+            }
+        }
         // P6 诊断：打印 pass 尺寸 + Java 调用来源（P29：getStackTrace() 开销大，
         // 仅 DX12_LOG_VERBOSE=1 时输出，避免图集上传时每帧数百次堆栈遍历）。
         if (Dx12Native.LOG_VERBOSE) {
@@ -170,7 +184,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             System.err.flush();
         }
         Dx12RenderPassBackend pass = new Dx12RenderPassBackend(this.device, this.ctx,
-            area, w, h, hasDepth, colorCount > 0 ? colorTextures[0] : 0L);
+            area, w, h, hasDepth, colorCount > 0 ? colorTextures[0] : 0L, flipY);
         this.currentRenderPass = pass;
         return pass;
     }

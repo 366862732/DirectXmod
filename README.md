@@ -14,7 +14,7 @@
 
 ### 核心特点
 
-- **Mixin 注入**：9 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载/世界加载全链路诊断（见 [Mixin 注入点](#mixin-注入点)）
+- **Mixin 注入**：8 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载/世界加载全链路诊断（见 [Mixin 注入点](#mixin-注入点)）
 - **官方 GpuBackend 接口**：完整实现 `GpuBackend` / `GpuDeviceBackend` / `CommandEncoderBackend` / `RenderPassBackend` / `GpuSurfaceBackend` 等官方接口
 - **零自定义渲染循环**：不复写 `RenderSystem`，完全接管 Minecraft 官方的渲染流程
 - **Shaderc + Spvc 编译链**：GLSL → SPIR-V（shaderc）→ HLSL SM5.1（spvc）→ DXBC（D3DCompile）
@@ -23,7 +23,7 @@
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
 
-### 当前阶段：P0-P27 全部完成，BUG-01 semanticNames 修复，P24 SRV 堆修复，黑屏根因（level=null）诊断中（2026-08-27）
+### 当前阶段：P0-P28 全部完成，BUG-01 semanticNames 修复，P24 SRV 堆修复，P28 图集渲染修复，黑屏根因（level=null）诊断中（2026-08-29）
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -64,7 +64,6 @@ dx12-lib-template-26.1.2/
 │   │   ├── mixin/
 │   │   │   ├── PreferredGraphicsApiMixin.java          # 将 D3D12 设为首选图形 API
 │   │   │   ├── GameRendererRenderDebugMixin.java       # P16: renderLevel 诊断（frame/resourcesLoaded等）
-│   │   │   ├── BufferBuilderMixin.java                 # P17: 绘制目标跟踪插桩
 │   │   │   ├── MinecraftRunDebugMixin.java             # P19: Minecraft.run() 入口诊断
 │   │   │   ├── MinecraftRunTickDebugMixin.java         # P19: runTick 每帧 level/gameLoadFinished/pause
 │   │   │   ├── MinecraftSetLevelDebugMixin.java        # P19: setLevel() 调用诊断
@@ -72,18 +71,18 @@ dx12-lib-template-26.1.2/
 │   │   │   ├── MinecraftDoWorldLoadDebugMixin.java     # P0: doWorldLoad() 入口诊断
 │   │   │   └── ClientPacketListenerLoginDebugMixin.java  # P0: handleLogin() 登录包诊断
 │   │   └── dx12/                    # D3D12 后端核心实现（镜像官方 Vulkan 后端）
-│   │       ├── Dx12Native.java               # JNI 桥接层（60 native 方法，318 行）
-│   │       ├── Dx12Backend.java              # GpuBackend 实现：窗口/设备创建 + 4 轮自测（361 行）
-│   │       ├── Dx12Device.java               # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存（519 行）
-│   │       ├── Dx12ShaderCompiler.java       # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，246 行）
-│   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息（spvc 语义注入，337 行）
+│   │       ├── Dx12Native.java               # JNI 桥接层（61 native 方法，398 行）
+│   │       ├── Dx12Backend.java              # GpuBackend 实现：窗口/设备创建 + 4 轮自测（402 行）
+│   │       ├── Dx12Device.java               # GpuDeviceBackend 实现：资源创建 + Shader 编译缓存（600 行）
+│   │       ├── Dx12ShaderCompiler.java       # GLSL→SPIR-V→HLSL 编译链（shaderc+spvc，300 行）
+│   │       ├── Dx12IntermediaryShaderModule.java  # SPIR-V 反射绑定信息（spvc 语义注入，360 行）
 │   │       ├── Dx12CompiledShader.java       # 编译产物（HLSL 源码 + 绑定列表）
 │   │       ├── Dx12CompiledRenderPipeline.java  # 编译后的渲染管线
 │   │       ├── Dx12BindGroupEntry.java       # 管线绑定条目（UBO/SRV/TexelBuffer）
-│   │       ├── Dx12GpuSurface.java           # DXGI swapchain（P5+P17，144 行）
-│   │       ├── Dx12CommandEncoderBackend.java    # 命令编码层（P3，313 行）
-│   │       ├── Dx12RenderPassBackend.java        # 渲染通道层（P6+P17，432 行）
-│   │       ├── Dx12TransientMemory.java          # 瞬时内存管理（per-frame 缓冲回收，238 行）
+│   │       ├── Dx12GpuSurface.java           # DXGI swapchain（P5+P17，157 行）
+│   │       ├── Dx12CommandEncoderBackend.java    # 命令编码层（P3，413 行）
+│   │       ├── Dx12RenderPassBackend.java        # 渲染通道层（P6+P17，516 行）
+│   │       ├── Dx12TransientMemory.java          # 瞬时内存管理（per-frame 缓冲回收，259 行）
 │   │       ├── Dx12GpuTexture.java             # D3D12 纹理资源包装（view 引用计数，68 行）
 │   │       ├── Dx12GpuTextureView.java         # D3D12 纹理视图（SRV，延迟销毁，43 行）
 │   │       ├── Dx12GpuBuffer.java              # D3D12 缓冲区资源包装（61 行）
@@ -98,7 +97,7 @@ dx12-lib-template-26.1.2/
 │   │   └── Dx12DeviceTest.java           # 单元测试（渲染循环验证）
 │   ├── src/main/resources/
 │   │   ├── fabric.mod.json           # Fabric 模组描述（client + modmenu entrypoints）
-│   │   ├── gl4dx12.mixins.json       # Mixin 配置（9 个 mixin）
+│   │   ├── gl4dx12.mixins.json       # Mixin 配置（8 个 mixin）
 │   │   ├── dx12_mc.dll               # 原生 DLL（从 JAR 提取，运行时替换到 {user.dir}）
 │   │   └── assets/dx12mod/icon.png   # 模组图标（16x16）
 │   ├── libs/
@@ -107,14 +106,14 @@ dx12-lib-template-26.1.2/
 │   └── gradle.properties             # 版本参数
 ├── native/                          # D3D12 原生层（C++17，MSVC + CMake）
 │   ├── src/
-│   │   ├── dx12_device.cpp           # D3D12 设备/资源/命令/管线/Draw（3067 行）
+│   │   ├── dx12_device.cpp           # D3D12 设备/资源/命令/管线/Draw（3154 行）
 │   │   ├── dx12_device.h             # 公共头文件（347 行，定义 DeviceContext/CommandContext 等）
 │   │   ├── dx12_surface.cpp          # DXGI swapchain + blit + present + 读回诊断（551 行）
-│   │   ├── jni_bridge.cpp            # JNI 入口（112 行）
-│   │   ├── jni_bridge_p3.cpp         # P3 命令层 native（293 行）
+│   │   ├── jni_bridge.cpp            # JNI 入口（114 行）
+│   │   ├── jni_bridge_p3.cpp         # P3 命令层 native（265 行）
 │   │   ├── jni_bridge_p4.cpp         # P4 管线编译 native（168 行）
-│   │   ├── jni_bridge_p5.cpp         # P5 交换链 + 读回 native（376 行）
-│   │   └── jni_bridge_p6.cpp         # P6 绘制 native（156 行）
+│   │   ├── jni_bridge_p5.cpp         # P5 交换链 + 读回 native（375 行）
+│   │   └── jni_bridge_p6.cpp         # P6 绘制 native（135 行）
 │   ├── CMakeLists.txt                # CMake 构建配置
 │   └── build/bin/Release/dx12_mc.dll # 预编译 DLL（开发用，JAR 内打包版本另行构建）
 ├── docs/
@@ -193,7 +192,7 @@ Dx12CompiledRenderPipeline (handle ≠ 0 表示成功)
 
 ### Mixin 注入点
 
-9 个 Mixin 覆盖从 API 选择到世界加载的完整诊断链路：
+8 个 Mixin 覆盖从 API 选择到世界加载的完整诊断链路：
 
 ```java
 // PreferredGraphicsApiMixin.java — 强制 D3D12 为首选
@@ -207,9 +206,6 @@ public abstract class PreferredGraphicsApiMixin {
 
 // GameRendererRenderDebugMixin.java — P16: renderLevel 诊断
 //   inject: GameRenderer.render() HEAD → 打印 frame/resourcesLoaded/advanceGameTime/levelNotNull
-
-// BufferBuilderMixin.java — P17: 绘制目标跟踪
-//   inject: BufferBuilder.begin() → 记录 activeColorTargets
 
 // MinecraftRunDebugMixin.java — P19: Minecraft.run() 入口
 //   inject: Minecraft.run() HEAD → 确认渲染循环是否启动
@@ -355,7 +351,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 ## 路线图
 
-### P0-P27: D3D12 后端核心层 ✅ 全部完成
+### P0-P28: D3D12 后端核心层 ✅ 全部完成
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|

@@ -112,24 +112,18 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         String fragmentHlsl = fragment.toHlsl(false);
         // P28：对图集合成管线（animate_sprite）注入 gl_Position.y 翻转。
         // 该管线用于将 GUI atlas 合成为最终纹理，ortho 下 w=1，clip 空间翻转 Y 即正确。
-        // P31：GUI 离屏渲染（entity_cutout/item_cutout）使用 invertY=true 投影矩阵，
-        // shader Y-flip 补偿 NDC 绕序反转（防止 CULL_BACK 剔除）并修正 PIP 人物方向。
-        // 精确匹配：仅 entity_cutout / item_cutout / entity_cutout_cull / item_cutout_translucent。
-        // 排除 entity_cutout_z_offset 等变体（勿误编译 flipY 管线，影响主世界渲染）。
+        // 注意：item_cutout 使用透视投影，shader Y-flip 会同时翻转 W 分量导致顶点落出视锥体，
+        // 因此不对 item_cutout 注入 shader Y-flip。背面剔除由 Dx12Device 层关闭处理。
         String pipelineLocation = pipeline.getLocation().toString();
-        boolean needsYFlip = pipelineLocation.contains("animate_sprite") || flipY;
+        boolean needsYFlip = pipelineLocation.contains("animate_sprite");
         if (needsYFlip) {
             String before = vertexHlsl;
             vertexHlsl = injectVertexYFlip(vertexHlsl);
             if (!before.equals(vertexHlsl)) {
-                System.err.println("[dx12-java] ["
-                    + (pipelineLocation.contains("animate_sprite") ? "P28" : "P31")
-                    + "] inject Y-flip into " + pipelineLocation + " vertex HLSL");
+                System.err.println("[dx12-java] [P28] inject Y-flip into " + pipelineLocation + " vertex HLSL");
                 System.err.flush();
             } else {
-                System.err.println("[dx12-java] ["
-                    + (pipelineLocation.contains("animate_sprite") ? "P28" : "P31")
-                    + "] WARN: no gl_Position assignment found in " + pipelineLocation
+                System.err.println("[dx12-java] [P28] WARN: no gl_Position assignment found in " + pipelineLocation
                     + " vertex HLSL, Y-flip NOT injected");
                 System.err.flush();
             }
@@ -171,11 +165,9 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     }
 
     /**
-     * P28/P31：在 spvc 生成的顶点 HLSL 中，于每个 {@code gl_Position = ...;} 赋值后插入
+     * P28：在 spvc 生成的顶点 HLSL 中，于每个 {@code gl_Position = ...;} 赋值后插入
      * {@code gl_Position.y = -gl_Position.y;}，把 GL bottom-up NDC 修正为 D3D12
      * top-down NDC（图集 blit 专用；ortho 下 w=1，clip 空间直接翻转 Y 即正确）。
-     * P31：实体管线顶点 shader 多为多分支 gl_VertexID 写法，每个分支各有一个
-     * gl_Position 赋值——必须翻转所有赋值，只翻第一个会导致几何错位。
      */
     private static String injectVertexYFlip(String hlsl) {
         java.util.regex.Matcher m = java.util.regex.Pattern
