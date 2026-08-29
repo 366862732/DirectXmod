@@ -105,11 +105,14 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 vertexInputNames.add(attribute.name());
             }
         }
-        vertex.rebind(vertexInputNames, entries);
-        fragment.rebind(vertexOutputNames, entries);
+        // 克隆 SPIR-V 工作副本：原始缓存模块不可变，避免多次 rebind() 互相污染。
+        Dx12IntermediaryShaderModule vertexWork = vertex.cloneForCompile();
+        Dx12IntermediaryShaderModule fragmentWork = fragment.cloneForCompile();
+        vertexWork.rebind(vertexInputNames, entries);
+        fragmentWork.rebind(vertexOutputNames, entries);
 
-        String vertexHlsl = vertex.toHlsl(true);
-        String fragmentHlsl = fragment.toHlsl(false);
+        String vertexHlsl = vertexWork.toHlsl(true);
+        String fragmentHlsl = fragmentWork.toHlsl(false);
         // P31：在 GUI 离屏 pass（flipY=true）中，对 entity_cutout / item_cutout / animate_sprite 管线
         // 注入 gl_Position.y 翻转。shader Y-flip 与 enableScissor 中的 scissorY 翻转配合使用，
         // 确保几何与 scissor 在同一坐标系内对齐。
@@ -118,6 +121,9 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         boolean needsYFlip = flipY && (pipelineLocation.contains("animate_sprite")
             || pipelineLocation.contains("entity_cutout")
             || pipelineLocation.contains("item_cutout"));
+        // P28 诊断：打印 pipelineLocation + flipY + needsYFlip，便于追踪注入路径。
+        System.err.println("[dx12-java] [P28] " + pipelineLocation + " flipY=" + flipY + " needsYFlip=" + needsYFlip);
+        System.err.flush();
         if (needsYFlip) {
             String before = vertexHlsl;
             vertexHlsl = injectVertexYFlip(vertexHlsl);
