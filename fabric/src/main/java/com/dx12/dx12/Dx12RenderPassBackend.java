@@ -52,7 +52,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private final boolean hasDepth;
     /** P27：本 pass 的 color[0] 纹理 native handle（用于图集合成后 dump 验证）。 */
     private final long colorTargetHandle;
-    /** P31：本 pass 是否为 GUI 离屏渲染（物品图集 / PIP）→ 管线需选 Y-flip 变体。 */
+    /** P31：是否使用 shader Y-flip 变体管线（GUI 离屏 pass，由 CommandEncoder 根据 texture usage 判断）。 */
     private final boolean flipY;
     private int pushedDebugGroups = 0;
 
@@ -66,13 +66,6 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     private record TextureViewAndSampler(Dx12GpuTextureView view, Dx12GpuSampler sampler) {
     }
 
-    public Dx12RenderPassBackend(@Nullable Dx12Device device, long ctx,
-        @Nullable RenderArea renderArea, int outputWidth, int outputHeight,
-        boolean hasDepth, long colorTargetHandle) {
-        this(device, ctx, renderArea, outputWidth, outputHeight, hasDepth, colorTargetHandle, false);
-    }
-
-    /** P31：多出 flipY——本 pass 是否需用管线 Y-flip 变体（GUI 离屏 pass）。 */
     public Dx12RenderPassBackend(@Nullable Dx12Device device, long ctx,
         @Nullable RenderArea renderArea, int outputWidth, int outputHeight,
         boolean hasDepth, long colorTargetHandle, boolean flipY) {
@@ -153,7 +146,6 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (device == null) {
             throw new IllegalStateException("No D3D12 device bound to this render pass");
         }
-        // P31：GUI 离屏 pass（flipY=true）取 Y-flip 变体管线，其余取普通变体。
         Dx12CompiledRenderPipeline compiled = device.getOrCompilePipeline(pipeline, this.flipY);
         if (compiled == null || !compiled.isValid()) {
             throw new IllegalStateException(
@@ -172,7 +164,6 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (Dx12Native.LOG_VERBOSE) {
             System.err.println("[dx12-java] setPipeline: " + pipeline.getLocation()
                     + " pso=" + Long.toHexString(compiled.handle())
-                    + " flipY=" + this.flipY
                     + " passHasDepth=" + this.hasDepth + " pipelineHasDepth=" + pipelineHasDepth
                     + " useDepth=" + useDepth + " ok=" + ok);
         }
@@ -345,8 +336,11 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void enableScissor(int x, int y, int width, int height) {
-        if (!Dx12Native.dx12SetScissor(this.ctx, x, y, width, height)) {
-            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, y, width, height);
+        // P31：flipY 模式下，shader 已将几何 Y 轴翻转，scissor 坐标需同步翻转以保持裁剪区域对齐。
+        // newW = outputHeight - y - height，使 scissor 原点从左下角转为左上角（与 shader 翻转后一致）。
+        int scissorY = this.flipY ? (this.outputHeight - y - height) : y;
+        if (!Dx12Native.dx12SetScissor(this.ctx, x, scissorY, width, height)) {
+            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, scissorY, width, height);
         }
     }
 

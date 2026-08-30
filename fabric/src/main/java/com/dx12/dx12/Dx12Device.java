@@ -8,6 +8,7 @@ import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.CompiledRenderPipeline;
 import com.mojang.blaze3d.pipeline.DepthStencilState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.platform.CompareOp;
 import com.mojang.blaze3d.preprocessor.GlslPreprocessor;
 import com.mojang.blaze3d.shaders.ShaderSource;
 import com.mojang.blaze3d.shaders.ShaderType;
@@ -75,8 +76,8 @@ public class Dx12Device implements GpuDeviceBackend {
 
     // P4: pipeline + shader caches（镜像官方 VulkanDevice）
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
-    /** P31：flipY 变体管线缓存（GUI 离屏 pass 专用，同一 RenderPipeline 的第二个变体）。 */
-    private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCacheFlipY = new IdentityHashMap<>();
+    /** P31：flipY 变体管线缓存（GUI 离屏 pass 专用，避免与主世界实体管线共享）。 */
+    private final Map<FlipYKey, Dx12CompiledRenderPipeline> pipelineCacheFlipY = new IdentityHashMap<>();
     private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
     @Nullable
     private Dx12ShaderCompiler glslCompiler;
@@ -175,31 +176,31 @@ public class Dx12Device implements GpuDeviceBackend {
         return encoder;
     }
 
+    /** P31：管线+flipY 的组合缓存键。 */
+    private record FlipYKey(RenderPipeline pipeline, boolean flipY) {
+        @Override public int hashCode() { return java.util.Objects.hash(pipeline, flipY); }
+        @Override public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof FlipYKey that)) return false;
+            return pipeline == that.pipeline && flipY == that.flipY;
+        }
+    }
+
+    public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline, boolean flipY) {
+        if (!flipY) {
+            return this.pipelineCache.computeIfAbsent(pipeline,
+                ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, false));
+        }
+        return this.pipelineCacheFlipY.computeIfAbsent(new FlipYKey(pipeline, true),
+            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, true));
+    }
+
     @Override
     public CompiledRenderPipeline precompilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource) {
         ShaderSource source = shaderSource == null ? this.defaultShaderSource : shaderSource;
         return this.pipelineCache.computeIfAbsent(pipeline,
             ignored -> this.compilePipeline(pipeline, source, false));
-    }
-
-    /**
-     * 取（或编译）管线，镜像官方 {@code VulkanDevice.getOrCompilePipeline}。
-     * 渲染 pass setPipeline 时按需编译，使用 createDevice 传入的默认 shader 源。
-     */
-    public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline) {
-        return this.getOrCompilePipeline(pipeline, false);
-    }
-
-    /**
-     * P31：取（或编译）管线变体。flipY=true 时为 GUI 离屏 pass（物品图集 /
-     * PIP 实体纹理）编译 Y-flip 变体，顶点输出翻转 Y + 关闭背面剔除。
-     */
-    public Dx12CompiledRenderPipeline getOrCompilePipeline(RenderPipeline pipeline, boolean flipY) {
-        Map<RenderPipeline, Dx12CompiledRenderPipeline> cache =
-            flipY ? this.pipelineCacheFlipY : this.pipelineCache;
-        return cache.computeIfAbsent(pipeline,
-            ignored -> this.compilePipeline(pipeline, this.defaultShaderSource, flipY));
     }
 
     @Override
@@ -313,7 +314,7 @@ public class Dx12Device implements GpuDeviceBackend {
      * desc -> 原生层 D3DCompile + root signature + 双 PSO。任何失败都返回
      * handle=0 的无效管线（isValid()==false），镜像官方 compilePipeline。
      *
-     * @param flipY P31：true 时编译 Y-flip 变体（GUI 离屏 pass 专用）
+     * @param flipY P31：true 时注入 shader Y-flip + 关闭背面剔除（GUI 离屏 pass 专用）。
      */
     private Dx12CompiledRenderPipeline compilePipeline(RenderPipeline pipeline,
         @Nullable ShaderSource shaderSource, boolean flipY) {
@@ -342,10 +343,9 @@ public class Dx12Device implements GpuDeviceBackend {
                     pipeName);
                 return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
             }
-            LOGGER.info("[dx12-java] {} COMPILE OK (handle={}{})", pipeName, handle,
-                flipY ? ", flipY variant" : "");
+            LOGGER.info("[dx12-java] {} COMPILE OK (handle={})", pipeName, handle);
             return new Dx12CompiledRenderPipeline(pipeline, handle,
-                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl(), flipY);
+                vertexShader, fragmentShader, compiled.vertexHlsl(), compiled.fragmentHlsl());
         } catch (ShaderCompileException e) {
             LOGGER.error("[dx12-java] {} COMPILE FAILED (compile): {}", pipeName, e.getMessage());
             return new Dx12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "");
@@ -439,8 +439,8 @@ public class Dx12Device implements GpuDeviceBackend {
      * 打包原生层 {@code dx12CreateGraphicsPipeline} 的 desc（little-endian）。
      * 布局见 {@link Dx12Native#dx12CreateGraphicsPipeline} Javadoc。
      */
-    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled, RenderPipeline pipeline,
-        boolean flipY) {
+    private static ByteBuffer buildNativeDesc(Dx12CompiledShader compiled,
+        RenderPipeline pipeline, boolean flipY) {
         byte[] vsBytes = compiled.vertexHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] psBytes = compiled.fragmentHlsl().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         ColorTargetState[] colorTargets = pipeline.getColorTargetStates();
@@ -486,18 +486,29 @@ public class Dx12Device implements GpuDeviceBackend {
         }
 
         desc.put((byte) (hasDepth ? 1 : 0));
+        String loc = pipeline.getLocation().toString();
         if (hasDepth) {
-            writeDepthState(desc, pipeline.getDepthStencilState());
+            // P31：item_cutout 继承自 ITEM_SNIPPET 的 DepthStencilState.DEFAULT（depthTest=NEVER_PASS），
+            // 在有深度缓冲的 GUI atlas pass（flipY=true）中使用时，depthFunc=NEVER 导致所有 fragment
+            // 深度测试失败 → 物品全黑消失。覆盖为 GREATER_EQUAL。
+            DepthStencilState dss = pipeline.getDepthStencilState();
+            if (flipY && loc.contains("/item_cutout") && dss.depthTest() == CompareOp.NEVER_PASS) {
+                dss = new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, dss.writeDepth());
+                System.err.println("[dx12-java] [P31] item_cutout depthTest: NEVER_PASS→GREATER_EQUAL (flipY)");
+                System.err.flush();
+            }
+            writeDepthState(desc, dss);
         }
 
-        // P28：animate_sprite 管线已注入 gl_Position.y 翻转（修正 GL bottom-up
-        // 投影在 D3D12 下的 Y 方向）。翻转会反转三角形绕序（CCW→CW），若仍按
-        // CullMode=BACK + FrontCounterClockwise 剔除，所有三角形被判为背面 →
-        // 图集全黑。blit 不依赖绕序，强制关闭剔除。
-        // P31：flipY 变体（GUI 离屏 pass）同样注入 Y-flip，绕序反转，同理关闭剔除。
+        // P31：shader Y-flip 会反转三角形绕序（CCW→CW），若仍按 CullMode=BACK 剔除，所有三角形被判为背面。
+        // animate_sprite / entity_cutout / item_cutout 三类管线在 flipY=true 时均需关闭剔除。
         boolean cull = pipeline.isCull();
-        if (pipeline.getLocation().toString().contains("animate_sprite") || flipY) {
+        boolean needsCullDisable = loc.contains("animate_sprite")
+            || (flipY && (loc.contains("/entity_cutout") || loc.contains("/item_cutout")));
+        if (needsCullDisable) {
             cull = false;
+            System.err.println("[dx12-java] [P31] cull=false for " + loc + " (flipY=" + flipY + ")");
+            System.err.flush();
         }
         desc.putInt(pipeline.getPrimitiveTopology().ordinal());
         desc.put((byte) (cull ? 1 : 0));

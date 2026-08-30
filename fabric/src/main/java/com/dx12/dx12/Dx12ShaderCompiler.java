@@ -105,33 +105,33 @@ public class Dx12ShaderCompiler implements AutoCloseable {
                 vertexInputNames.add(attribute.name());
             }
         }
-        vertex.rebind(vertexInputNames, entries);
-        fragment.rebind(vertexOutputNames, entries);
+        // 克隆 SPIR-V 工作副本：原始缓存模块不可变，避免多次 rebind() 互相污染。
+        Dx12IntermediaryShaderModule vertexWork = vertex.cloneForCompile();
+        Dx12IntermediaryShaderModule fragmentWork = fragment.cloneForCompile();
+        vertexWork.rebind(vertexInputNames, entries);
+        fragmentWork.rebind(vertexOutputNames, entries);
 
-        String vertexHlsl = vertex.toHlsl(true);
-        String fragmentHlsl = fragment.toHlsl(false);
-        // P28：animate_sprite 图集合成管线（blit/interpolate）的顶点 shader 用 GL
-        // bottom-up 投影（ortho(0,W,0,H)）配合 vanilla 的 bottom-up sprite 坐标。
-        // D3D12 的 NDC Y 与 GL 相反（NDC -1 在顶部），导致图集内容整体垂直翻转
-        // （dump 证实：所有稀疏图集内容落在 y[H-h..H-1]）。修复：在顶点输出上
-        // 翻转 Y，只作用于图集上传管线，不影响屏幕 GUI（其坐标是 top-down 本就正确）。
-        // P31：flipY 变体——GUI 离屏纹理（物品图集 GuiItemAtlas / PIP 实体纹理，
-        // 颜色附件 usage=13 且带深度附件）以 invertY 正交投影渲染到 D3D12 纹理，
-        // GL 的"双翻转抵消"机制在 D3D12 下失效，导致物品图标不可见 / 实体倒置。
-        // 同样注入 Y-flip（方向与 P28 一致），只作用于离屏 pass 的管线变体，
-        // 不影响主世界渲染方向。
+        String vertexHlsl = vertexWork.toHlsl(true);
+        String fragmentHlsl = fragmentWork.toHlsl(false);
+        // P31：在 GUI 离屏 pass（flipY=true）中，对 entity_cutout / item_cutout / animate_sprite 管线
+        // 注入 gl_Position.y 翻转。shader Y-flip 与 enableScissor 中的 scissorY 翻转配合使用，
+        // 确保几何与 scissor 在同一坐标系内对齐。
+        // 注意：这些管线在 flipY=false 时保持原始着色器，主世界 3D 渲染方向不受影响。
         String pipelineLocation = pipeline.getLocation().toString();
-        if (pipelineLocation.contains("animate_sprite") || flipY) {
+        boolean needsYFlip = flipY && (pipelineLocation.contains("animate_sprite")
+            || pipelineLocation.contains("entity_cutout")
+            || pipelineLocation.contains("item_cutout"));
+        // P28 诊断：打印 pipelineLocation + flipY + needsYFlip，便于追踪注入路径。
+        System.err.println("[dx12-java] [P28] " + pipelineLocation + " flipY=" + flipY + " needsYFlip=" + needsYFlip);
+        System.err.flush();
+        if (needsYFlip) {
             String before = vertexHlsl;
             vertexHlsl = injectVertexYFlip(vertexHlsl);
             if (!before.equals(vertexHlsl)) {
-                System.err.println("[dx12-java] " + (flipY ? "[P31]" : "[P28]")
-                    + " inject Y-flip into " + pipelineLocation + " vertex HLSL"
-                    + (flipY ? " (flipY variant)" : ""));
+                System.err.println("[dx12-java] [P28] inject Y-flip into " + pipelineLocation + " vertex HLSL");
                 System.err.flush();
             } else {
-                System.err.println("[dx12-java] " + (flipY ? "[P31]" : "[P28]")
-                    + " WARN: no gl_Position assignment found in " + pipelineLocation
+                System.err.println("[dx12-java] [P28] WARN: no gl_Position assignment found in " + pipelineLocation
                     + " vertex HLSL, Y-flip NOT injected");
                 System.err.flush();
             }
@@ -176,8 +176,6 @@ public class Dx12ShaderCompiler implements AutoCloseable {
      * P28：在 spvc 生成的顶点 HLSL 中，于每个 {@code gl_Position = ...;} 赋值后插入
      * {@code gl_Position.y = -gl_Position.y;}，把 GL bottom-up NDC 修正为 D3D12
      * top-down NDC（图集 blit 专用；ortho 下 w=1，clip 空间直接翻转 Y 即正确）。
-     * P31：实体管线顶点 shader 多为多分支 gl_VertexID 写法，每个分支各有一个
-     * gl_Position 赋值——必须翻转所有赋值，只翻第一个会导致几何错位。
      */
     private static String injectVertexYFlip(String hlsl) {
         java.util.regex.Matcher m = java.util.regex.Pattern

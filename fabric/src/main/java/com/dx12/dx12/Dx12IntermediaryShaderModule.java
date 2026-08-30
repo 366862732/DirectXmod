@@ -314,7 +314,8 @@ public record Dx12IntermediaryShaderModule(
                 String hlsl = MemoryUtil.memUTF8(address);
                 // P7 诊断：打印 raw spvc 输出，确认 }}; 来自 spvc 还是注入逻辑
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")
-                        || name.contains("animate") || name.contains("sprite") || name.contains("text")) {
+                        || name.contains("animate") || name.contains("sprite") || name.contains("text")
+                        || name.contains("entity") || name.contains("item")) {
                     System.err.println("[dx12-java] [" + name + "] RAW spvc HLSL:\n" + hlsl);
                 }
                 // Fix S2：语义通过 spvc_compiler_hlsl_add_vertex_attribute_remap 在编译前注入，
@@ -323,7 +324,8 @@ public record Dx12IntermediaryShaderModule(
                 // P7 诊断：打印 raw spvc 输出，确认语义已正确生成
                 // P27：条件同步包含 animate/sprite，确保 animate_sprite_blit 的完整 HLSL 也输出
                 if (name.contains("gui") || name.contains("debug") || name.contains("position")
-                        || name.contains("animate") || name.contains("sprite") || name.contains("text")) {
+                        || name.contains("animate") || name.contains("sprite") || name.contains("text")
+                        || name.contains("entity") || name.contains("item")) {
                     System.err.println("[dx12-java] [" + name + "] spvc HLSL (no inject):\n" + result);
                 }
                 return result;
@@ -371,6 +373,19 @@ public record Dx12IntermediaryShaderModule(
             };
             throw new ShaderCompileException(message + " (" + name + ")");
         }
+    }
+
+    /**
+     * 为单次编译创建 SPIR-V 工作副本。
+     * rebind() 会原地修改 SPIR-V 的 decoration 字段，必须克隆后操作，
+     * 否则同一缓存模块被多次 rebind() 后互相污染。
+     */
+    public Dx12IntermediaryShaderModule cloneForCompile() {
+        if (this.spirv == null) return this;
+        ByteBuffer dup = MemoryUtil.memCalloc(this.spirv.remaining());
+        MemoryUtil.memCopy(this.spirv, dup);
+        return new Dx12IntermediaryShaderModule(
+            this.name, dup, this.uniformBuffers, this.samplers, this.outputs, this.inputs);
     }
 
     /** 读取 SPIR-V 二进制中某 decoration（33=BINDING / 30=LOCATION）的字节偏移。 */
