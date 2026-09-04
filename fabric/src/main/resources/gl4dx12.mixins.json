@@ -1,6 +1,6 @@
 {
     "required": true,
-    "package": "com.dx12.mixin",
+    "package": "com.xgdt.dx12.mixin",
     "compatibilityLevel": "JAVA_25",
     "client": [
         "PreferredGraphicsApiMixin",
@@ -10,7 +10,11 @@
         "MinecraftSetLevelDebugMixin",
         "MinecraftResourceLoadDebugMixin",
         "ClientPacketListenerLoginDebugMixin",
-        "MinecraftDoWorldLoadDebugMixin"
+        "MinecraftDoWorldLoadDebugMixin",
+        "LevelRendererPrepareChunksDebugMixin",
+        "CameraUpdateDebugMixin",
+        "FogRendererUpdateDebugMixin",
+        "SectionRenderDispatcherGetSliceDebugMixin"
     ],
     "injectors": {
         "defaultRequire": 1

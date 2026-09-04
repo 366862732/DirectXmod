@@ -1,5 +1,5 @@
 // JNI 桥（P6：render pass 内的 draw 命令录制）。
-// 与 Java 侧 com.dx12.dx12.Dx12Native 的 native 声明一一对应。
+// 与 Java 侧 com.xgdt.dx12.dx12.Dx12Native 的 native 声明一一对应。
 // 独立文件避免与 jni_bridge.cpp 冲突（IDE 曾锁定该文件）。
 
 #include <jni.h>
@@ -35,7 +35,7 @@ void logFail(const char* what, const std::string& err) {
 
 extern "C" {
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetPipeline(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetPipeline(
     JNIEnv*, jclass, jlong ctx, jlong pipeline, jboolean hasDepth) {
     std::string err;
     if (!setPipeline(toCtx(ctx), toPipeline(pipeline), hasDepth == JNI_TRUE, err)) {
@@ -45,7 +45,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetPipeline(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetScissor(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetScissor(
     JNIEnv*, jclass, jlong ctx, jint x, jint y, jint w, jint h) {
     std::string err;
     if (!setScissor(toCtx(ctx), x, y, w, h, err)) {
@@ -55,7 +55,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetScissor(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetVertexBuffer(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetVertexBuffer(
     JNIEnv*, jclass, jlong ctx, jint slot, jlong buffer, jlong offset, jint stride) {
     std::string err;
     if (!setVertexBuffer(toCtx(ctx), slot, toObject(buffer), offset, stride, err)) {
@@ -65,7 +65,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetVertexBuffer(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetIndexBuffer(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetIndexBuffer(
     JNIEnv*, jclass, jlong ctx, jlong buffer, jint indexType) {
     std::string err;
     if (!setIndexBuffer(toCtx(ctx), toObject(buffer), indexType, err)) {
@@ -75,7 +75,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12SetIndexBuffer(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12PushDescriptors(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PushDescriptors(
     JNIEnv* env, jclass, jlong ctx, jintArray types, jlongArray buffers,
     jlongArray offsets, jlongArray lengths, jintArray texelFormats, jlongArray views) {
     jsize count = env->GetArrayLength(types);
@@ -112,7 +112,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12PushDescriptors(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12DrawIndexed(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DrawIndexed(
     JNIEnv*, jclass, jlong ctx, jint indexCount, jint instanceCount,
     jint firstIndex, jint baseVertex, jint firstInstance) {
     std::string err;
@@ -124,7 +124,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12DrawIndexed(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12Draw(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12Draw(
     JNIEnv*, jclass, jlong ctx, jint vertexCount, jint instanceCount,
     jint firstVertex, jint firstInstance) {
     std::string err;
@@ -136,7 +136,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12Draw(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12DrawIndexedIndirect(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DrawIndexedIndirect(
     JNIEnv*, jclass, jlong ctx, jlong commands, jlong offset, jint drawCount) {
     std::string err;
     if (!drawIndexedIndirect(toCtx(ctx), toObject(commands), offset, (UINT)drawCount, err)) {
@@ -146,7 +146,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12DrawIndexedIndirect
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12DrawIndirect(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DrawIndirect(
     JNIEnv*, jclass, jlong ctx, jlong commands, jlong offset, jint drawCount) {
     std::string err;
     if (!drawIndirect(toCtx(ctx), toObject(commands), offset, (UINT)drawCount, err)) {

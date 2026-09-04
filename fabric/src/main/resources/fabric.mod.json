@@ -13,10 +13,10 @@
   "environment": "*",
   "entrypoints": {
     "client": [
-      "com.dx12.Dx12Mod"
+      "com.xgdt.dx12.Dx12Mod"
     ],
     "modmenu": [
-      "com.dx12.ModMenuIntegration"
+      "com.xgdt.dx12.ModMenuIntegration"
     ]
   },
   "depends": {

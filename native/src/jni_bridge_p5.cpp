@@ -1,5 +1,5 @@
 // JNI 桥（P5：DXGI swapchain surface）。
-// 与 Java 侧 com.dx12.dx12.Dx12Native 的 native 声明一一对应。
+// 与 Java 侧 com.xgdt.dx12.dx12.Dx12Native 的 native 声明一一对应。
 // 独立文件避免与 jni_bridge.cpp 冲突（IDE 曾锁定该文件）。
 
 #include <jni.h>
@@ -31,7 +31,7 @@ Dx12Object* toObject(jlong handle) {
 
 extern "C" {
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateSurface(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateSurface(
     JNIEnv* env, jclass, jlong hwnd) {
     std::string err;
     Dx12Surface* s = createSurface(static_cast<uintptr_t>(hwnd), err);
@@ -42,7 +42,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateSurface(
     return static_cast<jlong>(reinterpret_cast<uintptr_t>(s));
 }
 
-JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12SurfacePresentModes(
+JNIEXPORT jintArray JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SurfacePresentModes(
     JNIEnv* env, jclass) {
     std::vector<int> modes = surfacePresentModes();
     jintArray out = env->NewIntArray((jsize)modes.size());
@@ -52,7 +52,7 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12SurfacePresentMode
     return out;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12ConfigureSurface(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ConfigureSurface(
     JNIEnv* env, jclass, jlong surface, jint width, jint height, jint presentMode) {
     std::string err;
     if (!configureSurface(toSurface(surface), width, height, presentMode, err)) {
@@ -66,7 +66,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12ConfigureSurface(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12AcquireSurface(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12AcquireSurface(
     JNIEnv* env, jclass, jlong surface) {
     std::string err;
     if (!acquireSurface(toSurface(surface), err)) {
@@ -77,7 +77,7 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12AcquireSurface(
     return JNI_TRUE;
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BlitSurface(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12BlitSurface(
     JNIEnv* env, jclass, jlong ctx, jlong surface, jlong texture) {
     std::string err;
     if (!blitSurface(toCtx(ctx), toSurface(surface), toObject(texture), err)) {
@@ -88,7 +88,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BlitSurface(
         toCtx(ctx), toSurface(surface), toObject(texture));
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12PresentSurface(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PresentSurface(
     JNIEnv*, jclass, jlong surface) {
     presentSurface(toSurface(surface));
     // 注意：present 的真实结果（ok / OCCLUDED / MODE_CHANGED / FAILED）由
@@ -97,14 +97,14 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12PresentSurface(
 }
 
 // 返回当前 acquire 的 back buffer 原始资源指针，供 Java 侧直接 blit/readback。
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetBackBufferHandle(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetBackBufferHandle(
     JNIEnv*, jclass, jlong surface) {
     return (jlong)getBackBufferHandle(toSurface(surface));
 }
 
 // P6 诊断：读回指定纹理 3x3 采样像素，返回 Java int[]（[r,g,b,a] × 9）。
 // 用此函数直接读 render pass 的 colorTexture，判断渲染写入是否成功。
-JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackTexturePixels(
+JNIEXPORT jintArray JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ReadbackTexturePixels(
     JNIEnv* env, jclass, jlong texHandle) {
     std::string err;
     DeviceContext& ctx = deviceContextForJni();
@@ -250,27 +250,27 @@ JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackTexturePix
 // 复用 dbgReadbackTexturePixels（内部 waitIdle + 独立命令列表拷贝 +
 // dbgDumpPixelsToFile 写 dx12_dump_<tag>.bmp，并在日志打印 ASCII 缩略图）。
 // 注意：调用时纹理应处于 COMMON 状态（render pass 结束后），否则 barrier 验证失败。
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DumpTextureToFile(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DumpTextureToFile(
     JNIEnv* env, jclass, jlong texHandle, jstring tag) {
     const char* ctag = tag ? env->GetStringUTFChars(tag, nullptr) : nullptr;
     dbgReadbackTexturePixels(toObject(texHandle), ctag ? ctag : "tex");
     if (ctag) env->ReleaseStringUTFChars(tag, ctag);
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12IsSurfaceSuboptimal(
     JNIEnv* env, jclass, jlong surface) {
     Dx12Surface* s = toSurface(surface);
     return s ? (s->suboptimal ? JNI_TRUE : JNI_FALSE) : JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroySurface(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DestroySurface(
     JNIEnv*, jclass, jlong surface) {
     destroySurface(toSurface(surface));
 }
 
 // P6 诊断：返回当前 active surface 的 native handle（用于 readback 游戏实际画面）。
 // getActiveSurface() 在 acquireSurface 时被设置为最近创建/acquire 的 surface。
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetActiveSurfaceHandle(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetActiveSurfaceHandle(
     JNIEnv*, jclass) {
     Dx12Surface* s = getActiveSurface();
     return s ? static_cast<jlong>(reinterpret_cast<uintptr_t>(s)) : 0L;
@@ -278,7 +278,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetActiveSurfaceHandle
 
 // P6 诊断：读回当前 back buffer 采样像素，返回 Java int[]（[r,g,b,a] × 9）。
 // 用 JNI 直接传值进 Java，避免 fprintf(stderr) 被 PCL 启动器丢弃。
-JNIEXPORT jintArray JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadbackSurfacePixels(
+JNIEXPORT jintArray JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ReadbackSurfacePixels(
     JNIEnv* env, jclass, jlong surface) {
     std::string err;
     DeviceContext& ctx = deviceContextForJni();

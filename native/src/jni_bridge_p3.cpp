@@ -1,6 +1,6 @@
-// JNI 桥接层（P3 命令层）：导出 Java com.dx12.dx12.Dx12Native 的命令层 native 方法。
+// JNI 桥接层（P3 命令层）：导出 Java com.xgdt.dx12.dx12.Dx12Native 的命令层 native 方法。
 // 独立翻译单元：jni_bridge.cpp 被 IDE 进程锁定（EBUSY），P3 导出放在此文件。
-// 符号名必须与 Java 类/方法完全匹配（包 com.dx12.dx12，类 Dx12Native）。
+// 符号名必须与 Java 类/方法完全匹配（包 com.xgdt.dx12.dx12，类 Dx12Native）。
 
 #include <jni.h>
 
@@ -30,12 +30,12 @@ extern "C" {
 // P3 命令层：CommandEncoder（对应官方 VulkanCommandEncoder）
 // ===========================================================================
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampFrequency(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetTimestampFrequency(
     JNIEnv*, jclass) {
     return (jlong)dx12mc::getTimestampFrequency();
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateCommandEncoder(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateCommandEncoder(
     JNIEnv* env, jclass) {
     std::string err;
     dx12mc::CommandContext* ctx = dx12mc::createCommandEncoder(err);
@@ -43,12 +43,12 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateCommandEncoder(
     return reinterpret_cast<jlong>(ctx);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyCommandEncoder(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DestroyCommandEncoder(
     JNIEnv*, jclass, jlong ctx) {
     dx12mc::destroyCommandEncoder(reinterpret_cast<dx12mc::CommandContext*>(ctx));
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginCommandList(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12BeginCommandList(
     JNIEnv* env, jclass, jlong ctx) {
     std::string err;
     if (!dx12mc::beginCommandList(
@@ -57,7 +57,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginCommandList(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndCommandList(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12EndCommandList(
     JNIEnv* env, jclass, jlong ctx) {
     std::string err;
     if (!dx12mc::endCommandList(
@@ -66,7 +66,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndCommandList(
     }
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12Submit(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12Submit(
     JNIEnv* env, jclass, jlong ctx) {
     dx12mc::dbgLog("submit: JNI enter ctx=%p", (void*)ctx);
     std::string err;
@@ -77,7 +77,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12Submit(
     return (jlong)value;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12WaitForFence(
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12WaitForFence(
     JNIEnv* env, jclass, jlong ctx, jlong value, jlong timeoutNs) {
     std::string err;
     // createFence token 的 awaitCompletion：等待设备级队列 fence（目标值 =
@@ -96,14 +96,14 @@ JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12WaitForFence(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetFenceValue(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetFenceValue(
     JNIEnv*, jclass, jlong) {
     // createFence 捕获全局队列 fence 值（目标 = 当前值 + 1），对应官方共享
     // encoder 的 currentSubmitIndex——一次性 encoder 的 token 也随下一次提交完成。
     return (jlong)dx12mc::currentQueueFenceValue();
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampNow(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetTimestampNow(
     JNIEnv* env, jclass, jlong ctx) {
     std::string err;
     long long ts = dx12mc::getTimestampNow(
@@ -112,7 +112,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetTimestampNow(
     return (jlong)ts;
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBuffer(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CopyBuffer(
     JNIEnv* env, jclass, jlong ctx, jlong src, jlong srcOffset,
     jlong dst, jlong dstOffset, jlong size) {
     DBG_LOG_DEBUG("copyBuffer: src=%p(%lld) dst=%p(%lld) size=%lld",
@@ -126,7 +126,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBuffer(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12WriteToTexture(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12WriteToTexture(
     JNIEnv* env, jclass, jlong ctx, jlong stagingBuf, jlong stagingOffset,
     jint width, jint height, jlong dstTex, jint mip, jint layer,
     jint dstX, jint dstY) {
@@ -139,7 +139,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12WriteToTexture(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBufferToTexture(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CopyBufferToTexture(
     JNIEnv* env, jclass, jlong ctx, jlong srcBuf, jlong srcOffset,
     jint srcWidth, jint srcHeight, jlong dstTex, jint mip, jint layer,
     jint dstX, jint dstY, jint w, jint h) {
@@ -152,7 +152,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyBufferToTexture(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyTextureToBuffer(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CopyTextureToBuffer(
     JNIEnv* env, jclass, jlong ctx, jlong srcTex, jint mip, jint layer,
     jint srcX, jint srcY, jint w, jint h, jlong dstBuf, jlong dstOffset) {
     std::string err;
@@ -164,7 +164,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyTextureToBuffer(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyTextureToTexture(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CopyTextureToTexture(
     JNIEnv* env, jclass, jlong ctx, jlong srcTex, jlong dstTex,
     jint mip, jint layer, jint srcX, jint srcY, jint dstX, jint dstY,
     jint w, jint h) {
@@ -177,7 +177,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12CopyTextureToTexture(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearColorTexture(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ClearColorTexture(
     JNIEnv* env, jclass, jlong ctx, jlong texture,
     jfloat r, jfloat g, jfloat b, jfloat a) {
     std::string err;
@@ -188,7 +188,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearColorTexture(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearDepthTexture(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ClearDepthTexture(
     JNIEnv* env, jclass, jlong ctx, jlong texture, jdouble depth) {
     std::string err;
     if (!dx12mc::clearDepthTexture(
@@ -198,7 +198,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearDepthTexture(
     }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginRenderPass(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12BeginRenderPass(
     JNIEnv* env, jclass, jlong ctx, jlongArray colorTextures,
     jbyteArray colorClearFlags, jfloatArray clearColors, jlong depthTexture,
     jbyte depthClearFlag, jdouble depthClearValue,
@@ -241,7 +241,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginRenderPass(
     if (!ok) { throwJava(env, "dx12BeginRenderPass: " + err); }
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndRenderPass(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12EndRenderPass(
     JNIEnv* env, jclass, jlong ctx) {
     std::string err;
     if (!dx12mc::endRenderPass(
@@ -250,7 +250,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndRenderPass(
     }
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetActiveColorTexture(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetActiveColorTexture(
     JNIEnv*, jclass, jlong ctx) {
     return (jlong)getActiveColorTextureHandle(
         reinterpret_cast<dx12mc::CommandContext*>(ctx));
@@ -260,7 +260,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetActiveColorTexture(
 // P3：timestamp query pool
 // ---------------------------------------------------------------------------
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateQueryPool(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateQueryPool(
     JNIEnv* env, jclass, jint size) {
     std::string err;
     dx12mc::QueryPool* pool = dx12mc::createQueryPool(size, err);
@@ -268,12 +268,12 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateQueryPool(
     return reinterpret_cast<jlong>(pool);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyQueryPool(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DestroyQueryPool(
     JNIEnv*, jclass, jlong pool) {
     dx12mc::destroyQueryPool(reinterpret_cast<dx12mc::QueryPool*>(pool));
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12WriteTimestamp(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12WriteTimestamp(
     JNIEnv* env, jclass, jlong ctx, jlong pool, jint index) {
     std::string err;
     if (!dx12mc::writeTimestampToPool(
@@ -283,7 +283,7 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12WriteTimestamp(
     }
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadQueryValue(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ReadQueryValue(
     JNIEnv* env, jclass, jlong pool, jint index) {
     std::string err;
     long long out = 0;
@@ -294,7 +294,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadQueryValue(
     return (jlong)out;
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadQueryValues(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ReadQueryValues(
     JNIEnv* env, jclass, jlong pool, jint start, jint count, jlongArray out) {
     std::string err;
     std::vector<long long> buf(count);
