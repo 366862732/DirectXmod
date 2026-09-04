@@ -1,6 +1,6 @@
-package com.dx12.d3d12;
+package com.xgdt.dx12.d3d12;
 
-import com.dx12.dx12.Dx12Native;
+import com.xgdt.dx12.dx12.Dx12Native;
 import org.junit.jupiter.api.*;
 import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
