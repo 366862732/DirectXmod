@@ -12,9 +12,12 @@ import net.fabricmc.api.Environment;
 public class Dx12GpuTextureView extends GpuTextureView {
     private long handle;
     private boolean closed;
+    /** P3b：本 view 的 base mip（render pass 绑 RTV 时须用，图集逐级上传 mip）。 */
+    private final int baseMip;
 
     public Dx12GpuTextureView(GpuTexture texture, int baseMipLevel, int mipLevels) {
         super(texture, baseMipLevel, mipLevels);
+        this.baseMip = baseMipLevel;
         Dx12GpuTexture dx12Texture = (Dx12GpuTexture) texture;
         // 镜像 VulkanGpuTextureView：构造时注册 view 引用，close() 时 removeViews
         dx12Texture.addViews();
@@ -27,6 +30,11 @@ public class Dx12GpuTextureView extends GpuTextureView {
     /** Native handle ({@code Dx12Object*} as long). */
     public long handle() {
         return this.handle;
+    }
+
+    /** 该 view 指向的 base mip slice（render pass 附件 RTV/DSV 绑定用）。 */
+    public int baseMip() {
+        return this.baseMip;
     }
 
     @Override

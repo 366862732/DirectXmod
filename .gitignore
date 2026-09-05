@@ -44,7 +44,16 @@ temp_mc_shaders/
 
 # 图片目录
 图片/
+*.png
+*.jpg
+*.jpeg
+*.bmp
 
-## 方案目录
+## 方案
 多线程方案.md
 优化.md
+
+## 脚本/程序
+copilot.exe
+*.ps1
+*.py

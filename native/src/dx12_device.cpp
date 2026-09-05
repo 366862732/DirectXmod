@@ -1568,6 +1568,50 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
     return true;
 }
 
+// 构建绑定到指定 mip slice 的 RTV 描述符。原实现用 nullptr desc → 恒绑 mip0，
+// 官方 TextureAtlas 图集上传对每个 mipViews[level] 发起 render pass（逐级写入
+// mip1..N），mip0 以外的层级从未被写入 → 远处/大 LOD 采样到未初始化内容
+// （黑色远区块 / 个别方块呈 4px 粗颗粒模糊）。2D array / cubemap 保持整 array
+// 语义（与 nullptr desc 一致），仅修正 mip slice。
+static D3D12_RENDER_TARGET_VIEW_DESC makeRtvDesc(Dx12Object* tex, int mip) {
+    D3D12_RENDER_TARGET_VIEW_DESC d{};
+    d.Format = tex->dxgiFormat;
+    auto rd = tex->resource->GetDesc();
+    int mips = (int)rd.MipLevels;
+    UINT mipU = (UINT)std::max(0, std::min(mip, mips - 1));
+    if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.DepthOrArraySize > 1) {
+        d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray.MipSlice = mipU;
+        d.Texture2DArray.FirstArraySlice = 0;
+        d.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+        d.Texture2DArray.PlaneSlice = 0;
+    } else {
+        d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        d.Texture2D.MipSlice = mipU;
+        d.Texture2D.PlaneSlice = 0;
+    }
+    return d;
+}
+
+// 构建绑定到指定 mip slice 的 DSV 描述符（用途同 makeRtvDesc）。
+static D3D12_DEPTH_STENCIL_VIEW_DESC makeDsvDesc(Dx12Object* tex, int mip) {
+    D3D12_DEPTH_STENCIL_VIEW_DESC d{};
+    d.Format = tex->dxgiFormat;
+    auto rd = tex->resource->GetDesc();
+    int mips = (int)rd.MipLevels;
+    UINT mipU = (UINT)std::max(0, std::min(mip, mips - 1));
+    if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.DepthOrArraySize > 1) {
+        d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray.MipSlice = mipU;
+        d.Texture2DArray.FirstArraySlice = 0;
+        d.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+    } else {
+        d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        d.Texture2D.MipSlice = mipU;
+    }
+    return d;
+}
+
 bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     float r, float g, float b, float a, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "clearColorTexture: no open command list"; return false; }
@@ -1582,7 +1626,8 @@ bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
     ++gNextFrameRtv;
-    gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
+    D3D12_RENDER_TARGET_VIEW_DESC desc = makeRtvDesc(tex, 0);
+    gCtx.device->CreateRenderTargetView(tex->resource.Get(), &desc, cpu);
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = { r, g, b, a };
     ctx->commandList->ClearRenderTargetView(cpu, color, 0, nullptr);
@@ -1601,11 +1646,58 @@ bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
     ++gNextDsv;
-    gCtx.device->CreateDepthStencilView(tex->resource.Get(), nullptr, cpu);
+    D3D12_DEPTH_STENCIL_VIEW_DESC desc = makeDsvDesc(tex, 0);
+    gCtx.device->CreateDepthStencilView(tex->resource.Get(), &desc, cpu);
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     ctx->commandList->ClearDepthStencilView(cpu,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 0, nullptr);
     // P11：显式回切 COMMON（DEPTH_WRITE 不会随命令列表完成 decay）。
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    return true;
+}
+
+bool clearColorTextureRegion(CommandContext* ctx, Dx12Object* tex,
+    float r, float g, float b, float a, int x, int y, int w, int h,
+    std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "clearColorTextureRegion: no open command list"; return false; }
+    if (!tex || tex->kind != Dx12Object::Kind::Texture) {
+        err = "clearColorTextureRegion: invalid texture"; return false;
+    }
+    if (!(tex->usage & 8)) {  // RENDER_ATTACHMENT
+        err = "clearColorTextureRegion: texture lacks RENDER_ATTACHMENT"; return false;
+    }
+    if (w <= 0 || h <= 0) return true;  // 空区域：无事可做
+    if (gNextFrameRtv >= kFrameRtvHeapSize) { err = "clearColorTextureRegion: frame rtv heap exhausted"; return false; }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
+    ++gNextFrameRtv;
+    D3D12_RENDER_TARGET_VIEW_DESC desc = makeRtvDesc(tex, 0);
+    gCtx.device->CreateRenderTargetView(tex->resource.Get(), &desc, cpu);
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float color[4] = { r, g, b, a };
+    D3D12_RECT rc{ x, y, x + w, y + h };
+    ctx->commandList->ClearRenderTargetView(cpu, color, 1, &rc);
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    return true;
+}
+
+bool clearDepthTextureRegion(CommandContext* ctx, Dx12Object* tex, double depth,
+    int x, int y, int w, int h, std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "clearDepthTextureRegion: no open command list"; return false; }
+    if (!tex || tex->kind != Dx12Object::Kind::Texture) {
+        err = "clearDepthTextureRegion: invalid texture"; return false;
+    }
+    if (w <= 0 || h <= 0) return true;  // 空区域：无事可做
+    if (gNextDsv >= kDsvHeapSize) { err = "clearDepthTextureRegion: dsv heap exhausted"; return false; }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
+    ++gNextDsv;
+    D3D12_DEPTH_STENCIL_VIEW_DESC desc = makeDsvDesc(tex, 0);
+    gCtx.device->CreateDepthStencilView(tex->resource.Get(), &desc, cpu);
+    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    D3D12_RECT rc{ x, y, x + w, y + h };
+    ctx->commandList->ClearDepthStencilView(cpu,
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 1, &rc);
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
@@ -1780,8 +1872,9 @@ bool copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* d
 }
 
 bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
-    int colorCount, const int* colorClearFlags, const float* clearColors,
-    Dx12Object* depthView, int depthClearFlag, double depthClearValue,
+    int colorCount, const int* colorMips, const int* colorClearFlags,
+    const float* clearColors,
+    Dx12Object* depthView, int depthMip, int depthClearFlag, double depthClearValue,
     int x, int y, int w, int h, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "beginRenderPass: no open command list"; return false; }
     if (ctx->inRenderPass) { err = "beginRenderPass: render pass already open"; return false; }
@@ -1808,13 +1901,17 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
         ++gNextFrameRtv;
-        gCtx.device->CreateRenderTargetView(tex->resource.Get(), nullptr, cpu);
+        // P3b fix：RTV 绑定 view 的真实 mip slice（官方对每个 mipViews[level]
+        // 发起 render pass 逐级写入图集 mip1..N）。
+        int mip = colorMips ? colorMips[i] : 0;
+        D3D12_RENDER_TARGET_VIEW_DESC rdesc = makeRtvDesc(tex, mip);
+        gCtx.device->CreateRenderTargetView(tex->resource.Get(), &rdesc, cpu);
         rtvs.push_back(cpu);
         ctx->activeColorTargets.push_back(tex);
         // P27：beginRenderPass 加载期可调用数千次，逐条 dbgLog 写文件拖死主线程，
         // 降级为 DBG_LOG_DEBUG（DX12_LOG_VERBOSE=1 才输出）。
-        DBG_LOG_DEBUG("beginRenderPass color[%d] tex=%p rtv=%p dims=%ux%u fmt=%d",
-            i, (void*)tex, (void*)cpu.ptr, (UINT)tex->resource->GetDesc().Width,
+        DBG_LOG_DEBUG("beginRenderPass color[%d] tex=%p rtv=%p mip=%d dims=%ux%u fmt=%d",
+            i, (void*)tex, (void*)cpu.ptr, mip, (UINT)tex->resource->GetDesc().Width,
             (UINT)tex->resource->GetDesc().Height, (int)tex->dxgiFormat);
         transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (colorClearFlags && colorClearFlags[i] && clearColors) {
@@ -1839,7 +1936,9 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
         ++gNextDsv;
-        gCtx.device->CreateDepthStencilView(depthView->resource.Get(), nullptr, cpu);
+        // P3b fix：DSV 绑定真实 mip slice（默认 0，语义不变）。
+        D3D12_DEPTH_STENCIL_VIEW_DESC ddesc = makeDsvDesc(depthView, depthMip);
+        gCtx.device->CreateDepthStencilView(depthView->resource.Get(), &ddesc, cpu);
         dsv = cpu;
         hasDsv = true;
         ctx->activeDepthTarget = depthView;

@@ -198,10 +198,34 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearDepthTexture(
     }
 }
 
+// P3b：矩形区域 clear（GuiItemAtlas 槽位 STALE 重绘前只清该槽位区域）。
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearColorTextureRegion(
+    JNIEnv* env, jclass, jlong ctx, jlong texture,
+    jfloat r, jfloat g, jfloat b, jfloat a,
+    jint x, jint y, jint w, jint h) {
+    std::string err;
+    if (!dx12mc::clearColorTextureRegion(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            fromHandle(texture), r, g, b, a, x, y, w, h, err)) {
+        throwJava(env, "dx12ClearColorTextureRegion: " + err);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ClearDepthTextureRegion(
+    JNIEnv* env, jclass, jlong ctx, jlong texture, jdouble depth,
+    jint x, jint y, jint w, jint h) {
+    std::string err;
+    if (!dx12mc::clearDepthTextureRegion(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            fromHandle(texture), depth, x, y, w, h, err)) {
+        throwJava(env, "dx12ClearDepthTextureRegion: " + err);
+    }
+}
+
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginRenderPass(
     JNIEnv* env, jclass, jlong ctx, jlongArray colorTextures,
-    jbyteArray colorClearFlags, jfloatArray clearColors, jlong depthTexture,
-    jbyte depthClearFlag, jdouble depthClearValue,
+    jintArray colorMips, jbyteArray colorClearFlags, jfloatArray clearColors,
+    jlong depthTexture, jint depthMip, jbyte depthClearFlag, jdouble depthClearValue,
     jint x, jint y, jint w, jint h) {
     std::string err;
     jsize colorCount = colorTextures ? env->GetArrayLength(colorTextures) : 0;
@@ -209,7 +233,9 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginRenderPass(
     std::vector<jlong> texBuf;
     std::vector<jbyte> flagBuf;
     std::vector<jfloat> colorBuf;
+    std::vector<jint> mipBuf;
     dx12mc::Dx12Object** views = nullptr;
+    int* mips = nullptr;
     int* flags = nullptr;
     float* colors = nullptr;
     if (colorCount > 0) {
@@ -219,6 +245,12 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginRenderPass(
         env->GetByteArrayRegion(colorClearFlags, 0, colorCount, flagBuf.data());
         views = new dx12mc::Dx12Object*[colorCount];
         flags = new int[colorCount];
+        if (colorMips) {
+            mipBuf.resize(colorCount);
+            env->GetIntArrayRegion(colorMips, 0, colorCount, mipBuf.data());
+            mips = new int[colorCount];
+            for (jsize i = 0; i < colorCount; ++i) mips[i] = mipBuf[i];
+        }
         for (jsize i = 0; i < colorCount; ++i) {
             views[i] = texBuf[i] ? fromHandle(texBuf[i]) : nullptr;
             flags[i] = flagBuf[i];
@@ -234,9 +266,10 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginRenderPass(
     }
     bool ok = dx12mc::beginRenderPass(
         reinterpret_cast<dx12mc::CommandContext*>(ctx), views, (int)colorCount,
-        flags, colors, depthTexture ? fromHandle(depthTexture) : nullptr,
-        depthClearFlag, depthClearValue, x, y, w, h, err);
+        mips, flags, colors, depthTexture ? fromHandle(depthTexture) : nullptr,
+        depthMip, depthClearFlag, depthClearValue, x, y, w, h, err);
     delete[] views;
+    delete[] mips;
     delete[] flags;
     if (!ok) { throwJava(env, "dx12BeginRenderPass: " + err); }
 }

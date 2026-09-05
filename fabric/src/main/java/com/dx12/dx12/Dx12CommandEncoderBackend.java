@@ -99,6 +99,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             descriptor.colorAttachments();
         int colorCount = colorAttachments.size();
         long[] colorTextures = new long[colorCount];
+        int[] colorMips = new int[colorCount];
         byte[] colorClearFlags = new byte[colorCount];
         float[] clearColors = new float[colorCount * 4];
         for (int i = 0; i < colorCount; ++i) {
@@ -109,6 +110,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             }
             GpuTextureView view = attachment.textureView();
             colorTextures[i] = ((Dx12GpuTexture) view.texture()).handle();
+            // P3b：把 view 的 base mip 传给 native RTV（TextureAtlas 对 mipViews[level]
+            // 逐级上传；此前 RTV 恒绑 mip0 → 图集 mip1+ 从未写入，远处大 LOD 采样
+            // 到未初始化内容）。
+            if (view instanceof Dx12GpuTextureView dx12View) {
+                colorMips[i] = dx12View.baseMip();
+            }
             if (attachment.clearValue().isPresent()) {
                 Vector4fc color = attachment.clearValue().get();
                 colorClearFlags[i] = 1;
@@ -120,11 +127,16 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         }
 
         long depthTexture = 0L;
+        int depthMip = 0;
         byte depthClearFlag = 0;
         double depthClearValue = 0.0;
         RenderPassDescriptor.Attachment<OptionalDouble> depthAttachment = descriptor.depthAttachment();
         if (depthAttachment != null) {
-            depthTexture = ((Dx12GpuTexture) depthAttachment.textureView().texture()).handle();
+            GpuTextureView depthView = depthAttachment.textureView();
+            depthTexture = ((Dx12GpuTexture) depthView.texture()).handle();
+            if (depthView instanceof Dx12GpuTextureView dx12View) {
+                depthMip = dx12View.baseMip();
+            }
             if (depthAttachment.clearValue().isPresent()) {
                 depthClearFlag = 1;
                 depthClearValue = depthAttachment.clearValue().getAsDouble();
@@ -147,8 +159,9 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             }
         }
 
-        Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorClearFlags, clearColors,
-            depthTexture, depthClearFlag, depthClearValue, x, y, w, h);
+        Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorMips,
+            colorClearFlags, clearColors, depthTexture, depthMip,
+            depthClearFlag, depthClearValue, x, y, w, h);
         boolean hasDepth = depthTexture != 0L;
         // P31：GUI 离屏渲染判别——颜色附件 usage==13（COPY_DST|TEXTURE_BINDING|
         // RENDER_ATTACHMENT，无 COPY_SRC）且带深度附件。GuiItemAtlas / PIP 实体纹理
@@ -239,8 +252,14 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     public void clearColorAndDepthTextures(GpuTexture colorTexture, Vector4fc clearColor,
         GpuTexture depthTexture, double clearDepth, int regionX, int regionY,
         int regionWidth, int regionHeight) {
-        // P3 simplification: the full-texture clears below ignore the region.
-        this.clearColorAndDepthTextures(colorTexture, clearColor, depthTexture, clearDepth);
+        // P3b fix：GuiItemAtlas 槽位 STALE 重绘前只清该槽位矩形区域。原实现忽略
+        // region 整图清空 → 滚动/翻页触发任意槽位重绘时把整张物品图集抹掉，其它
+        // 已烘好的槽位图标（图集区域仍标记有效、不再触发重绘）随之消失。
+        Dx12Native.dx12ClearColorTextureRegion(this.ctx, textureHandle(colorTexture),
+            clearColor.x(), clearColor.y(), clearColor.z(), clearColor.w(),
+            regionX, regionY, regionWidth, regionHeight);
+        Dx12Native.dx12ClearDepthTextureRegion(this.ctx, textureHandle(depthTexture),
+            clearDepth, regionX, regionY, regionWidth, regionHeight);
     }
 
     @Override

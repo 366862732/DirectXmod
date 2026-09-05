@@ -196,16 +196,31 @@ public final class Dx12Native {
     public static native void dx12ClearDepthTexture(long ctx, long texture, double depth);
 
     /**
+     * Record a rectangular-region color clear (GuiItemAtlas 槽位 STALE 重绘前
+     * 只清该槽位区域，原实现忽略 region 整图清空导致翻页后其它物品消失)。
+     * 坐标 = 渲染目标像素空间（与 renderArea/scissor 同约定）。
+     */
+    public static native void dx12ClearColorTextureRegion(long ctx, long texture,
+        float r, float g, float b, float a, int x, int y, int w, int h);
+
+    /** Record a rectangular-region depth clear (坐标约定同上)。 */
+    public static native void dx12ClearDepthTextureRegion(long ctx, long texture,
+        double depth, int x, int y, int w, int h);
+
+    /**
      * Begin a render pass: create RTV/DSV descriptors, transition attachments,
      * OMSetRenderTargets, viewport/scissor, optional clears.
      *
      * @param colorTextures   color attachment textures (nulls are skipped)
+     * @param colorMips       per-attachment RTV mip slice (TextureAtlas 图集上传对
+     *                        mipViews[level] 逐级写 mip，必须绑定真实 mip)
      * @param colorClearFlags per-attachment 0=load / 1=clear
      * @param clearColors     r,g,b,a per attachment (length colorTextures.length * 4)
+     * @param depthMip        depth attachment RTV/DSV mip slice (default 0)
      */
     public static native void dx12BeginRenderPass(long ctx, long[] colorTextures,
-        byte[] colorClearFlags, float[] clearColors, long depthTexture,
-        byte depthClearFlag, double depthClearValue, int x, int y, int w, int h);
+        int[] colorMips, byte[] colorClearFlags, float[] clearColors, long depthTexture,
+        int depthMip, byte depthClearFlag, double depthClearValue, int x, int y, int w, int h);
 
     /** End the current render pass. */
     public static native void dx12EndRenderPass(long ctx);

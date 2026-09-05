@@ -291,6 +291,16 @@ bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
 bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
     std::string& err);
 
+// clear 颜色纹理矩形区域（P3b fix：GuiItemAtlas 槽位 STALE 重绘前只清该槽位。
+// 原简化实现忽略 region 整图清空，滚动时会把其它槽位已烘好的物品图标一并抹掉，
+// 翻页回来后这些区域不再触发重绘 → 物品消失）。
+bool clearColorTextureRegion(CommandContext* ctx, Dx12Object* tex,
+    float r, float g, float b, float a, int x, int y, int w, int h,
+    std::string& err);
+// clear 深度纹理矩形区域（同上）。
+bool clearDepthTextureRegion(CommandContext* ctx, Dx12Object* tex, double depth,
+    int x, int y, int w, int h, std::string& err);
+
 // ---------------------------------------------------------------------------
 // 纹理拷贝（P3）：CopyTextureRegion 系列
 // ---------------------------------------------------------------------------
@@ -317,15 +327,21 @@ unsigned long long getTimestampFrequency();
 // 渲染 pass 生命周期（P3：OMSetRenderTargets + viewport/scissor + clear；
 // draw 命令录制依赖 P4 pipeline）。
 //   colorViews      ：颜色纹理数组（允许空指针占位，对应 withUnusedColorAttachment）
+//   colorMips       ：每附件要绑定的 mip slice（长度 colorCount；可为 null=0。
+//                     官方 TextureAtlas 对 mipViews[level] 逐级发起 render pass 写
+//                     各 mip —— 原 RTV 恒绑 mip0 使 1+ 级图集内容从未写入：远处/大
+//                     LOD 采样到未初始化 mip → 黑色方块、4px 模糊块等）
 //   colorClearFlags ：0=保留(Load)，1=clear（对应 clearValue 存在）
 //   clearColors     ：每附件 4 个 float（r,g,b,a），长度 colorCount*4
 //   depthView       ：深度纹理（可为空）
+//   depthMip        ：深度附件绑定的 mip slice（默认 0）
 //   depthClearFlag  ：0=Load，1=clear
 //   depthClearValue ：深度清除值
 //   x/y/w/h         ：renderArea
 bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
-    int colorCount, const int* colorClearFlags, const float* clearColors,
-    Dx12Object* depthView, int depthClearFlag, double depthClearValue,
+    int colorCount, const int* colorMips, const int* colorClearFlags,
+    const float* clearColors,
+    Dx12Object* depthView, int depthMip, int depthClearFlag, double depthClearValue,
     int x, int y, int w, int h, std::string& err);
 bool endRenderPass(CommandContext* ctx, std::string& err);
 
