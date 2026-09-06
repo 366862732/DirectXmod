@@ -44,7 +44,7 @@ extern "C" {
 
 // long dx12CreateGraphicsPipeline(ByteBuffer desc) — desc 布局见 Dx12Native Javadoc。
 // 失败不抛异常：记录 stderr 并返回 0（Java 侧视为无效管线）。
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateGraphicsPipeline(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateGraphicsPipeline(
     JNIEnv* env, jclass, jobject desc) {
     jsize total = 0;
     const uint8_t* p = readBuffer(env, desc, total);
@@ -164,7 +164,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateGraphicsPipeline
 }
 
 // void dx12DestroyPipeline(long pipeline)
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyPipeline(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DestroyPipeline(
     JNIEnv*, jclass, jlong pipeline) {
     dx12mc::destroyPipeline(reinterpret_cast<dx12mc::Dx12Pipeline*>(pipeline));
 }

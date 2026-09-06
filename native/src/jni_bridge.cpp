@@ -1,5 +1,5 @@
-// JNI 桥接层：导出 Java com.dx12.dx12.Dx12Native 的 native 方法。
-// 符号名必须与 Java 类/方法完全匹配（包 com.dx12.dx12，类 Dx12Native）。
+// JNI 桥接层：导出 Java com.xgdt.dx12.dx12.Dx12Native 的 native 方法。
+// 符号名必须与 Java 类/方法完全匹配（包 com.xgdt.dx12.dx12，类 Dx12Native）。
 
 #include <jni.h>
 
@@ -34,7 +34,7 @@ extern "C" {
 
 // P1 探测 + P2 资源层自检：创建 D3D12 device/queue/heaps，
 // 自检 texture/buffer/sampler/view 后返回汇总信息。
-JNIEXPORT jstring JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateDevice(
+JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateDevice(
     JNIEnv* env, jclass) {
     std::string err;
     if (!dx12mc::ensureDevice(err)) {
@@ -57,7 +57,7 @@ JNIEXPORT jstring JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateDevice(
     return toJString(env, result);
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateTexture(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateTexture(
     JNIEnv* env, jclass, jint usage, jint format, jint width, jint height,
     jint depthOrLayers, jint mipLevels) {
     std::string err;
@@ -67,7 +67,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateTexture(
     return toHandle(obj);
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateBuffer(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateBuffer(
     JNIEnv* env, jclass, jint usage, jlong size) {
     std::string err;
     dx12mc::Dx12Object* obj = dx12mc::createBuffer(usage, size, err);
@@ -75,7 +75,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateBuffer(
     return toHandle(obj);
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateSampler(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateSampler(
     JNIEnv* env, jclass, jint addressU, jint addressV, jint minFilter,
     jint magFilter, jint maxAnisotropy, jfloat maxLod) {
     std::string err;
@@ -85,7 +85,7 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateSampler(
     return toHandle(obj);
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateTextureView(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateTextureView(
     JNIEnv* env, jclass, jlong texture, jint baseMipLevel, jint mipLevels) {
     std::string err;
     dx12mc::Dx12Object* obj = dx12mc::createTextureView(
@@ -94,12 +94,12 @@ JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateTextureView(
     return toHandle(obj);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyResource(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DestroyResource(
     JNIEnv*, jclass, jlong handle) {
     dx12mc::destroyObject(fromHandle(handle));
 }
 
-JNIEXPORT jobject JNICALL Java_com_dx12_dx12_Dx12Native_dx12MapBuffer(
+JNIEXPORT jobject JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12MapBuffer(
     JNIEnv* env, jclass, jlong buffer, jlong offset, jlong length,
     jboolean read, jboolean write) {
     std::string err;
@@ -108,32 +108,32 @@ JNIEXPORT jobject JNICALL Java_com_dx12_dx12_Dx12Native_dx12MapBuffer(
     return env->NewDirectByteBuffer(ptr, (jlong)length);
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12UnmapBuffer(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12UnmapBuffer(
     JNIEnv*, jclass, jlong buffer) {
     dx12mc::unmapBuffer(fromHandle(buffer));
 }
 
-JNIEXPORT jstring JNICALL Java_com_dx12_dx12_Dx12Native_dx12EnumerateAdapters(
+JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12EnumerateAdapters(
     JNIEnv* env, jclass) {
     return toJString(env, dx12mc::enumerateAdaptersJson());
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetQueueHandle(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetQueueHandle(
     JNIEnv*, jclass) {
     return static_cast<jlong>(dx12mc::getQueueHandle());
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12GetDeviceHandle(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetDeviceHandle(
     JNIEnv*, jclass) {
     return static_cast<jlong>(dx12mc::getDeviceHandle());
 }
 
-JNIEXPORT jlong JNICALL Java_com_dx12_dx12_Dx12Native_dx12CreateHiddenWindow(
+JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateHiddenWindow(
     JNIEnv*, jclass, jint width, jint height) {
     return static_cast<jlong>(dx12mc::createHiddenWindow(width, height));
 }
 
-JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyHiddenWindow(
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DestroyHiddenWindow(
     JNIEnv*, jclass, jlong hwnd) {
     dx12mc::destroyHiddenWindow(static_cast<uintptr_t>(hwnd));
 }
