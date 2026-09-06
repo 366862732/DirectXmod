@@ -48,10 +48,12 @@ temp_mc_shaders/
 *.jpg
 *.jpeg
 *.bmp
+Picture/
 
 ## 方案
 多线程方案.md
 优化.md
+
 
 ## 脚本/程序
 copilot.exe

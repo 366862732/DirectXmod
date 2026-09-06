@@ -63,6 +63,10 @@ public class Dx12Device implements GpuDeviceBackend {
     private static volatile boolean initialized = false;
     public static boolean isInitialized() { return initialized; }
 
+    /** P38 诊断：捕获 "Lightmap" 标签的 16×16 纹理（地形/UI 光照贴图），供 submit() 后读回验证内容与朝向。 */
+    private static volatile long debugLightmapHandle = 0L;
+    public static long getDebugLightmapHandle() { return debugLightmapHandle; }
+
     private final DeviceInfo deviceInfo;
     private long timestampCtx;
 
@@ -109,15 +113,30 @@ public class Dx12Device implements GpuDeviceBackend {
     @Override
     public GpuTexture createTexture(@Nullable Supplier<String> label, @GpuTexture.Usage int usage,
         GpuFormat format, int width, int height, int depthOrLayers, int mipLevels) {
-        return new Dx12GpuTexture(usage, label == null ? "" : label.get(), format, width, height,
-            depthOrLayers, mipLevels);
+        String name = label == null ? "" : label.get();
+        return captureDebugLightmap(new Dx12GpuTexture(usage, name, format, width, height,
+            depthOrLayers, mipLevels), name, width, height);
     }
 
     @Override
     public GpuTexture createTexture(@Nullable String label, @GpuTexture.Usage int usage,
         GpuFormat format, int width, int height, int depthOrLayers, int mipLevels) {
-        return new Dx12GpuTexture(usage, label == null ? "" : label, format, width, height,
-            depthOrLayers, mipLevels);
+        String name = label == null ? "" : label;
+        return captureDebugLightmap(new Dx12GpuTexture(usage, name, format, width, height,
+            depthOrLayers, mipLevels), name, width, height);
+    }
+
+    /** P38 诊断：Lightmap 类创建的两张 16×16 光照纹理（世界 + UI）都打 "Lightmap" 标签；捕获第一张。 */
+    private static GpuTexture captureDebugLightmap(Dx12GpuTexture tex, String name,
+        int width, int height) {
+        if (debugLightmapHandle == 0L && "Lightmap".equals(name)
+            && width == 16 && height == 16) {
+            debugLightmapHandle = tex.handle();
+            System.err.println("[dx12-java] P38 capture Lightmap texture handle=0x"
+                + Long.toHexString(debugLightmapHandle) + " usage=" + tex.usage());
+            System.err.flush();
+        }
+        return tex;
     }
 
     @Override

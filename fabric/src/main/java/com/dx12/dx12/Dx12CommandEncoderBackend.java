@@ -53,6 +53,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private static final java.util.Map<Long, java.util.List<Dx12RenderPassBackend>>
         gPendingAtlasByCtx = new java.util.HashMap<>();
 
+    /** P38 诊断：submit()（共享 encoder = 每帧）后读回 16×16 lightmap，验证内容与朝向。 */
+    private static final int MAX_LIGHTMAP_DUMPS = 5;
+    private static final int LIGHTMAP_DUMP_INTERVAL = 120;
+    private static int dx12DebugLightmapTick = 0;
+    private static int dx12DebugLightmapDumps = 0;
+
     public Dx12CommandEncoderBackend() {
         this(null);
     }
@@ -415,6 +421,24 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                             "atlas_" + dumpPass.outputWidth() + "x" + dumpPass.outputHeight()
                             + "_" + Long.toHexString(h & 0xFFFF));
                     }
+                }
+            }
+        }
+        // P38 诊断：共享 encoder（device != null）的 submit 对应整帧提交；此时 lightmap 的
+        // "Update light" pass 已执行，读回 16×16 光照纹理是真实内容。最多 dump MAX_LIGHTMAP_DUMPS 次、
+        // 间隔 LIGHTMAP_DUMP_INTERVAL 帧，降低 waitIdle 同步气泡与日志量。
+        if (this.device != null && Dx12Native.LOG_VERBOSE
+            && dx12DebugLightmapDumps < MAX_LIGHTMAP_DUMPS) {
+            long lmh = Dx12Device.getDebugLightmapHandle();
+            if (lmh != 0L) {
+                ++dx12DebugLightmapTick;
+                // 整帧 submit 满 LIGHTMAP_DUMP_INTERVAL 次触发一次（近似每 ~120 帧）
+                if (dx12DebugLightmapTick % LIGHTMAP_DUMP_INTERVAL == 0) {
+                    ++dx12DebugLightmapDumps;
+                    System.err.println("[dx12-java] P38 dump lightmap #" + dx12DebugLightmapDumps
+                        + " tex=0x" + Long.toHexString(lmh) + " after submit");
+                    System.err.flush();
+                    Dx12Native.dx12DumpTextureToFile(lmh, "lightmap_" + dx12DebugLightmapDumps);
                 }
             }
         }

@@ -23,7 +23,7 @@
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
 
-### 当前阶段：P0-P27 全部完成，BUG-01 semanticNames 修复，P24 SRV 堆修复，黑屏根因（level=null）诊断中（2026-08-27）
+### 当前阶段：P0-P28 全部完成，LIGHTMAP-VFLIP 修复（白天地形偏暗根因定位并修复），level=null 根因待确认（2026-09-06）
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -47,6 +47,7 @@
 | **P27: 高频日志降级** | ✅ 已完成 | beginRenderPass/setPipeline/drawIndexed 逐条诊断日志降级为 DBG_LOG_DEBUG（数千次/帧不拖死主线程） |
 | **P28: 图集渲染与坐标系适配** | ✅ 已完成 | animate_sprite 顶点着色器注入 Y-flip（GL bottom-up → D3D12 top-down）；静态采样器改 POINT（与官方图集上传 NEAREST 语义一致）；图集 dump 验证内容正确、GUI 按钮渲染正常 |
 | **BUG-01: semanticNames 修复** | ✅ 已完成 | `semanticNames` 基于 `vertex.inputs().size()` 补齐，与 spvc 基准对齐 |
+| **LIGHTMAP-VFLIP（已修复）** | ✅ 已完成 | 光贴图更新 pass（pipeline/lightmap）被 P31 flipY 判定排除（usage=13 且需带深度附件）→ GL bottom-up 写入方向与 terrain 采样相反，白天方块采到暗行（lightmapviz≈26-46、whitelight 探针恢复明亮、readback BMP 证实内容渐变正确但 Y 镜像）。修复：Dx12ShaderCompiler 对 location 含 "lightmap" 且 !flipY 的管线在 frag_main 入口注入 `texCoord.y = 1.0f - texCoord.y;`；诊断：whitelight/uv2viz/lightmapviz 探针 + dbgReadbackTexturePixels 读回 16×16 光贴图 |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线编译 + surface blit + buffer copy + texture readback 全部通过 |
 
 ## 项目结构
@@ -251,6 +252,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P21 深度测试修复** | 移除 depthClearFlag=0 的无条件 clear=1.0 回退（pre-clear 已由 MC 完成）；修复 reverse-Z 比较函数 |
 | **P22 描述符堆扩容** | drawHeap 从 2 半区扩展到 4 半区，支持三帧并行飞行（fenceValue%4 交替写入） |
 | **BUG-01 semanticNames 修复** | `semanticNames` 补齐改用 `vertex.inputs().size()` 与 spvc remap 基准对齐 |
+| **LIGHTMAP-VFLIP 修复** | 光贴图更新 pass（pipeline/lightmap）被 P31 flipY 判定排除 → GL bottom-up 内容写入方向与 terrain 采样相反，白天采到暗行（lightmapviz≈26-46、whitelight 探针恢复明亮、readback BMP 证实内容渐变正确但镜像）。修复：frag_main 注入 `texCoord.y = 1.0f - texCoord.y;`（location 含 lightmap 且 !flipY 时自动生效） |
 | **Shader 编译自检** | 内嵌 core/gui + core/position_tex_color 的 GLSL 源码，createDevice 时资源包未加载也可编译 |
 | **4 轮自测** | Java 资源(self-test)→命令层→管线→Surface 逐轮验证，任何失败立即终止并回退 OpenGL |
 | **D3D12 资源管理** | AutoCloseable 模式 + TextureView 引用计数 + gPendingDeletes 延迟销毁 |
@@ -355,7 +357,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 ## 路线图
 
-### P0-P27: D3D12 后端核心层 ✅ 全部完成
+### P0-P28: D3D12 后端核心层 ✅ 全部完成
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -366,7 +368,7 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **P4: 管线编译层** | ✅ | shaderc SPIR-V → spvc 反射/rebind → HLSL → D3DCompile DXBC |
 | **P5: 交换链层** | ✅ | Dx12GpuSurface: DXGI flip-model swapchain |
 | **P6: Draw 全链路** | ✅ | Dx12RenderPassBackend: setPipeline + pushDescriptors + draw |
-| **P15-P28: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级/图集渲染与坐标系适配 |
+| **P15-P28: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级/图集渲染与坐标系适配/光贴图 Y-flip 修复 |
 | **BUG-01: semanticNames** | ✅ | 补齐逻辑与 spvc 基准对齐 |
 | **自测通过** | ✅ | GUI + GUI_TEXTURED 管线 + surface blit + buffer copy + texture readback |
 

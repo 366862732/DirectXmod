@@ -4,6 +4,9 @@ import com.dx12.dx12.Dx12Device;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
+import net.minecraft.client.renderer.state.GameRenderState;
+import net.minecraft.client.renderer.state.LightmapRenderState;
+import org.joml.Vector3fc;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -24,6 +27,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class GameRendererRenderDebugMixin {
 
     @Shadow @Final private Minecraft minecraft;
+    @Shadow @Final private GameRenderState gameRenderState;
 
     // P15: frame counter, reset on each new game load
     private int dx12_renderFrameCount = 0;
@@ -63,6 +67,21 @@ public class GameRendererRenderDebugMixin {
                 + " backend=" + (Dx12Device.isInitialized() ? "DX12" : "NONE")
                 + " paused=" + this.minecraft.isPaused());
             System.err.flush();
+            // P38: 打印 Lightmap renderState 数值，供与读回的 16×16 lightmap 内容对照。
+            LightmapRenderState s = this.gameRenderState.lightmapRenderState;
+            System.err.println("[dx12-debug] lightmapState needsUpdate=" + s.needsUpdate
+                + " skyFactor=" + s.skyFactor
+                + " blockFactor=" + s.blockFactor
+                + " brightness=" + s.brightness
+                + " darknessScale=" + s.darknessEffectScale
+                + " bossDark=" + s.bossOverlayWorldDarkening
+                + " nvInt=" + s.nightVisionEffectIntensity
+                + " ambient=(" + fmt(s.ambientColor) + ")"
+                + " skyColor=(" + fmt(s.skyLightColor) + ")"
+                + " blockTint=(" + fmt(s.blockLightTint) + ")"
+                + " nvColor=(" + fmt(s.nightVisionColor) + ")"
+                + " lmHandle=" + (Dx12Device.getDebugLightmapHandle() != 0L ? "captured" : "none"));
+            System.err.flush();
         }
 
         // Always print the decision path on frame 1 (loading → loaded transition)
@@ -71,5 +90,12 @@ public class GameRendererRenderDebugMixin {
                 + (resourcesLoaded && advanceGameTime && levelNotNull));
             System.err.flush();
         }
+    }
+
+    private static String fmt(Vector3fc c) {
+        if (c == null) {
+            return "null";
+        }
+        return String.format(java.util.Locale.ROOT, "%.3f,%.3f,%.3f", c.x(), c.y(), c.z());
     }
 }
