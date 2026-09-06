@@ -18,6 +18,7 @@ include_directories("${JAVA_HOME}/include" "${JAVA_HOME}/include/win32")
 # d3d12.lib、dxgi.lib 由 MSVC 的 Windows SDK 环境自动提供。
 
 add_library(dx12_mc SHARED
+    src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
     src/jni_bridge.cpp
     src/jni_bridge_p3.cpp
