@@ -27,6 +27,11 @@
 #include <unordered_set>
 #include <vector>
 
+// P33 async：异步渲染基础设施（MainCommandExecutor + BundleRecorderPool）
+#include "dx12_async_executor.h"
+#include "dx12_async_bundle.h"
+#include "dx12_async_descriptor.h"
+
 namespace dx12mc {
 
 using Microsoft::WRL::ComPtr;
@@ -216,6 +221,12 @@ struct CommandContext {
     UINT drawHeapSlotBase = 0;
     UINT nextDrawSlot = 0;
 
+    // P33 async：记录上一次 submitCommandList 写入的 queue fence 值。
+    // beginCommandListWithWait 据此等待 GPU 完成上一帧后再 Reset allocator，
+    // 避免异步线程并发提交时的 use-after-free（ACCESS_VIOLATION 根因）。
+    // 初始值 0 表示"无需等待"（首帧或 createBuffer 一次性路径）。
+    UINT64 lastSubmitQueueFence = 0;
+
     // 本 command list 内已过渡的资源状态（资源指针 -> 当前 D3D12 状态）。
     // 初始态 = 资源创建时的状态（texture=COMMON，buffer=initialStateFor）。
     // beginCommandList 清空：因为 submit 同步等待完成，上一 command list
@@ -239,8 +250,12 @@ struct CommandContext {
 CommandContext* createCommandEncoder(std::string& err);
 void destroyCommandEncoder(CommandContext* ctx);
 
-// 开始录制：Reset 当前 allocator（其对应帧的 GPU 工作必须已完成）+ list。
+// 开始录制：先等待 GPU 完成 waitForValue 对应的提交（若 waitForValue > 0），
+// 再 Reset 当前 allocator + list。用于异步多线程场景，确保 allocator 不被
+// 还在使用的 GPU 命令列表引用时覆写。waitForValue == 0 时跳过等待（兼容原有
+// 单线程路径及 createBuffer 一次性路径）。
 bool beginCommandList(CommandContext* ctx, std::string& err);
+bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::string& err);
 // 结束录制：Close list（之后可提交）。
 bool endCommandList(CommandContext* ctx, std::string& err);
 // 提交：ExecuteCommandLists + Signal(fence, ++fenceValue)。
@@ -252,6 +267,32 @@ bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
     std::string& err);
 // 当前 fence value（Java 侧 createFence 记录用）。
 UINT64 currentFenceValue(CommandContext* ctx);
+
+// ---------------------------------------------------------------------------
+// P33 async：独立 C++ 渲染线程（渲染工作从主线程剥离）
+// ---------------------------------------------------------------------------
+//
+// 架构：独立的 C++ 渲染线程负责 GPU 同步（acquire/present/fence wait），
+// 主线程只负责 push 绘制命令，不阻塞等 GPU。
+//
+// 四阶段状态机（通过 Windows events 协调）：
+//   1. BEGIN_FRAME      — 主线程发信号，请求开始新帧
+//   2. RECORDING_READY  — 渲染线程发信号，告知 GPU 已就绪，可以 push 命令
+//   3. COMMANDS_READY   — 主线程发信号，所有绘制命令已入队
+//   4. SUBMIT_DONE      — 渲染线程发信号，命令已提交，回到步骤 1
+// ---------------------------------------------------------------------------
+bool initAsyncRenderer(UINT workerCount);
+void destroyAsyncRenderer();
+// 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
+bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
+// 阻塞：等到本帧提交完成（或超时 ms）。
+bool asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs, std::string& err);
+// 非阻塞：查询渲染线程是否已到达 "recording ready" 阶段。
+bool asyncRenderIsRecordingReady(CommandContext* ctx);
+// 主线程通知渲染线程：所有命令已入队（设置 gEvtCommandsReady）。
+void asyncSendCommandsReady(CommandContext* ctx);
+// 查询命令列表是否已打开。
+bool isListOpen(CommandContext* ctx);
 
 // ---------------------------------------------------------------------------
 // 全局队列 fence（P6 fence token；对应官方共享 encoder 的 submit index）

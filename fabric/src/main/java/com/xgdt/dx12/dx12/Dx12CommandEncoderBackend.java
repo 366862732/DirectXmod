@@ -70,12 +70,26 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             throw new IllegalStateException("dx12CreateCommandEncoder returned a null handle");
         }
         this.transientMemory = new Dx12TransientMemory(this.ctx);
+        // P33 fix：在构造函数中打开命令列表。beginCommandList 现在是幂等的
+        // （C++ 侧若 listOpen=1 则跳过 Reset），因此 submit() 可安全再次调用而
+        // 不会触发 allocator Reset E_FAIL。这确保了 self-test 等一次性路径的
+        // recording 方法（writeToBuffer 等）能在 listOpen=1 的状态下执行。
         Dx12Native.dx12BeginCommandList(this.ctx);
     }
 
     /** Native CommandContext* handle (used by surface blit + render pass). */
     long nativeHandle() {
         return this.ctx;
+    }
+
+    /**
+     * P33：懒加载打开命令列表。若列表未打开（async 路径下由渲染线程负责打开），
+     * 则主线程自行打开。dx12BeginCommandList 是幂等的（C++ 侧若 listOpen=1 则跳过 Reset）。
+     */
+    private void ensureListOpen() {
+        if (!Dx12Native.dx12IsListOpen(this.ctx)) {
+            Dx12Native.dx12BeginCommandList(this.ctx);
+        }
     }
 
     private static long textureHandle(GpuTexture texture) {
@@ -165,6 +179,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             }
         }
 
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12BeginRenderPass(this.ctx, colorTextures, colorMips,
             colorClearFlags, clearColors, depthTexture, depthMip,
             depthClearFlag, depthClearValue, x, y, w, h);
@@ -238,6 +254,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void clearColorTexture(GpuTexture colorTexture, Vector4fc clearColor) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12ClearColorTexture(this.ctx, textureHandle(colorTexture),
             clearColor.x(), clearColor.y(), clearColor.z(), clearColor.w());
     }
@@ -245,6 +263,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     @Override
     public void clearColorAndDepthTextures(GpuTexture colorTexture, Vector4fc clearColor,
         GpuTexture depthTexture, double clearDepth) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12ClearColorTexture(this.ctx, textureHandle(colorTexture),
             clearColor.x(), clearColor.y(), clearColor.z(), clearColor.w());
         Dx12Native.dx12ClearDepthTexture(this.ctx, textureHandle(depthTexture), clearDepth);
@@ -254,6 +274,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     public void clearColorAndDepthTextures(GpuTexture colorTexture, Vector4fc clearColor,
         GpuTexture depthTexture, double clearDepth, int regionX, int regionY,
         int regionWidth, int regionHeight) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         // P3b fix：GuiItemAtlas 槽位 STALE 重绘前只清该槽位矩形区域。原实现忽略
         // region 整图清空 → 滚动/翻页触发任意槽位重绘时把整张物品图集抹掉，其它
         // 已烘好的槽位图标（图集区域仍标记有效、不再触发重绘）随之消失。
@@ -266,6 +288,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void clearDepthTexture(GpuTexture depthTexture, double clearDepth) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12ClearDepthTexture(this.ctx, textureHandle(depthTexture), clearDepth);
     }
 
@@ -275,6 +299,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void writeToBuffer(GpuBufferSlice destination, ByteBuffer data) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         // 与官方 VulkanCommandEncoder.writeToBuffer 对齐：直接上传，不做 NaN 检测/替换。
         // 若数据含 NaN（例如投影矩阵 near/far 异常），应在源头修复，而非在上传时暴力覆盖。
         // 暴力替换会把整块顶点数据也错误地覆写，导致黑屏（P7 根因定位）。
@@ -286,6 +312,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void copyToBuffer(GpuBufferSlice source, GpuBufferSlice target) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         // P22 诊断：记录 copyToBuffer 参数，排查缓冲区大小不足
         if (System.err instanceof java.io.PrintStream) {
             System.err.printf("[dx12-java] copyToBuf srcBuf=%x srcOff=%d srcLen=%d dstBuf=%x dstOff=%d%n",
@@ -300,6 +328,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     @Override
     public void writeToTexture(GpuTexture destination, ByteBuffer source, int mipLevel,
         int depthOrLayer, int destX, int destY, int width, int height) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         GpuBufferSlice staging = this.transientMemory.uploadStaging(source, 1,
             GpuBuffer.USAGE_COPY_SRC);
         Dx12Native.dx12WriteToTexture(this.ctx, bufferHandle(staging.buffer()), staging.offset(),
@@ -329,6 +359,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     @Override
     public void copyTextureToBuffer(GpuTexture source, GpuBuffer destination, long offset,
         Runnable callback, int mipLevel, int x, int y, int width, int height) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12CopyTextureToBuffer(this.ctx, textureHandle(source), mipLevel, 0,
             x, y, width, height, bufferHandle(destination), offset);
         // Run the callback after the next submit (mirror of the destroyQueue rotate).
@@ -338,6 +370,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     @Override
     public void copyTextureToTexture(GpuTexture source, GpuTexture destination, int mipLevel,
         int destX, int destY, int sourceX, int sourceY, int width, int height) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12CopyTextureToTexture(this.ctx, textureHandle(source),
             textureHandle(destination), mipLevel, 0, sourceX, sourceY, destX, destY, width, height);
     }
@@ -380,6 +414,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void writeTimestamp(GpuQueryPool pool, int index) {
+        // P33：确保命令列表已打开
+        this.ensureListOpen();
         Dx12Native.dx12WriteTimestamp(this.ctx, ((Dx12GpuQueryPool) pool).nativeHandle(), index);
     }
 
@@ -389,15 +425,76 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     @Override
     public void submit() {
-        // P15 诊断：记录提交前的 fence 值，用于排查命令未提交/未完成
+        // P33 async：独立渲染线程流水线
+        //
+        // 流程：
+        //   1. 记录当前 queue fence 值（= 上一帧的 submitQueueFence）
+        //   2. 请求渲染线程开始新帧（acquireSurface + 等 GPU + beginCommandList）
+        //   3. 等待渲染线程发 RECORDING_READY（渲染线程已 Reset allocator，可以录制）
+        //   4. 主线程继续录制命令（render pass / clear / copy / draw）
+        //   5. 通知渲染线程命令已就绪（set gEvtCommandsReady）
+        //   6. 等待渲染线程完成提交 + present（submits + signal fence + present）
+        //   7. 执行 post-submit 清理（transientMemory rotate、callback 等）
+        //
+        // 注意：不再调用 dx12BeginCommandListWithWait —— 由渲染线程在步骤 2 中负责
+        //       allocator reset + command list begin，主线程只负责命令录制。
+
+        // P15 诊断：记录提交前的 fence 值
         long fenceBefore = Dx12Native.dx12GetFenceValue(this.ctx);
-        Dx12Native.dx12Submit(this.ctx);
+
+        // 步骤 2：请求渲染线程开始新帧
+        boolean asyncStarted = Dx12Native.dx12AsyncRenderBeginFrame(this.ctx);
+        if (!asyncStarted) {
+            // 无 active surface（初始化阶段或窗口未创建），回退到同步路径
+            // 同步路径：确保命令列表已打开（幂等：已打开则跳过 Reset），录制命令、提交
+            Dx12Native.dx12BeginCommandList(this.ctx);
+            Dx12Native.dx12Submit(this.ctx);
+            this.transientMemory.rotate();
+            Dx12Device.dumpDebugLightmap();
+            List<Runnable> run = this.pendingCallbacks;
+            this.pendingCallbacks.clear();
+            for (Runnable callback : run) { callback.run(); }
+            return;
+        }
+
+        // 异步路径：渲染线程负责 allocator reset + command list begin，
+        // 主线程只负责命令录制（已在此 submit() 调用前完成）和协调事件。
+        // 注意：不在此调用 dx12BeginCommandList，避免与渲染线程竞争同一 allocator。
+
+        // 步骤 3：等待渲染线程到达 RECORDING_READY（带超时保护，防止死锁）
+        long startTime = System.nanoTime();
+        long timeoutNs = 10_000_000_000L; // 10 秒超时
+        while (!Dx12Native.dx12AsyncRenderIsRecordingReady(this.ctx)) {
+            long elapsed = System.nanoTime() - startTime;
+            if (elapsed > timeoutNs) {
+                throw new RuntimeException("[dx12] asyncRenderIsRecordingReady timeout after "
+                    + (elapsed / 1_000_000) + "ms — renderer may be stuck");
+            }
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("[dx12] asyncRenderIsRecordingReady interrupted", e);
+            }
+        }
+
+        // 步骤 4：命令已由上层框架在此 submit() 之前录制完毕（render pass、clear、copy、draw）
+        //         无需额外操作。
+
+        // 步骤 5：通知渲染线程所有命令已入队
+        Dx12Native.dx12AsyncSendCommandsReady(this.ctx);
+
+        // 步骤 6：等待渲染线程完成提交 + present
+        boolean completed = Dx12Native.dx12AsyncRenderWaitComplete(this.ctx, 10000);
+        if (!completed) {
+            System.err.println("[dx12] [P33] asyncRenderWaitComplete timeout! ctx=0x"
+                + Long.toHexString(this.ctx));
+            System.err.flush();
+        }
+
+        // 步骤 7：post-submit 清理（与旧同步 submit 保持一致）
         this.transientMemory.rotate();
-        // P27: dx12Submit 已提交 GPU → 现在读回图集才是真实内容（dbgReadbackTexturePixels
-        // 内部 deviceWaitIdle 会等待刚提交的命令完成）。只消费本 ctx 的 pending 列表：
-        // 别的 encoder 记录的 blit pass 命令尚未提交 GPU，读回全 0（纯黑假象）。
-        // 按 color target handle 去重，最多 dump MAX_ATLAS_DUMPS 个不同图集。
-        // P29：dump 含 deviceWaitIdle，仅 verbose 模式启用。
+        // P27: dx12Submit 已提交 GPU → 现在读回图集才是真实内容。
         if (Dx12Native.LOG_VERBOSE) {
             List<Dx12RenderPassBackend> atlasPasses = gPendingAtlasByCtx.remove(this.ctx);
             if (atlasPasses != null && !atlasPasses.isEmpty()) {
@@ -444,10 +541,9 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         for (Runnable callback : run) {
             callback.run();
         }
-        Dx12Native.dx12BeginCommandList(this.ctx);
-        // P15: 每 30 帧打印一次 submit 摘要（P29：仅 verbose）
+        // P15: 每 30 帧打印一次 submit 摘要
         if (Dx12Native.LOG_VERBOSE && (fenceBefore % 30L) == 0) {
-            System.err.println("[dx12-java] submit: frame=" + fenceBefore
+            System.err.println("[dx12-java] submit(async): frame=" + fenceBefore
                 + " ctx=" + Long.toHexString(this.ctx));
             System.err.flush();
         }

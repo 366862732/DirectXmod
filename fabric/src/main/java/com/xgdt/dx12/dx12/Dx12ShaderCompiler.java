@@ -98,6 +98,11 @@ public class Dx12ShaderCompiler implements AutoCloseable {
     private static final String LIGHTMAP_VIZ_FLAG_NAME = "dx12_diag_lightmapviz.flag";
     private static final boolean DIAG_LIGHTMAP_VIZ = new java.io.File(LIGHTMAP_VIZ_FLAG_NAME).exists();
 
+    // P38 诊断：submit()（共享 encoder = 每帧）后读回 16×16 lightmap，验证内容与朝向。
+    // （常量已移至 Dx12Device，此处保留仅供日志参考）
+    private static final int MAX_LIGHTMAP_DUMPS = 5;
+    private static final int LIGHTMAP_DUMP_INTERVAL = 120;
+
     private final long shaderCompiler;
     private final long shaderOptions;
     private final ShaderDefines globalDefines;
@@ -454,7 +459,6 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         String c = String.format(java.util.Locale.ROOT, "%.4f", gray);
         return stripFragMainWithColor(hlsl, c + ", " + c + ", " + c + ", 1.0");
     }
-
     /** 通用：把 spvc 生成的 frag_main 函数体替换为输出指定颜色常量。 */
     private static String stripFragMainWithColor(String hlsl, String colorExpr) {
         String[] lines = hlsl.split("\n", -1);

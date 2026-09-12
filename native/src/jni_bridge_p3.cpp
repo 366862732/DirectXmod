@@ -57,6 +57,16 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginCommandList(
     }
 }
 
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12BeginCommandListWithWait(
+    JNIEnv* env, jclass, jlong ctx, jlong waitForValue) {
+    std::string err;
+    if (!dx12mc::beginCommandListWithWait(
+            reinterpret_cast<dx12mc::CommandContext*>(ctx),
+            (UINT64)waitForValue, err)) {
+        throwJava(env, "dx12BeginCommandListWithWait: " + err);
+    }
+}
+
 JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12EndCommandList(
     JNIEnv* env, jclass, jlong ctx) {
     std::string err;
@@ -337,6 +347,63 @@ JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12ReadQueryValues(
         throwJava(env, "dx12ReadQueryValues: " + err); return;
     }
     env->SetLongArrayRegion(out, 0, count, (const jlong*)buf.data());
+}
+
+// ===========================================================================
+// P33 async：独立渲染线程接口
+// ===========================================================================
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12InitAsyncRenderer(
+    JNIEnv* env, jclass, jint workerCount) {
+    std::string err;
+    if (!dx12mc::initAsyncRenderer((UINT)workerCount)) {
+        throwJava(env, "dx12InitAsyncRenderer: " + err);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12DestroyAsyncRenderer(
+    JNIEnv* env, jclass) {
+    dx12mc::destroyAsyncRenderer();
+}
+
+JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12AsyncRenderBeginFrame(
+    JNIEnv* env, jclass, jlong ctx) {
+    std::string err;
+    bool ok = dx12mc::asyncRenderBeginFrame(
+        reinterpret_cast<dx12mc::CommandContext*>(ctx), err);
+    if (!ok && !err.empty()) {
+        throwJava(env, "dx12AsyncRenderBeginFrame: " + err);
+    }
+    return ok;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12AsyncRenderWaitComplete(
+    JNIEnv* env, jclass, jlong ctx, jlong timeoutMs) {
+    std::string err;
+    bool ok = dx12mc::asyncRenderWaitComplete(
+        reinterpret_cast<dx12mc::CommandContext*>(ctx),
+        (UINT64)timeoutMs, err);
+    if (!ok && !err.empty()) {
+        throwJava(env, "dx12AsyncRenderWaitComplete: " + err);
+    }
+    return ok;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12AsyncRenderIsRecordingReady(
+    JNIEnv* env, jclass, jlong ctx) {
+    return dx12mc::asyncRenderIsRecordingReady(
+        reinterpret_cast<dx12mc::CommandContext*>(ctx));
+}
+
+JNIEXPORT void JNICALL Java_com_dx12_dx12_Dx12Native_dx12AsyncSendCommandsReady(
+    JNIEnv* env, jclass, jlong ctx) {
+    dx12mc::asyncSendCommandsReady(
+        reinterpret_cast<dx12mc::CommandContext*>(ctx));
+}
+
+JNIEXPORT jboolean JNICALL Java_com_dx12_dx12_Dx12Native_dx12IsListOpen(
+    JNIEnv*, jclass, jlong ctx) {
+    return dx12mc::isListOpen(reinterpret_cast<dx12mc::CommandContext*>(ctx)) ? JNI_TRUE : JNI_FALSE;
 }
 
 }  // extern "C"

@@ -141,6 +141,15 @@ public final class Dx12Native {
     /** Begin recording on the current command list (resets its allocator). */
     public static native void dx12BeginCommandList(long ctx);
 
+    /**
+     * Begin recording with explicit GPU wait: blocks until the queue fence
+     * reaches {@code waitForValue} before resetting the allocator.
+     * Use this from the main thread when the async worker has already submitted
+     * the previous frame (aligned with official Vulkan double-buffered submit).
+     * Pass 0 to skip waiting (compatible with single-threaded / one-shot paths).
+     */
+    public static native void dx12BeginCommandListWithWait(long ctx, long waitForValue);
+
     /** Close the current command list. */
     public static native void dx12EndCommandList(long ctx);
 
@@ -157,6 +166,49 @@ public final class Dx12Native {
 
     /** Current fence value of the context (for createFence). */
     public static native long dx12GetFenceValue(long ctx);
+
+    // -----------------------------------------------------------------------
+    // P33 async：独立渲染线程（渲染工作从主线程剥离）
+    // -----------------------------------------------------------------------
+
+    /**
+     * 启动独立渲染线程。workerCount 目前忽略（单线程渲染线程）。
+     * 必须在 createCommandEncoder 之前调用。
+     */
+    public static native void dx12InitAsyncRenderer(int workerCount);
+
+    /** 销毁独立渲染线程，释放所有事件句柄。 */
+    public static native void dx12DestroyAsyncRenderer();
+
+    /**
+     * 非阻塞：请求渲染线程开始下一帧。
+     * 返回 true = 成功排队（渲染线程会随后 acquireSurface + 等 GPU + 发 RECORDING_READY 信号）。
+     * 返回 false = 上一帧尚未处理完（不应连续调用）。
+     */
+    public static native boolean dx12AsyncRenderBeginFrame(long ctx);
+
+    /**
+     * 非阻塞：查询渲染线程是否已到达 "recording ready" 阶段。
+     * 返回 true 表示主线程可以立即开始 push 绘制命令。
+     */
+    public static native boolean dx12AsyncRenderIsRecordingReady(long ctx);
+
+    /**
+     * 阻塞：等到本帧提交完成（或超时）。
+     * 渲染线程在 acquireSurface → 等 GPU → beginCommandList → 收到 COMMANDS_READY →
+     * end + submit + present → 发 SUBMIT_DONE 信号后返回。
+     */
+    public static native boolean dx12AsyncRenderWaitComplete(long ctx, long timeoutMs);
+
+    /**
+     * 主线程通知渲染线程：所有命令已录制完毕（设置 gEvtCommandsReady 事件）。
+     * 必须在 dx12AsyncRenderIsRecordingReady 返回 true 后调用。
+     * @return true 表示成功发送信号，false 表示渲染线程尚未到达可接收状态。
+     */
+    public static native boolean dx12AsyncSendCommandsReady(long ctx);
+
+    /** 查询当前 command context 的命令列表是否处于打开录制状态。 */
+    public static native boolean dx12IsListOpen(long ctx);
 
     /** Read the GPU timestamp now (blocking). */
     public static native long dx12GetTimestampNow(long ctx);

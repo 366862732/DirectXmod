@@ -11,6 +11,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 namespace dx12mc {
 
@@ -1227,14 +1230,33 @@ void destroyCommandEncoder(CommandContext* ctx) {
 }
 
 bool beginCommandList(CommandContext* ctx, std::string& err) {
-    if (!ctx) { err = "beginCommandList: null ctx"; return false; }
+    // 兼容路径：无等待值（单线程 / createBuffer 一次性路径）直接 begin。
+    // P33 fix：若列表已打开（构造函数或先前调用已打开），幂等返回——不再 Reset
+    // 同一 allocator，避免 E_FAIL（allocator 仍在 GPU 使用中）。
+    if (ctx && ctx->listOpen) return true;
+    return beginCommandListWithWait(ctx, 0, err);
+}
+
+bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::string& err) {
+    if (!ctx) { err = "beginCommandListWithWait: null ctx"; return false; }
     // P6 诊断：转储上一帧累积的验证错误（Close 成功后不打印不代表无错）。
     if (gLogLevel >= 3) dumpInfoQueueMessages();
-    DBG_LOG_DEBUG("beginCommandList: fenceValue=%llu", (unsigned long long)ctx->fenceValue);
+    DBG_LOG_DEBUG("beginCommandListWithWait: fenceValue=%llu waitValue=%llu",
+        (unsigned long long)ctx->fenceValue, (unsigned long long)waitForValue);
+    // P33 async：若 waitForValue > 0，先等 GPU 完成对应提交后再 Reset allocator。
+    // 这是对齐官方 Vulkan 双缓冲模式的关键——Vulkan 在 signalSemaphore(idx) 后
+    // awaitSubmitCompletion(idx-2) 再 reset command pool，保证 GPU 不再引用。
+    // D3D12 等效：Signal(queueFence, N) → beginCommandList 等 queueFence=N-1 完成。
+    if (waitForValue > 0) {
+        if (!waitForQueueFenceValue(waitForValue, 5'000'000'000ULL, err)) {
+            DBG_LOG_DEBUG("beginCommandListWithWait: wait FAILED: %s", err.c_str());
+            return false;
+        }
+    }
     HRESULT hr = ctx->currentAllocator()->Reset();
-    if (FAILED(hr)) { err = "beginCommandList: allocator Reset " + hrText(hr); return false; }
+    if (FAILED(hr)) { err = "beginCommandListWithWait: allocator Reset " + hrText(hr); return false; }
     hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
-    if (FAILED(hr)) { err = "beginCommandList: list Reset " + hrText(hr); return false; }
+    if (FAILED(hr)) { err = "beginCommandListWithWait: list Reset " + hrText(hr); return false; }
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
     ctx->colorTargetsWritten = false;  // 新 command list 从零开始追踪绘制状态
@@ -1337,6 +1359,9 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
         if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), qv))) {
             err = "submitCommandList: Signal(queue) failed"; return 0;
         }
+        // P33 async：记录本次 submit 的 queue fence 值，供 beginCommandListWithWait
+        // 等待。下一帧 begin 时传入此值，确保 GPU 完成当前帧后才 Reset allocator。
+        ctx->lastSubmitQueueFence = qv;
     }
     // P18：记录 per-backbuffer fence 值，供 acquireSurface 按需同步（非阻塞）。
     // submit 本身不等待 GPU，改为在 acquireSurface 中检查重用的 back buffer
@@ -1350,13 +1375,14 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
             s->surfaceFences[(size_t)idx] = gCtx.queueFenceValue;
         }
     }
-    DBG_LOG_DEBUG("submit: done v=%llu", (unsigned long long)value);
+    DBG_LOG_DEBUG("submit: done v=%llu qf=%llu", (unsigned long long)value,
+        (unsigned long long)gCtx.queueFenceValue);
     // 提交并同步等待完成：本命令列表已执行完，其引用的资源可安全释放。
     // 若所有打开的命令列表都已提交完成，则统一释放 pending 删除对象
     // （延迟销毁的 flush 点，对应官方 queueForDestroy 的 execute 时机）。
     if (gOpenListCount > 0) --gOpenListCount;
     if (gOpenListCount == 0) flushPendingDeletes();
-    return value;
+    return gCtx.queueFenceValue;
 }
 
 bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs,
@@ -3718,6 +3744,238 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     dbgLog("blitBindSourceTexture: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
         ctx->drawHeapSlotBase, ctx->nextDrawSlot, (unsigned long long)srvGpu.ptr);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// P33 async：独立的 C++ 渲染线程
+// ---------------------------------------------------------------------------
+namespace {
+
+// 四阶段 Windows events（manual-reset，多线程安全）
+HANDLE gEvtBeginFrame     = nullptr;  // 主线程→渲染线程：开始新帧
+HANDLE gEvtRecordingReady = nullptr;  // 渲染线程→主线程：可以 push 命令了
+HANDLE gEvtCommandsReady  = nullptr;  // 主线程→渲染线程：所有命令已入队
+HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：已提交，可循环
+
+// 当前正在处理的 ctx（nullptr = 无活动帧）
+CommandContext* gAsyncRenderCtx = nullptr;
+
+// 渲染线程控制标志
+static bool gRenderRunning = false;
+
+// 渲染线程函数
+static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+
+    while (true) {
+        // 步骤 1：等待主线程请求开始新帧（500ms 超时 + 每轮检查 gRenderRunning 退出）
+        for (;;) {
+            if (!gRenderRunning) return 0;
+            DWORD r = WaitForSingleObject(gEvtBeginFrame, 500);
+            if (r == WAIT_OBJECT_0) break;
+            if (r == WAIT_TIMEOUT && !gRenderRunning) return 0;
+        }
+        if (!gRenderRunning) return 0;
+        if (!gAsyncRenderCtx) continue;
+
+        CommandContext* ctx = gAsyncRenderCtx;
+        std::string err;
+
+        // 获取本帧应等待的 queue fence 值（= 上一帧 submit 时的值）
+        UINT64 waitForValue = ctx->lastSubmitQueueFence;
+        DBG_LOG_DEBUG("renderThread: begin wait=%llu ctx=%p",
+            (unsigned long long)waitForValue, (void*)ctx);
+
+        // 步骤 2：acquireSurface（阻塞等显示器）
+        Dx12Surface* surf = getActiveSurface();
+        if (surf == nullptr || !gRenderRunning) {
+            // 初始化阶段无 surface，休眠 100ms 后重试
+            Sleep(100);
+            SetEvent(gEvtSubmitDone);
+            continue;
+        }
+        if (!acquireSurface(surf, err)) {
+            dbgLog("renderThread: acquireSurface FAILED");
+            SetEvent(gEvtSubmitDone);
+            continue;
+        }
+
+        // 步骤 3：等 GPU 完成前两帧，再 Reset allocator（非阻塞，失败则跳过）
+        if (waitForValue > 0) {
+            if (!waitForQueueFenceValue(waitForValue, 500, err)) {
+                DBG_LOG_DEBUG("renderThread: GPU wait timeout, skipping frame");
+                // 释放 surface 并跳过
+                destroySurface(getActiveSurface());
+                SetEvent(gEvtSubmitDone);
+                continue;
+            }
+        }
+
+        // 步骤 4a：关闭构造函数打开的旧 command list（释放 allocator），否则 beginCommandListWithWait
+        //          的 Reset 会因 allocator InUse 而返回 E_FAIL。
+        endCommandList(ctx, err);
+
+        // 步骤 4b：begin command list（Reset allocator + list）
+        if (!beginCommandListWithWait(ctx, waitForValue, err)) {
+            dbgLog("renderThread: beginCommandList FAILED: %s", err.c_str());
+            destroySurface(getActiveSurface());
+            SetEvent(gEvtSubmitDone);
+            continue;
+        }
+
+        // 步骤 5：通知主线程可以 push 命令了
+        SetEvent(gEvtRecordingReady);
+
+        // 步骤 6：等待主线程完成命令录制（30s 超时，退出时也能响应）
+        for (;;) {
+            if (!gRenderRunning) { destroySurface(getActiveSurface()); return 0; }
+            DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
+            if (r == WAIT_OBJECT_0) break;
+            if (r == WAIT_TIMEOUT && !gRenderRunning) { destroySurface(getActiveSurface()); return 0; }
+        }
+
+        // 步骤 7：end + submit + present
+        std::string submitErr;
+        UINT64 value = submitCommandList(ctx, submitErr);
+        if (value == 0) {
+            dbgLog("renderThread: submitCommandList FAILED: %s", submitErr.c_str());
+            destroySurface(getActiveSurface());
+            SetEvent(gEvtSubmitDone);
+            continue;
+        }
+
+        // 全局 queue fence（submitCommandList 已推进 gCtx.queueFenceValue）
+        ctx->lastSubmitQueueFence = gCtx.queueFenceValue;
+
+        // per-backbuffer fence
+        Dx12Surface* s = getActiveSurface();
+        if (s) {
+            int idx = s->currentImageIndex;
+            if (idx >= 0 && idx < (int)kSurfaceBufferCount) {
+                if (s->surfaceFences.size() < (size_t)kSurfaceBufferCount)
+                    s->surfaceFences.resize(kSurfaceBufferCount, 0);
+                s->surfaceFences[(size_t)idx] = gCtx.queueFenceValue;
+            }
+        }
+
+        DBG_LOG_DEBUG("renderThread: submit done v=%llu qf=%llu",
+            (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue);
+
+        // present（presentSurface 返回 void）
+        presentSurface(getActiveSurface());
+
+        // 步骤 8：通知主线程提交完成
+        SetEvent(gEvtSubmitDone);
+    }
+
+    return 0;
+}
+
+static std::thread gRenderThread;
+
+}  // namespace
+
+bool initAsyncRenderer(UINT workerCount) {
+    std::string initErr;
+    if (!ensureDevice(initErr)) return false;
+    if (gRenderRunning) return true;
+
+    // 创建四个 manual-reset events
+    gEvtBeginFrame    = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    gEvtRecordingReady = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    gEvtCommandsReady  = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    gEvtSubmitDone     = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    if (!gEvtBeginFrame || !gEvtRecordingReady || !gEvtCommandsReady || !gEvtSubmitDone) {
+        dbgLog("initAsyncRenderer: CreateEvent failed");
+        if (gEvtBeginFrame)     CloseHandle(gEvtBeginFrame);
+        if (gEvtRecordingReady) CloseHandle(gEvtRecordingReady);
+        if (gEvtCommandsReady)  CloseHandle(gEvtCommandsReady);
+        if (gEvtSubmitDone)     CloseHandle(gEvtSubmitDone);
+        return false;
+    }
+
+    gAsyncRenderCtx = nullptr;
+    gRenderRunning = true;
+    gRenderThread = std::thread([]() {
+        DWORD ret = renderThreadFunc(nullptr);
+        (void)ret;
+    });
+
+    dbgLogInfo("initAsyncRenderer: started render thread");
+    return true;
+}
+
+void destroyAsyncRenderer() {
+    if (!gRenderRunning) return;
+
+    if (gRenderThread.joinable()) {
+        // 先发信号让渲染线程从任何等待点苏醒（manual-reset events 持久有效）
+        SetEvent(gEvtBeginFrame);
+        SetEvent(gEvtRecordingReady);
+        SetEvent(gEvtCommandsReady);
+        SetEvent(gEvtSubmitDone);
+        // 再设标志，线程在下一次循环检查时看到 false 并退出
+        gRenderRunning = false;
+        gRenderThread.join();
+    } else {
+        gRenderRunning = false;
+    }
+
+    if (gEvtBeginFrame)     { CloseHandle(gEvtBeginFrame);     gEvtBeginFrame = nullptr; }
+    if (gEvtRecordingReady) { CloseHandle(gEvtRecordingReady); gEvtRecordingReady = nullptr; }
+    if (gEvtCommandsReady)  { CloseHandle(gEvtCommandsReady);  gEvtCommandsReady  = nullptr; }
+    if (gEvtSubmitDone)     { CloseHandle(gEvtSubmitDone);     gEvtSubmitDone     = nullptr; }
+    gAsyncRenderCtx = nullptr;
+    dbgLogInfo("destroyAsyncRenderer: done");
+}
+
+bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
+    if (!gRenderRunning) { err = "asyncRenderBeginFrame: renderer not running"; return false; }
+    if (getActiveSurface() == nullptr) {
+        // 初始化阶段无 surface（窗口未创建），回退到同步路径
+        return false;
+    }
+    if (gAsyncRenderCtx != nullptr) { err = "asyncRenderBeginFrame: previous frame not complete"; return false; }
+    gAsyncRenderCtx = ctx;
+    // Reset events for this frame
+    ResetEvent(gEvtRecordingReady);
+    ResetEvent(gEvtCommandsReady);
+    ResetEvent(gEvtSubmitDone);
+    // Signal start
+    SetEvent(gEvtBeginFrame);
+    return true;
+}
+
+bool asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs, std::string& err) {
+    (void)ctx;
+    if (!gRenderRunning) return false;
+    // 等待 SUBMIT_DONE
+    DWORD r = WaitForSingleObject(gEvtSubmitDone, (DWORD)timeoutMs);
+    if (r == WAIT_OBJECT_0) {
+        gAsyncRenderCtx = nullptr;
+        return true;
+    }
+    err = "asyncRenderWaitComplete: timeout";
+    return false;
+}
+
+bool asyncRenderIsRecordingReady(CommandContext* ctx) {
+    (void)ctx;
+    if (!gRenderRunning) return false;
+    // 检查 RECORDING_READY 是否已设置
+    // 用 0 timeout 查询（非阻塞）
+    DWORD r = WaitForSingleObject(gEvtRecordingReady, 0);
+    return r == WAIT_OBJECT_0;
+}
+
+bool isListOpen(CommandContext* ctx) {
+    return ctx && ctx->listOpen;
+}
+
+void asyncSendCommandsReady(CommandContext* ctx) {
+    (void)ctx;
+    if (!gRenderRunning) return;
+    SetEvent(gEvtCommandsReady);
 }
 
 }  // namespace dx12mc

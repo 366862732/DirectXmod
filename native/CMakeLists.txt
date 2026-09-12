@@ -20,6 +20,10 @@ include_directories("${JAVA_HOME}/include" "${JAVA_HOME}/include/win32")
 add_library(dx12_mc SHARED
     src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
+    src/dx12_async_executor.cpp
+    src/dx12_async_bundle.cpp
+    src/dx12_async_descriptor.cpp
+    src/dx12_async_fence.cpp
     src/jni_bridge.cpp
     src/jni_bridge_p3.cpp
     src/jni_bridge_p4.cpp

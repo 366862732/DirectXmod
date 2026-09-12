@@ -64,10 +64,31 @@ public class Dx12Device implements GpuDeviceBackend {
     private static volatile boolean initialized = false;
     public static boolean isInitialized() { return initialized; }
 
-    /** P38 诊断：捕获 "Lightmap" 标签的 16×16 纹理（地形/UI 光照贴图），供 submit() 后读回验证内容与朝向。 */
+    /** P38 诊断：捕获 "Lightmap" 标签的 16×16 纹理（世界 + UI 光照贴图），供 submit() 后读回验证内容与朝向。 */
     private static volatile long debugLightmapHandle = 0L;
     public static long getDebugLightmapHandle() { return debugLightmapHandle; }
 
+    /** P38 诊断：lightmap dump 帧计数器和状态。 */
+    private static int dx12DebugLightmapTick = 0;
+    private static int dx12DebugLightmapDumps = 0;
+    private static final int MAX_LIGHTMAP_DUMPS = 5;
+    private static final int LIGHTMAP_DUMP_INTERVAL = 120;
+
+    /** P38 诊断：每帧 submit 后读回 lightmap 纹理并 dump 到文件。 */
+    public static void dumpDebugLightmap() {
+        long h = debugLightmapHandle;
+        if (h == 0L) return;
+        dx12DebugLightmapTick++;
+        if (dx12DebugLightmapTick % LIGHTMAP_DUMP_INTERVAL == 0
+            && dx12DebugLightmapDumps < MAX_LIGHTMAP_DUMPS) {
+            dx12DebugLightmapDumps++;
+            System.err.println("[dx12-java] P38 dump lightmap at tick="
+                + dx12DebugLightmapTick + " handle=0x"
+                + Long.toHexString(h));
+            System.err.flush();
+            Dx12Native.dx12DumpTextureToFile(h, "lightmap_tick" + dx12DebugLightmapTick);
+        }
+    }
     private final DeviceInfo deviceInfo;
     private long timestampCtx;
 
@@ -98,6 +119,9 @@ public class Dx12Device implements GpuDeviceBackend {
             LOGGER.warn("[dx12] GetTimestampFrequency returned 0; timestampPeriod=1.0");
         }
         this.deviceInfo = buildDeviceInfo(parseAdapterName(probe), frequency);
+        // P33：启动独立渲染线程（异步流水线：渲染线程负责 acquire/present/fence-wait，
+        // 主线程负责命令录制）。在 createCommandEncoder 之前初始化，确保渲染线程已就绪。
+        Dx12Native.dx12InitAsyncRenderer(1);
         initialized = true;
     }
 
@@ -306,6 +330,8 @@ public class Dx12Device implements GpuDeviceBackend {
             compiler.close();
             this.glslCompiler = null;
         }
+        // P33：销毁独立渲染线程。
+        Dx12Native.dx12DestroyAsyncRenderer();
         appendJavaLog("device.close: done");
         watchdog.interrupt();
     }
