@@ -9,6 +9,7 @@
 #include "dx12_device.h"
 
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <dxgi1_4.h>
 
 #include <cstdio>
@@ -78,6 +79,42 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     ctx.adapter->GetDesc(&devDesc);
     std::fprintf(stderr, "[dx12] createSurface: devLuid=%08X%08X desc=%S\n",
         devDesc.AdapterLuid.LowPart, devDesc.AdapterLuid.HighPart, devDesc.Description);
+    // #region debug-point A:hwnd-validation
+    HWND win = nullptr;
+    LONG_PTR classStyle = 0;
+    if (hwnd != 0) {
+        win = reinterpret_cast<HWND>(hwnd);
+        DWORD wndPid = 0;
+        DWORD wndTid = GetWindowThreadProcessId(win, &wndPid);
+        RECT rc{};
+        BOOL hasRect = GetClientRect(win, &rc);
+        wchar_t className[256]{};
+        GetClassNameW(win, className, 255);
+        classStyle = GetClassLongPtrW(win, GCL_STYLE);
+        std::fprintf(stderr,
+            "[dx12] createSurface: isWindow=%d wndTid=%lu wndPid=%lu curTid=%lu curPid=%lu clientRect=%ld,%ld-%ld,%ld hasRect=%d classStyle=0x%llx CS_OWNDC=%d CS_CLASSDC=%d CS_PARENTDC=%d class=%S\n",
+            IsWindow(win) ? 1 : 0,
+            (unsigned long)wndTid,
+            (unsigned long)wndPid,
+            (unsigned long)GetCurrentThreadId(),
+            (unsigned long)GetCurrentProcessId(),
+            (long)rc.left, (long)rc.top, (long)rc.right, (long)rc.bottom,
+            hasRect ? 1 : 0,
+            (unsigned long long)classStyle,
+            (classStyle & CS_OWNDC) ? 1 : 0,
+            (classStyle & CS_CLASSDC) ? 1 : 0,
+            (classStyle & CS_PARENTDC) ? 1 : 0,
+            className);
+    }
+    // #endregion
+
+    // P33 修复：GLFW30 窗口类带 CS_OWNDC 标志时，CreateSwapChainForHwnd 返回
+    // E_ACCESSDENIED。通过动态加载 IDXGIFactory5::CreateSwapChainForComposition
+    // 作为 fallback——该 API 不绑定 HWND，再用 MakeWindowAssociation 关联到目标窗口。
+    if (win != nullptr && (classStyle & CS_OWNDC) != 0) {
+        std::fprintf(stderr, "[dx12] createSurface: detected CS_OWNDC, will use "
+            "CreateSwapChainForComposition fallback\n");
+    }
 
     ComPtr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -125,21 +162,72 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         &sd, nullptr, nullptr, &swapChain1);
     if (FAILED(hr)) {
         err = "CreateSwapChainForHwnd failed " + hrText(hr);
-        // 若 hwnd=0（无窗口），改用 CreateSwapChainForCoreWindow + 匿名窗口
-        // 失败则尝试 CreateSwapChainForComposition（不绑定 HWND，用于自测）。
+        // #region debug-point C:post-fail-infoqueue
+        if (ctx.infoQueue) {
+            UINT64 n = ctx.infoQueue->GetNumStoredMessages();
+            for (UINT64 i = 0; i < n; ++i) {
+                SIZE_T len = 0;
+                if (FAILED(ctx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+                std::vector<char> buf(len > 0 ? len : 1);
+                D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                if (SUCCEEDED(ctx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+                    const char* sev = "?";
+                    switch (msg->Severity) {
+                        case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
+                        case D3D12_MESSAGE_SEVERITY_ERROR: sev = "ERROR"; break;
+                        case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
+                        case D3D12_MESSAGE_SEVERITY_INFO: sev = "INFO"; break;
+                        default: break;
+                    }
+                    std::fprintf(stderr, "[dx12] PostSwapInfoQueue[%s] %s\n",
+                        sev, msg->pDescription ? msg->pDescription : "");
+                }
+            }
+            ctx.infoQueue->ClearStoredMessages();
+        }
+        // #endregion
+        // 若 hwnd=0（无窗口），跳过 swapchain 创建
         if (hwnd == 0) {
             dbgLog("hwnd=0, skipping swapchain creation");
             return nullptr;
         }
-        // Fallback: 使用 NULL HWND 创建（仅用于自测，不绑定真实窗口）
-        std::fprintf(stderr, "[dx12] dx12CreateSurface: retrying with NULL hwnd (diag only)\n");
-        ComPtr<IDXGISwapChain1> testSwap;
-        HRESULT hr2 = factory->CreateSwapChainForHwnd(ctx.queue.Get(), nullptr,
-            &sd, nullptr, nullptr, &testSwap);
-        if (SUCCEEDED(hr2)) {
-            std::fprintf(stderr, "[dx12] dx12CreateSurface: NULL-hwnd swapchain OK (hr2=%08X)\n", (unsigned)hr2);
-            std::fprintf(stderr, "[dx12] dx12CreateSurface: real-hwnd failed (hr=%08X), hwnd=0x%llx\n",
-                (unsigned)hr, (unsigned long long)hwnd);
+        // Fallback: 用 CreateSwapChainForComposition 绕过 CS_OWNDC 限制
+        std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForHwnd failed hr=%08X, "
+            "retrying with CreateSwapChainForComposition\n", (unsigned)hr);
+        {
+            HMODULE hDxgi = GetModuleHandleW(L"dxgi.dll");
+            using FnCreateForComp = HRESULT(STDMETHODCALLTYPE*)(
+                ID3D12CommandQueue*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+            auto fn = hDxgi ? reinterpret_cast<FnCreateForComp>(
+                GetProcAddress(hDxgi, "CreateSwapChainForComposition")) : nullptr;
+            if (fn) {
+                ComPtr<IDXGISwapChain1> compSwap;
+                HRESULT hrComp = fn(ctx.queue.Get(), &sd, nullptr, &compSwap);
+                if (SUCCEEDED(hrComp)) {
+                    std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForComposition OK hr=%08X\n",
+                        (unsigned)hrComp);
+                    // 关联到目标窗口
+                    hrComp = factory->MakeWindowAssociation(
+                        reinterpret_cast<HWND>(hwnd), DXGI_MWA_NO_ALT_ENTER);
+                    if (SUCCEEDED(hrComp)) {
+                        std::fprintf(stderr, "[dx12] dx12CreateSurface: MakeWindowAssociation OK\n");
+                    }
+                    ComPtr<IDXGISwapChain3> swapChain3;
+                    if (SUCCEEDED(compSwap.As(&swapChain3))) {
+                        Dx12Surface* s = new Dx12Surface();
+                        s->hwnd = hwnd;
+                        s->swapChain = swapChain3;
+                        setActiveSurface(s);
+                        return s;
+                    }
+                } else {
+                    std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForComposition "
+                        "also failed hr=%08X\n", (unsigned)hrComp);
+                }
+            } else {
+                std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForComposition "
+                    "not available (old DXGI)\n");
+            }
         }
         return nullptr;
     }
@@ -281,10 +369,35 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
             &sd, nullptr, nullptr, &swapChain1);
         if (FAILED(hr)) {
-            err = "CreateSwapChainForHwnd (recreate) failed " + hrText(hr);
-            return false;
+            // 与 createSurface 相同的 composition fallback
+            std::fprintf(stderr, "[dx12] configureSurface: recreate CreateSwapChainForHwnd failed hr=%08X, "
+                "retrying with CreateSwapChainForComposition\n", (unsigned)hr);
+            HMODULE hDxgi = GetModuleHandleW(L"dxgi.dll");
+            using FnCreateForComp = HRESULT(STDMETHODCALLTYPE*)(
+                ID3D12CommandQueue*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+            auto fn = hDxgi ? reinterpret_cast<FnCreateForComp>(
+                GetProcAddress(hDxgi, "CreateSwapChainForComposition")) : nullptr;
+            if (fn) {
+                ComPtr<IDXGISwapChain1> compSwap;
+                HRESULT hrComp = fn(ctx.queue.Get(), &sd, nullptr, &compSwap);
+                if (SUCCEEDED(hrComp)) {
+                    // 关联到目标窗口
+                    hrComp = factory->MakeWindowAssociation(
+                        reinterpret_cast<HWND>(s->hwnd), DXGI_MWA_NO_ALT_ENTER);
+                    if (SUCCEEDED(hrComp)) {
+                        dbgLog("configureSurface: MakeWindowAssociation OK");
+                    }
+                    if (SUCCEEDED(compSwap.As(&s->swapChain))) {
+                        dbgLog("configureSurface: recreated swapchain via composition %dx%d", width, height);
+                    }
+                }
+            }
+            if (!s->swapChain) {
+                err = "CreateSwapChainForHwnd (recreate) failed " + hrText(hr);
+                return false;
+            }
         }
-        if (FAILED(swapChain1.As(&s->swapChain))) {
+        if (!s->swapChain && FAILED(swapChain1.As(&s->swapChain))) {
             err = "swapchain does not support IDXGISwapChain3";
             return false;
         }
