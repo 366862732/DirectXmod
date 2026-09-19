@@ -33,6 +33,8 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateSurface(
     JNIEnv* env, jclass, jlong hwnd) {
+    std::fprintf(stderr, "[dx12] dx12CreateSurface: JNI hwnd=0x%llx (long=%lld)\n",
+        (unsigned long long)hwnd, (long long)hwnd);
     std::string err;
     Dx12Surface* s = createSurface(static_cast<uintptr_t>(hwnd), err);
     if (!s) {
