@@ -50,6 +50,35 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         return nullptr;
     }
 
+    // P33 诊断：清空调试层消息（防止自测期间累积的旧消息干扰本次判断）
+    if (ctx.infoQueue) {
+        UINT64 n = ctx.infoQueue->GetNumStoredMessages();
+        if (n > 0) {
+            for (UINT64 i = 0; i < n; ++i) {
+                SIZE_T len = 0;
+                if (FAILED(ctx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+                std::vector<char> buf(len > 0 ? len : 1);
+                D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                if (SUCCEEDED(ctx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+                    const char* sev = "?";
+                    switch (msg->Severity) {
+                        case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
+                        case D3D12_MESSAGE_SEVERITY_ERROR:    sev = "ERROR";    break;
+                        case D3D12_MESSAGE_SEVERITY_WARNING:  sev = "WARNING";  break;
+                        default: break;
+                    }
+                    std::fprintf(stderr, "[dx12] PreSwapInfoQueue[%s] %s\n",
+                        sev, msg->pDescription ? msg->pDescription : "");
+                }
+            }
+            ctx.infoQueue->ClearStoredMessages();
+        }
+    }
+    DXGI_ADAPTER_DESC devDesc{};
+    ctx.adapter->GetDesc(&devDesc);
+    std::fprintf(stderr, "[dx12] createSurface: devLuid=%08X%08X desc=%S\n",
+        devDesc.AdapterLuid.LowPart, devDesc.AdapterLuid.HighPart, devDesc.Description);
+
     ComPtr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) {
