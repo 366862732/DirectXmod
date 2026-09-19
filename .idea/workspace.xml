@@ -4,26 +4,14 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
-      <change beforePath="$PROJECT_DIR$/deploy/dx12_mc.dll" beforeDir="false" afterPath="$PROJECT_DIR$/deploy/dx12_mc.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/dx12mod/dx12_mc.dll" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/dx12mod/dx12_mc.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12CommandEncoderBackend.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12CommandEncoderBackend.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12Device.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12Device.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12Native.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12Native.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12ShaderCompiler.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/dx12/dx12/Dx12ShaderCompiler.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/resources/dx12_mc.dll" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/resources/dx12_mc.dll" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/native/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/native/CMakeLists.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/native/src/dx12_device.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/native/src/dx12_device.cpp" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/native/src/dx12_device.h" beforeDir="false" afterPath="$PROJECT_DIR$/native/src/dx12_device.h" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/native/src/jni_bridge_p3.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/native/src/jni_bridge_p3.cpp" afterDir="false" />
-    </list>
+    <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="7358" />
+    <option name="cachedIndexableFilesCount" value="68200" />
   </component>
   <component name="ExternalProjectsData">
     <projectState path="$PROJECT_DIR$">
@@ -94,7 +82,7 @@
     "SHARE_PROJECT_CONFIGURATION_FILES": "true",
     "codeWithMe.voiceChat.enabledByDefault": "false",
     "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
-    "git-widget-placeholder": "ac98c440",
+    "git-widget-placeholder": "main",
     "ignore.virus.scanning.warn.message": "true",
     "junie.onboarding.icon.badge.shown": "true",
     "kotlin-language-version-configured": "true",

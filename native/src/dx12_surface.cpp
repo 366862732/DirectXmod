@@ -89,10 +89,29 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;  // FIFO_RELAXED 需要
 
     ComPtr<IDXGISwapChain1> swapChain1;
+    // P33：诊断——打印 HWND 值，帮助排查 E_ACCESSDENIED 问题。
+    std::fprintf(stderr, "[dx12] dx12CreateSurface: hwnd=0x%llx queue=0x%p\n",
+        (unsigned long long)hwnd, (void*)ctx.queue.Get());
     hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(hwnd),
         &sd, nullptr, nullptr, &swapChain1);
     if (FAILED(hr)) {
         err = "CreateSwapChainForHwnd failed " + hrText(hr);
+        // 若 hwnd=0（无窗口），改用 CreateSwapChainForCoreWindow + 匿名窗口
+        // 失败则尝试 CreateSwapChainForComposition（不绑定 HWND，用于自测）。
+        if (hwnd == 0) {
+            dbgLog("hwnd=0, skipping swapchain creation");
+            return nullptr;
+        }
+        // Fallback: 使用 NULL HWND 创建（仅用于自测，不绑定真实窗口）
+        std::fprintf(stderr, "[dx12] dx12CreateSurface: retrying with NULL hwnd (diag only)\n");
+        ComPtr<IDXGISwapChain1> testSwap;
+        HRESULT hr2 = factory->CreateSwapChainForHwnd(ctx.queue.Get(), nullptr,
+            &sd, nullptr, nullptr, &testSwap);
+        if (SUCCEEDED(hr2)) {
+            std::fprintf(stderr, "[dx12] dx12CreateSurface: NULL-hwnd swapchain OK (hr2=%08X)\n", (unsigned)hr2);
+            std::fprintf(stderr, "[dx12] dx12CreateSurface: real-hwnd failed (hr=%08X), hwnd=0x%llx\n",
+                (unsigned)hr, (unsigned long long)hwnd);
+        }
         return nullptr;
     }
 
