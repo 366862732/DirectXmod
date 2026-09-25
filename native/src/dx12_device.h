@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -152,6 +153,9 @@ void destroyDevice();
 
 // JNI 层访问设备上下文（读 adapterName/featureLevel）。
 DeviceContext& deviceContextForJni();
+// P33 fix：flush 延迟删除对象，在 destroySurface 等 present fence 后调用，
+// 确保 GPU 工作完成后再释放资源。
+void flushPendingDeletes();
 
 // 返回设备/队列的原始 COM 指针（用于 Java 侧持有句柄）。
 uintptr_t getDeviceHandle();
@@ -283,6 +287,8 @@ UINT64 currentFenceValue(CommandContext* ctx);
 // ---------------------------------------------------------------------------
 bool initAsyncRenderer(UINT workerCount);
 void destroyAsyncRenderer();
+// 等待渲染线程完成当前帧（不销毁线程，仅同步到 gEvtSubmitDone 触发后）
+void waitForRenderThreadSubmit();
 // 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
 bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
 // 阻塞：等到本帧提交完成（或超时 ms）。
@@ -554,12 +560,21 @@ struct Dx12Surface {
     // P18：per-backbuffer fence 值。submitCommandList 记录本帧写入的 fence 值，
     // acquireSurface 据此判断重用的 back buffer 是否仍被 GPU 使用。
     std::vector<UINT64> surfaceFences;
+    // P33 fix：per-surface present fence。渲染线程每次 presentSurface() 后递增并
+    // signal 此 fence，确保 Display Controller 完成 flip 后再销毁 surface。
+    // IMMEDIATE 模式 + FLIP_DISCARD 下 deviceWaitIdle 不等待 display controller，
+    // 此 fence 填补该空档，避免 backbuffer 被 DWM/显示器读取时释放导致 CORRUPTION。
+    std::vector<UINT64> surfacePresentFences;
 };
 
 // P18：当前 active surface（单例，渲染线程访问）。submit 时写入 per-backbuffer fence。
 extern Dx12Surface* gActiveSurface;
 inline void setActiveSurface(Dx12Surface* s) { gActiveSurface = s; }
 inline Dx12Surface* getActiveSurface() { return gActiveSurface; }
+// P33：async 渲染线程 handle（供 destroySurface 在关闭渲染线程后等待 GPU 空闲使用）
+extern std::thread gRenderThread;
+// P33：渲染线程运行标志（供 destroySurface 判断是否需要等待线程退出）
+extern bool gRenderRunning;
 
 // 从 rtvHeap 分配一个 RTV CPU 句柄（surface 的 back buffer 用）。
 D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err);
@@ -581,6 +596,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
 // FIFO_RELAXED=Present(1,ALLOW_TEARING)。
 void presentSurface(Dx12Surface* s);
 void destroySurface(Dx12Surface* s);
+// 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部调用，在 render thread 已停止后使用）
+void destroySurfaceNoWaitIdle(Dx12Surface* s);
 // P6 诊断：把当前 back buffer 读回 CPU 并打印 3x3 采样点 RGBA（每 ~60 帧调用
 // 一次，内部先等 GPU 空闲；用于确认画面实际颜色/内容——纯色=渲染未生效）。
 bool readbackSurfacePixels(Dx12Surface* s, std::string& err);

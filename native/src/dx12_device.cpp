@@ -40,20 +40,8 @@ std::vector<UINT> gFreeSamplerSlots;
 
 // 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
 // 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
-void flushPendingDeletes() {
-    for (Dx12Object* o : gPendingDeletes) {
-        // 先归还描述符堆槽位（delete 后句柄失效，须在此前完成）
-        if (o->descSlot >= 0) {
-            if (o->kind == Dx12Object::Kind::TextureView) {
-                gFreeSrvSlots.push_back((UINT)o->descSlot);
-            } else if (o->kind == Dx12Object::Kind::Sampler) {
-                gFreeSamplerSlots.push_back((UINT)o->descSlot);
-            }
-        }
-        delete o;
-    }
-    gPendingDeletes.clear();
-}
+// 定义在匿名 namespace 外，以便 destroySurface 等跨编译单元调用。
+// （见 dx12_device.cpp 第 235 行之后）
 
 // 描述符堆槽位分配（P2 简单递增；P3 渲染层再做槽位回收）
 UINT gNextSrv = 0;
@@ -231,6 +219,24 @@ void dumpInfoQueueMessages() {
 }
 
 }  // namespace
+
+// 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
+// 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
+// 定义在此处（匿名 namespace 外）以便 destroySurface 等跨编译单元调用。
+void flushPendingDeletes() {
+    for (Dx12Object* o : gPendingDeletes) {
+        // 先归还描述符堆槽位（delete 后句柄失效，须在此前完成）
+        if (o->descSlot >= 0) {
+            if (o->kind == Dx12Object::Kind::TextureView) {
+                gFreeSrvSlots.push_back((UINT)o->descSlot);
+            } else if (o->kind == Dx12Object::Kind::Sampler) {
+                gFreeSamplerSlots.push_back((UINT)o->descSlot);
+            }
+        }
+        delete o;
+    }
+    gPendingDeletes.clear();
+}
 
 // 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
 double nowMs() {
@@ -1378,10 +1384,10 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     DBG_LOG_DEBUG("submit: done v=%llu qf=%llu", (unsigned long long)value,
         (unsigned long long)gCtx.queueFenceValue);
     // 提交并同步等待完成：本命令列表已执行完，其引用的资源可安全释放。
-    // 若所有打开的命令列表都已提交完成，则统一释放 pending 删除对象
-    // （延迟销毁的 flush 点，对应官方 queueForDestroy 的 execute 时机）。
+    // 注意：flushPendingDeletes() 不在 submit 时调用，而是延迟到渲染线程
+    // presentSurface + present fence signal 之后执行，确保 GPU 工作（含 display
+    // controller flip）完成后才释放延迟删除对象。
     if (gOpenListCount > 0) --gOpenListCount;
-    if (gOpenListCount == 0) flushPendingDeletes();
     return gCtx.queueFenceValue;
 }
 
@@ -3760,9 +3766,6 @@ HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：已提交，
 // 当前正在处理的 ctx（nullptr = 无活动帧）
 CommandContext* gAsyncRenderCtx = nullptr;
 
-// 渲染线程控制标志
-static bool gRenderRunning = false;
-
 // 渲染线程函数
 static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -3794,19 +3797,37 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             SetEvent(gEvtSubmitDone);
             continue;
         }
+        // P34：连续 acquire 失败计数器——用于指数退避，避免无意义的高速循环
+        static int acquireFailCount = 0;
         if (!acquireSurface(surf, err)) {
-            dbgLog("renderThread: acquireSurface FAILED: %s", err.c_str());
+            acquireFailCount++;
+            // 前 3 次快速重试（swapchain 可能正在 ResizeBuffers）；
+            // 之后指数退避，防止日志爆炸和 CPU 空转。
+            if (acquireFailCount <= 3) {
+                dbgLog("renderThread: acquireSurface FAILED(%d): %s", acquireFailCount, err.c_str());
+                SetEvent(gEvtSubmitDone);
+                continue;
+            }
+            // 超过 3 次失败：退避 + 诊断
+            UINT waitMs = (acquireFailCount <= 10) ? (1 << (acquireFailCount - 3)) : 100;
+            if (acquireFailCount == 4 || acquireFailCount == 10) {
+                dbgLog("renderThread: acquireSurface STUCK(%d): %s surf=%p idx=%d bbCount=%u",
+                    acquireFailCount, err.c_str(), (void*)surf,
+                    surf->currentImageIndex, (UINT)surf->backBuffers.size());
+            }
+            Sleep(waitMs);
             SetEvent(gEvtSubmitDone);
             continue;
         }
+        acquireFailCount = 0;  // P34：成功 acquire 后重置计数器
         dbgLogInfo("renderThread: acquired surface idx=%d", surf->currentImageIndex);
 
         // 步骤 3：等 GPU 完成前两帧，再 Reset allocator（非阻塞，失败则跳过）
         if (waitForValue > 0) {
             if (!waitForQueueFenceValue(waitForValue, 500, err)) {
                 DBG_LOG_DEBUG("renderThread: GPU wait timeout, skipping frame");
-                // 释放 surface 并跳过
-                destroySurface(getActiveSurface());
+                // 释放 surface 并跳过（render thread 此时仍运行，不等待 GPU）
+                destroySurfaceNoWaitIdle(getActiveSurface());
                 SetEvent(gEvtSubmitDone);
                 continue;
             }
@@ -3819,7 +3840,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         // 步骤 4b：begin command list（Reset allocator + list）
         if (!beginCommandListWithWait(ctx, waitForValue, err)) {
             dbgLog("renderThread: beginCommandList FAILED: %s", err.c_str());
-            destroySurface(getActiveSurface());
+            destroySurfaceNoWaitIdle(getActiveSurface());
             SetEvent(gEvtSubmitDone);
             continue;
         }
@@ -3829,10 +3850,10 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // 步骤 6：等待主线程完成命令录制（30s 超时，退出时也能响应）
         for (;;) {
-            if (!gRenderRunning) { destroySurface(getActiveSurface()); return 0; }
+            if (!gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
             if (r == WAIT_OBJECT_0) break;
-            if (r == WAIT_TIMEOUT && !gRenderRunning) { destroySurface(getActiveSurface()); return 0; }
+            if (r == WAIT_TIMEOUT && !gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
         }
 
         // 步骤 7：end + submit + present
@@ -3840,7 +3861,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         UINT64 value = submitCommandList(ctx, submitErr);
         if (value == 0) {
             dbgLog("renderThread: submitCommandList FAILED: %s", submitErr.c_str());
-            destroySurface(getActiveSurface());
+            destroySurfaceNoWaitIdle(getActiveSurface());
             SetEvent(gEvtSubmitDone);
             continue;
         }
@@ -3865,6 +3886,25 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         // present（presentSurface 返回 void）
         presentSurface(getActiveSurface());
 
+        // P33 fix：signal per-surface present fence，确保 Display Controller 完成
+        // flip 后再销毁 surface。deviceWaitIdle 仅等命令队列，不等待 display controller。
+        {
+            Dx12Surface* ps = getActiveSurface();
+            if (ps) {
+                UINT64 pv = ++gCtx.queueFenceValue;
+                gCtx.queue->Signal(gCtx.queueFence.Get(), pv);
+                if (ps->surfacePresentFences.size() < (size_t)kSurfaceBufferCount)
+                    ps->surfacePresentFences.resize(kSurfaceBufferCount, 0);
+                int pidx = ps->currentImageIndex;
+                if (pidx >= 0 && pidx < kSurfaceBufferCount)
+                    ps->surfacePresentFences[(size_t)pidx] = pv;
+            }
+        }
+
+        // P33 fix：在 present fence signal 之后才 flush 延迟删除对象，确保所有
+        // GPU 工作（含 display controller flip）完成后才释放资源，避免 CORRUPTION。
+        if (gOpenListCount == 0) flushPendingDeletes();
+
         // 步骤 8：通知主线程提交完成
         SetEvent(gEvtSubmitDone);
     }
@@ -3872,9 +3912,26 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
     return 0;
 }
 
-static std::thread gRenderThread;
-
 }  // namespace
+
+// P33 async renderer thread（外部可访问，供 destroySurface 调用）
+std::thread gRenderThread;
+// P33：渲染线程运行标志（外部可访问）
+bool gRenderRunning = false;
+
+// 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。
+// 用于 destroySurface 场景：确保渲染线程不再并发操作 swapchain 后再调用 deviceWaitIdle。
+void waitForRenderThreadSubmit() {
+    if (!gRenderRunning || !gRenderThread.joinable()) return;
+    // 若渲染线程正在 WaitForSingleObject(gEvtBeginFrame)，SetEvent 会唤醒它；
+    // 若渲染线程已完成帧循环等待 gEvtSubmitDone，SetEvent 无效（不影响）。
+    SetEvent(gEvtBeginFrame);
+    // 等待本帧提交完成（10s 超时，避免永久阻塞）。
+    DWORD r = WaitForSingleObject(gEvtSubmitDone, 10000);
+    if (r != WAIT_OBJECT_0) {
+        dbgLog("waitForRenderThreadSubmit: timeout (render thread may be stuck)");
+    }
+}
 
 bool initAsyncRenderer(UINT workerCount) {
     std::string initErr;

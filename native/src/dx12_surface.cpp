@@ -213,7 +213,8 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
     s->swapChain = swapChain3;
-    setActiveSurface(s);  // P18：注册为 active surface（submit 时记录 per-backbuffer fence）
+    // 注意：不在此处 setActiveSurface！surface 必须在 configureSurface 完成后
+    // 才设为 active，否则渲染线程会在 backBuffers 为空时尝试 acquire 导致无限循环。
     return s;
 }
 
@@ -390,6 +391,10 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         ctx.device->CreateRenderTargetView(s->backBuffers[i].Get(), nullptr, rtv);
         s->rtvHandles.push_back(rtv);
     }
+    // P35：配置完成后才设为 active surface，确保渲染线程不会在 backBuffers 未就绪时 acquire。
+    setActiveSurface(s);
+    dbgLogInfo("configureSurface: registered active surface=%p bbCount=%u", (void*)s,
+        (UINT)s->backBuffers.size());
     return true;
 }
 
@@ -399,10 +404,27 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         return false;
     }
     dbgLog("acquireSurface: enter surface=%p", (void*)s);
-    s->currentImageIndex = (int)s->swapChain->GetCurrentBackBufferIndex();
+    // P34 诊断：记录 GetCurrentBackBufferIndex 的原始返回值和 HRESULT
+    UINT rawIdx = s->swapChain->GetCurrentBackBufferIndex();
+    s->currentImageIndex = (int)rawIdx;
+    UINT bbCount = (UINT)s->backBuffers.size();
+    dbgLog("acquireSurface: rawIdx=%u bbCount=%u currentImageIndex=%d",
+        rawIdx, bbCount, s->currentImageIndex);
     if (s->currentImageIndex < 0 ||
-        s->currentImageIndex >= (int)s->backBuffers.size()) {
-        err = "GetCurrentBackBufferIndex returned an invalid index";
+        s->currentImageIndex >= (int)bbCount) {
+        // P34 容错：若 backBuffers 为空说明 surface 尚未完成配置，直接返回 false
+        // 让渲染线程稍后重试；若 backBuffers 已就绪但 index 异常，尝试通过
+        // GetBufferCount 交叉验证 swapchain 状态。
+        if (bbCount == 0) {
+            err = "acquireSurface: backBuffers empty (surface not configured yet)";
+        } else {
+            // 交叉验证：从 swapchain desc 获取实际 buffer 数
+            DXGI_SWAP_CHAIN_DESC1 sd{};
+            HRESULT hr = s->swapChain->GetDesc1(&sd);
+            err = "GetCurrentBackBufferIndex returned invalid index=" + std::to_string(rawIdx)
+                + " bbCount=" + std::to_string(bbCount)
+                + " scGetDesc_hr=" + hrText(hr) + " BufferCount=" + std::to_string(sd.BufferCount);
+        }
         return false;
     }
     // P18：如果重用的是上一帧的 back buffer（上次 blit 可能还没完成），
@@ -631,7 +653,7 @@ void presentSurface(Dx12Surface* s) {
     // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
     // P3.2 诊断：每帧检查 Backbuffer 格式和尺寸是否与窗口匹配
     if (!s->backBuffers.empty()) {
-        ID3D12Resource* bb = s->backBuffers[(size_t)s->currentImageIndex >= 0 ? (size_t)s->currentImageIndex : 0].Get();
+        ID3D12Resource* bb = s->backBuffers[(size_t)(s->currentImageIndex >= 0 ? s->currentImageIndex : 0)].Get();
         if (bb) {
             D3D12_RESOURCE_DESC bbDesc = bb->GetDesc();
             if ((s->currentImageIndex + 1) % 30 == 0) {
@@ -669,13 +691,46 @@ void presentSurface(Dx12Surface* s) {
 void destroySurface(Dx12Surface* s) {
     if (!s) return;
     dbgLog("destroySurface: enter surface=%p", (void*)s);
-    // GPU 可能仍在写入 backbuffer；先等队列空闲再销毁 swapchain，
-    // 否则资源在使用中被释放会触发 DXGI_ERROR_DEVICE_REMOVED。
+    // P33 修复：async render thread 可能在 destroySurface 期间仍在操作同一 swapchain。
+    // 先等待渲染线程完成当前帧（仅同步，不销毁线程），再等 GPU 空闲，
+    // 避免 deviceWaitIdle → queue->Signal 与渲染线程的 Present 并发访问 swapchain 导致崩溃。
+    waitForRenderThreadSubmit();
     std::string err;
     deviceWaitIdle(err);
-    if (getActiveSurface() == s) setActiveSurface(nullptr);  // P18：清除 active 指针
+    // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
+    // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
+    // 不等待 display controller，backbuffer 仍可能被 DWM 异步读取。
+    if (!s->surfacePresentFences.empty()) {
+        UINT64 pv = 0;
+        for (UINT64 v : s->surfacePresentFences) if (v > pv) pv = v;
+        if (pv > 0) {
+            DeviceContext& dc = deviceContextForJni();
+            if (dc.queueFence) {
+                HANDLE hEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (hEvt) {
+                    HRESULT hr = dc.queueFence->SetEventOnCompletion(pv, hEvt);
+                    if (SUCCEEDED(hr)) {
+                        WaitForSingleObject(hEvt, 5000);
+                    }
+                    CloseHandle(hEvt);
+                }
+            }
+        }
+    }
+    // P33 fix：present fence 等 GPU 完成所有命令（含 present），此时再 flush
+    // 延迟删除对象，确保不在 GPU 仍引用资源时释放它们（消除 PreSwapInfoQueue
+    // CORRUPTION 警告的根本原因）。
+    flushPendingDeletes();
+    if (getActiveSurface() == s) setActiveSurface(nullptr);
     delete s;
     dbgLog("destroySurface: done surface=%p", (void*)s);
+}
+
+// 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部使用：render thread 已自行退出后调用）
+void destroySurfaceNoWaitIdle(Dx12Surface* s) {
+    if (!s) return;
+    if (getActiveSurface() == s) setActiveSurface(nullptr);
+    delete s;
 }
 
 // P6 诊断：读回 back buffer 采样像素。内部先等 GPU 完全空闲（同步一帧），
