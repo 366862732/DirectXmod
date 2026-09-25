@@ -1368,6 +1368,9 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
         // P33 async：记录本次 submit 的 queue fence 值，供 beginCommandListWithWait
         // 等待。下一帧 begin 时传入此值，确保 GPU 完成当前帧后才 Reset allocator。
         ctx->lastSubmitQueueFence = qv;
+        dbgLog("renderThread: submitCommandList done ctx=%p value=%llu qf=%llu lastQF=%llu",
+            (void*)ctx, (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue,
+            (unsigned long long)ctx->lastSubmitQueueFence);
     }
     // P18：记录 per-backbuffer fence 值，供 acquireSurface 按需同步（非阻塞）。
     // submit 本身不等待 GPU，改为在 acquireSurface 中检查重用的 back buffer
@@ -3786,7 +3789,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // 获取本帧应等待的 queue fence 值（= 上一帧 submit 时的值）
         UINT64 waitForValue = ctx->lastSubmitQueueFence;
-        DBG_LOG_DEBUG("renderThread: begin wait=%llu ctx=%p",
+        dbgLog("renderThread: begin wait=%llu ctx=%p",
             (unsigned long long)waitForValue, (void*)ctx);
 
         // 步骤 2：acquireSurface（阻塞等显示器）
@@ -3820,12 +3823,13 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             continue;
         }
         acquireFailCount = 0;  // P34：成功 acquire 后重置计数器
-        dbgLogInfo("renderThread: acquired surface idx=%d", surf->currentImageIndex);
+        dbgLog("renderThread: acquired surface idx=%d", surf->currentImageIndex);
 
         // 步骤 3：等 GPU 完成前两帧，再 Reset allocator（非阻塞，失败则跳过）
         if (waitForValue > 0) {
+            dbgLog("renderThread: waitQFence=%llu", (unsigned long long)waitForValue);
             if (!waitForQueueFenceValue(waitForValue, 500, err)) {
-                DBG_LOG_DEBUG("renderThread: GPU wait timeout, skipping frame");
+                dbgLog("renderThread: GPU wait timeout, skipping frame");
                 // 释放 surface 并跳过（render thread 此时仍运行，不等待 GPU）
                 destroySurfaceNoWaitIdle(getActiveSurface());
                 SetEvent(gEvtSubmitDone);
@@ -3835,9 +3839,12 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // 步骤 4a：关闭构造函数打开的旧 command list（释放 allocator），否则 beginCommandListWithWait
         //          的 Reset 会因 allocator InUse 而返回 E_FAIL。
+        dbgLog("renderThread: begin endCommandList");
         endCommandList(ctx, err);
+        dbgLog("renderThread: done endCommandList");
 
         // 步骤 4b：begin command list（Reset allocator + list）
+        dbgLog("renderThread: begin beginCommandListWithWait");
         if (!beginCommandListWithWait(ctx, waitForValue, err)) {
             dbgLog("renderThread: beginCommandList FAILED: %s", err.c_str());
             destroySurfaceNoWaitIdle(getActiveSurface());
@@ -3846,6 +3853,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         }
 
         // 步骤 5：通知主线程可以 push 命令了
+        dbgLog("renderThread: signaling recordingReady");
         SetEvent(gEvtRecordingReady);
 
         // 步骤 6：等待主线程完成命令录制（30s 超时，退出时也能响应）
@@ -3906,6 +3914,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         if (gOpenListCount == 0) flushPendingDeletes();
 
         // 步骤 8：通知主线程提交完成
+        dbgLog("renderThread: frame done, looping back");
         SetEvent(gEvtSubmitDone);
     }
 
@@ -4002,7 +4011,8 @@ bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
     ResetEvent(gEvtSubmitDone);
     // Signal start
     SetEvent(gEvtBeginFrame);
-    dbgLogInfo("asyncRenderBeginFrame: signaled beginFrame ctx=%p", (void*)ctx);
+    dbgLog("asyncRenderBeginFrame: signaled beginFrame ctx=%p lastQF=%llu",
+        (void*)ctx, (unsigned long long)ctx->lastSubmitQueueFence);
     return true;
 }
 
