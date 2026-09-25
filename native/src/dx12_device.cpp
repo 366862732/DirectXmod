@@ -3795,10 +3795,11 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             continue;
         }
         if (!acquireSurface(surf, err)) {
-            dbgLog("renderThread: acquireSurface FAILED");
+            dbgLog("renderThread: acquireSurface FAILED: %s", err.c_str());
             SetEvent(gEvtSubmitDone);
             continue;
         }
+        dbgLogInfo("renderThread: acquired surface idx=%d", surf->currentImageIndex);
 
         // 步骤 3：等 GPU 完成前两帧，再 Reset allocator（非阻塞，失败则跳过）
         if (waitForValue > 0) {
@@ -3933,6 +3934,7 @@ bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
     if (!gRenderRunning) { err = "asyncRenderBeginFrame: renderer not running"; return false; }
     if (getActiveSurface() == nullptr) {
         // 初始化阶段无 surface（窗口未创建），回退到同步路径
+        dbgLogInfo("asyncRenderBeginFrame: no active surface, fallback sync");
         return false;
     }
     if (gAsyncRenderCtx != nullptr) { err = "asyncRenderBeginFrame: previous frame not complete"; return false; }
@@ -3943,6 +3945,7 @@ bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
     ResetEvent(gEvtSubmitDone);
     // Signal start
     SetEvent(gEvtBeginFrame);
+    dbgLogInfo("asyncRenderBeginFrame: signaled beginFrame ctx=%p", (void*)ctx);
     return true;
 }
 
@@ -3953,9 +3956,11 @@ bool asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs, std::string&
     DWORD r = WaitForSingleObject(gEvtSubmitDone, (DWORD)timeoutMs);
     if (r == WAIT_OBJECT_0) {
         gAsyncRenderCtx = nullptr;
+        dbgLogInfo("asyncRenderWaitComplete: OK timeout=%llu", (unsigned long long)timeoutMs);
         return true;
     }
     err = "asyncRenderWaitComplete: timeout";
+    dbgLogInfo("asyncRenderWaitComplete: TIMEOUT timeout=%llu", (unsigned long long)timeoutMs);
     return false;
 }
 

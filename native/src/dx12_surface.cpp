@@ -154,82 +154,54 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;  // FIFO_RELAXED 需要
 
+    // P33 CS_OWNDC workaround：多级 fallback
+    // Tier 1: FLIP_DISCARD + ALLOW_TEARING（正常路径，FIFO_RELAXED 需要）
+    // Tier 2: FLIP_DISCARD 无 ALLOW_TEARING（CS_OWNDC 窗口可能需要）
+    static constexpr struct { DXGI_SWAP_EFFECT effect; UINT flags; const char* label; } kSwapChainTiers[] = {
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, "FLIP_DISCARD+TEARING" },
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD, 0,                                  "FLIP_DISCARD"       },
+    };
+
     ComPtr<IDXGISwapChain1> swapChain1;
     // P33：诊断——打印 HWND 值，帮助排查 E_ACCESSDENIED 问题。
     std::fprintf(stderr, "[dx12] dx12CreateSurface: hwnd=0x%llx queue=0x%p\n",
         (unsigned long long)hwnd, (void*)ctx.queue.Get());
-    hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(hwnd),
-        &sd, nullptr, nullptr, &swapChain1);
-    if (FAILED(hr)) {
-        err = "CreateSwapChainForHwnd failed " + hrText(hr);
-        // #region debug-point C:post-fail-infoqueue
-        if (ctx.infoQueue) {
-            UINT64 n = ctx.infoQueue->GetNumStoredMessages();
-            for (UINT64 i = 0; i < n; ++i) {
-                SIZE_T len = 0;
-                if (FAILED(ctx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
-                std::vector<char> buf(len > 0 ? len : 1);
-                D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-                if (SUCCEEDED(ctx.infoQueue->GetMessage((UINT)i, msg, &len))) {
-                    const char* sev = "?";
-                    switch (msg->Severity) {
-                        case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
-                        case D3D12_MESSAGE_SEVERITY_ERROR: sev = "ERROR"; break;
-                        case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
-                        case D3D12_MESSAGE_SEVERITY_INFO: sev = "INFO"; break;
-                        default: break;
-                    }
-                    std::fprintf(stderr, "[dx12] PostSwapInfoQueue[%s] %s\n",
-                        sev, msg->pDescription ? msg->pDescription : "");
-                }
+
+    {
+        bool created = false;
+        for (size_t t = 0; t < sizeof(kSwapChainTiers) / sizeof(kSwapChainTiers[0]); ++t) {
+            sd.SwapEffect = kSwapChainTiers[t].effect;
+            sd.Flags = kSwapChainTiers[t].flags;
+            hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(hwnd),
+                &sd, nullptr, nullptr, &swapChain1);
+            if (SUCCEEDED(hr)) {
+                std::fprintf(stderr, "[dx12] dx12CreateSurface: swapchain OK (tier=%s)\n",
+                    kSwapChainTiers[t].label);
+                created = true;
+                break;
             }
-            ctx.infoQueue->ClearStoredMessages();
+            std::fprintf(stderr, "[dx12] dx12CreateSurface: tier %s failed hr=%08X, trying next\n",
+                kSwapChainTiers[t].label, (unsigned)hr);
         }
-        // #endregion
-        // 若 hwnd=0（无窗口），跳过 swapchain 创建
-        if (hwnd == 0) {
-            dbgLog("hwnd=0, skipping swapchain creation");
+        if (!created) {
+            // 打印调试层消息辅助诊断
+            if (ctx.infoQueue) {
+                UINT64 n = ctx.infoQueue->GetNumStoredMessages();
+                for (UINT64 i = 0; i < n && i < 20; ++i) {
+                    SIZE_T len = 0;
+                    if (FAILED(ctx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+                    std::vector<char> buf(len > 0 ? len : 1);
+                    D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                    if (SUCCEEDED(ctx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+                        std::fprintf(stderr, "[dx12] InfoQueue[%u] %s\n",
+                            (unsigned)i, msg->pDescription ? msg->pDescription : "");
+                    }
+                }
+                ctx.infoQueue->ClearStoredMessages();
+            }
+            err = "CreateSwapChainForHwnd failed (all tiers) " + hrText(hr);
             return nullptr;
         }
-        // Fallback: 用 CreateSwapChainForComposition 绕过 CS_OWNDC 限制
-        std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForHwnd failed hr=%08X, "
-            "retrying with CreateSwapChainForComposition\n", (unsigned)hr);
-        {
-            HMODULE hDxgi = GetModuleHandleW(L"dxgi.dll");
-            using FnCreateForComp = HRESULT(STDMETHODCALLTYPE*)(
-                ID3D12CommandQueue*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
-            auto fn = hDxgi ? reinterpret_cast<FnCreateForComp>(
-                GetProcAddress(hDxgi, "CreateSwapChainForComposition")) : nullptr;
-            if (fn) {
-                ComPtr<IDXGISwapChain1> compSwap;
-                HRESULT hrComp = fn(ctx.queue.Get(), &sd, nullptr, &compSwap);
-                if (SUCCEEDED(hrComp)) {
-                    std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForComposition OK hr=%08X\n",
-                        (unsigned)hrComp);
-                    // 关联到目标窗口
-                    hrComp = factory->MakeWindowAssociation(
-                        reinterpret_cast<HWND>(hwnd), DXGI_MWA_NO_ALT_ENTER);
-                    if (SUCCEEDED(hrComp)) {
-                        std::fprintf(stderr, "[dx12] dx12CreateSurface: MakeWindowAssociation OK\n");
-                    }
-                    ComPtr<IDXGISwapChain3> swapChain3;
-                    if (SUCCEEDED(compSwap.As(&swapChain3))) {
-                        Dx12Surface* s = new Dx12Surface();
-                        s->hwnd = hwnd;
-                        s->swapChain = swapChain3;
-                        setActiveSurface(s);
-                        return s;
-                    }
-                } else {
-                    std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForComposition "
-                        "also failed hr=%08X\n", (unsigned)hrComp);
-                }
-            } else {
-                std::fprintf(stderr, "[dx12] dx12CreateSurface: CreateSwapChainForComposition "
-                    "not available (old DXGI)\n");
-            }
-        }
-        return nullptr;
     }
 
     ComPtr<IDXGISwapChain3> swapChain3;
@@ -361,43 +333,35 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = kSurfaceBufferCount;
         sd.Scaling = DXGI_SCALING_STRETCH;
-        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-        sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
+        // 多级 fallback（与 createSurface 相同逻辑）
+        static constexpr struct { DXGI_SWAP_EFFECT effect; UINT flags; const char* label; } kRecreateTiers[] = {
+            { DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, "FLIP_DISCARD+TEARING" },
+            { DXGI_SWAP_EFFECT_FLIP_DISCARD, 0,                                  "FLIP_DISCARD"       },
+        };
 
         ComPtr<IDXGISwapChain1> swapChain1;
-        hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
-            &sd, nullptr, nullptr, &swapChain1);
-        if (FAILED(hr)) {
-            // 与 createSurface 相同的 composition fallback
-            std::fprintf(stderr, "[dx12] configureSurface: recreate CreateSwapChainForHwnd failed hr=%08X, "
-                "retrying with CreateSwapChainForComposition\n", (unsigned)hr);
-            HMODULE hDxgi = GetModuleHandleW(L"dxgi.dll");
-            using FnCreateForComp = HRESULT(STDMETHODCALLTYPE*)(
-                ID3D12CommandQueue*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
-            auto fn = hDxgi ? reinterpret_cast<FnCreateForComp>(
-                GetProcAddress(hDxgi, "CreateSwapChainForComposition")) : nullptr;
-            if (fn) {
-                ComPtr<IDXGISwapChain1> compSwap;
-                HRESULT hrComp = fn(ctx.queue.Get(), &sd, nullptr, &compSwap);
-                if (SUCCEEDED(hrComp)) {
-                    // 关联到目标窗口
-                    hrComp = factory->MakeWindowAssociation(
-                        reinterpret_cast<HWND>(s->hwnd), DXGI_MWA_NO_ALT_ENTER);
-                    if (SUCCEEDED(hrComp)) {
-                        dbgLog("configureSurface: MakeWindowAssociation OK");
-                    }
-                    if (SUCCEEDED(compSwap.As(&s->swapChain))) {
-                        dbgLog("configureSurface: recreated swapchain via composition %dx%d", width, height);
-                    }
-                }
+        bool recreated = false;
+        for (size_t t = 0; t < sizeof(kRecreateTiers) / sizeof(kRecreateTiers[0]); ++t) {
+            sd.SwapEffect = kRecreateTiers[t].effect;
+            sd.Flags = kRecreateTiers[t].flags;
+            hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
+                &sd, nullptr, nullptr, &swapChain1);
+            if (SUCCEEDED(hr)) {
+                std::fprintf(stderr, "[dx12] configureSurface: recreate OK (tier=%s %dx%d)\n",
+                    kRecreateTiers[t].label, width, height);
+                recreated = true;
+                break;
             }
-            if (!s->swapChain) {
-                err = "CreateSwapChainForHwnd (recreate) failed " + hrText(hr);
-                return false;
-            }
+            std::fprintf(stderr, "[dx12] configureSurface: recreate tier %s failed hr=%08X\n",
+                kRecreateTiers[t].label, (unsigned)hr);
         }
-        if (!s->swapChain && FAILED(swapChain1.As(&s->swapChain))) {
+        if (!recreated) {
+            err = "CreateSwapChainForHwnd (recreate) failed (all tiers) " + hrText(hr);
+            return false;
+        }
+        if (FAILED(swapChain1.As(&s->swapChain))) {
             err = "swapchain does not support IDXGISwapChain3";
             return false;
         }

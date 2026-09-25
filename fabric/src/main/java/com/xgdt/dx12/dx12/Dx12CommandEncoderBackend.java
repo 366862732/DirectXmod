@@ -445,6 +445,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 步骤 2：请求渲染线程开始新帧
         boolean asyncStarted = Dx12Native.dx12AsyncRenderBeginFrame(this.ctx);
         if (!asyncStarted) {
+            System.err.println("[dx12-java] submit: SYNC fallback (no active surface or previous frame pending) fence=" + fenceBefore);
+            System.err.flush();
             // 无 active surface（初始化阶段或窗口未创建），回退到同步路径
             // 同步路径：确保命令列表已打开（幂等：已打开则跳过 Reset），录制命令、提交
             Dx12Native.dx12BeginCommandList(this.ctx);
@@ -460,6 +462,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 异步路径：渲染线程负责 allocator reset + command list begin，
         // 主线程只负责命令录制（已在此 submit() 调用前完成）和协调事件。
         // 注意：不在此调用 dx12BeginCommandList，避免与渲染线程竞争同一 allocator。
+        System.err.println("[dx12-java] submit: ASYNC path fence=" + fenceBefore);
+        System.err.flush();
 
         // 步骤 3：等待渲染线程到达 RECORDING_READY（带超时保护，防止死锁）
         long startTime = System.nanoTime();
