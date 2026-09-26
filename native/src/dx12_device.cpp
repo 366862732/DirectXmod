@@ -1254,10 +1254,15 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
     // awaitSubmitCompletion(idx-2) 再 reset command pool，保证 GPU 不再引用。
     // D3D12 等效：Signal(queueFence, N) → beginCommandList 等 queueFence=N-1 完成。
     if (waitForValue > 0) {
+        dbgLog("beginCommandListWithWait: checking qf=%llu cv=%llu qfVal=%llu",
+            (unsigned long long)waitForValue,
+            (unsigned long long)gCtx.queueFence ? gCtx.queueFence->GetCompletedValue() : 0ULL,
+            (unsigned long long)gCtx.queueFenceValue);
         if (!waitForQueueFenceValue(waitForValue, 5'000'000'000ULL, err)) {
-            DBG_LOG_DEBUG("beginCommandListWithWait: wait FAILED: %s", err.c_str());
+            dbgLog("beginCommandListWithWait: wait FAILED: %s", err.c_str());
             return false;
         }
+        dbgLog("beginCommandListWithWait: wait done");
     }
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandListWithWait: allocator Reset " + hrText(hr); return false; }
@@ -3857,6 +3862,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         SetEvent(gEvtRecordingReady);
 
         // 步骤 6：等待主线程完成命令录制（30s 超时，退出时也能响应）
+        dbgLog("renderThread: waiting for gEvtCommandsReady");
         for (;;) {
             if (!gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
@@ -3892,6 +3898,9 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue);
 
         // present（presentSurface 返回 void）
+        dbgLog("renderThread: about to presentSurface qf=%llu bbIdx=%d",
+            (unsigned long long)gCtx.queueFenceValue,
+            (int)(getActiveSurface() ? getActiveSurface()->currentImageIndex : -1));
         presentSurface(getActiveSurface());
 
         // P33 fix：signal per-surface present fence，确保 Display Controller 完成
@@ -3911,6 +3920,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // P33 fix：在 present fence signal 之后才 flush 延迟删除对象，确保所有
         // GPU 工作（含 display controller flip）完成后才释放资源，避免 CORRUPTION。
+        dbgLog("renderThread: post-present qf=%llu openList=%d",
+            (unsigned long long)gCtx.queueFenceValue, gOpenListCount);
         if (gOpenListCount == 0) flushPendingDeletes();
 
         // 步骤 8：通知主线程提交完成
