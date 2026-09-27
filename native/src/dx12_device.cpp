@@ -1228,6 +1228,7 @@ void destroyCommandEncoder(CommandContext* ctx) {
     if (ctx->listOpen) {
         ctx->listOpen = 0;
         if (gOpenListCount > 0) --gOpenListCount;
+        dbgLog("destroyCommandEncoder: openList now=%d", gOpenListCount);
         if (gOpenListCount == 0) flushPendingDeletes();
     }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
@@ -1254,9 +1255,10 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
     // awaitSubmitCompletion(idx-2) 再 reset command pool，保证 GPU 不再引用。
     // D3D12 等效：Signal(queueFence, N) → beginCommandList 等 queueFence=N-1 完成。
     if (waitForValue > 0) {
+        UINT64 cv = 0ULL;
+        if (gCtx.queueFence) cv = gCtx.queueFence->GetCompletedValue();
         dbgLog("beginCommandListWithWait: checking qf=%llu cv=%llu qfVal=%llu",
-            (unsigned long long)waitForValue,
-            (unsigned long long)gCtx.queueFence ? gCtx.queueFence->GetCompletedValue() : 0ULL,
+            (unsigned long long)waitForValue, cv,
             (unsigned long long)gCtx.queueFenceValue);
         if (!waitForQueueFenceValue(waitForValue, 5'000'000'000ULL, err)) {
             dbgLog("beginCommandListWithWait: wait FAILED: %s", err.c_str());
@@ -1264,14 +1266,20 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
         }
         dbgLog("beginCommandListWithWait: wait done");
     }
+    dbgLog("beginCommandListWithWait: begin allocator reset");
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandListWithWait: allocator Reset " + hrText(hr); return false; }
+    dbgLog("beginCommandListWithWait: allocator reset ok");
+    dbgLog("beginCommandListWithWait: begin list reset");
     hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
     if (FAILED(hr)) { err = "beginCommandListWithWait: list Reset " + hrText(hr); return false; }
+    dbgLog("beginCommandListWithWait: list reset ok");
+    dbgLog("beginCommandListWithWait: pre-increment ctx=%p", (void*)ctx);
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
     ctx->colorTargetsWritten = false;  // 新 command list 从零开始追踪绘制状态
     ++gOpenListCount;  // 延迟销毁：登记打开计数，submit 完成前不释放资源
+    dbgLog("beginCommandListWithWait: post-increment openList=%d ctx=%p", gOpenListCount, (void*)ctx);
     // submit 阻塞等待 GPU 完成（见 submitCommandList），此处清空 resourceState
     // 后一切资源视为初始态是正确且保守的（D3D12 驱动会按实际 GPU 状态纠正）。
     ctx->resourceState.clear();
@@ -1396,6 +1404,7 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     // presentSurface + present fence signal 之后执行，确保 GPU 工作（含 display
     // controller flip）完成后才释放延迟删除对象。
     if (gOpenListCount > 0) --gOpenListCount;
+    dbgLog("submitCommandList: openList now=%d", gOpenListCount);
     return gCtx.queueFenceValue;
 }
 
@@ -3858,15 +3867,15 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         }
 
         // 步骤 5：通知主线程可以 push 命令了
-        dbgLog("renderThread: signaling recordingReady");
+        dbgLog("renderThread: signaling recordingReady ctx=%p", (void*)ctx);
         SetEvent(gEvtRecordingReady);
 
         // 步骤 6：等待主线程完成命令录制（30s 超时，退出时也能响应）
-        dbgLog("renderThread: waiting for gEvtCommandsReady");
+        dbgLog("renderThread: waiting for gEvtCommandsReady ctx=%p", (void*)ctx);
         for (;;) {
             if (!gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
-            if (r == WAIT_OBJECT_0) break;
+            if (r == WAIT_OBJECT_0) { dbgLog("renderThread: commandsReady ctx=%p", (void*)ctx); break; }
             if (r == WAIT_TIMEOUT && !gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
         }
 
