@@ -207,6 +207,9 @@ public final class Dx12Native {
      */
     public static native boolean dx12AsyncSendCommandsReady(long ctx);
 
+    /** 主动清除 gAsyncRenderCtx（供 Java 侧 P41 超时降级时同步调用）。 */
+    public static native void dx12ClearAsyncRenderCtx();
+
     /** 查询当前 command context 的命令列表是否处于打开录制状态。 */
     public static native boolean dx12IsListOpen(long ctx);
 

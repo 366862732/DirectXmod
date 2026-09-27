@@ -39,6 +39,14 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private final Dx12TransientMemory transientMemory;
     private final List<Runnable> pendingCallbacks = new ArrayList<>();
     private @Nullable Dx12RenderPassBackend currentRenderPass;
+    /**
+     * P42：标记当前 submit() 走的是 ASYNC 路径。
+     * 在 ASYNC 路径下，render thread 负责 allocator reset + command list begin，
+     * 主线程只负责命令录制。ensureListOpen() 在 inAsyncSubmit=true 时跳过
+     * dx12BeginCommandList，避免与 render thread 的 beginCommandListWithWait
+     * 竞争同一 allocator（E_FAIL 根因）。
+     */
+    private boolean inAsyncSubmit = false;
     /** P27：图集合成 pass 结束后 dump 图集纹理（定位按钮纹理错乱）。 */
     private static final int MAX_ATLAS_DUMPS = 14;
     private static final java.util.Set<Long> gDumpedAtlas = new java.util.HashSet<>();
@@ -88,6 +96,14 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
      */
     private void ensureListOpen() {
         if (!Dx12Native.dx12IsListOpen(this.ctx)) {
+            // P42：ASYNC 路径下 render thread 负责 allocator reset + command list begin，
+            // 主线程此时调用 dx12BeginCommandList 会与 render thread 的
+            // beginCommandListWithWait 竞争同一 allocator → E_FAIL。
+            // render thread 在发送 RECORDING_READY 前已完成 beginCommandList，
+            // 因此命令录制阶段 list 一定已是 open 状态，无需额外操作。
+            if (this.inAsyncSubmit) {
+                return;
+            }
             Dx12Native.dx12BeginCommandList(this.ctx);
         }
     }
@@ -462,6 +478,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 异步路径：渲染线程负责 allocator reset + command list begin，
         // 主线程只负责命令录制（已在此 submit() 调用前完成）和协调事件。
         // 注意：不在此调用 dx12BeginCommandList，避免与渲染线程竞争同一 allocator。
+        this.inAsyncSubmit = true;
         System.err.println("[dx12-java] submit: ASYNC path fence=" + fenceBefore);
         System.err.flush();
 
@@ -476,6 +493,8 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                     + (elapsed / 1_000_000) + "ms — falling back to SYNC, ctx=0x"
                     + Long.toHexString(this.ctx));
                 System.err.flush();
+                // 清除 gAsyncRenderCtx，防止下一个 asyncBeginFrame 被 "previous frame not complete" 拒绝
+                Dx12Native.dx12ClearAsyncRenderCtx();
                 Dx12Native.dx12BeginCommandList(this.ctx);
                 Dx12Native.dx12Submit(this.ctx);
                 this.transientMemory.rotate();
@@ -561,6 +580,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                 + " ctx=" + Long.toHexString(this.ctx));
             System.err.flush();
         }
+        this.inAsyncSubmit = false;
     }
 
     public void close() {

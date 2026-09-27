@@ -3868,9 +3868,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             dbgLog("renderThread: waitQFence=%llu", (unsigned long long)waitForValue);
             if (!waitForQueueFenceValue(waitForValue, 500, err)) {
                 dbgLog("renderThread: GPU wait timeout, skipping frame");
-                // 释放 surface 并跳过（render thread 此时仍运行，不等待 GPU）
-                destroySurfaceNoWaitIdle(getActiveSurface());
-                // P41：清除卡住的上下文，否则下一个 asyncBeginFrame 会被 "previous frame not complete" 拒绝
+                // P41 fix：不清除 surface（render thread 仍持有引用，销毁会导致 use-after-free）
+                // 仅清除上下文让下一个 asyncBeginFrame 可以重试
                 if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
                 SetEvent(gEvtSubmitDone);
                 continue;
@@ -3887,8 +3886,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         dbgLog("renderThread: begin beginCommandListWithWait");
         if (!beginCommandListWithWait(ctx, waitForValue, err)) {
             dbgLog("renderThread: beginCommandList FAILED: %s", err.c_str());
-            destroySurfaceNoWaitIdle(getActiveSurface());
-            // P41：清除卡住的上下文
+            // P41 fix：不清除 surface（allocato rReset 失败不代表 surface 无效）
             if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
             SetEvent(gEvtSubmitDone);
             continue;
@@ -3925,8 +3923,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         UINT64 value = submitCommandList(ctx, submitErr);
         if (value == 0) {
             dbgLog("renderThread: submitCommandList FAILED: %s", submitErr.c_str());
-            destroySurfaceNoWaitIdle(getActiveSurface());
-            // P41：清除卡住的上下文
+            // P41 fix：不清除 surface（submit 失败不代表 surface 无效）
             if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
             SetEvent(gEvtSubmitDone);
             continue;
@@ -4111,6 +4108,10 @@ void asyncSendCommandsReady(CommandContext* ctx) {
     (void)ctx;
     if (!gRenderRunning) return;
     SetEvent(gEvtCommandsReady);
+}
+
+void clearAsyncRenderCtx() {
+    gAsyncRenderCtx = nullptr;
 }
 
 }  // namespace dx12mc

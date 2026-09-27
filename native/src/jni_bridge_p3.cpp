@@ -401,6 +401,11 @@ JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncSendCommandsR
         reinterpret_cast<dx12mc::CommandContext*>(ctx));
 }
 
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12ClearAsyncRenderCtx(
+    JNIEnv* env, jclass) {
+    dx12mc::clearAsyncRenderCtx();
+}
+
 JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12IsListOpen(
     JNIEnv*, jclass, jlong ctx) {
     return dx12mc::isListOpen(reinterpret_cast<dx12mc::CommandContext*>(ctx)) ? JNI_TRUE : JNI_FALSE;

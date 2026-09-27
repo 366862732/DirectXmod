@@ -1,0 +1,402 @@
+---- Minecraft Crash Report ----
+// Hi. I'm Minecraft, and I'm a crashaholic.
+
+Time: 2026-09-27 13:35:13
+Description: Render Frame
+
+java.lang.IllegalStateException: dx12CreateBuffer: CreateCommittedResource(buffer): HRESULT 0x887A0005 — GetDeviceRemovedReason=HRESULT 0x887A0001 | msg[52](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[53](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[54](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[55](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[56](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[57](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[58](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[59](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[60](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[61](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[62](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[63](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[64](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[65](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[66](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[67](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[68](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[69](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[70](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[71](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[72](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[73](ID3D12CommandList::ClearRenderTargetView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.) | msg[74](ID3D12CommandQueue::ExecuteCommandLists: Command lists must be closed before execution.) | msg[75](ID3D12CommandList::ClearDepthStencilView: The application did not pass any clear value to resource creation. The clear operation is typically slower as a result; but will still clear to the desired value.)
+	at knot//com.xgdt.dx12.dx12.Dx12Native.dx12CreateBuffer(Native Method)
+	at knot//com.xgdt.dx12.dx12.Dx12GpuBuffer.<init>(Dx12GpuBuffer.java:25)
+	at knot//com.xgdt.dx12.dx12.Dx12TransientMemory.upload(Dx12TransientMemory.java:150)
+	at knot//com.xgdt.dx12.dx12.Dx12TransientMemory.uploadStaging(Dx12TransientMemory.java:115)
+	at knot//com.mojang.blaze3d.systems.TransientMemory.uploadStaging(TransientMemory.java:40)
+	at knot//com.mojang.blaze3d.systems.TransientMemory.uploadStaging(TransientMemory.java:36)
+	at knot//com.xgdt.dx12.dx12.Dx12CommandEncoderBackend.writeToBuffer(Dx12CommandEncoderBackend.java:323)
+	at knot//com.mojang.blaze3d.systems.CommandEncoder.writeToBuffer(CommandEncoder.java:237)
+	at knot//net.minecraft.client.renderer.GlobalSettingsUniform.update(GlobalSettingsUniform.java:45)
+	at knot//net.minecraft.client.renderer.GameRenderer.render(GameRenderer.java:421)
+	at knot//net.minecraft.client.Minecraft.renderFrame(Minecraft.java:1374)
+	at knot//net.minecraft.client.Minecraft.runTick(Minecraft.java:1269)
+	at knot//net.minecraft.client.Minecraft.run(Minecraft.java:959)
+	at knot//net.minecraft.client.main.Main.main(Main.java:292)
+	at net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider.launch(MinecraftGameProvider.java:517)
+	at net.fabricmc.loader.impl.launch.knot.Knot.launch(Knot.java:72)
+	at net.fabricmc.loader.impl.launch.knot.KnotClient.main(KnotClient.java:23)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at oolloo.jlw.Wrapper.invokeMain(Wrapper.java:112)
+	at oolloo.jlw.Wrapper.main(Wrapper.java:105)
+
+
+A detailed walkthrough of the error, its code path and all known details is as follows:
+---------------------------------------------------------------------------------------
+
+-- Head --
+Thread: Render thread
+Stacktrace:
+	at knot//com.xgdt.dx12.dx12.Dx12Native.dx12CreateBuffer(Native Method)
+	at knot//com.xgdt.dx12.dx12.Dx12GpuBuffer.<init>(Dx12GpuBuffer.java:25)
+	at knot//com.xgdt.dx12.dx12.Dx12TransientMemory.upload(Dx12TransientMemory.java:150)
+	at knot//com.xgdt.dx12.dx12.Dx12TransientMemory.uploadStaging(Dx12TransientMemory.java:115)
+	at knot//com.mojang.blaze3d.systems.TransientMemory.uploadStaging(TransientMemory.java:40)
+	at knot//com.mojang.blaze3d.systems.TransientMemory.uploadStaging(TransientMemory.java:36)
+	at knot//com.xgdt.dx12.dx12.Dx12CommandEncoderBackend.writeToBuffer(Dx12CommandEncoderBackend.java:323)
+	at knot//com.mojang.blaze3d.systems.CommandEncoder.writeToBuffer(CommandEncoder.java:237)
+	at knot//net.minecraft.client.renderer.GlobalSettingsUniform.update(GlobalSettingsUniform.java:45)
+	at knot//net.minecraft.client.renderer.GameRenderer.render(GameRenderer.java:421)
+
+-- Render Frame Details --
+Details:
+	Modules: 
+		ADVAPI32.dll:高级 Windows 32 基本 API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		AVRT.dll:多媒体实时运行时:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		CFGMGR32.dll:Configuration Manager DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		COMCTL32.dll:用户体验控件库:6.10 (WinBuild.160101.0800):Microsoft Corporation
+		COMDLG32.dll:Common Dialogs DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		CRYPT32.dll:加密 API32:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		CRYPTBASE.dll:Base cryptographic API DLL:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		CRYPTSP.dll:Cryptographic Service Provider API:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		CoreMessaging.dll:Microsoft CoreMessaging Dll:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		D3D12Core.dll:Direct3D 12 Core Runtime:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		D3D12SDKLayers.dll:Direct3D 12 SDK Layers:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		D3DCOMPILER_47.dll:Direct3D HLSL Compiler:10.0.26100.9457 (WinBuild.160101.0800):Microsoft Corporation
+		D3DSCache.dll:Microsoft (R) D3D 着色器缓存库:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		DBGHELP.DLL:Windows Image Helper:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		DEVOBJ.dll:Device Information Set DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		DNSAPI.dll:DNS 客户端 API DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		DSPARSE.dll:Active Directory Domain Services API:10.0.26100.1 (WinBuild.160101.0800):Microsoft Corporation
+		DWrite.dll:Microsoft DirectX 版式服务:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		DXGIDebug.dll:DXGI Debug Binary:10.0.26100.1882 (WinBuild.160101.0800):Microsoft Corporation
+		GDI32.dll:GDI Client DLL:10.0.26100.8328 (WinBuild.160101.0800):Microsoft Corporation
+		GLU32.dll:OpenGL 实用工具库 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		IMM32.DLL:Multi-User Windows IMM32 API Client DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		IPHLPAPI.DLL:IP 帮助程序 API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		KERNEL32.DLL:Windows NT 基本 API 客户端 DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		KERNELBASE.dll:Windows NT 基本 API 客户端 DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		MMDevApi.dll:MMDevice API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		MSCTF.dll:MSCTF 服务器 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		Microsoft.Internal.WarpPal.dll
+		NSI.dll:NSI User-mode interface DLL:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		NTASN1.dll:Microsoft ASN.1 API:10.0.26100.1 (WinBuild.160101.0800):Microsoft Corporation
+		NvMemMapStoragex.dll
+		OLEAUT32.dll:OLEAUT32.DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		Oleacc.dll:Active Accessibility Core Component:7.2.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		OpenAL.dll:Main implementation library:1.25.1:
+		POWRPROF.dll:电源配置文件帮助程序 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		PSAPI.DLL:Process Status Helper:10.0.26100.8521 (WinBuild.160101.0800):Microsoft Corporation
+		Pdh.dll:Windows 性能数据助手 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		RPCRT4.dll:远程过程调用运行时:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		SETUPAPI.dll:Windows 安装程序 API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		SHCORE.dll:SHCORE:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		SHELL32.dll:Windows Shell 公用 DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		SspiCli.dll:Security Support Provider Interface:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		UMPDC.dll:User Mode Power Dependency Coordinator:10.0.26100.8972 (WinBuild.160101.0800):Microsoft Corporation
+		USER32.dll:多用户 Windows 用户 API 客户端 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		USERENV.dll:Userenv:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		USP10.dll:Uniscribe Unicode script processor:10.0.26100.1 (WinBuild.160101.0800):Microsoft Corporation
+		VCRUNTIME140.dll:Microsoft® C Runtime Library:14.40.33810.0:Microsoft Corporation
+		VERSION.dll:Version Checking and File Installation Libraries:10.0.26100.1150 (WinBuild.160101.0800):Microsoft Corporation
+		WINMM.dll:MCI API DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		WINSTA.dll:Winstation Library:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		WINTRUST.dll:Microsoft Trust Verification APIs:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		WS2_32.dll:Windows Socket 2.0 32 位 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		Wtsapi32.dll:Windows Remote Desktop Session Host Server SDK APIs:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		amsi.dll:Anti-Malware Scan Interface:10.0.26100.7309 (WinBuild.160101.0800):Microsoft Corporation
+		bcrypt.dll:Windows 加密基元库:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		bcryptPrimitives.dll:Windows Cryptographic Primitives Library:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		clbcatq.dll:COM+ Configuration Catalog:2001.12.10941.16384 (WinBuild.160101.0800):Microsoft Corporation
+		combase.dll:用于 Windows 的 Microsoft COM:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		cryptnet.dll:Crypto Network Related API:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		d3d12.dll:Direct3D 12 Runtime:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		dbgcore.DLL:Windows Core Debugging Helpers:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		dcomp.dll:Microsoft DirectComposition Library:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		dinput8.dll:Microsoft DirectInput:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		directxdatabasehelper.dll:DirectXDatabaseHelper:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		drvstore.dll:Driver Store API:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		dwmapi.dll:Microsoft 桌面窗口管理器 API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		dx12_mc.dll
+		dxcore.dll:DXCore:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		dxgi.dll:DirectX Graphics Infrastructure:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		extnet.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		fastprox.dll:WMI Custom Marshaller:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		freetype.dll:Font Rendering Library:2.14.1:The FreeType Project
+		fwpuclnt.dll:FWP/IPsec 用户模式 API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		gdi32full.dll:GDI Client DLL:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		glfw.dll:GLFW 3.5.0 DLL:3.5.0:GLFW
+		icm32.dll:Microsoft Color Management Module (CMM):10.0.26100.9168 (WinBuild.160101.0800):Microsoft Corporation
+		imagehlp.dll:Windows NT Image Helper:10.0.26100.4202 (WinBuild.160101.0800):Microsoft Corporation
+		inputhost.dll:InputHost:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		instrument.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		java.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		javaw.exe:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		jemalloc.dll
+		jimage.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		jli.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		jna13386403267658336313.dll:JNA native library:7.0.2:Java(TM) Native Access (JNA)
+		jvm.dll:Zulu 64-Bit Server VM:25.0.3:Azul Systems Inc.
+		kernel.appcore.dll:AppModel API Host:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		libjlw-x86_64-1.4.3.dll
+		lwjgl.dll
+		lwjgl_opengl.dll
+		lwjgl_stb.dll
+		lwjgl_tinyfd.dll
+		lwjgl_vma.dll
+		management.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		management_ext.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		msasn1.dll:ASN.1 Runtime APIs:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		mscms.dll:Microsoft 颜色匹配系统 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		msvcp140.dll:Microsoft® C Runtime Library:14.40.33810.0:Microsoft Corporation
+		msvcp_win.dll:Microsoft® C Runtime Library:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		msvcrt.dll:Windows NT CRT DLL:7.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		mswsock.dll:Microsoft Windows Sockets 2.0 服务提供程序:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		napinsp.dll:电子邮件命名填充提供程序:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		ncrypt.dll:Windows NCrypt 路由器:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		net.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		nio.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		nlansp_c.dll:NLA Namespace Service Provider DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		ntdll.dll:NT 层 DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		ntmarta.dll:Windows NT MARTA 提供程序:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		nvgpucomp64.dll:NVIDIA GPU Compiler Driver, Version 617.14 :32.0.16.1714:NVIDIA Corporation
+		nvldumdx.dll:NVIDIA Driver Loader, Version 617.14 :32.0.16.1714:NVIDIA Corporation
+		nvoglv64.dll:NVIDIA Compatible OpenGL ICD:32.0.16.1714:NVIDIA Corporation
+		nvppex.dll:NVIDIA Driver, Version 617.14 :32.0.16.1714:NVIDIA Corporation
+		nvspcap64.dll:NVIDIA Game Proxy\x008\x16\x01FileVersion\x00\x001:11.0.9.251\x00\x008\x16\x01Produc:NVIDIA Corporation\x00\x00L$\x01FileDescriptio
+		nvwgf2umx.dll:NVIDIA D3D10 Driver, Version 617.14 :32.0.16.1714:NVIDIA Corporation
+		ole32.dll:用于 Windows 的 Microsoft OLE:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		opengl32.dll:OpenGL Client DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		perfos.dll:Windows 系统性能对象 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		perfproc.dll:Windows 系统进程性能对象 DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		pfclient.dll:SysMain Client:10.0.26100.4202 (WinBuild.160101.0800):Microsoft Corporation
+		profapi.dll:User Profile Basic API:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		rasadhlp.dll:Remote Access AutoDial Helper:10.0.26100.7920 (WinBuild.160101.0800):Microsoft Corporation
+		rsaenh.dll:Microsoft Enhanced Cryptographic Provider:10.0.26100.1 (WinBuild.160101.0800):Microsoft Corporation
+		sapi.dll:语音 API:5.3.31910.00 (WinBuild.160101.0800):Microsoft Corporation
+		sechost.dll:Host for SCM/SDDL/LSA Lookup APIs:10.0.26100.1 (WinBuild.160101.0800):Microsoft Corporation
+		shaderc.dll
+		shlwapi.dll:外壳简易实用工具库:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		spirv-cross.dll
+		sunmscapi.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		textinputframework.dll:"TextInputFramework.DYNLINK":10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		ucrtbase.dll:Microsoft® C Runtime Library:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		uxtheme.dll:Microsoft UxTheme 库:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		vcruntime140_1.dll:Microsoft® C Runtime Library:14.40.33810.0:Microsoft Corporation
+		verify.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+		vulkan-1.dll:Vulkan Loader:1.4.341.0:
+		wbemcomn.dll:WMI:10.0.26100.7920 (WinBuild.160101.0800):Microsoft Corporation
+		wbemprox.dll:WMI:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		wbemsvc.dll:WMI:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		win32u.dll:Win32u:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		windows.staterepositorycore.dll:Windows StateRepository API Core:10.0.26100.9444 (WinBuild.160101.0800):Microsoft Corporation
+		windows.storage.dll:Microsoft WinRT Storage API:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		winrnr.dll:LDAP RnR Provider DLL:10.0.26100.9278 (WinBuild.160101.0800):Microsoft Corporation
+		wldp.dll:Windows 锁定策略:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		wshbth.dll:Windows Sockets Helper DLL:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		wshunix.dll:AF_UNIX Winsock2 Helper DLL:10.0.26100.1 (WinBuild.160101.0800):Microsoft Corporation
+		xinput1_4.dll:Microsoft 公共控制器 API:10.0.26100.8875 (WinBuild.160101.0800):Microsoft Corporation
+		zip.dll:Zulu Platform x64 Architecture:25.0.3:Azul Systems Inc.
+Stacktrace:
+	at knot//net.minecraft.client.Minecraft.runTick(Minecraft.java:1269)
+	at knot//net.minecraft.client.Minecraft.run(Minecraft.java:959)
+	at knot//net.minecraft.client.main.Main.main(Main.java:292)
+	at net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider.launch(MinecraftGameProvider.java:517)
+	at net.fabricmc.loader.impl.launch.knot.Knot.launch(Knot.java:72)
+	at net.fabricmc.loader.impl.launch.knot.KnotClient.main(KnotClient.java:23)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at oolloo.jlw.Wrapper.invokeMain(Wrapper.java:112)
+	at oolloo.jlw.Wrapper.main(Wrapper.java:105)
+
+-- Uptime --
+Details:
+	JVM uptime: 10.239s
+	Wall uptime: 3.588s
+	High-res time: 2.948s
+	Client ticks: 33 ticks / 1.650s
+Stacktrace:
+	at knot//net.minecraft.client.Minecraft.fillReport(Minecraft.java:2496)
+	at knot//net.minecraft.client.Minecraft.emergencySaveAndCrash(Minecraft.java:1008)
+	at knot//net.minecraft.client.Minecraft.run(Minecraft.java:980)
+	at knot//net.minecraft.client.main.Main.main(Main.java:292)
+	at net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider.launch(MinecraftGameProvider.java:517)
+	at net.fabricmc.loader.impl.launch.knot.Knot.launch(Knot.java:72)
+	at net.fabricmc.loader.impl.launch.knot.KnotClient.main(KnotClient.java:23)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at oolloo.jlw.Wrapper.invokeMain(Wrapper.java:112)
+	at oolloo.jlw.Wrapper.main(Wrapper.java:105)
+
+-- Last reload --
+Details:
+	Reload number: 1
+	Reload reason: initial
+	Finished: No
+	Packs: vanilla, fabric-advancement-api-v1, fabric-api, fabric-api-base, fabric-api-lookup-api-v1, fabric-biome-api-v1, fabric-block-api-v1, fabric-block-getter-api-v2, fabric-command-api-v2, fabric-content-registries-v0, fabric-convention-tags-v2, fabric-crash-report-info-v1, fabric-creative-tab-api-v1, fabric-data-attachment-api-v1, fabric-data-generation-api-v1, fabric-debug-api-v1, fabric-dimensions-v1, fabric-entity-events-v1, fabric-events-interaction-v0, fabric-game-rule-api-v1, fabric-item-api-v1, fabric-key-mapping-api-v1, fabric-lifecycle-events-v1, fabric-loot-api-v3, fabric-menu-api-v1, fabric-message-api-v1, fabric-model-loading-api-v1, fabric-networking-api-v1, fabric-object-builder-api-v1, fabric-particles-v1, fabric-permission-api-v1, fabric-recipe-api-v1, fabric-registry-sync-v0, fabric-renderer-api-v1, fabric-renderer-indigo, fabric-rendering-fluids-v1, fabric-rendering-v1, fabric-resource-conditions-api-v1, fabric-resource-loader-v0, fabric-resource-loader-v1, fabric-screen-api-v1, fabric-serialization-api-v1, fabric-sound-api-v1, fabric-tag-api-v1, fabric-transfer-api-v1, fabric-transitive-access-wideners-v1, fabricloader, gl4dx12, modmenu, placeholder-api
+	Recovery: Yes
+	Recovery reason: java.util.concurrent.CompletionException: java.lang.IllegalStateException: dx12CopyBuffer: copyBufferToBuffer: no open command list
+	at java.base/java.util.concurrent.CompletableFuture.wrapInCompletionException(CompletableFuture.java:323)
+	at java.base/java.util.concurrent.CompletableFuture.encodeThrowable(CompletableFuture.java:359)
+	at java.base/java.util.concurrent.CompletableFuture.completeThrowable(CompletableFuture.java:364)
+	at java.base/java.util.concurrent.CompletableFuture$UniAccept.tryFire(CompletableFuture.java:743)
+	at java.base/java.util.concurrent.CompletableFuture$Completion.run(CompletableFuture.java:503)
+	at knot//net.minecraft.server.packs.resources.ProfiledReloadInstance.lambda$profiledExecutor$1(ProfiledReloadInstance.java:58)
+	at knot//net.minecraft.server.packs.resources.SimpleReloadInstance.lambda$prepareTasks$3(SimpleReloadInstance.java:59)
+	at knot//net.minecraft.util.thread.BlockableEventLoop.doRunTask(BlockableEventLoop.java:173)
+	at knot//net.minecraft.util.thread.ReentrantBlockableEventLoop.doRunTask(ReentrantBlockableEventLoop.java:23)
+	at knot//net.minecraft.util.thread.BlockableEventLoop.pollTask(BlockableEventLoop.java:147)
+	at knot//net.minecraft.util.thread.BlockableEventLoop.runAllTasks(BlockableEventLoop.java:127)
+	at knot//net.minecraft.client.Minecraft.runTick(Minecraft.java:1235)
+	at knot//net.minecraft.client.Minecraft.run(Minecraft.java:959)
+	at knot//net.minecraft.client.main.Main.main(Main.java:292)
+	at net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider.launch(MinecraftGameProvider.java:517)
+	at net.fabricmc.loader.impl.launch.knot.Knot.launch(Knot.java:72)
+	at net.fabricmc.loader.impl.launch.knot.KnotClient.main(KnotClient.java:23)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at oolloo.jlw.Wrapper.invokeMain(Wrapper.java:112)
+	at oolloo.jlw.Wrapper.main(Wrapper.java:105)
+Caused by: java.lang.IllegalStateException: dx12CopyBuffer: copyBufferToBuffer: no open command list
+	at knot//com.xgdt.dx12.dx12.Dx12Native.dx12CopyBuffer(Native Method)
+	at knot//com.xgdt.dx12.dx12.Dx12TransientMemory.upload(Dx12TransientMemory.java:161)
+	at knot//com.xgdt.dx12.dx12.Dx12TransientMemory.uploadStaging(Dx12TransientMemory.java:115)
+	at knot//com.mojang.blaze3d.systems.TransientMemory.uploadStaging(TransientMemory.java:40)
+	at knot//com.mojang.blaze3d.systems.TransientMemory.uploadStaging(TransientMemory.java:36)
+	at knot//net.minecraft.client.renderer.texture.CubeMapTexture.doLoad(CubeMapTexture.java:53)
+	at knot//net.minecraft.client.renderer.texture.ReloadableTexture.apply(ReloadableTexture.java:34)
+	at knot//net.minecraft.client.renderer.texture.TextureManager.lambda$reload$2(TextureManager.java:144)
+	at java.base/java.util.concurrent.CompletableFuture$UniAccept.tryFire(CompletableFuture.java:739)
+	... 17 more
+
+
+-- System Details --
+Details:
+	Minecraft Version: 26.2
+	Minecraft Version ID: 26.2
+	Operating System: Windows 11 (amd64) version 10.0
+	Java Version: 25.0.3, Azul Systems, Inc.
+	Java VM Version: OpenJDK 64-Bit Server VM (mixed mode, sharing), Azul Systems, Inc.
+	Memory: 7465861120 bytes (7120 MiB) / 8589934592 bytes (8192 MiB) up to 8589934592 bytes (8192 MiB)
+	Memory (heap): init: 8192MiB, used: 1066MiB, committed: 8192MiB, max: 8192MiB
+	Memory (non-head): init: 007MiB, used: 165MiB, committed: 167MiB, max: 000MiB
+	CPUs: 20
+	Processor Vendor: GenuineIntel
+	Processor Name: 12th Gen Intel(R) Core(TM) i7-12700KF
+	Identifier: Intel64 Family 6 Model 151 Stepping 2
+	Microarchitecture: Alder Lake
+	Frequency (GHz): 3.61
+	Number of physical packages: 1
+	Number of physical CPUs: 12
+	Number of logical CPUs: 20
+	Graphics card #0 name: NVIDIA GeForce RTX 4070
+	Graphics card #0 vendor: NVIDIA
+	Graphics card #0 VRAM (MiB): 12282.00
+	Graphics card #0 deviceId: VideoController1
+	Graphics card #0 versionInfo: 32.0.16.1714
+	Memory slot #0 capacity (MiB): 16384.00
+	Memory slot #0 clockSpeed (GHz): 4.80
+	Memory slot #0 type: DDR5
+	Memory slot #1 capacity (MiB): 16384.00
+	Memory slot #1 clockSpeed (GHz): 4.80
+	Memory slot #1 type: DDR5
+	Memory slot #2 capacity (MiB): 16384.00
+	Memory slot #2 clockSpeed (GHz): 4.80
+	Memory slot #2 type: DDR5
+	Memory slot #3 capacity (MiB): 16384.00
+	Memory slot #3 clockSpeed (GHz): 4.80
+	Memory slot #3 type: DDR5
+	Virtual memory max (MiB): 66316.42
+	Virtual memory used (MiB): 32544.92
+	Swap memory total (MiB): 1024.00
+	Swap memory used (MiB): 0.00
+	Space in storage for jna.tmpdir (MiB): available: 214098.50, total: 754795.69
+	Space in storage for org.lwjgl.system.SharedLibraryExtractPath (MiB): available: 214098.50, total: 754795.69
+	Space in storage for io.netty.native.workdir (MiB): available: 214098.50, total: 754795.69
+	Space in storage for java.io.tmpdir (MiB): available: 97098.03, total: 195697.00
+	Space in storage for workdir (MiB): available: 214098.50, total: 754795.69
+	Operating System Version: Microsoft Windows 11 build 26200
+	Process Elevated: false
+	Process Loads: Uptime: 10s, user: 40s (414.94%), kernel: 9s (90.96%), total: 49s (505.90%)
+	Process Virtual Size (MiB): 2026.36
+	Process Resident Size (MiB): 676.48
+	JVM Flags: 5 total; -XX:+UseZGC -XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump -Xmn1228m -Xmx8192m -Xms8192m
+	Debug Flags: 0 total; 
+	Fabric Mods: 
+		fabric-api: Fabric API 0.161.0+26.2
+			fabric-advancement-api-v1: Fabric Advancement API (v1) 1.0.0+58719a3b9e
+			fabric-api-base: Fabric API Base 2.0.4+ece063239e
+			fabric-api-lookup-api-v1: Fabric API Lookup API (v1) 2.0.18+11e1c9a39e
+			fabric-biome-api-v1: Fabric Biome API (v1) 18.0.6+c7bd5b8e9e
+			fabric-block-api-v1: Fabric Block API (v1) 3.1.0+53515aab9e
+			fabric-block-getter-api-v2: Fabric BlockGetter API (v2) 2.0.7+ec56b6019e
+			fabric-command-api-v2: Fabric Command API (v2) 3.1.0+00cb03469e
+			fabric-content-registries-v0: Fabric Content Registries (v0) 11.3.2+37b1aa249e
+			fabric-convention-tags-v2: Fabric Convention Tags (v2) 4.7.1+1f023a9e9e
+			fabric-crash-report-info-v1: Fabric Crash Report Info (v1) 1.0.5+086d547a9e
+			fabric-creative-tab-api-v1: Fabric Creative Tab API (v1) 5.0.15+6468574f9e
+			fabric-data-attachment-api-v1: Fabric Data Attachment API (v1) 2.2.19+515ac5339e
+			fabric-data-generation-api-v1: Fabric Data Generation API (v1) 25.6.0+c0da0b829e
+			fabric-debug-api-v1: Fabric Debug API (v1) 1.0.2+c792624d9e
+			fabric-dimensions-v1: Fabric Dimensions API (v1) 5.1.12+515ac5339e
+			fabric-entity-events-v1: Fabric Entity Events (v1) 5.0.5+06488ac19e
+			fabric-events-interaction-v0: Fabric Events Interaction (v0) 5.2.8+515ac5339e
+			fabric-game-rule-api-v1: Fabric Game Rule API (v1) 4.0.8+46a6d00c9e
+			fabric-item-api-v1: Fabric Item API (v1) 14.5.0+c68f6cbe9e
+			fabric-key-mapping-api-v1: Fabric Key Mapping API (v1) 2.0.5+e2bdee789e
+			fabric-lifecycle-events-v1: Fabric Lifecycle Events (v1) 4.1.4+29b6eb019e
+			fabric-loot-api-v3: Fabric Loot API (v3) 3.0.17+06488ac19e
+			fabric-menu-api-v1: Fabric Menu API (v1) 2.0.17+086d547a9e
+			fabric-message-api-v1: Fabric Message API (v1) 7.0.8+bb2ed3f79e
+			fabric-model-loading-api-v1: Fabric Model Loading API (v1) 8.0.17+c80601bb9e
+			fabric-networking-api-v1: Fabric Networking API (v1) 6.3.4+2989c6a09e
+			fabric-object-builder-api-v1: Fabric Object Builder API (v1) 24.1.1+6fcd5f039e
+			fabric-particles-v1: Fabric Particles (v1) 5.0.19+d1756aa99e
+			fabric-permission-api-v1: Fabric Permission API (v1) 1.0.5+e442d8d09e
+			fabric-recipe-api-v1: Fabric Recipe API (v1) 9.0.22+11e1c9a39e
+			fabric-registry-sync-v0: Fabric Registry Sync (v0) 7.1.1+c7bd5b8e9e
+			fabric-renderer-api-v1: Fabric Renderer API (v1) 14.1.4+2b0d8a229e
+			fabric-renderer-indigo: Fabric Renderer - Indigo 9.1.4+2b0d8a229e
+			fabric-rendering-fluids-v1: Fabric Rendering Fluids (v1) 6.0.4+06488ac19e
+			fabric-rendering-v1: Fabric Rendering (v1) 25.3.3+515ac5339e
+			fabric-resource-conditions-api-v1: Fabric Resource Conditions API (v1) 6.1.0+10e9a28b9e
+			fabric-resource-loader-v0: Fabric Resource Loader (v0) 3.3.20+4fc5413f9e
+			fabric-resource-loader-v1: Fabric Resource Loader (v1) 2.0.13+9edec1269e
+			fabric-screen-api-v1: Fabric Screen API (v1) 5.2.1+5087f8249e
+			fabric-serialization-api-v1: Fabric Serialization API (v1) 2.0.4+11a26f319e
+			fabric-sound-api-v1: Fabric Sound API (v1) 2.0.5+11a26f319e
+			fabric-tag-api-v1: Fabric Tag API (v1) 2.1.4+515ac5339e
+			fabric-transfer-api-v1: Fabric Transfer API (v1) 8.0.13+11dbb7d79e
+			fabric-transitive-access-wideners-v1: Fabric Transitive Access Wideners (v1) 8.1.4+67c847259e
+		fabricloader: Fabric Loader 0.19.5
+			mixinextras: MixinExtras 0.5.5
+		gl4dx12: DirectXMod 0.1.0
+		java: OpenJDK 64-Bit Server VM 25
+		minecraft: Minecraft 26.2
+		modmenu: Mod Menu 20.0.3
+		placeholder-api: Placeholder API 3.1.0-beta.1+26.2
+	Launched Version: 26.2-Fabric_0.19.3
+	Launcher name: PCLCE
+	Backend library: LWJGL version 3.4.1-snapshot
+	Window size: 854x480
+	Surface Info: acquired, suboptimal, IMMEDIATE, 854 x 480
+	GFLW Platform: win32
+	Graphics Device: NVIDIA GeForce RTX 4070
+	Graphics Backend: DX12
+	Graphics Vendor: D3D12
+	Graphics Drivers: D3D12 driver
+	Graphics Device Extensions: 
+	Graphics Device Type: DISCRETE
+	Graphics Device Features: DeviceFeatures[shaderDrawParameters=true, multiDrawDirectInterleaved=true, multiDrawDirectSeparate=false, multiDrawIndirect=true, drawIndirect=true, nonZeroFirstInstance=true, persistentMapping=true]
+	GL debug messages: <debugging unavailable>
+	Is Modded: Definitely; Client brand changed to 'fabric'
+	Universe: 400921fb54442d18
+	Type: Client
+	Transparency: regular
+	Render Distance: 11/11 chunks
+	Narrator config: OFF
+	Narrator status: true
+	Resource Packs: vanilla, fabric-advancement-api-v1, fabric-api, fabric-api-base, fabric-api-lookup-api-v1, fabric-biome-api-v1, fabric-block-api-v1, fabric-block-getter-api-v2, fabric-command-api-v2, fabric-content-registries-v0, fabric-convention-tags-v2, fabric-crash-report-info-v1, fabric-creative-tab-api-v1, fabric-data-attachment-api-v1, fabric-data-generation-api-v1, fabric-debug-api-v1, fabric-dimensions-v1, fabric-entity-events-v1, fabric-events-interaction-v0, fabric-game-rule-api-v1, fabric-item-api-v1, fabric-key-mapping-api-v1, fabric-lifecycle-events-v1, fabric-loot-api-v3, fabric-menu-api-v1, fabric-message-api-v1, fabric-model-loading-api-v1, fabric-networking-api-v1, fabric-object-builder-api-v1, fabric-particles-v1, fabric-permission-api-v1, fabric-recipe-api-v1, fabric-registry-sync-v0, fabric-renderer-api-v1, fabric-renderer-indigo, fabric-rendering-fluids-v1, fabric-rendering-v1, fabric-resource-conditions-api-v1, fabric-resource-loader-v0, fabric-resource-loader-v1, fabric-screen-api-v1, fabric-serialization-api-v1, fabric-sound-api-v1, fabric-tag-api-v1, fabric-transfer-api-v1, fabric-transitive-access-wideners-v1, fabricloader, gl4dx12, modmenu, placeholder-api
+	Sound Cache: 0 bytes in 0 buffers
+	Current Language: zh_cn
+	Locale: zh_SG
+	System encoding: GBK
+	File encoding: COMPAT
+	CPU: 20x 12th Gen Intel(R) Core(TM) i7-12700KF

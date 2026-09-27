@@ -304,6 +304,8 @@ bool asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs, std::string&
 bool asyncRenderIsRecordingReady(CommandContext* ctx);
 // 主线程通知渲染线程：所有命令已入队（设置 gEvtCommandsReady）。
 void asyncSendCommandsReady(CommandContext* ctx);
+// 主动清除 gAsyncRenderCtx（供 Java 侧超时降级时同步调用）。
+void clearAsyncRenderCtx();
 // 查询命令列表是否已打开。
 bool isListOpen(CommandContext* ctx);
 
