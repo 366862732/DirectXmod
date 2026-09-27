@@ -584,6 +584,8 @@ inline Dx12Surface* getActiveSurface() { return gActiveSurface; }
 extern std::thread gRenderThread;
 // P33：渲染线程运行标志（供 destroySurface 判断是否需要等待线程退出）
 extern bool gRenderRunning;
+// P33：当前正在处理的 ctx（nullptr = 无活动帧），供诊断读回函数检测 ASYNC 管道活跃。
+extern CommandContext* gAsyncRenderCtx;
 
 // 从 rtvHeap 分配一个 RTV CPU 句柄（surface 的 back buffer 用）。
 D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err);

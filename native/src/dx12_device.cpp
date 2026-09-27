@@ -3097,6 +3097,10 @@ bool drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
 // ---------------------------------------------------------------------------
 
 void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
+    // P33: 禁止在 ASYNC 管道活跃时执行读回——static command list 会竞争
+    //      gCtx.queue 与 render thread 的 submitCommandList，触发
+    //      "Command lists must be closed before execution" → device removed。
+    if (gAsyncRenderCtx != nullptr) return;
     if (!tex || tex->kind != Dx12Object::Kind::Texture || !tex->resource) return;
     std::string err;
     if (!deviceWaitIdle(err)) return;
@@ -3342,6 +3346,9 @@ void dbgDumpPixelsToFile(const uint8_t* rgba, UINT w, UINT h, UINT64 pitch,
 }
 
 void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const char* tag) {
+    // P33: 禁止在 ASYNC 管道活跃时执行读回——static command list 会竞争
+    //      gCtx.queue 与 render thread 的 submitCommandList。
+    if (gAsyncRenderCtx != nullptr) return;
     if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) return;
     if (offset < 0 || offset >= buf->size) return;
     long long avail = buf->size - offset;
@@ -3799,9 +3806,6 @@ HANDLE gEvtRecordingReady = nullptr;  // 渲染线程→主线程：可以 push 
 HANDLE gEvtCommandsReady  = nullptr;  // 主线程→渲染线程：所有命令已入队
 HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：已提交，可循环
 
-// 当前正在处理的 ctx（nullptr = 无活动帧）
-CommandContext* gAsyncRenderCtx = nullptr;
-
 // 渲染线程函数
 static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -3987,6 +3991,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 std::thread gRenderThread;
 // P33：渲染线程运行标志（外部可访问）
 bool gRenderRunning = false;
+// P33：当前正在处理的 ctx（外部可访问，供诊断读回检测 ASYNC 管道活跃）
+CommandContext* gAsyncRenderCtx = nullptr;
 
 // 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。
 // 用于 destroySurface 场景：确保渲染线程不再并发操作 swapchain 后再调用 deviceWaitIdle。
