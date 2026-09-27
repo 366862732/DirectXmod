@@ -1253,7 +1253,12 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
     // P33 async：若 waitForValue > 0，先等 GPU 完成对应提交后再 Reset allocator。
     // 这是对齐官方 Vulkan 双缓冲模式的关键——Vulkan 在 signalSemaphore(idx) 后
     // awaitSubmitCompletion(idx-2) 再 reset command pool，保证 GPU 不再引用。
-    // D3D12 等效：Signal(queueFence, N) → beginCommandList 等 queueFence=N-1 完成。
+    // D3D12 等效：Signal(fence, N) → beginCommandList 等 fence=N 完成。
+    //
+    // P40 fix：改用 per-command-list fence（ctx->fence）而非 queue fence。
+    // queue fence 仅表示命令已入队执行，GPU 可能仍在处理；
+    // per-command-list fence 在 GPU 真正执行完该命令列表后才 signal，
+    // 保证 allocator 不再被 GPU 引用，Reset 不会 hang。
     if (waitForValue > 0) {
         UINT64 cv = 0ULL;
         if (gCtx.queueFence) cv = gCtx.queueFence->GetCompletedValue();
@@ -1265,6 +1270,17 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
             return false;
         }
         dbgLog("beginCommandListWithWait: wait done");
+    }
+    // P40：等待 per-command-list fence 完成，确保 GPU 已实际执行完引用该
+    // allocator 的所有命令，再 Reset——避免 allocator->Reset() 内部 hang。
+    if (waitForValue > 0) {
+        std::string fenceErr;
+        if (!waitForFenceValue(ctx, waitForValue, 5'000'000'000ULL, fenceErr)) {
+            dbgLog("beginCommandListWithWait: per-list fence wait FAILED: %s", fenceErr.c_str());
+            return false;
+        }
+        dbgLog("beginCommandListWithWait: per-list fence wait done val=%llu",
+            (unsigned long long)waitForValue);
     }
     dbgLog("beginCommandListWithWait: begin allocator reset");
     HRESULT hr = ctx->currentAllocator()->Reset();
@@ -1381,6 +1397,9 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
         // P33 async：记录本次 submit 的 queue fence 值，供 beginCommandListWithWait
         // 等待。下一帧 begin 时传入此值，确保 GPU 完成当前帧后才 Reset allocator。
         ctx->lastSubmitQueueFence = qv;
+        // P40：记录 per-command-list fence 值，确保 GPU 实际执行完引用该
+        // allocator 的所有命令后再 Reset——这是避免 hang 的关键同步点。
+        ctx->prevFenceValue = value;
         dbgLog("renderThread: submitCommandList done ctx=%p value=%llu qf=%llu lastQF=%llu",
             (void*)ctx, (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue,
             (unsigned long long)ctx->lastSubmitQueueFence);
@@ -3801,8 +3820,9 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         CommandContext* ctx = gAsyncRenderCtx;
         std::string err;
 
-        // 获取本帧应等待的 queue fence 值（= 上一帧 submit 时的值）
-        UINT64 waitForValue = ctx->lastSubmitQueueFence;
+        // P40：使用 per-command-list fence 值（而非 queue fence）作为等待目标。
+        // queue fence 仅表示命令已入队，per-list fence 保证 GPU 真正执行完毕。
+        UINT64 waitForValue = ctx->prevFenceValue;
         dbgLog("renderThread: begin wait=%llu ctx=%p",
             (unsigned long long)waitForValue, (void*)ctx);
 
@@ -3822,6 +3842,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             // 之后指数退避，防止日志爆炸和 CPU 空转。
             if (acquireFailCount <= 3) {
                 dbgLog("renderThread: acquireSurface FAILED(%d): %s", acquireFailCount, err.c_str());
+                // P41：surface 可能被销毁/重建，清除上下文让主线程用新 surface 重试
+                if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
                 SetEvent(gEvtSubmitDone);
                 continue;
             }
@@ -3832,6 +3854,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
                     acquireFailCount, err.c_str(), (void*)surf,
                     surf->currentImageIndex, (UINT)surf->backBuffers.size());
             }
+            // P41：长时间 acquire 失败也清除上下文
+            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
             Sleep(waitMs);
             SetEvent(gEvtSubmitDone);
             continue;
@@ -3846,6 +3870,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
                 dbgLog("renderThread: GPU wait timeout, skipping frame");
                 // 释放 surface 并跳过（render thread 此时仍运行，不等待 GPU）
                 destroySurfaceNoWaitIdle(getActiveSurface());
+                // P41：清除卡住的上下文，否则下一个 asyncBeginFrame 会被 "previous frame not complete" 拒绝
+                if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
                 SetEvent(gEvtSubmitDone);
                 continue;
             }
@@ -3862,6 +3888,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         if (!beginCommandListWithWait(ctx, waitForValue, err)) {
             dbgLog("renderThread: beginCommandList FAILED: %s", err.c_str());
             destroySurfaceNoWaitIdle(getActiveSurface());
+            // P41：清除卡住的上下文
+            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
             SetEvent(gEvtSubmitDone);
             continue;
         }
@@ -3870,13 +3898,26 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         dbgLog("renderThread: signaling recordingReady ctx=%p", (void*)ctx);
         SetEvent(gEvtRecordingReady);
 
-        // 步骤 6：等待主线程完成命令录制（30s 超时，退出时也能响应）
+        // 步骤 6：等待主线程完成命令录制（超时保护：5s 后放弃当前帧）
         dbgLog("renderThread: waiting for gEvtCommandsReady ctx=%p", (void*)ctx);
+        int commandsWaitLoops = 0;
         for (;;) {
             if (!gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
             if (r == WAIT_OBJECT_0) { dbgLog("renderThread: commandsReady ctx=%p", (void*)ctx); break; }
             if (r == WAIT_TIMEOUT && !gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
+            // P41：超时保护——5s 内未收到 CommandsReady，说明主线程卡死，放弃本帧
+            if (++commandsWaitLoops >= 10) {
+                dbgLog("renderThread: commandsReady timeout after %ds, aborting frame ctx=%p",
+                    commandsWaitLoops * 500 / 1000, (void*)ctx);
+                if (ctx->listOpen) {
+                    endCommandList(ctx, err);
+                    if (gOpenListCount > 0) --gOpenListCount;
+                }
+                gAsyncRenderCtx = nullptr;
+                SetEvent(gEvtSubmitDone);
+                break;
+            }
         }
 
         // 步骤 7：end + submit + present
@@ -3885,6 +3926,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         if (value == 0) {
             dbgLog("renderThread: submitCommandList FAILED: %s", submitErr.c_str());
             destroySurfaceNoWaitIdle(getActiveSurface());
+            // P41：清除卡住的上下文
+            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
             SetEvent(gEvtSubmitDone);
             continue;
         }
@@ -4031,8 +4074,8 @@ bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
     ResetEvent(gEvtSubmitDone);
     // Signal start
     SetEvent(gEvtBeginFrame);
-    dbgLog("asyncRenderBeginFrame: signaled beginFrame ctx=%p lastQF=%llu",
-        (void*)ctx, (unsigned long long)ctx->lastSubmitQueueFence);
+    dbgLog("asyncRenderBeginFrame: signaled beginFrame ctx=%p prevFence=%llu",
+        (void*)ctx, (unsigned long long)ctx->prevFenceValue);
     return true;
 }
 

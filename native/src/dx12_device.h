@@ -231,6 +231,13 @@ struct CommandContext {
     // 初始值 0 表示"无需等待"（首帧或 createBuffer 一次性路径）。
     UINT64 lastSubmitQueueFence = 0;
 
+    // P40：记录上一帧 submit 时写入的 per-command-list fence 值。
+    // beginCommandListWithWait 等待此 fence 完成，确保 GPU 已实际执行完
+    // 引用该 allocator 的所有命令，再 Reset allocator——这是避免 hang 的关键。
+    // 与 lastSubmitQueueFence 的区别：queue fence 仅表示命令已入队，
+    // per-command-list fence 表示 GPU 已完成执行。
+    UINT64 prevFenceValue = 0;
+
     // 本 command list 内已过渡的资源状态（资源指针 -> 当前 D3D12 状态）。
     // 初始态 = 资源创建时的状态（texture=COMMON，buffer=initialStateFor）。
     // beginCommandList 清空：因为 submit 同步等待完成，上一 command list

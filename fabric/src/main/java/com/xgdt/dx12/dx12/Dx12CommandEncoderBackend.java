@@ -467,12 +467,22 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
         // 步骤 3：等待渲染线程到达 RECORDING_READY（带超时保护，防止死锁）
         long startTime = System.nanoTime();
-        long timeoutNs = 10_000_000_000L; // 10 秒超时
+        long timeoutNs = 5_000_000_000L; // 5 秒超时（原10秒太长，会拖慢整体响应）
         while (!Dx12Native.dx12AsyncRenderIsRecordingReady(this.ctx)) {
             long elapsed = System.nanoTime() - startTime;
             if (elapsed > timeoutNs) {
-                throw new RuntimeException("[dx12] asyncRenderIsRecordingReady timeout after "
-                    + (elapsed / 1_000_000) + "ms — renderer may be stuck");
+                // P41：渲染线程卡死，降级到 SYNC 模式避免整个游戏崩溃
+                System.err.println("[dx12] [P41] asyncRenderIsRecordingReady timeout after "
+                    + (elapsed / 1_000_000) + "ms — falling back to SYNC, ctx=0x"
+                    + Long.toHexString(this.ctx));
+                System.err.flush();
+                Dx12Native.dx12BeginCommandList(this.ctx);
+                Dx12Native.dx12Submit(this.ctx);
+                this.transientMemory.rotate();
+                List<Runnable> run = this.pendingCallbacks;
+                this.pendingCallbacks.clear();
+                for (Runnable callback : run) { callback.run(); }
+                return;
             }
             try {
                 Thread.sleep(1);
