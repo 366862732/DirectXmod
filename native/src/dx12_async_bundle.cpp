@@ -16,11 +16,13 @@ D3D12_PRIMITIVE_TOPOLOGY bundlePrimitiveTopology(int ordinal) {
     }
 }
 
-bool BundleRecorder::init(ID3D12Device* device, UINT workerId) {
+bool BundleRecorder::init(ID3D12Device* device, ID3D12DescriptorHeap* heap,
+    UINT workerId) {
     if (!device) return false;
 
     m_device = device;
     m_workerId = workerId;
+    m_heap = heap;  // 非拥有；bundle 内 SetGraphicsRootDescriptorTable 前须自设该堆
 
     for (UINT i = 0; i < kBundleSlotCount; ++i) {
         HRESULT hr = device->CreateCommandAllocator(
@@ -67,6 +69,16 @@ bool BundleRecorder::begin(UINT frameSlot, UINT64 frameValue) {
     if (FAILED(hr)) return false;
     hr = m_bundle->Reset(m_allocators[slot].Get(), nullptr);
     if (FAILED(hr)) return false;
+
+    // D3D12 bundle 不继承父命令列表的描述符堆。本 bundle 会录制
+    // SetGraphicsRootDescriptorTable，必须在此（任何描述符表命令之前、且整段
+    // bundle 仅一次）显式绑定 shader-visible 堆；否则运行时解析 GPU 句柄时
+    // 读到空堆指针（命令列表成员 +0x28）而访问冲突崩溃。
+    // 该堆必须与父命令列表执行本 bundle 时绑定的堆完全一致。
+    if (m_heap) {
+        ID3D12DescriptorHeap* heaps[] = { m_heap.Get() };
+        m_bundle->SetDescriptorHeaps(1, heaps);
+    }
 
     m_recording = true;
     m_rootSig = nullptr;
@@ -174,13 +186,14 @@ bool BundleRecorder::drawIndirect(ID3D12Resource* commands, UINT64 offset,
     return true;
 }
 
-bool BundleRecorderPool::init(ID3D12Device* device, UINT workerCount) {
+bool BundleRecorderPool::init(ID3D12Device* device, ID3D12DescriptorHeap* heap,
+    UINT workerCount) {
     if (!device || workerCount == 0) return false;
     shutdown();
     m_recorders.reserve(workerCount);
     for (UINT i = 0; i < workerCount; ++i) {
         std::unique_ptr<BundleRecorder> rec(new BundleRecorder());
-        if (!rec->init(device, i)) {
+        if (!rec->init(device, heap, i)) {
             shutdown();
             return false;
         }

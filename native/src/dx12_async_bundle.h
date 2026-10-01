@@ -10,7 +10,9 @@
 //   - 任何 Copy（CopyBufferRegion / CopyTextureRegion / CopyResource / CopyDescriptors*）
 //   - ResourceBarrier / ResolveSubresource / BeginQuery / EndQuery
 //   - OMSetRenderTargets / RSSetViewports / RSSetScissorRects
-//   - ExecuteBundle / render pass begin/end / SetDescriptorHeaps（须由父列表负责）
+//   - ExecuteBundle / render pass begin/end / 二次 SetDescriptorHeaps
+//     （bundle 不继承父列表的描述符堆；本类在 begin() 内统一 SetDescriptorHeaps 一次，
+//      因为会录制 SetGraphicsRootDescriptorTable；父列表负责在别处的堆设置）
 // bundle 内允许：SetPipelineState、SetGraphicsRootSignature、
 // SetGraphicsRootDescriptorTable、IASetVertexBuffers/IASetIndexBuffer/
 // IASetPrimitiveTopology、DrawInstanced/DrawIndexedInstanced、ExecuteIndirect。
@@ -65,7 +67,10 @@ public:
 
     // 创建 kBundleSlotCount 组 BUNDLE allocator + command list（初始为 closed）。
     // 现有 ExecuteIndirect 用的 command signature 从 DeviceContext 读取。
-    bool init(ID3D12Device* device, UINT workerId);
+    // heap 为 DeviceContext::drawHeap（shader-visible CBV_SRV_UAV，非拥有）；
+    // bundle 内若要编辑描述符表（SetGraphicsRootDescriptorTable），必须自行
+    // SetDescriptorHeaps 一次，否则运行时解析 GPU 句柄时空堆指针解引用崩溃。
+    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerId);
 
     bool valid() const { return m_bundle != nullptr; }
     UINT workerId() const { return m_workerId; }
@@ -124,6 +129,9 @@ private:
     ComPtr<ID3D12GraphicsCommandList> m_bundle;
     ComPtr<ID3D12CommandSignature> m_cmdSigIndexed;     // = DeviceContext::cmdSigIndexed
     ComPtr<ID3D12CommandSignature> m_cmdSigNonIndexed;  // = DeviceContext::cmdSigNonIndexed
+    // 本 bundle 内 SetGraphicsRootDescriptorTable 引用的 shader-visible 堆。
+    // 必须与父命令列表执行 bundle 时绑定的堆一致，否则行为未定义。
+    ComPtr<ID3D12DescriptorHeap> m_heap;
 
     ID3D12Device* m_device = nullptr;
     UINT m_workerId = 0;
@@ -148,7 +156,7 @@ public:
     BundleRecorderPool(const BundleRecorderPool&) = delete;
     BundleRecorderPool& operator=(const BundleRecorderPool&) = delete;
 
-    bool init(ID3D12Device* device, UINT workerCount);
+    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerCount);
     void shutdown();
 
     bool valid() const { return !m_recorders.empty(); }

@@ -251,7 +251,9 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundlePoolCreate(
         return 0;
     }
     auto* pool = new BundleRecorderPool();
-    if (!pool->init(dc.device.Get(), (UINT)workerCount)) {
+    // bundle 会录制 SetGraphicsRootDescriptorTable，须自行绑定 shader-visible
+    // 描述符堆；传入与父命令列表相同的 drawHeap（非拥有）。
+    if (!pool->init(dc.device.Get(), dc.drawHeap.Get(), (UINT)workerCount)) {
         logFail("dx12AsyncBundlePoolCreate: init");
         delete pool;
         return 0;
