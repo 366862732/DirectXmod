@@ -304,6 +304,12 @@ public final class Dx12Native {
      */
     public static native boolean dx12AsyncPrepareCBVBuffers(long ctx, long[] buffers);
 
+    /**
+     * 在派发 bundle 之前，把这一批 draw 采样用到的纹理视图在主列表上过渡到
+     * SHADER_RESOURCE（bundle 内禁止 ResourceBarrier）。
+     */
+    public static native boolean dx12AsyncPrepareTextureViews(long ctx, long[] views);
+
     /** 创建主命令列表执行器（自带 kFramesInFlight 组 allocator/list + fence）。失败返回 0。 */
     public static native long dx12AsyncExecutorCreate();
 

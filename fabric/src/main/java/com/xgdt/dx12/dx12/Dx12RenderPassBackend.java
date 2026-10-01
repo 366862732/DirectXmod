@@ -12,6 +12,7 @@ import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import java.nio.IntBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -463,6 +464,267 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // P33：并行 bundle 录制（worker pool）
+    // -----------------------------------------------------------------------
+
+    /** 低于此批量时并行调度开销高于收益，直接走串行路径。 */
+    private static final int PARALLEL_MIN_DRAWS = 24;
+
+    @SuppressWarnings("unchecked")
+    private static <T> List<RenderPass.Draw<T>> materialize(Collection<RenderPass.Draw<T>> draws) {
+        if (draws instanceof List<?>) {
+            return (List<RenderPass.Draw<T>>) draws;
+        }
+        return new ArrayList<>(draws);
+    }
+
+    /** 从当前 pipeline 的 vertexFormatBindings 推导 slot 的顶点步长；无法推导返回 0。 */
+    private int vertexStrideFor(int slot) {
+        Dx12CompiledRenderPipeline p = this.pipeline;
+        if (p == null) {
+            return 0;
+        }
+        var bindings = p.info().getVertexFormatBindings();
+        if (bindings != null && slot < bindings.length && bindings[slot] != null) {
+            return bindings[slot].getVertexSize();
+        }
+        return 0;
+    }
+
+    /**
+     * 把整批 draw 按 worker 数切段：各 worker 在自己的描述符分区内写瞬时 CBV/SRV 并
+     * 录制成 D3D12 BUNDLE，最后由主列表按原顺序 {@code ExecuteBundle} 回放。
+     *
+     * <p>bundle 内禁止 ResourceBarrier，因此本批用到的 CBV 缓冲与纹理视图先由主列表
+     * 统一过渡（{@code dx12AsyncPrepare*}）。描述符互不重叠，worker 之间无数据竞争。
+     *
+     * @return true = 已并行录制并回放；false = 未处理，调用方须走串行路径
+     */
+    private <T> boolean tryParallelDrawMultipleIndexed(List<RenderPass.Draw<T>> draws,
+        @Nullable GpuBuffer defaultIndexBuffer, @Nullable IndexType defaultIndexType,
+        T uniformArgument) {
+        Dx12AsyncContext async = Dx12AsyncContext.get();
+        if (async == null || !async.available()) {
+            return false;
+        }
+        final int n = draws.size();
+        if (n < PARALLEL_MIN_DRAWS) {
+            return false;
+        }
+        Dx12CompiledRenderPipeline pl = this.pipeline;
+        List<Dx12BindGroupEntry> bindings = pl.buildBindings();
+        final int bc = bindings.size();
+        if (bc == 0) {
+            return false;
+        }
+        final int[] bType = new int[bc];
+        for (int j = 0; j < bc; j++) {
+            Dx12BindGroupEntry.Type type = bindings.get(j).type();
+            if (type == Dx12BindGroupEntry.Type.TEXEL_BUFFER) {
+                return false;  // 分区堆没有 texel buffer SRV 写入原语 -> 串行
+            }
+            bType[j] = type == Dx12BindGroupEntry.Type.UNIFORM_BUFFER ? 0 : 1;
+        }
+
+        // 每 draw 的绘制参数
+        final long[] idxBuf = new long[n];
+        final int[] idxType = new int[n];
+        final int[] idxCount = new int[n];
+        final int[] firstIdx = new int[n];
+        final int[] baseVert = new int[n];
+        final int[] vbSlot = new int[n];
+        final long[] vbBuf = new long[n];
+        final long[] vbOff = new long[n];
+        final int[] vbStride = new int[n];
+        // 每 (draw, binding) 的描述符取值；n*bc 以 long 计算，防 int 溢出
+        final long cells = (long) n * bc;
+        if (cells > Integer.MAX_VALUE) {
+            return false;
+        }
+        final long[] bBuf = new long[(int) cells];
+        final long[] bOff = new long[bBuf.length];
+        final long[] bLen = new long[bBuf.length];
+        final long[] bView = new long[bBuf.length];
+        java.util.LinkedHashSet<Long> cbvBuffers = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<Long> textureViews = new java.util.LinkedHashSet<>();
+
+        for (int d = 0; d < n; d++) {
+            RenderPass.Draw<T> draw = draws.get(d);
+            BiConsumer<T, RenderPass.UniformUploader> uploader = draw.uniformUploaderConsumer();
+            if (uploader != null) {
+                uploader.accept(uniformArgument, this::setUniform);
+            }
+            GpuBuffer indexBuffer = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
+            IndexType indexType = draw.indexType() != null ? draw.indexType() : defaultIndexType;
+            if (indexBuffer == null || indexType == null || indexBuffer.isClosed()
+                || (indexBuffer.usage() & USAGE_INDEX) == 0) {
+                return false;
+            }
+            idxBuf[d] = ((Dx12GpuBuffer) indexBuffer).handle();
+            idxType[d] = indexType == IndexType.INT ? 1 : 0;
+            idxCount[d] = draw.indexCount();
+            firstIdx[d] = draw.firstIndex();
+            baseVert[d] = draw.baseVertex();
+
+            GpuBufferSlice vb = draw.vertexBuffer().slice();
+            GpuBuffer vbBuffer = vb.buffer();
+            int stride = this.vertexStrideFor(draw.slot());
+            if (vbBuffer.isClosed() || (vbBuffer.usage() & USAGE_VERTEX) == 0 || stride == 0) {
+                return false;
+            }
+            vbSlot[d] = draw.slot();
+            vbBuf[d] = ((Dx12GpuBuffer) vbBuffer).handle();
+            vbOff[d] = vb.offset();
+            vbStride[d] = stride;
+
+            int o = d * bc;
+            for (int j = 0; j < bc; j++) {
+                String name = bindings.get(j).name();
+                if (bType[j] == 0) {
+                    GpuBufferSlice value = this.uniforms.get(name);
+                    if (value == null || value.buffer().isClosed()) {
+                        return false;
+                    }
+                    bBuf[o + j] = ((Dx12GpuBuffer) value.buffer()).handle();
+                    bOff[o + j] = value.offset();
+                    bLen[o + j] = value.length();
+                    cbvBuffers.add(bBuf[o + j]);
+                } else {
+                    TextureViewAndSampler texture = this.textures.get(name);
+                    if (texture == null || texture.view().isClosed()) {
+                        return false;
+                    }
+                    bView[o + j] = texture.view().handle();
+                    textureViews.add(bView[o + j]);
+                }
+            }
+        }
+
+        final int frameSlot = async.frameSlot(this.ctx);
+        if (frameSlot < 0) {
+            return false;
+        }
+        // bundle 内禁止 barrier：本批所有 CBV 缓冲 / 纹理视图先在主列表上完成过渡。
+        Dx12Native.dx12AsyncPrepareCBVBuffers(this.ctx, toLongArray(cbvBuffers));
+        Dx12Native.dx12AsyncPrepareTextureViews(this.ctx, toLongArray(textureViews));
+
+        final long pool = async.bundlePool();
+        final long alloc = async.descriptorAlloc();
+        final long pipelineHandle = pl.handle();
+        final boolean useDepth = this.hasDepth && pl.info().getDepthStencilState() != null;
+        final int workerCount = Math.max(1, Math.min(async.workerCount(), n));
+        final int perWorker = (n + workerCount - 1) / workerCount;
+        final long[] bundles = new long[workerCount];
+        final java.util.concurrent.atomic.AtomicBoolean failed =
+            new java.util.concurrent.atomic.AtomicBoolean();
+        final java.util.concurrent.CountDownLatch done =
+            new java.util.concurrent.CountDownLatch(workerCount);
+        java.util.concurrent.ExecutorService poolExec = async.workers();
+        if (poolExec == null) {
+            return false;
+        }
+        for (int w = 0; w < workerCount; w++) {
+            final int worker = w;
+            final int start = worker * perWorker;
+            final int end = Math.min(n, start + perWorker);
+            poolExec.execute(() -> {
+                try {
+                    if (failed.get()) {
+                        return;
+                    }
+                    int count = end - start;
+                    if (count <= 0) {
+                        return;
+                    }
+                    // 一次性为本段分配全部槽位，避免每 draw 一次 JNI 调用。
+                    int base = Dx12Native.dx12AsyncDescriptorAllocate(alloc, frameSlot,
+                        worker, count * bc);
+                    if (base < 0
+                        || !Dx12Native.dx12AsyncBundleBegin(pool, worker, frameSlot)
+                        || !Dx12Native.dx12AsyncBundleSetPipelineState(pool, worker,
+                            pipelineHandle, useDepth)) {
+                        failed.set(true);
+                        return;
+                    }
+                    for (int i = 0; i < count; i++) {
+                        int d = start + i;
+                        int slot = base + i * bc;
+                        int o = d * bc;
+                        for (int j = 0; j < bc; j++) {
+                            if (bType[j] == 0) {
+                                Dx12Native.dx12AsyncDescriptorWriteCBV(alloc, slot + j,
+                                    bBuf[o + j], bOff[o + j], bLen[o + j]);
+                            } else {
+                                Dx12Native.dx12AsyncDescriptorWriteSRV(alloc, slot + j,
+                                    bView[o + j]);
+                            }
+                        }
+                        long gpuHandle = Dx12Native.dx12AsyncDescriptorGpuHandle(alloc, slot);
+                        Dx12Native.dx12AsyncBundleSetDescriptorTable(pool, worker, 0, gpuHandle);
+                        Dx12Native.dx12AsyncBundleSetIndexBuffer(pool, worker,
+                            idxBuf[d], idxType[d]);
+                        Dx12Native.dx12AsyncBundleSetVertexBuffer(pool, worker, vbSlot[d],
+                            vbBuf[d], vbOff[d], vbStride[d]);
+                        Dx12Native.dx12AsyncBundleDrawIndexed(pool, worker,
+                            idxCount[d], 1, firstIdx[d], baseVert[d], 0);
+                    }
+                    bundles[worker] = Dx12Native.dx12AsyncBundleEnd(pool, worker);
+                    if (bundles[worker] == 0) {
+                        failed.set(true);
+                    }
+                } catch (Throwable t) {
+                    failed.set(true);
+                    if (Dx12Native.LOG_VERBOSE) {
+                        LOGGER.warn("parallel bundle worker {} failed", worker, t);
+                    }
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        try {
+            done.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            failed.set(true);
+        }
+
+        if (failed.get()) {
+            // 丢弃已录制的 bundle，交回串行路径重录（分区内的描述符随后会被覆盖）。
+            for (int w = 0; w < workerCount; w++) {
+                if (bundles[w] == 0) {
+                    Dx12Native.dx12AsyncBundleEnd(pool, w);
+                }
+            }
+            Dx12AsyncContext.countFallback();
+            if (Dx12Native.LOG_VERBOSE) {
+                LOGGER.warn("drawMultipleIndexed: parallel recording failed, falling back to serial"
+                    + " (draws={}, bindings={}, worker={}/{})", n, bc, frameSlot, workerCount);
+            }
+            return false;
+        }
+        for (int w = 0; w < workerCount; w++) {
+            if (bundles[w] != 0 && !Dx12Native.dx12ExecuteBundle(this.ctx, bundles[w])) {
+                // 已经回放了一部分 bundle，不能再回退串行（会重复绘制），直接抛错。
+                throw new IllegalStateException("dx12ExecuteBundle failed for worker " + w);
+            }
+        }
+        // bundle 内改写了根描述符表/PSO 等父列表状态，强制下次撤销 anyDescriptorDirty 快速路径，
+        // 让后续 draw 重新推送描述符（否则会复用 bundle 留下的根表）。
+        this.anyDescriptorDirty = true;
+        return true;
+    }
+
+    private static long[] toLongArray(java.util.Set<Long> values) {
+        long[] out = new long[values.size()];
+        int i = 0;
+        for (Long v : values) {
+            out[i++] = v;
+        }
+        return out;
+    }
+
     @Override
     public <T> void drawMultipleIndexed(Collection<RenderPass.Draw<T>> draws,
         @Nullable GpuBuffer defaultIndexBuffer, @Nullable IndexType defaultIndexType,
@@ -470,7 +732,14 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (this.pipeline == null || !this.pipeline.isValid()) {
             throw new IllegalStateException("drawMultipleIndexed called without a valid pipeline");
         }
-        for (RenderPass.Draw<T> draw : draws) {
+        List<RenderPass.Draw<T>> batch = materialize(draws);
+        // P33：批量足够大时走并行 bundle 录制（worker pool）；任何条件不满足或录制失败
+        // 都回退到下面的串行路径，保证功能等价。
+        if (this.tryParallelDrawMultipleIndexed(batch, defaultIndexBuffer,
+                defaultIndexType, uniformArgument)) {
+            return;
+        }
+        for (RenderPass.Draw<T> draw : batch) {
             BiConsumer<T, RenderPass.UniformUploader> uploader = draw.uniformUploaderConsumer();
             if (uploader != null) {
                 uploader.accept(uniformArgument, this::setUniform);

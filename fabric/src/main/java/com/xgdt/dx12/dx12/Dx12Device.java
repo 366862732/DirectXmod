@@ -122,6 +122,9 @@ public class Dx12Device implements GpuDeviceBackend {
         // P33：启动独立渲染线程（异步流水线：渲染线程负责 acquire/present/fence-wait，
         // 主线程负责命令录制）。在 createCommandEncoder 之前初始化，确保渲染线程已就绪。
         Dx12Native.dx12InitAsyncRenderer(1);
+        // P33：初始化 CPU/GPU 并行录制上下文（分区描述符堆 + bundle 池 + worker 池）。
+        // 失败会自动退回单线程录制，不影响功能。
+        Dx12AsyncContext.init();
         initialized = true;
     }
 
@@ -330,6 +333,9 @@ public class Dx12Device implements GpuDeviceBackend {
             compiler.close();
             this.glslCompiler = null;
         }
+        // P33：先停 worker 池并销毁 bundle/描述符 native 资源，再销毁渲染线程。
+        Dx12AsyncContext.shutdown();
+        appendJavaLog("device.close: after asyncContext.shutdown");
         // P33：销毁独立渲染线程。
         Dx12Native.dx12DestroyAsyncRenderer();
         appendJavaLog("device.close: done");

@@ -41,6 +41,7 @@
 //   static native int     dx12AsyncCurrentFrameSlot(long ctx);
 //   static native boolean dx12ExecuteBundle(long ctx, long bundle);
 //   static native boolean dx12AsyncPrepareCBVBuffers(long ctx, long[] buffers);
+//   static native boolean dx12AsyncPrepareTextureViews(long ctx, long[] views);
 //
 //   // ---- 主 Command List 执行器 ----
 //   static native long    dx12AsyncExecutorCreate();
@@ -520,6 +521,29 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncPrepareCBVBuffers(
         Dx12Object* buf = toPtr<Dx12Object>(raw[(size_t)i]);
         if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) continue;
         transitionBufferTo(c, buf, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    }
+    return JNI_TRUE;
+}
+
+// 与 dx12AsyncPrepareCBVBuffers 同源：把这一批 draw 采样用到的纹理视图，在主列表上
+// 过渡到 PIXEL/NON_PIXEL_SHADER_RESOURCE（bundle 内禁止 ResourceBarrier）。语义与
+// pushDescriptors 对 type==1 的处理一致；状态已匹配时 transitionTextureTo 为空操作。
+JNIEXPORT jboolean JNICALL
+Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncPrepareTextureViews(
+    JNIEnv* env, jclass, jlong ctx, jlongArray views) {
+    CommandContext* c = toPtr<CommandContext>(ctx);
+    if (!c || !c->listOpen || !views) return JNI_FALSE;
+    const jsize n = env->GetArrayLength(views);
+    if (n <= 0) return JNI_TRUE;
+    std::vector<jlong> raw((size_t)n);
+    env->GetLongArrayRegion(views, 0, n, raw.data());
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    for (jsize i = 0; i < n; ++i) {
+        Dx12Object* v = toPtr<Dx12Object>(raw[(size_t)i]);
+        if (!v || !v->sourceTexture) continue;
+        transitionTextureTo(c, v->sourceTexture,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
     return JNI_TRUE;
 }
