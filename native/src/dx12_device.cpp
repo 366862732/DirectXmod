@@ -3883,7 +3883,20 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         // 步骤 4a：关闭构造函数打开的旧 command list（释放 allocator），否则 beginCommandListWithWait
         //          的 Reset 会因 allocator InUse 而返回 E_FAIL。
         dbgLog("renderThread: begin endCommandList");
-        endCommandList(ctx, err);
+        bool discardedOpenList = ctx->listOpen != 0;
+        if (!endCommandList(ctx, err)) {
+            dbgLog("renderThread: endCommandList FAILED: %s", err.c_str());
+            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
+            SetEvent(gEvtSubmitDone);
+            continue;
+        }
+        // 这里关闭的是构造阶段/上一轮遗留、且不会进入 submit 的旧命令列表；
+        // 它曾在 beginCommandListWithWait 中计入 gOpenListCount，需要显式归还。
+        if (discardedOpenList && gOpenListCount > 0) {
+            --gOpenListCount;
+            dbgLog("renderThread: discarded stale openList now=%d", gOpenListCount);
+            if (gOpenListCount == 0) flushPendingDeletes();
+        }
         dbgLog("renderThread: done endCommandList");
 
         // 步骤 4b：begin command list（Reset allocator + list）
