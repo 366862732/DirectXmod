@@ -602,12 +602,16 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         }
 
         final int frameSlot = async.frameSlot(this.ctx);
-        if (frameSlot < 0) {
+        final long frameValue = async.frameValue(this.ctx);
+        if (frameSlot < 0 || frameValue < 0) {
             return false;
         }
         // bundle 内禁止 barrier：本批所有 CBV 缓冲 / 纹理视图先在主列表上完成过渡。
-        Dx12Native.dx12AsyncPrepareCBVBuffers(this.ctx, toLongArray(cbvBuffers));
-        Dx12Native.dx12AsyncPrepareTextureViews(this.ctx, toLongArray(textureViews));
+        // 过渡失败则说明主列表状态异常，直接回退串行（串行路径会自行 transition）。
+        if (!Dx12Native.dx12AsyncPrepareCBVBuffers(this.ctx, toLongArray(cbvBuffers))
+            || !Dx12Native.dx12AsyncPrepareTextureViews(this.ctx, toLongArray(textureViews))) {
+            return false;
+        }
 
         final long pool = async.bundlePool();
         final long alloc = async.descriptorAlloc();
@@ -641,7 +645,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     int base = Dx12Native.dx12AsyncDescriptorAllocate(alloc, frameSlot,
                         worker, count * bc);
                     if (base < 0
-                        || !Dx12Native.dx12AsyncBundleBegin(pool, worker, frameSlot)
+                        || !Dx12Native.dx12AsyncBundleBegin(pool, worker, frameSlot,
+                            frameValue)
                         || !Dx12Native.dx12AsyncBundleSetPipelineState(pool, worker,
                             pipelineHandle, useDepth)) {
                         failed.set(true);
@@ -652,22 +657,29 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                         int slot = base + i * bc;
                         int o = d * bc;
                         for (int j = 0; j < bc; j++) {
-                            if (bType[j] == 0) {
-                                Dx12Native.dx12AsyncDescriptorWriteCBV(alloc, slot + j,
-                                    bBuf[o + j], bOff[o + j], bLen[o + j]);
-                            } else {
-                                Dx12Native.dx12AsyncDescriptorWriteSRV(alloc, slot + j,
+                            boolean written = bType[j] == 0
+                                ? Dx12Native.dx12AsyncDescriptorWriteCBV(alloc, slot + j,
+                                    bBuf[o + j], bOff[o + j], bLen[o + j])
+                                : Dx12Native.dx12AsyncDescriptorWriteSRV(alloc, slot + j,
                                     bView[o + j]);
+                            if (!written) {
+                                failed.set(true);
+                                return;
                             }
                         }
                         long gpuHandle = Dx12Native.dx12AsyncDescriptorGpuHandle(alloc, slot);
-                        Dx12Native.dx12AsyncBundleSetDescriptorTable(pool, worker, 0, gpuHandle);
-                        Dx12Native.dx12AsyncBundleSetIndexBuffer(pool, worker,
-                            idxBuf[d], idxType[d]);
-                        Dx12Native.dx12AsyncBundleSetVertexBuffer(pool, worker, vbSlot[d],
-                            vbBuf[d], vbOff[d], vbStride[d]);
-                        Dx12Native.dx12AsyncBundleDrawIndexed(pool, worker,
-                            idxCount[d], 1, firstIdx[d], baseVert[d], 0);
+                        if (gpuHandle == 0
+                            || !Dx12Native.dx12AsyncBundleSetDescriptorTable(pool, worker, 0,
+                                gpuHandle)
+                            || !Dx12Native.dx12AsyncBundleSetIndexBuffer(pool, worker,
+                                idxBuf[d], idxType[d])
+                            || !Dx12Native.dx12AsyncBundleSetVertexBuffer(pool, worker,
+                                vbSlot[d], vbBuf[d], vbOff[d], vbStride[d])
+                            || !Dx12Native.dx12AsyncBundleDrawIndexed(pool, worker,
+                                idxCount[d], 1, firstIdx[d], baseVert[d], 0)) {
+                            failed.set(true);
+                            return;
+                        }
                     }
                     bundles[worker] = Dx12Native.dx12AsyncBundleEnd(pool, worker);
                     if (bundles[worker] == 0) {

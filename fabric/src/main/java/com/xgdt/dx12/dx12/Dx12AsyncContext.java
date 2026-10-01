@@ -163,6 +163,17 @@ public final class Dx12AsyncContext implements AutoCloseable {
         return slot;
     }
 
+    /**
+     * 当前帧的原始帧号（= ctx 的 fenceValue）。bundle 录制器用它判定「是否进入新的
+     * 一帧」，从而在同一帧内为每一批 drawMultipleIndexed 选一个独立的 allocator 槽位；
+     * 同一帧内已 ExecuteBundle 的 bundle 在父命令列表执行完成前不能被 Reset。
+     *
+     * @return 帧号；取不到时返回 -1（调用方退回串行）
+     */
+    long frameValue(long ctx) {
+        return Dx12Native.dx12AsyncCurrentFrameValue(ctx);
+    }
+
     /** 运行时统计：本帧回退到串行路径的批次数（仅诊断用）。 */
     private static final AtomicInteger fallbackCount = new AtomicInteger();
 

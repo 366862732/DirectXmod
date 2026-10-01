@@ -226,6 +226,9 @@ public final class Dx12Native {
     /** 当前帧的 drawHeap 段号（= fenceValue % 4），用于对齐 worker 描述符区域。 */
     public static native int dx12AsyncCurrentFrameSlot(long ctx);
 
+    /** 当前帧的原始帧号（= ctx->fenceValue），用于 bundle allocator 的帧槽轮转。 */
+    public static native long dx12AsyncCurrentFrameValue(long ctx);
+
     /**
      * 创建分区描述符分配器：把 drawHeap 按 (frameSlot, worker) 切成互不相交的
      * 区域，供 worker 并发写瞬时 CBV/SRV。同时把同步 ring 的可用容量收窄到
@@ -261,8 +264,13 @@ public final class Dx12Native {
     /** 销毁 bundle 录制器池。 */
     public static native void dx12AsyncBundlePoolDestroy(long pool);
 
-    /** 开始录制 worker 的 bundle（frameSlot 须为 fenceValue % 4）。 */
-    public static native boolean dx12AsyncBundleBegin(long pool, int worker, int frameSlot);
+    /**
+     * 开始录制 worker 的 bundle。frameSlot 须为 fenceValue % 4；frameValue 为原始帧号，
+     * 用于在同一帧内为每一批 drawMultipleIndexed 选一个独立的 allocator 槽位
+     * （已 ExecuteBundle 的 bundle 在父列表执行完成前不能被 Reset）。同一帧内批次
+     * 超出上限时返回 false，调用方退回串行录制。
+     */
+    public static native boolean dx12AsyncBundleBegin(long pool, int worker, int frameSlot, long frameValue);
 
     /** 结束录制，返回 bundle 命令列表句柄（失败返回 0）。 */
     public static native long dx12AsyncBundleEnd(long pool, int worker);

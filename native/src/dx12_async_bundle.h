@@ -38,8 +38,22 @@ using Microsoft::WRL::ComPtr;
 // 轮转，保证复用某槽时其 N-kBundleFrameSlots 帧前的提交已完成。
 constexpr UINT kBundleFrameSlots = 4;
 
+// 单个帧槽内允许的并行 bundle 批次数。同一帧里会对同一命令列表多次调用
+// drawMultipleIndexed（地形按 layer / draw group 分批），而已经 ExecuteBundle 进
+// 父命令列表的 bundle，在其父列表提交并执行完成前不能 Reset 其 allocator。
+// 因此同一帧内的第 b 批使用 (frameSlot, b) 对应的独立槽位；b 超过本上限时
+// begin() 返回 false，调用方回退串行录制（功能正确，仅少了这段并行）。
+constexpr UINT kBundleBatchesPerFrame = 16;
+// (allocator, list) 槽位总数。
+constexpr UINT kBundleSlotCount = kBundleFrameSlots * kBundleBatchesPerFrame;
+
 // MC PrimitiveTopology ordinal -> 命令列表级拓扑（bundle 内使用）。
 D3D12_PRIMITIVE_TOPOLOGY bundlePrimitiveTopology(int ordinal);
+
+// 前向声明：录制时记录所属管线，用于与同步路径同样规则校正顶点步长
+// （Dx12Pipeline::vertexStrides 由 inputElements 实际格式推算，覆盖 Java 侧
+// getVertexSize() 的错误值）。
+struct Dx12Pipeline;
 
 class BundleRecorder {
 public:
@@ -49,7 +63,7 @@ public:
     BundleRecorder(const BundleRecorder&) = delete;
     BundleRecorder& operator=(const BundleRecorder&) = delete;
 
-    // 创建 kBundleFrameSlots 组 BUNDLE allocator + command list（初始为 closed）。
+    // 创建 kBundleSlotCount 组 BUNDLE allocator + command list（初始为 closed）。
     // 现有 ExecuteIndirect 用的 command signature 从 DeviceContext 读取。
     bool init(ID3D12Device* device, UINT workerId);
 
@@ -58,15 +72,21 @@ public:
     bool isRecording() const { return m_recording; }
     ID3D12GraphicsCommandList* commandList() const { return m_bundle.Get(); }
 
-    // 开始 / 结束录制。frameSlot 选择本帧使用的 allocator/list 槽（须为
-    // fenceValue % kBundleFrameSlots，保证该槽的 GPU 工作已完成）。
+    // 开始 / 结束录制。frameSlot 须为 fenceValue % kBundleFrameSlots；frameValue 为
+    // 原始帧号（fenceValue），用于判定「同一帧内的第几批」，从而为每一批选一个独立的
+    // allocator 槽位（已 ExecuteBundle 的 bundle 在父列表执行完成前不能被 Reset）。
+    // 同一帧内批次数超过 kBundleBatchesPerFrame 时返回 false（调用方回退串行）。
     // end() 成功返回 bundle 命令列表句柄，失败返回 nullptr。
-    bool begin(UINT frameSlot);
+    bool begin(UINT frameSlot, UINT64 frameValue);
     ID3D12GraphicsCommandList* end();
 
     // ---- 录制命令（仅 bundle 允许的子集）----
     void setRootSignature(ID3D12RootSignature* rootSignature);
     void setPipelineState(ID3D12PipelineState* pso);
+    // 记录本 bundle 所属管线；用于 correctedStride（与同步路径 setVertexBuffer 一致）。
+    void setPipeline(const Dx12Pipeline* pipeline);
+    // 按所属管线的修正 stride 覆盖 slot 的顶点步长；无记录时返回 0（调用方回退传入值）。
+    UINT correctedStride(int slot) const;
     void setDescriptorTable(UINT slot, D3D12_GPU_DESCRIPTOR_HANDLE handle);
     void setVertexBuffers(UINT startSlot, UINT count,
         const D3D12_VERTEX_BUFFER_VIEW* views);
@@ -92,11 +112,15 @@ public:
     void resetStats() { m_stats = Stats{}; }
 
 private:
-    // 按帧槽轮转，避免 Reset 正在被 GPU 读取的 allocator（详见 kBundleFrameSlots）。
-    ComPtr<ID3D12CommandAllocator> m_allocators[kBundleFrameSlots];
-    ComPtr<ID3D12GraphicsCommandList> m_lists[kBundleFrameSlots];
-    // 当前录制使用的槽位与其命令列表（begin 时指向 m_lists[m_frameSlot]）。
-    UINT m_frameSlot = 0;
+    // 按 (帧槽, 帧内批次序号) 轮转，避免 Reset 正在被 GPU 读取的 allocator
+    // （详见 kBundleFrameSlots / kBundleBatchesPerFrame）。
+    ComPtr<ID3D12CommandAllocator> m_allocators[kBundleSlotCount];
+    ComPtr<ID3D12GraphicsCommandList> m_lists[kBundleSlotCount];
+    // 当前录制使用的槽位与其命令列表（begin 时指向 m_lists[m_activeSlot]）。
+    UINT m_activeSlot = 0;
+    // 每个帧槽最近一次录制所属的帧号，以及该帧内已用批次数；帧号变化时批次归零。
+    UINT64 m_frameOfSlot[kBundleFrameSlots] = {};
+    UINT m_batchOfSlot[kBundleFrameSlots] = {};
     ComPtr<ID3D12GraphicsCommandList> m_bundle;
     ComPtr<ID3D12CommandSignature> m_cmdSigIndexed;     // = DeviceContext::cmdSigIndexed
     ComPtr<ID3D12CommandSignature> m_cmdSigNonIndexed;  // = DeviceContext::cmdSigNonIndexed
@@ -109,6 +133,8 @@ private:
     ID3D12RootSignature* m_rootSig = nullptr;
     ID3D12PipelineState* m_pso = nullptr;
     D3D12_PRIMITIVE_TOPOLOGY m_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    // 本 bundle 所属管线（非拥有，随 DeviceContext 的管线缓存存活）；begin 时清空。
+    const Dx12Pipeline* m_pipeline = nullptr;
 
     Stats m_stats;
 };

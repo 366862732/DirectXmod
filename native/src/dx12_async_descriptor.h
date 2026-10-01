@@ -42,7 +42,15 @@ constexpr UINT kAsyncFrameSlots = 4;
 // 单帧槽内可划分的 worker 分区上限。
 constexpr UINT kMaxAsyncWorkers = 8;
 // 每个帧槽起始处保留给同步路径 ring 的槽位数（blit / 小批量同步 draw）。
-constexpr UINT kAsyncSyncRingReserve = 8192;
+// 取 32768 = 未启用异步时同步路径原本可用的每帧槽位数（原 kDrawHeapPerFrame），
+// 保证开启 P33 后同步路径容量不缩水，避免 GUI/实体等大量单 draw 路径
+// 触发 "draw descriptor heap exhausted for this frame" 异常。
+constexpr UINT kAsyncSyncRingReserve = 32768;
+// 每个帧槽内供 worker 并行录制使用的槽位总数（= 各 worker 分区之和）。
+// 与 kAsyncSyncRingReserve 相加即为每帧段的槽位数（dx12_device.cpp 的
+// kDrawHeapPerFrame），二者严格互不重叠。容量不足时 worker 回退串行录制，
+// 由同步 ring 承接，功能与帧率降级但不会越界。
+constexpr UINT kAsyncWorkerSlotsPerSection = 24576;
 
 class PartitionedDescriptorAllocator {
 public:

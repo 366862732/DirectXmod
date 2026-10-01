@@ -19,7 +19,7 @@
 //   // ---- Bundle 录制器池 ----
 //   static native long    dx12AsyncBundlePoolCreate(int workerCount);
 //   static native void    dx12AsyncBundlePoolDestroy(long pool);
-//   static native boolean dx12AsyncBundleBegin(long pool, int worker, int frameSlot);
+//   static native boolean dx12AsyncBundleBegin(long pool, int worker, int frameSlot, long frameValue);
 //   static native long    dx12AsyncBundleEnd(long pool, int worker);            // 返回 bundle 命令列表句柄
 //   static native boolean dx12AsyncBundleSetPipelineState(long pool, int worker, long pipeline, boolean hasDepth);
 //   static native boolean dx12AsyncBundleSetDescriptorTable(long pool, int worker, int slot, long gpuHandle);
@@ -39,6 +39,7 @@
 //
 //   // ---- 在既有（同步）命令列表上执行 bundle ----
 //   static native int     dx12AsyncCurrentFrameSlot(long ctx);
+//   static native long    dx12AsyncCurrentFrameValue(long ctx);
 //   static native boolean dx12ExecuteBundle(long ctx, long bundle);
 //   static native boolean dx12AsyncPrepareCBVBuffers(long ctx, long[] buffers);
 //   static native boolean dx12AsyncPrepareTextureViews(long ctx, long[] views);
@@ -266,10 +267,11 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundlePoolDestroy(
 
 JNIEXPORT jboolean JNICALL
 Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleBegin(
-    JNIEnv*, jclass, jlong pool, jint worker, jint frameSlot) {
+    JNIEnv*, jclass, jlong pool, jint worker, jint frameSlot, jlong frameValue) {
     BundleRecorderPool* p = toPtr<BundleRecorderPool>(pool);
     BundleRecorder* r = p ? p->recorder((UINT)worker) : nullptr;
-    if (!r || frameSlot < 0 || !r->begin((UINT)frameSlot)) {
+    if (!r || frameSlot < 0 || frameValue < 0
+        || !r->begin((UINT)frameSlot, (UINT64)frameValue)) {
         logFail("dx12AsyncBundleBegin");
         return JNI_FALSE;
     }
@@ -303,6 +305,8 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleSetPipelineState(
     r->setRootSignature(pl->rootSignature.Get());
     r->setPipelineState(pso);
     r->setPrimitiveTopology(bundlePrimitiveTopology(pl->topology));
+    // P33：记录管线，使 setVertexBuffer 能与同步路径一样用修正 stride 覆盖 Java 传入值。
+    r->setPipeline(pl);
     return JNI_TRUE;
 }
 
@@ -336,7 +340,12 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleSetVertexBuffer(
     D3D12_VERTEX_BUFFER_VIEW vb{};
     vb.BufferLocation = buf->resource->GetGPUVirtualAddress() + (UINT64)offset;
     vb.SizeInBytes = (UINT)(buf->size - offset);
-    vb.StrideInBytes = (UINT)stride;
+    // P33：与同步路径 setVertexBuffer 一致，优先使用管线记录的修正 stride
+    // （Java 的 getVertexSize() 在部分管线上不等于实际顶点步长）。
+    UINT effectiveStride = (UINT)stride;
+    const UINT corrected = r->correctedStride((int)slot);
+    if (corrected > 0) effectiveStride = corrected;
+    vb.StrideInBytes = effectiveStride;
     r->setVertexBuffers((UINT)slot, 1, &vb);
     return JNI_TRUE;
 }
@@ -489,6 +498,17 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncCurrentFrameSlot(
     CommandContext* c = toPtr<CommandContext>(ctx);
     if (!c) return -1;
     return (jint)currentDrawFrameSlot(c);
+}
+
+// 当前帧的原始帧号（= ctx->fenceValue）。bundle allocator 用 (frameSlot, 帧内批次)
+// 选槽，需要原始帧号来判定「是否进入新的一帧」——仅靠 frameSlot（%4）在中间隔了
+// 整数圈的空帧时会误判。
+JNIEXPORT jlong JNICALL
+Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncCurrentFrameValue(
+    JNIEnv*, jclass, jlong ctx) {
+    CommandContext* c = toPtr<CommandContext>(ctx);
+    if (!c) return -1;
+    return (jlong)c->fenceValue;
 }
 
 JNIEXPORT jboolean JNICALL

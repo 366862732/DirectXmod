@@ -22,7 +22,7 @@ bool BundleRecorder::init(ID3D12Device* device, UINT workerId) {
     m_device = device;
     m_workerId = workerId;
 
-    for (UINT i = 0; i < kBundleFrameSlots; ++i) {
+    for (UINT i = 0; i < kBundleSlotCount; ++i) {
         HRESULT hr = device->CreateCommandAllocator(
             D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&m_allocators[i]));
         if (FAILED(hr)) return false;
@@ -35,6 +35,10 @@ bool BundleRecorder::init(ID3D12Device* device, UINT workerId) {
         m_lists[i]->Close();
     }
     m_recording = false;
+    for (UINT i = 0; i < kBundleFrameSlots; ++i) {
+        m_frameOfSlot[i] = UINT64_MAX;  // 未使用过（fenceValue 从 1 开始递增）
+        m_batchOfSlot[i] = 0;
+    }
 
     // 复用现有 ExecuteIndirect 的 command signature（drawIndexed 用 indexed）。
     const DeviceContext& dc = deviceContextForJni();
@@ -43,20 +47,32 @@ bool BundleRecorder::init(ID3D12Device* device, UINT workerId) {
     return true;
 }
 
-bool BundleRecorder::begin(UINT frameSlot) {
+bool BundleRecorder::begin(UINT frameSlot, UINT64 frameValue) {
     if (m_recording) return false;
-    m_frameSlot = frameSlot % kBundleFrameSlots;
-    m_bundle = m_lists[m_frameSlot];
-    if (!m_bundle || !m_allocators[m_frameSlot]) return false;
-    HRESULT hr = m_allocators[m_frameSlot]->Reset();
+    const UINT fs = frameSlot % kBundleFrameSlots;
+    // 新的一帧：该帧槽内的批次序号归零，重新从这批的第一个 allocator 槽开始。
+    if (m_frameOfSlot[fs] != frameValue) {
+        m_frameOfSlot[fs] = frameValue;
+        m_batchOfSlot[fs] = 0;
+    }
+    const UINT batch = m_batchOfSlot[fs];
+    if (batch >= kBundleBatchesPerFrame) return false;  // 本帧配额用尽，回退串行
+    m_batchOfSlot[fs] = batch + 1;
+
+    const UINT slot = fs * kBundleBatchesPerFrame + batch;
+    m_activeSlot = slot;
+    m_bundle = m_lists[slot];
+    if (!m_bundle || !m_allocators[slot]) return false;
+    HRESULT hr = m_allocators[slot]->Reset();
     if (FAILED(hr)) return false;
-    hr = m_bundle->Reset(m_allocators[m_frameSlot].Get(), nullptr);
+    hr = m_bundle->Reset(m_allocators[slot].Get(), nullptr);
     if (FAILED(hr)) return false;
 
     m_recording = true;
     m_rootSig = nullptr;
     m_pso = nullptr;
     m_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    m_pipeline = nullptr;
     resetStats();
     return true;
 }
@@ -80,6 +96,16 @@ void BundleRecorder::setPipelineState(ID3D12PipelineState* pso) {
     m_bundle->SetPipelineState(pso);
     m_pso = pso;
     ++m_stats.commandsRecorded;
+}
+
+void BundleRecorder::setPipeline(const Dx12Pipeline* pipeline) {
+    m_pipeline = pipeline;
+}
+
+UINT BundleRecorder::correctedStride(int slot) const {
+    if (!m_pipeline) return 0;
+    auto it = m_pipeline->vertexStrides.find(slot);
+    return it == m_pipeline->vertexStrides.end() ? 0u : it->second;
 }
 
 void BundleRecorder::setDescriptorTable(UINT slot, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
