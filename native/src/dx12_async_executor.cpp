@@ -126,17 +126,27 @@ UINT64 MainCommandExecutor::endFrame() {
     FrameSlot& slot = m_slots[m_slotIndex];
 
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    std::vector<ID3D12GraphicsCommandList*> bundles;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         barriers.swap(m_barriers);
+        bundles.swap(m_bundles);
     }
 
-    // barrier 统一在主列表执行（bundle 内禁止 barrier）。
-    // 注意：bundle 由 replayPendingBundles() 在 ctx 上 Execute，此处不重复执行。
+    // barrier 统一在主列表执行（bundle 内禁止 barrier），须在 ExecuteBundle 之前。
     if (!barriers.empty()) {
         slot.commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
         std::lock_guard<std::mutex> lk(m_mutex);
         m_stats.barriersExecuted += barriers.size();
+    }
+
+    // 按加入顺序回放 bundle（顺序影响重叠/blend 几何的绘制结果）。
+    for (ID3D12GraphicsCommandList* b : bundles) {
+        if (b) slot.commandList->ExecuteBundle(b);
+    }
+    if (!bundles.empty()) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_stats.bundlesExecuted += bundles.size();
     }
 
     if (FAILED(slot.commandList->Close())) {

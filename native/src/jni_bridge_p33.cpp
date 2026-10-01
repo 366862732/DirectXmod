@@ -38,6 +38,7 @@
 //   static native boolean dx12AsyncFenceRegisterCallback(long mgr, long value, Dx12FenceCallback callback, long timeoutMs);
 //
 //   // ---- 在既有（同步）命令列表上执行 bundle ----
+//   static native int     dx12AsyncCurrentFrameSlot(long ctx);
 //   static native boolean dx12ExecuteBundle(long ctx, long bundle);
 //   static native boolean dx12AsyncPrepareCBVBuffers(long ctx, long[] buffers);
 //
@@ -480,6 +481,14 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncFenceRegisterCallback(
 // viewport/scissor、clear、copy、barrier 都在主列表上），只有 draw 密集的区段
 // 由 worker 并行录制成 bundle，再在这里按顺序 ExecuteBundle 回主列表。
 // ===========================================================================
+
+JNIEXPORT jint JNICALL
+Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncCurrentFrameSlot(
+    JNIEnv*, jclass, jlong ctx) {
+    CommandContext* c = toPtr<CommandContext>(ctx);
+    if (!c) return -1;
+    return (jint)currentDrawFrameSlot(c);
+}
 
 JNIEXPORT jboolean JNICALL
 Java_com_xgdt_dx12_dx12_Dx12Native_dx12ExecuteBundle(

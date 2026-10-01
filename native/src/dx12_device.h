@@ -90,6 +90,11 @@ struct DeviceContext {
     ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler（SHADER_VISIBLE）
     ComPtr<ID3D12DescriptorHeap> drawHeap;     // P6：每帧瞬时 CBV/SRV 描述符（SHADER_VISIBLE，ring x2）
 
+    // P33 async：开启异步分区后，drawHeap 的每个帧段被划出一部分给 worker 分区，
+    // 同步 ring 只允许使用每段起始的 syncRingReserve 个槽位。0 = 未开启异步分区
+    // （同步 ring 可用整段 kDrawHeapPerFrame）。由 dx12AsyncDescriptorCreate 设置。
+    UINT syncRingReserve = 0;
+
     // P6：ExecuteIndirect 用 command signature（DrawIndexedInstanced / DrawInstanced）
     ComPtr<ID3D12CommandSignature> cmdSigIndexed;
     ComPtr<ID3D12CommandSignature> cmdSigNonIndexed;
@@ -156,6 +161,23 @@ DeviceContext& deviceContextForJni();
 // P33 fix：flush 延迟删除对象，在 destroySurface 等 present fence 后调用，
 // 确保 GPU 工作完成后再释放资源。
 void flushPendingDeletes();
+
+// ---------------------------------------------------------------------------
+// P33 async：把瞬时描述符直接写到 drawHeap 的「绝对槽位」（供 worker 线程在
+// 自己的分区区域内写 CBV / 纹理 SRV / texel buffer SRV）。
+//
+// 与 pushDescriptors 的区别：不做 transition（bundle 内禁止 ResourceBarrier），
+// 调用方须先用 transitionBufferTo / transitionTextureTo 在主列表上完成过渡；
+// 槽位由 PartitionedDescriptorAllocator 分配，保证与其他 worker 互不重叠。
+// ---------------------------------------------------------------------------
+// buffer[offset, offset+size) 写为 CBV（size 向上取整 256 对齐）。
+bool writeCBVToDrawHeap(UINT slot, Dx12Object* buf, long long offset, long long size,
+    std::string& err);
+// 复制纹理视图已有的 SRV 描述符到 slot。
+bool writeTextureSRVToDrawHeap(UINT slot, Dx12Object* view, std::string& err);
+// buffer[offset, offset+length) 写为 texel buffer SRV（texelFormat = GpuFormat ordinal）。
+bool writeBufferSRVToDrawHeap(UINT slot, Dx12Object* buf, long long offset,
+    long long length, int texelFormat, std::string& err);
 
 // 返回设备/队列的原始 COM 指针（用于 Java 侧持有句柄）。
 uintptr_t getDeviceHandle();
@@ -309,6 +331,11 @@ void clearAsyncRenderCtx();
 // 查询命令列表是否已打开。
 bool isListOpen(CommandContext* ctx);
 
+// P33 async：当前帧使用的 drawHeap 段号（= fenceValue % kDrawHeapSections）。
+// 与 beginCommandListWithWait 中 drawHeapSlotBase 的段号一致；Java 侧据此把
+// worker 的 (frameSlot, worker) 描述符区域对齐到同一段，避免与同步 ring 重叠。
+UINT currentDrawFrameSlot(CommandContext* ctx);
+
 // ---------------------------------------------------------------------------
 // 全局队列 fence（P6 fence token；对应官方共享 encoder 的 submit index）
 // ---------------------------------------------------------------------------
@@ -333,6 +360,11 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
 // 绝不回退 COMMON——decay 由命令列表完成时隐式处理）。blitSurface 也要用它
 // 把渲染后的源纹理过渡到 COPY_SOURCE。
 void transitionTextureTo(CommandContext* ctx, Dx12Object* tex,
+    D3D12_RESOURCE_STATES to);
+
+// 状态追踪的 buffer 过渡（同上，初始锚点 = initialStateFor(heapType)）。
+// 异步路径在主列表上为 bundle 批量预过渡 CBV/SRV 资源时复用。
+void transitionBufferTo(CommandContext* ctx, Dx12Object* buf,
     D3D12_RESOURCE_STATES to);
 
 // 底层过渡：直接接受 ID3D12Resource*，用于 swapchain back buffer 等

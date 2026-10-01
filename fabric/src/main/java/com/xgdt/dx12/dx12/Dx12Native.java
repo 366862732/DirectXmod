@@ -210,6 +210,156 @@ public final class Dx12Native {
     /** 主动清除 gAsyncRenderCtx（供 Java 侧 P41 超时降级时同步调用）。 */
     public static native void dx12ClearAsyncRenderCtx();
 
+    // -----------------------------------------------------------------------
+    // P33 async：并行 bundle 录制基础设施（worker pool + 分区描述符堆）
+    //
+    // 设计：主命令列表仍由现有渲染线程流水线录制（render pass 起止、clear、
+    // copy、barrier、viewport/scissor 都在主列表上）；只有同一 pass + 同一 PSO
+    // + 同一 scissor 下的密集 draw 段（如地形区块）才由 worker 并行录制成
+    // D3D12 BUNDLE，再按原顺序在主列表上 ExecuteBundle 回放。
+    //
+    // 约束（D3D12 bundle 限制）：bundle 内禁止 Clear/Copy/ResourceBarrier/
+    // OMSetRenderTargets/RSSetViewport/RSSetScissorRects/SetDescriptorHeaps，
+    // 因此这些必须在主列表上提前完成（见 dx12AsyncPrepareCBVBuffers）。
+    // -----------------------------------------------------------------------
+
+    /** 当前帧的 drawHeap 段号（= fenceValue % 4），用于对齐 worker 描述符区域。 */
+    public static native int dx12AsyncCurrentFrameSlot(long ctx);
+
+    /**
+     * 创建分区描述符分配器：把 drawHeap 按 (frameSlot, worker) 切成互不相交的
+     * 区域，供 worker 并发写瞬时 CBV/SRV。同时把同步 ring 的可用容量收窄到
+     * 每段起始的保留槽位数。失败返回 0。
+     */
+    public static native long dx12AsyncDescriptorCreate(int workerCount);
+
+    /** 销毁分区描述符分配器，并恢复同步 ring 可用整段 drawHeap。 */
+    public static native void dx12AsyncDescriptorDestroy(long alloc);
+
+    /** (frameSlot, worker) 区域的绝对起始槽位；越界返回 -1。 */
+    public static native int dx12AsyncDescriptorRegionBase(long alloc, int frameSlot, int worker);
+
+    /** 在区域内原子分配 count 个连续槽位；区域耗尽返回 -1。 */
+    public static native int dx12AsyncDescriptorAllocate(long alloc, int frameSlot, int worker, int count);
+
+    /** 帧边界：清零该帧槽下所有 worker 的分配游标（须等该帧 GPU 工作完成）。 */
+    public static native void dx12AsyncDescriptorResetFrame(long alloc, int frameSlot);
+
+    /** 绝对槽位的 GPU 句柄（供 SetGraphicsRootDescriptorTable）。 */
+    public static native long dx12AsyncDescriptorGpuHandle(long alloc, int slot);
+
+    /** 把 buffer[offset, offset+size) 写为常量缓冲视图到 slot。 */
+    public static native boolean dx12AsyncDescriptorWriteCBV(long alloc, int slot,
+        long buffer, long offset, long size);
+
+    /** 把已存在的纹理视图描述符复制到 slot。 */
+    public static native boolean dx12AsyncDescriptorWriteSRV(long alloc, int slot, long view);
+
+    /** 创建 bundle 录制器池（每 worker 一个 BUNDLE allocator + command list）。失败返回 0。 */
+    public static native long dx12AsyncBundlePoolCreate(int workerCount);
+
+    /** 销毁 bundle 录制器池。 */
+    public static native void dx12AsyncBundlePoolDestroy(long pool);
+
+    /** 开始录制 worker 的 bundle（frameSlot 须为 fenceValue % 4）。 */
+    public static native boolean dx12AsyncBundleBegin(long pool, int worker, int frameSlot);
+
+    /** 结束录制，返回 bundle 命令列表句柄（失败返回 0）。 */
+    public static native long dx12AsyncBundleEnd(long pool, int worker);
+
+    /** 在 bundle 内绑定管线（含 root signature + primitive topology）。 */
+    public static native boolean dx12AsyncBundleSetPipelineState(long pool, int worker,
+        long pipeline, boolean hasDepth);
+
+    /** 在 bundle 内绑定根描述符表 slot = gpuHandle。 */
+    public static native boolean dx12AsyncBundleSetDescriptorTable(long pool, int worker,
+        int slot, long gpuHandle);
+
+    /** 在 bundle 内绑定顶点缓冲。 */
+    public static native boolean dx12AsyncBundleSetVertexBuffer(long pool, int worker,
+        int slot, long buffer, long offset, int stride);
+
+    /** 在 bundle 内绑定索引缓冲（indexType：0=SHORT，1=INT）。 */
+    public static native boolean dx12AsyncBundleSetIndexBuffer(long pool, int worker,
+        long buffer, int indexType);
+
+    /** 在 bundle 内录制 DrawIndexedInstanced。 */
+    public static native boolean dx12AsyncBundleDrawIndexed(long pool, int worker,
+        int indexCount, int instanceCount, int firstIndex, int baseVertex, int firstInstance);
+
+    /** 在 bundle 内录制 DrawInstanced。 */
+    public static native boolean dx12AsyncBundleDraw(long pool, int worker,
+        int vertexCount, int instanceCount, int firstVertex, int firstInstance);
+
+    /** 在 bundle 内录制 DrawIndexedIndirect（使用设备级 command signature）。 */
+    public static native boolean dx12AsyncBundleDrawIndexedIndirect(long pool, int worker,
+        long commands, long offset, int drawCount);
+
+    /** 在既有（主）命令列表上按顺序回放一个 bundle。 */
+    public static native boolean dx12ExecuteBundle(long ctx, long bundle);
+
+    /**
+     * 在派发 bundle 之前，把这一批 draw 用到的 CBV 缓冲在主列表上过渡到
+     * VERTEX_AND_CONSTANT_BUFFER（bundle 内禁止 ResourceBarrier）。
+     */
+    public static native boolean dx12AsyncPrepareCBVBuffers(long ctx, long[] buffers);
+
+    /** 创建主命令列表执行器（自带 kFramesInFlight 组 allocator/list + fence）。失败返回 0。 */
+    public static native long dx12AsyncExecutorCreate();
+
+    /** 销毁主命令列表执行器。 */
+    public static native void dx12AsyncExecutorDestroy(long exec);
+
+    /** 非阻塞开始一帧；上一帧未完成时返回 false（调用方跳过本帧）。 */
+    public static native boolean dx12AsyncExecutorTryBeginFrame(long exec);
+
+    /** 聚合一个待回放的 bundle（保持加入顺序）。 */
+    public static native boolean dx12AsyncExecutorAddBundle(long exec, long bundle);
+
+    /** 在主列表上添加资源过渡（bundle 内禁止 barrier）。 */
+    public static native boolean dx12AsyncExecutorAddTransition(long exec, long object,
+        int stateBefore, int stateAfter);
+
+    /** 关闭并提交本帧；返回本次提交的 fence 值（失败返回 0）。 */
+    public static native long dx12AsyncExecutorEndFrame(long exec);
+
+    /** 最近一次提交的 fence 值。 */
+    public static native long dx12AsyncExecutorLastFenceValue(long exec);
+
+    /** 是否有帧正在录制中。 */
+    public static native boolean dx12AsyncExecutorIsFrameInProgress(long exec);
+
+    /** 阻塞等待指定 fence 值达成（timeoutMs==0 表示无限等待）。 */
+    public static native boolean dx12AsyncExecutorWaitFrame(long exec, long fenceValue, long timeoutMs);
+
+    // -----------------------------------------------------------------------
+    // P33 async：Fence 管理器（SetEventOnCompletion + 监控线程，非轮询）
+    // -----------------------------------------------------------------------
+
+    /** 创建 fence 管理器（内部 ID3D12Fence + 监控线程）。失败返回 0。 */
+    public static native long dx12AsyncFenceCreate();
+
+    /** 销毁 fence 管理器。 */
+    public static native void dx12AsyncFenceDestroy(long mgr);
+
+    /** queue->Signal(fence, value)。 */
+    public static native boolean dx12AsyncFenceSignal(long mgr, long value);
+
+    /** 阻塞等待 fence 达到 value（timeoutMs==0 表示无限等待）。 */
+    public static native boolean dx12AsyncFenceWait(long mgr, long value, long timeoutMs);
+
+    /** 非阻塞查询 fence 是否已达 value。 */
+    public static native boolean dx12AsyncFenceIsComplete(long mgr, long value);
+
+    /**
+     * 登记完成回调：fence 达到 value 时在监控线程回调
+     * {@link Dx12FenceCallback#onFenceComplete(long, boolean)}（timeoutMs==0 表示无超时）。
+     * 回调在锁外调用，允许回调内再次注册/注销。
+     */
+    public static native boolean dx12AsyncFenceRegisterCallback(long mgr, long value,
+        Dx12FenceCallback callback, long timeoutMs);
+
+
     /** 查询当前 command context 的命令列表是否处于打开录制状态。 */
     public static native boolean dx12IsListOpen(long ctx);
 

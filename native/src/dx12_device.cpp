@@ -77,6 +77,13 @@ constexpr UINT kDrawHeapPerFrame = 32768;
 constexpr UINT kDrawHeapSections = 4;
 constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * kDrawHeapSections;
 
+// P33 async：同步 ring 在当前帧段内可用的槽位数。
+// 未开启异步分区（syncRingReserve==0）时同步路径独占整段；开启后每段起始的
+// syncRingReserve 个槽位归同步 ring，其余归 worker 分区，二者绝不重叠。
+inline UINT syncRingCapacity() {
+    return gCtx.syncRingReserve > 0 ? gCtx.syncRingReserve : kDrawHeapPerFrame;
+}
+
 // 从 free-list 复用或从堆尾分配一个 SRV 槽位；失败填充 err 返回 -1。
 int allocSrvSlot(std::string& err) {
     if (!gFreeSrvSlots.empty()) {
@@ -2828,7 +2835,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     if (!ctx || !ctx->listOpen) { err = "pushDescriptors: no open command list"; return false; }
     UINT count = (UINT)bindings.size();
     if (count == 0) return true;
-    if (ctx->nextDrawSlot + count > kDrawHeapPerFrame) {
+    if (ctx->nextDrawSlot + count > syncRingCapacity()) {
         err = "pushDescriptors: draw descriptor heap exhausted for this frame";
         return false;
     }
@@ -3001,6 +3008,84 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
             (unsigned long long)base, (unsigned)count);
     }
     ctx->commandList->SetGraphicsRootDescriptorTable(0, gpuRoot);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// P33 async：把瞬时描述符写到 drawHeap 的绝对槽位（worker 分区区域内）。
+// 不做 transition（bundle 内禁止 ResourceBarrier），调用方须先在主列表上过渡。
+// ---------------------------------------------------------------------------
+namespace {
+
+// 绝对槽位 -> drawHeap 的 CPU 句柄。
+D3D12_CPU_DESCRIPTOR_HANDLE drawHeapCpuSlot(UINT slot) {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)slot * gCtx.drawInc;
+    return h;
+}
+
+bool drawHeapSlotInRange(UINT slot, const char* what, std::string& err) {
+    if (!gCtx.drawHeap || !gCtx.device) {
+        err = std::string(what) + ": drawHeap/device not ready";
+        return false;
+    }
+    if (slot >= (UINT)gCtx.drawHeap->GetDesc().NumDescriptors) {
+        err = std::string(what) + ": slot out of range";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool writeCBVToDrawHeap(UINT slot, Dx12Object* buf, long long offset, long long size,
+    std::string& err) {
+    if (!drawHeapSlotInRange(slot, "writeCBVToDrawHeap", err)) return false;
+    if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
+        err = "writeCBVToDrawHeap: invalid buffer";
+        return false;
+    }
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+    cbv.BufferLocation = buf->resource->GetGPUVirtualAddress() + (UINT64)offset;
+    UINT64 cbvSize = (UINT64)size;
+    cbvSize = (cbvSize + 255) & ~255ULL;
+    if (cbvSize == 0) cbvSize = 256;
+    cbv.SizeInBytes = (UINT)cbvSize;
+    gCtx.device->CreateConstantBufferView(&cbv, drawHeapCpuSlot(slot));
+    return true;
+}
+
+bool writeTextureSRVToDrawHeap(UINT slot, Dx12Object* view, std::string& err) {
+    if (!drawHeapSlotInRange(slot, "writeTextureSRVToDrawHeap", err)) return false;
+    if (!view || view->cpuHandle.ptr == 0) {
+        err = "writeTextureSRVToDrawHeap: invalid texture view";
+        return false;
+    }
+    gCtx.device->CopyDescriptorsSimple(1, drawHeapCpuSlot(slot), view->cpuHandle,
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return true;
+}
+
+bool writeBufferSRVToDrawHeap(UINT slot, Dx12Object* buf, long long offset,
+    long long length, int texelFormat, std::string& err) {
+    if (!drawHeapSlotInRange(slot, "writeBufferSRVToDrawHeap", err)) return false;
+    if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
+        err = "writeBufferSRVToDrawHeap: invalid buffer";
+        return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = toDxgiFormat(texelFormat);
+    if (srv.Format == DXGI_FORMAT_UNKNOWN) {
+        err = "writeBufferSRVToDrawHeap: unsupported texel buffer format "
+            + std::to_string(texelFormat);
+        return false;
+    }
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    UINT elementBytes = std::max<UINT>(1u, blockSizeFor(srv.Format));
+    srv.Buffer.FirstElement = (UINT)((UINT64)offset / elementBytes);
+    srv.Buffer.NumElements = (UINT)((UINT64)length / elementBytes);
+    gCtx.device->CreateShaderResourceView(buf->resource.Get(), &srv, drawHeapCpuSlot(slot));
     return true;
 }
 
@@ -3763,7 +3848,7 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     // descriptor heap"（dx12-native.log 658 行），根表绑定无效。
     // 改为复用 pushDescriptors 的机制：把 SRV 写到本帧 drawHeap 瞬态槽位，
     // root table 绑定该槽位的 GPU 句柄（与命令列表当前堆一致）。
-    if (ctx->nextDrawSlot + 1 > kDrawHeapPerFrame) {
+    if (ctx->nextDrawSlot + 1 > syncRingCapacity()) {
         err = "blitBindSourceTexture: draw descriptor heap exhausted for this frame";
         return false;
     }
@@ -4121,6 +4206,11 @@ bool asyncRenderIsRecordingReady(CommandContext* ctx) {
 
 bool isListOpen(CommandContext* ctx) {
     return ctx && ctx->listOpen;
+}
+
+UINT currentDrawFrameSlot(CommandContext* ctx) {
+    if (!ctx) return 0;
+    return (UINT)(ctx->fenceValue % kDrawHeapSections);
 }
 
 void asyncSendCommandsReady(CommandContext* ctx) {
