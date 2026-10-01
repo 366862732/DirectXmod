@@ -92,6 +92,17 @@ JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12BlitSurface(
 
 JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PresentSurface(
     JNIEnv*, jclass, jlong surface) {
+    // P33 fix（重复 Present 修复）：ASYNC 路径下，渲染线程在 submitCommandList 之后
+    // 已经调用 presentSurface() 完成本帧的 Present，并置 gAsyncOwnsPresent=true。
+    // Java 侧 GpuSurface.present() 在 encoder.submit() 之后调用本函数，若再 Present
+    // 一次，swapchain 会连续 flip 两次，其中一帧的 back buffer 从未被渲染写入
+    // → 表现为窗口闪烁各种颜色。这里消费该标记并跳过重复 Present。
+    if (gAsyncOwnsPresent) {
+        gAsyncOwnsPresent = false;
+        dbgLog("dx12PresentSurface: skipped (async render thread already presented) surface=%p",
+            toSurface(surface));
+        return;
+    }
     presentSurface(toSurface(surface));
     // 注意：present 的真实结果（ok / OCCLUDED / MODE_CHANGED / FAILED）由
     // presentSurface() 内部 dbgLog 打印；此处不再无条件打 "ok"（会掩盖

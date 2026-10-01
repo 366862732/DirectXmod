@@ -160,7 +160,9 @@ void destroyDevice();
 DeviceContext& deviceContextForJni();
 // P33 fix：flush 延迟删除对象，在 destroySurface 等 present fence 后调用，
 // 确保 GPU 工作完成后再释放资源。
-void flushPendingDeletes();
+// P46：默认只释放 queue fence 已确认完成的条目（不阻塞）；force=true 时
+// 忽略 fence 门槛全部释放（仅用于进程退出等 GPU 已空闲的场景）。
+void flushPendingDeletes(bool force = false);
 
 // ---------------------------------------------------------------------------
 // P33 async：把瞬时描述符直接写到 drawHeap 的「绝对槽位」（供 worker 线程在
@@ -618,6 +620,10 @@ extern std::thread gRenderThread;
 extern bool gRenderRunning;
 // P33：当前正在处理的 ctx（nullptr = 无活动帧），供诊断读回函数检测 ASYNC 管道活跃。
 extern CommandContext* gAsyncRenderCtx;
+// P33：本帧的 Present 是否已由渲染线程执行（true = Java 侧 present() 必须跳过，
+// 否则会重复 Present：一个渲染完成的帧 + 一个未渲染的 back buffer 交替显示，
+// 表现为窗口闪烁各种颜色）。由渲染线程 present 后置位，Java present() 消费后清位。
+extern bool gAsyncOwnsPresent;
 
 // 从 rtvHeap 分配一个 RTV CPU 句柄（surface 的 back buffer 用）。
 D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err);

@@ -76,9 +76,14 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         }
     }
     DXGI_ADAPTER_DESC devDesc{};
+    if (!ctx.adapter) {
+        err = "createSurface: ctx.adapter is null";
+        return nullptr;
+    }
     ctx.adapter->GetDesc(&devDesc);
     std::fprintf(stderr, "[dx12] createSurface: devLuid=%08X%08X desc=%S\n",
         devDesc.AdapterLuid.LowPart, devDesc.AdapterLuid.HighPart, devDesc.Description);
+    std::fflush(stderr);
     // #region debug-point A:hwnd-validation
     HWND win = nullptr;
     LONG_PTR classStyle = 0;
@@ -117,7 +122,15 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     }
 
     ComPtr<IDXGIFactory4> factory;
+    // 诊断：上一次运行在「CS_OWNDC 提示」之后、configureSurface 打印之前静默中断且无任何
+    // 错误输出（见 debug.log）。此处按步骤打点并 fflush，以便把中断位置精确定位到
+    // 具体调用（CreateDXGIFactory1 / EnumAdapters / ctx.adapter 赋值）。
+    std::fprintf(stderr, "[dx12] createSurface: step=CreateDXGIFactory1 begin\n");
+    std::fflush(stderr);
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    std::fprintf(stderr, "[dx12] createSurface: step=CreateDXGIFactory1 done hr=%08X\n",
+        (unsigned)hr);
+    std::fflush(stderr);
     if (FAILED(hr)) {
         err = "CreateDXGIFactory1 failed " + hrText(hr);
         return nullptr;
@@ -137,6 +150,9 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
             }
         }
     }
+    std::fprintf(stderr, "[dx12] createSurface: step=adapter-scan done adapter=%p\n",
+        (void*)ctx.adapter.Get());
+    std::fflush(stderr);
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = 1;                    // 占位；configure() 时 ResizeBuffers 到实际尺寸
@@ -166,6 +182,7 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     // P33：诊断——打印 HWND 值，帮助排查 E_ACCESSDENIED 问题。
     std::fprintf(stderr, "[dx12] dx12CreateSurface: hwnd=0x%llx queue=0x%p\n",
         (unsigned long long)hwnd, (void*)ctx.queue.Get());
+    std::fflush(stderr);
 
     {
         bool created = false;

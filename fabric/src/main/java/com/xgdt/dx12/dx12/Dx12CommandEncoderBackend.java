@@ -41,10 +41,10 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private @Nullable Dx12RenderPassBackend currentRenderPass;
     /**
      * P42：标记当前 submit() 走的是 ASYNC 路径。
-     * 在 ASYNC 路径下，render thread 负责 allocator reset + command list begin，
-     * 主线程只负责命令录制。ensureListOpen() 在 inAsyncSubmit=true 时跳过
-     * dx12BeginCommandList，避免与 render thread 的 beginCommandListWithWait
-     * 竞争同一 allocator（E_FAIL 根因）。
+     * P33 fix：命令列表的 begin / allocator reset 现在由**主线程**在帧开始时负责
+     * （{@link #ensureListOpen()} → dx12BeginCommandList，内部按 fenceValue-2 等待
+     * allocator 不再被 GPU 占用）。渲染线程只做 Close + ExecuteCommandLists + Present，
+     * 因此不会与主线程的录制竞争同一 allocator。
      */
     private boolean inAsyncSubmit = false;
     /** P27：图集合成 pass 结束后 dump 图集纹理（定位按钮纹理错乱）。 */
@@ -77,7 +77,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         if (this.ctx == 0) {
             throw new IllegalStateException("dx12CreateCommandEncoder returned a null handle");
         }
-        this.transientMemory = new Dx12TransientMemory(this.ctx);
+        this.transientMemory = new Dx12TransientMemory(this.ctx, this::ensureListOpen);
         // P33 fix：在构造函数中打开命令列表。beginCommandList 现在是幂等的
         // （C++ 侧若 listOpen=1 则跳过 Reset），因此 submit() 可安全再次调用而
         // 不会触发 allocator Reset E_FAIL。这确保了 self-test 等一次性路径的
@@ -91,19 +91,14 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     }
 
     /**
-     * P33：懒加载打开命令列表。若列表未打开（async 路径下由渲染线程负责打开），
-     * 则主线程自行打开。dx12BeginCommandList 是幂等的（C++ 侧若 listOpen=1 则跳过 Reset）。
+     * P33：懒加载打开命令列表。dx12BeginCommandList 是幂等的（C++ 侧若 listOpen=1
+     * 则跳过 Reset），因此重复调用安全；列表未打开时会执行 allocator reset（内部按
+     * fenceValue-2 等待 GPU 释放该 allocator）并 Reset 命令列表，随后录制命令。
      */
     private void ensureListOpen() {
         if (!Dx12Native.dx12IsListOpen(this.ctx)) {
-            // P42：ASYNC 路径下 render thread 负责 allocator reset + command list begin，
-            // 主线程此时调用 dx12BeginCommandList 会与 render thread 的
-            // beginCommandListWithWait 竞争同一 allocator → E_FAIL。
-            // render thread 在发送 RECORDING_READY 前已完成 beginCommandList，
-            // 因此命令录制阶段 list 一定已是 open 状态，无需额外操作。
-            if (this.inAsyncSubmit) {
-                return;
-            }
+            // P33 fix：ASYNC 路径下 begin/Reset 由主线程负责（渲染线程不再触碰
+            // allocator/list），因此这里直接打开即可，不存在与渲染线程竞争的问题。
             Dx12Native.dx12BeginCommandList(this.ctx);
         }
     }
@@ -201,16 +196,25 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             colorClearFlags, clearColors, depthTexture, depthMip,
             depthClearFlag, depthClearValue, x, y, w, h);
         boolean hasDepth = depthTexture != 0L;
-        // P31：检测 GUI 离屏 pass——color[0] 为 GUI atlas（usage=15=COPY_DST|COPY_SRC|RENDER_ATTACHMENT|TEXTURE_BINDING）且有 depth attachment。
-        // 此类 pass 使用 invertY=true 投影矩阵，需要 flipY 变体管线。
+        // P28/P31：识别「离屏图集合成 pass」（GuiItemAtlas / PictureInPicture），其特征是
+        // color[0] 的 usage == 13 = COPY_DST|TEXTURE_BINDING|RENDER_ATTACHMENT（GpuTexture 位常量
+        // 1|4|8）且带 depth attachment（color depth usage==9，lightmap 则无 depth）。
+        // 这类 pass 用 invertY=true 的正交投影渲染，其内容随后以 GL 自底向上的 UV 约定采样，
+        // 在 D3D12（NDC Y 向上）下需要 flipY 变体管线（shader 注入 gl_Position.y 取反）修正。
+        //
+        // 注意：绝不能用 usage == 15（=COPY_DST|COPY_SRC|TEXTURE_BINDING|RENDER_ATTACHMENT，主窗口
+        // MainTarget / TextureAtlas 的通用特征）。此前误用 15 导致每帧主窗口 pass 被判定为
+        // 「离屏图集 pass」，对 item_cutout/entity_cutout 注入 Y 翻转并翻转 scissor，使 GUI 图标
+        // 镜像/错位、按钮底图裁剪区错乱（实测日志中 854x480 主 pass 命中 4920 次）。
         boolean flipY = false;
         if (hasDepth && colorCount > 0) {
             RenderPassDescriptor.Attachment<Optional<Vector4fc>> first = colorAttachments.get(0);
             if (first != null && first.textureView() != null) {
                 int usage = ((Dx12GpuTexture) first.textureView().texture()).usage();
-                if (usage == 15) {
+                if (usage == 13) {
                     flipY = true;
-                    System.err.println("[dx12-java] [P31] flipY=true for GUI atlas pass (" + w + "x" + h + ")");
+                    System.err.println("[dx12-java] [P28] flipY=true for offscreen GUI atlas/PIP pass ("
+                        + w + "x" + h + ")");
                     System.err.flush();
                 }
             }
@@ -445,15 +449,18 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         //
         // 流程：
         //   1. 记录当前 queue fence 值（= 上一帧的 submitQueueFence）
-        //   2. 请求渲染线程开始新帧（acquireSurface + 等 GPU + beginCommandList）
-        //   3. 等待渲染线程发 RECORDING_READY（渲染线程已 Reset allocator，可以录制）
+        //   2. 请求渲染线程开始新帧（通知它主线程已录制完毕）
+        //   3. 等待渲染线程发 RECORDING_READY
         //   4. 主线程继续录制命令（render pass / clear / copy / draw）
         //   5. 通知渲染线程命令已就绪（set gEvtCommandsReady）
         //   6. 等待渲染线程完成提交 + present（submits + signal fence + present）
         //   7. 执行 post-submit 清理（transientMemory rotate、callback 等）
         //
-        // 注意：不再调用 dx12BeginCommandListWithWait —— 由渲染线程在步骤 2 中负责
-        //       allocator reset + command list begin，主线程只负责命令录制。
+        // P33 fix（帧序倒置修复）：allocator Reset + command list begin 由**主线程**
+        //       在帧开始时完成（ensureListOpen → dx12BeginCommandList）。渲染线程
+        //       只负责 Close + ExecuteCommandLists + Present，绝不再 Reset 列表——
+        //       否则会丢弃主线程已录制的整帧命令，back buffer 永远不被写入，
+        //       Present 只能显示未初始化内容（窗口闪烁各种颜色的根因）。
 
         // P15 诊断：记录提交前的 fence 值
         long fenceBefore = Dx12Native.dx12GetFenceValue(this.ctx);
@@ -475,9 +482,9 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             return;
         }
 
-        // 异步路径：渲染线程负责 allocator reset + command list begin，
-        // 主线程只负责命令录制（已在此 submit() 调用前完成）和协调事件。
-        // 注意：不在此调用 dx12BeginCommandList，避免与渲染线程竞争同一 allocator。
+        // 异步路径：命令已由上层框架在本次 submit() 之前录制完毕，
+        // 渲染线程只负责 Close + Execute + Present。
+        // 注意：不在此调用 dx12BeginCommandList（列表已由录制阶段打开）。
         this.inAsyncSubmit = true;
         System.err.println("[dx12-java] submit: ASYNC path fence=" + fenceBefore);
         System.err.flush();

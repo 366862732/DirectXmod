@@ -23,7 +23,7 @@ public class CameraUpdateDebugMixin {
         if (dx12_cameraUpdateCount % 60 != 0 && dx12_cameraUpdateCount <= 5) return;
 
         float depthFar;
-        float renderDistance;
+        int renderDistance;
         try {
             java.lang.reflect.Field dfField = Camera.class.getDeclaredField("depthFar");
             dfField.setAccessible(true);

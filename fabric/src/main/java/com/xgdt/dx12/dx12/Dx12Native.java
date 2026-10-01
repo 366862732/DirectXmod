@@ -60,7 +60,11 @@ public final class Dx12Native {
                             }
                             zf.close();
                         }
-                        if (jarModified >= 0 && dllPath.toFile().lastModified() > jarModified) {
+                        // 注意：Gradle 打包时 JAR 内条目使用固定时间戳（1980 epoch），
+                        // 因此“本地更新”几乎恒成立。必须同时要求大小一致，否则 JAR 里
+                        // 换了新 DLL 也会被旧的本地文件挡住（曾导致新 DLL 一直不生效）。
+                        if (jarModified >= 0 && dllPath.toFile().lastModified() > jarModified
+                                && dllPath.toFile().length() == jarBytes.length) {
                             useJarDll = false;
                         }
                     }

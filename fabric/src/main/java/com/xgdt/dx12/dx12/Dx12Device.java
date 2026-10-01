@@ -101,8 +101,13 @@ public class Dx12Device implements GpuDeviceBackend {
 
     // P4: pipeline + shader caches（镜像官方 VulkanDevice）
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
-    /** P31：flipY 变体管线缓存（GUI 离屏 pass 专用，避免与主世界实体管线共享）。 */
-    private final Map<FlipYKey, Dx12CompiledRenderPipeline> pipelineCacheFlipY = new IdentityHashMap<>();
+    /**
+     * P31：flipY 变体管线缓存（GUI 离屏 pass 专用，避免与主世界实体管线共享）。
+     * 注意：键是值语义的 {@link FlipYKey}（每次调用都会新建实例），必须用 HashMap
+     * 按 equals/hashCode 查找；若误用 IdentityHashMap 则按 `==` 比较，永远 miss
+     * → flipY 管线每帧重编译（spvc + HLSL dump + D3DCompile），是低帧率主因。
+     */
+    private final Map<FlipYKey, Dx12CompiledRenderPipeline> pipelineCacheFlipY = new HashMap<>();
     private final Map<ShaderCompilationKey, Dx12IntermediaryShaderModule> shaderCache = new HashMap<>();
     @Nullable
     private Dx12ShaderCompiler glslCompiler;

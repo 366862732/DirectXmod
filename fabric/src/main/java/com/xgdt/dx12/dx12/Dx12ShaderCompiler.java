@@ -184,17 +184,20 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertexWork.toHlsl(true);
         String fragmentHlsl = fragmentWork.toHlsl(false);
-        // P31：在 GUI 离屏 pass（flipY=true）中，对 entity_cutout / item_cutout / animate_sprite 管线
-        // 注入 gl_Position.y 翻转。shader Y-flip 与 enableScissor 中的 scissorY 翻转配合使用，
-        // 确保几何与 scissor 在同一坐标系内对齐。
+        // P31：在 GUI 离屏 pass（flipY=true，仅 GuiItemAtlas / PictureInPicture 离屏图集）
+        // 中，对 entity_cutout / item_cutout / animate_sprite 管线注入 gl_Position.y 翻转，
+        // 抵消这些 pass 的 invertY=true 正交投影在 D3D12（NDC Y 向上）下多出的一次 Y 镜像。
+        // scissor 由 Dx12RenderPassBackend 原样直通，无需再翻转。
         // 注意：这些管线在 flipY=false 时保持原始着色器，主世界 3D 渲染方向不受影响。
         String pipelineLocation = pipeline.getLocation().toString();
         boolean needsYFlip = flipY && (pipelineLocation.contains("animate_sprite")
             || pipelineLocation.contains("entity_cutout")
             || pipelineLocation.contains("item_cutout"));
-        // P28 诊断：打印 pipelineLocation + flipY + needsYFlip，便于追踪注入路径。
-        System.err.println("[dx12-java] [P28] " + pipelineLocation + " flipY=" + flipY + " needsYFlip=" + needsYFlip);
-        System.err.flush();
+        // P28 诊断：打印 pipelineLocation + flipY + needsYFlip，便于追踪注入路径（P29：仅 verbose 输出）
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] [P28] " + pipelineLocation + " flipY=" + flipY + " needsYFlip=" + needsYFlip);
+            System.err.flush();
+        }
         if (needsYFlip) {
             String before = vertexHlsl;
             vertexHlsl = injectVertexYFlip(vertexHlsl);

@@ -29,14 +29,61 @@ DeviceContext gCtx;
 // （"was deleted prior to closing the command list"）。因此 destroyObject
 // 只登记到 pending，等所有打开的命令列表都提交完成（submit 同步等待后）
 // 才统一 delete。
-std::vector<Dx12Object*> gPendingDeletes;
+// P46 fix：待删对象 + 其"必须已完成的 queue fence 值"。
+// 仅凭"没有打开的命令列表"就判定可释放是**不够的**：命令列表可以已经 Close
+// 并 ExecuteCommandLists 提交，但仍在 GPU 上飞行（三帧飞行）。此时 Release
+// 底层 ID3D12Resource 会被调试层判定为 CORRUPTION：
+//   ID3D12Resource3::<final-release>: CORRUPTION: An ID3D12Resource object
+//   (...) is referenced by GPU operations in-flight on Command Queue (...)
+// → RaiseException(0x0000087D) → 无调试器时进程终止（本次实测崩溃根因）。
+// 现在每个对象登记释放门槛，flush 时只释放 gCtx.queueFence 已完成到该值的
+// 条目，未满足的留到后续帧，不阻塞渲染线程。
+struct PendingDelete {
+    Dx12Object* obj;
+    UINT64 requiredFence;
+};
+std::vector<PendingDelete> gPendingDeletes;
 int gOpenListCount = 0;  // 当前打开（已 begin 未提交）的命令列表数
+
+// P47 fix（#921 CORRUPTION 根因）：destroyObject 发生时若仍有**打开**的命令列表
+// （gOpenListCount>0），该对象可能被这条"尚未提交"的列表引用，而它的提交时刻
+// 未知——可能远在若干帧之后（queue fence 值高得多）。此时用 destroy 当下的
+// queueFenceValue 作为门槛必然偏低。
+// 实测场景：加载期存在一条长期保持打开的共享列表，装载尾声才一次性
+// Close→Execute 提交（qf=54）；而在此期间被 destroy 的 12381 个对象记录的
+// requiredFence 全部 ≤53，于是 flush 在 gpuDone=53 时把这批资源 final-release，
+// 而引用它们的 qf=54 提交仍在 GPU 在飞 → 调试层 #921 CORRUPTION → RaiseException。
+// 解决办法：这类对象先登记"阻塞哨兵值"，直到所有打开列表都已提交
+// （flush 时 gOpenListCount 归零）才回填真实门槛（见 flushPendingDeletes）。
+const UINT64 kFenceBlockedByOpenList = UINT64_MAX;
+
+// P44 诊断：flushPendingDeletes 崩溃定位用。崩溃过滤器读取这些值即可知道
+// 崩溃发生在哪个延迟删除对象上（delete 前的最后一次记录），无需逐行日志。
+Dx12Object* volatile gPdDeletingObj = nullptr;  // 当前正在 delete 的对象
+volatile long gPdDeletingIndex = -1;            // 其在 gPendingDeletes 中的下标
+volatile long gPdDeletingTotal = 0;             // 本次 flush 的待删对象总数
+volatile long gPdInProgress = 0;                // flush 重入保护（Interlocked）
 
 // P6：SRV / sampler 描述符堆槽位复用。纹理 view 与 sampler 长会话累积分配，
 // gNextSrv 单调递增会耗尽 4096 槽位（窗口 resize 触发 RenderTarget 重建 view
 // 时崩溃："srv heap exhausted"）。对象销毁时把槽位归还 free-list。
 std::vector<UINT> gFreeSrvSlots;
 std::vector<UINT> gFreeSamplerSlots;
+
+// P45 fix（崩溃根因）：以上两个容器会被多线程并发访问——
+//   渲染线程：present 后 flushPendingDeletes() 遍历 gPendingDeletes 并
+//             向 gFree*Slots 归还槽位；
+//   主线程  ：JNI destroyObject() push_back、allocSrvSlot/allocSamplerSlot
+//             从 gFree*Slots 取用。
+// 此前完全无锁：渲染线程正在遍历 pending 时，主线程 push_back 触发 vector
+// 扩容 → 渲染线程的迭代器指向已被释放的旧缓冲区 → 读到旧/垃圾 Dx12Object*
+// → delete 已释放对象 → ComPtr<ID3D12Resource>::Release() 落到已析构内存
+// → D3D12 调试层（D3D12SDKLayers.dll）判定 CORRUPTION 并
+// RaiseException(0x0000087D) → 无调试器时进程终止。这就是"加载末期
+// flushPendingDeletes: begin count=12425 后立刻 FATAL"的成因。
+// 下面两个互斥量把所有对上述容器的访问串行化。
+std::mutex gPendingMutex;   // 保护 gPendingDeletes
+std::mutex gFreeSlotMutex;  // 保护 gFreeSrvSlots / gFreeSamplerSlots
 
 // 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
 // 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
@@ -89,30 +136,54 @@ inline UINT syncRingCapacity() {
     return gCtx.syncRingReserve > 0 ? gCtx.syncRingReserve : kDrawHeapPerFrame;
 }
 
+// P45 fix：pending 列表 / free-list 的加锁访问辅助（供本文件各处复用）。
+size_t pendingDeletesCount() {
+    std::lock_guard<std::mutex> lk(gPendingMutex);
+    return gPendingDeletes.size();
+}
+int popFreeSrvSlot() {
+    std::lock_guard<std::mutex> lk(gFreeSlotMutex);
+    if (gFreeSrvSlots.empty()) return -1;
+    int slot = (int)gFreeSrvSlots.back();
+    gFreeSrvSlots.pop_back();
+    return slot;
+}
+int popFreeSamplerSlot() {
+    std::lock_guard<std::mutex> lk(gFreeSlotMutex);
+    if (gFreeSamplerSlots.empty()) return -1;
+    int slot = (int)gFreeSamplerSlots.back();
+    gFreeSamplerSlots.pop_back();
+    return slot;
+}
+size_t freeSrvSlotCount() {
+    std::lock_guard<std::mutex> lk(gFreeSlotMutex);
+    return gFreeSrvSlots.size();
+}
+size_t freeSamplerSlotCount() {
+    std::lock_guard<std::mutex> lk(gFreeSlotMutex);
+    return gFreeSamplerSlots.size();
+}
+
 // 从 free-list 复用或从堆尾分配一个 SRV 槽位；失败填充 err 返回 -1。
 int allocSrvSlot(std::string& err) {
-    if (!gFreeSrvSlots.empty()) {
-        int slot = (int)gFreeSrvSlots.back();
-        gFreeSrvSlots.pop_back();
-        return slot;
-    }
+    int slot = popFreeSrvSlot();
+    if (slot >= 0) return slot;
     // P6 兜底：堆满但存在未 flush 的延迟删除对象且没有打开的命令列表时，
     // 先 flush 一次再重试（正常路径 submit 后已 flush，此分支仅防御性的
     // 覆盖"批量 create+destroy 夹在两次 submit 之间"的时序）。
-    if (gNextSrv >= kSrvHeapSize && !gPendingDeletes.empty() && gOpenListCount == 0) {
+    // 注意：flush 内部会取 gFreeSlotMutex，故上面必须先释放锁（popFree*
+    // 为独立作用域），否则死锁。
+    if (gNextSrv >= kSrvHeapSize && gOpenListCount == 0 && pendingDeletesCount() > 0) {
         flushPendingDeletes();
-        if (!gFreeSrvSlots.empty()) {
-            int slot = (int)gFreeSrvSlots.back();
-            gFreeSrvSlots.pop_back();
-            return slot;
-        }
+        slot = popFreeSrvSlot();
+        if (slot >= 0) return slot;
     }
     if (gNextSrv >= kSrvHeapSize) {
         // 诊断：若仍耗尽，打印堆使用画像定位泄漏（live 近似 = next - free，
         // 实际持有者 = next - free - pending 中未 flush 的 view）。
         err = "srv heap exhausted (next=" + std::to_string((long long)gNextSrv)
-            + " free=" + std::to_string((long long)gFreeSrvSlots.size())
-            + " pending=" + std::to_string((long long)gPendingDeletes.size())
+            + " free=" + std::to_string((long long)freeSrvSlotCount())
+            + " pending=" + std::to_string((long long)pendingDeletesCount())
             + " openLists=" + std::to_string(gOpenListCount) + ")";
         return -1;
     }
@@ -121,23 +192,17 @@ int allocSrvSlot(std::string& err) {
 
 // 同上，sampler 槽位。
 int allocSamplerSlot(std::string& err) {
-    if (!gFreeSamplerSlots.empty()) {
-        int slot = (int)gFreeSamplerSlots.back();
-        gFreeSamplerSlots.pop_back();
-        return slot;
-    }
-    if (gNextSampler >= kSamplerHeapSize && !gPendingDeletes.empty() && gOpenListCount == 0) {
+    int slot = popFreeSamplerSlot();
+    if (slot >= 0) return slot;
+    if (gNextSampler >= kSamplerHeapSize && gOpenListCount == 0 && pendingDeletesCount() > 0) {
         flushPendingDeletes();
-        if (!gFreeSamplerSlots.empty()) {
-            int slot = (int)gFreeSamplerSlots.back();
-            gFreeSamplerSlots.pop_back();
-            return slot;
-        }
+        slot = popFreeSamplerSlot();
+        if (slot >= 0) return slot;
     }
     if (gNextSampler >= kSamplerHeapSize) {
         err = "sampler heap exhausted (next=" + std::to_string((long long)gNextSampler)
-            + " free=" + std::to_string((long long)gFreeSamplerSlots.size())
-            + " pending=" + std::to_string((long long)gPendingDeletes.size())
+            + " free=" + std::to_string((long long)freeSamplerSlotCount())
+            + " pending=" + std::to_string((long long)pendingDeletesCount())
             + " openLists=" + std::to_string(gOpenListCount) + ")";
         return -1;
     }
@@ -235,10 +300,70 @@ void dumpInfoQueueMessages() {
 // 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
 // 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
 // 定义在此处（匿名 namespace 外）以便 destroySurface 等跨编译单元调用。
-void flushPendingDeletes() {
-    for (Dx12Object* o : gPendingDeletes) {
+void flushPendingDeletes(bool force) {
+    // P44：重入/并发保护。flush 可能来自渲染线程（present 后）、主线程
+    // （allocSrvSlot 堆满兜底）或 destroyCommandEncoder；若两处同时进入，
+    // 会并发遍历/修改同一个 std::vector → 迭代器失效 + double free。
+    // 拿到锁的线程先跑完，另一线程直接返回（对象留待下次 flush）。
+    if (InterlockedExchange(&gPdInProgress, 1) != 0) {
+        dbgLog("flushPendingDeletes: concurrent/re-entrant call skipped (pending=%lld)",
+            (long long)pendingDeletesCount());
+        return;
+    }
+    // P46 fix：只摘出 GPU 确已完成（queueFence 已推进到 requiredFence）的条目。
+    // force=true 用于进程退出：此时必须释放全部，否则遗留 live object；
+    // 调用方须自行保证 GPU 已空闲（见 destroyDevice 的 fence drain）。
+    UINT64 gpuDone = UINT64_MAX;
+    if (!force && gCtx.queueFence) {
+        gpuDone = gCtx.queueFence->GetCompletedValue();
+    }
+    // P45 fix：在锁内把可释放条目摘出到本地，随后在锁外逐个 delete。
+    // 这样既杜绝与主线程 destroyObject() 的 push_back 竞争（扩容导致迭代器
+    // 失效 → double free），又不会在耗时的 delete 期间长时间持锁。
+    //
+    // P47 fix（#921 根因）：先把"阻塞于打开列表"（kFenceBlockedByOpenList）的
+    // 条目回填为真实门槛。前提是此刻没有打开的命令列表（各调用点均以
+    // gOpenListCount==0 为前提）——说明 destroy 时那些打开的列表现已全部提交，
+    // 其 queue fence 值必然 ≤ 当前 gCtx.queueFenceValue（含 present flip 的推进），
+    // 故以当前值作为这些对象的上界门槛，再按 gpuDone 判定是否可释放。
+    const bool canResolveBlocked = (gOpenListCount == 0);
+    const UINT64 resolveFence = gCtx.queueFenceValue;
+    std::vector<PendingDelete> local;
+    {
+        std::lock_guard<std::mutex> lk(gPendingMutex);
+        std::vector<PendingDelete> keep;
+        keep.reserve(gPendingDeletes.size());
+        for (PendingDelete& pd : gPendingDeletes) {
+            if (force) {
+                local.push_back(pd);
+                continue;
+            }
+            if (pd.requiredFence == kFenceBlockedByOpenList) {
+                if (!canResolveBlocked) { keep.push_back(pd); continue; }
+                pd.requiredFence = resolveFence;  // 回填后随下一帧 gpuDone 推进释放
+            }
+            if (pd.requiredFence <= gpuDone) {
+                local.push_back(pd);
+            } else {
+                keep.push_back(pd);
+            }
+        }
+        gPendingDeletes.swap(keep);
+    }
+    gPdDeletingTotal = (long)local.size();
+    if (gPdDeletingTotal > 0) {
+        dbgLog("flushPendingDeletes: begin count=%ld deferred=%lld gpuDone=%llu",
+            gPdDeletingTotal, (long long)pendingDeletesCount(),
+            (unsigned long long)gpuDone);
+    }
+    long idx = 0;
+    for (const PendingDelete& pd : local) {
+        Dx12Object* o = pd.obj;
+        gPdDeletingObj = o;
+        gPdDeletingIndex = idx++;
         // 先归还描述符堆槽位（delete 后句柄失效，须在此前完成）
         if (o->descSlot >= 0) {
+            std::lock_guard<std::mutex> lk(gFreeSlotMutex);
             if (o->kind == Dx12Object::Kind::TextureView) {
                 gFreeSrvSlots.push_back((UINT)o->descSlot);
             } else if (o->kind == Dx12Object::Kind::Sampler) {
@@ -247,7 +372,11 @@ void flushPendingDeletes() {
         }
         delete o;
     }
-    gPendingDeletes.clear();
+    gPdDeletingObj = nullptr;
+    gPdDeletingIndex = -1;
+    gPdDeletingTotal = 0;
+    InterlockedExchange(&gPdInProgress, 0);
+    dbgLog("flushPendingDeletes: done");
 }
 
 // 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
@@ -326,11 +455,105 @@ void setLogLevel(int level) {
     gLogLevel = (level < 0) ? 0 : (level > 3) ? 3 : level;
 }
 
+// P44 诊断：D3D12 调试层同步消息回调。
+// 调试层判定 CORRUPTION（severity=0）时默认 break——无调试器时表现为
+// RaiseException(0x87D) → 未处理异常 → 进程终止。此时 InfoQueue 轮询根本
+// 来不及，只有同步回调能在抛异常前抓到这条消息。仅打印 WARNING 及以上
+// （0=CORRUPTION 1=ERROR 2=WARNING），避免 INFO 级信息洪流拖慢帧率。
+DWORD gInfoQueueCookie = 0;
+void CALLBACK dx12DebugMessageCallback(D3D12_MESSAGE_CATEGORY /*category*/,
+    D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
+    LPCSTR description, void* /*context*/) {
+    if ((int)severity > (int)D3D12_MESSAGE_SEVERITY_WARNING) return;
+    static const char* kSev[] = { "CORRUPTION", "ERROR", "WARNING", "INFO", "MESSAGE" };
+    int si = (int)severity;
+    const char* sevName = (si >= 0 && si <= 4) ? kSev[si] : "?";
+    std::fprintf(stderr, "[dx12][D3D12 %s #%d] %s\n", sevName, (int)id,
+        description ? description : "(null)");
+    std::fflush(stderr);
+}
+
 // ---------------------------------------------------------------------------
 // 设备生命周期
 // ---------------------------------------------------------------------------
 
+// P33 诊断：全局未处理异常过滤器。上一次运行在第二次 dx12CreateSurface 内部静默崩溃
+// （无错误输出、无 JVM 崩溃日志），无法定位。这里在进程因原生异常终止前打印异常码、
+// 出错地址及其所属模块（DLL 名），便于判断崩溃发生在 nvapi/DXGI 还是本模块。
+LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
+    if (ep != nullptr && ep->ExceptionRecord != nullptr) {
+        EXCEPTION_RECORD* rec = ep->ExceptionRecord;
+        char modPath[MAX_PATH] = "<unknown>";
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(rec->ExceptionAddress), &mod)) {
+            GetModuleFileNameA(mod, modPath, MAX_PATH);
+        }
+        std::fprintf(stderr,
+            "[dx12] FATAL native exception code=0x%08X addr=%p tid=%lu module=%s\n",
+            (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
+            (unsigned long)GetCurrentThreadId(), modPath);
+        // P44 诊断：延迟删除状态。若崩溃发生在 flushPendingDeletes 内，
+        // 这里能直接看到正被 delete 的对象指针 / 下标 / 本批总数。
+        std::fprintf(stderr,
+            "[dx12] FATAL context: pendingDeletes=%lld openList=%d flushInProgress=%ld "
+            "deletingObj=%p deletingIndex=%ld deletingTotal=%ld\n",
+            (long long)gPendingDeletes.size(), gOpenListCount, (long)gPdInProgress,
+            (void*)gPdDeletingObj, (long)gPdDeletingIndex, (long)gPdDeletingTotal);
+        // P44 诊断：正被 delete 的对象详情。若该对象确为 Texture/Buffer
+        // （resource != null），说明崩溃在其 ID3D12Resource::Release()。
+        Dx12Object* dObj = gPdDeletingObj;
+        if (dObj) {
+            std::fprintf(stderr,
+                "[dx12] FATAL deletingObj: kind=%d descSlot=%d resource=%p "
+                "sourceTexture=%p mappedPtr=%p size=%lld\n",
+                (int)dObj->kind, dObj->descSlot, (void*)dObj->resource.Get(),
+                (void*)dObj->sourceTexture, dObj->mappedPtr, (long long)dObj->size);
+        }
+        // P44 诊断：设备移除原因。若此前 GPU 已挂（TDR/页错误），后续任意
+        // D3D12 调用都会被调试层报为 CORRUPTION → break。此值可区分两者。
+        if (gCtx.device) {
+            std::fprintf(stderr, "[dx12] FATAL deviceRemovedReason=0x%08X\n",
+                (unsigned)gCtx.device->GetDeviceRemovedReason());
+        }
+        // P44 诊断：栈回溯（模块名 + RVA）。即使没有 PDB 也能定位到"哪个模块的
+        // 哪段代码"；本 DLL 的 RVA 可用同版本 map/PDB 反查函数名。
+        void* frames[48];
+        USHORT nframes = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+        std::fprintf(stderr, "[dx12] FATAL backtrace: %u frames\n", (unsigned)nframes);
+        for (USHORT i = 0; i < nframes; ++i) {
+            HMODULE fm = nullptr;
+            char fpath[MAX_PATH] = "<unknown>";
+            unsigned long long rva = 0;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(frames[i]), &fm)) {
+                GetModuleFileNameA(fm, fpath, MAX_PATH);
+                rva = (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)fm);
+            }
+            const char* fb = fpath;
+            for (const char* p = fpath; *p; ++p) {
+                if (*p == '\\' || *p == '/') fb = p + 1;
+            }
+            std::fprintf(stderr, "  [%02u] %s+0x%llx\n",
+                (unsigned)i, fb, rva);
+        }
+        std::fflush(stderr);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;  // 按原行为终止进程
+}
+
+// 仅安装一次（进程级）。
+void installCrashHandlerOnce() {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    SetUnhandledExceptionFilter(&dx12CrashFilter);
+}
+
 bool ensureDevice(std::string& errorOut) {
+    installCrashHandlerOnce();
     // P6 修复：guard 必须同时校验描述符堆齐备。若上次调用在堆创建中途失败
     // （如 Sampler 堆 4096 超过 D3D12 上限 2048），gCtx.device 已置位但堆为
     // null，此 guard 若只看 device 会短路返回 true，后续 createSampler/
@@ -388,6 +611,21 @@ bool ensureDevice(std::string& errorOut) {
     if (debugEnabled) {
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&gCtx.infoQueue)))) {
             gCtx.infoQueue = nullptr;
+        }
+        // P44 诊断：注册同步消息回调。调试层对 CORRUPTION 级消息默认 break
+        // （RaiseException → 崩溃），轮询 InfoQueue 拿不到那条消息；同步回调
+        // 能在抛异常前把确切的错误描述写入日志。
+        if (gCtx.infoQueue) {
+            ComPtr<ID3D12InfoQueue1> iq1;
+            if (SUCCEEDED(gCtx.infoQueue.As(&iq1)) && iq1) {
+                if (FAILED(iq1->RegisterMessageCallback(&dx12DebugMessageCallback,
+                        D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &gInfoQueueCookie))) {
+                    dbgLog("infoQueue: RegisterMessageCallback failed");
+                } else {
+                    dbgLogInfo("infoQueue: message callback registered cookie=%lu",
+                        (unsigned long)gInfoQueueCookie);
+                }
+            }
         }
     }
 
@@ -463,9 +701,24 @@ void destroyDevice() {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
     }
+    // P46：延迟删除队列里的对象现在带 fence 门槛，正常路径会在后续帧被 GPU
+    // 追平后释放。进程退出时不会再有后续帧，这里先尽力等 queue fence 追平
+    // （最多 1s），再强制释放全部，避免遗留 live object。
+    if (gCtx.queue && gCtx.queueFence) {
+        UINT64 target = gCtx.queueFenceValue;
+        if (gCtx.queueFence->GetCompletedValue() < target) {
+            HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (evt) {
+                if (SUCCEEDED(gCtx.queueFence->SetEventOnCompletion(target, evt))) {
+                    WaitForSingleObject(evt, 1000);
+                }
+                CloseHandle(evt);
+            }
+        }
+    }
     // 进程退出前释放所有延迟删除对象（若此后不再有 submit，pending 不会
     // 被 flush，需在此兜底）。
-    flushPendingDeletes();
+    flushPendingDeletes(/*force=*/true);
     gCtx = DeviceContext{};
     dbgLog("destroyDevice: done");
 }
@@ -847,7 +1100,28 @@ void destroyObject(Dx12Object* obj) {
     // "deleted prior to closing the command list"（E_INVALIDARG）。登记到
     // pending，等所有打开的命令列表提交完成（submitCommandList 同步等待后
     // 调用 flushPendingDeletes）再统一释放。
-    gPendingDeletes.push_back(obj);
+    // P45 fix：与渲染线程 flushPendingDeletes() 的 swap 互斥（见 gPendingMutex
+    // 注释）。此前无锁的 push_back 会在渲染线程遍历期间触发扩容 → 迭代器失效。
+    //
+    // P46 fix：登记"必须已完成"的 queue fence 值。submitCommandList 每次提交
+    // 都会 `++gCtx.queueFenceValue` 并 Signal gCtx.queueFence，所以
+    // 「下一次提交的 fence 值」就覆盖了任何可能引用本对象的在飞命令列表。
+    //
+    // P47 fix（#921 根因）：分两种情况——
+    //   - 仍有打开的命令列表：该对象可能被这条未提交的列表引用，而它的提交时刻
+    //     未知（可能很多帧之后、fence 值远高于当前）。登记阻塞哨兵值，待所有
+    //     打开列表都提交完毕后再回填门槛（见 flushPendingDeletes）。
+    //   - 无打开列表：新列表无法再引用它（Java 句柄已销毁），只需等"当前已提交/
+    //     正在提交"的所有 GPU 工作完成，即 queueFenceValue+1（+1 覆盖并发中
+    //     尚未 Signal 的那次提交，消除 endCommandList 与 ++queueFenceValue 之间的
+    //     竞态窗口）。
+    UINT64 required = (gOpenListCount > 0)
+        ? kFenceBlockedByOpenList
+        : (gCtx.queueFenceValue + 1);
+    {
+        std::lock_guard<std::mutex> lk(gPendingMutex);
+        gPendingDeletes.push_back(PendingDelete{obj, required});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,11 +1523,18 @@ void destroyCommandEncoder(CommandContext* ctx) {
 }
 
 bool beginCommandList(CommandContext* ctx, std::string& err) {
-    // 兼容路径：无等待值（单线程 / createBuffer 一次性路径）直接 begin。
+    if (!ctx) { err = "beginCommandList: null ctx"; return false; }
     // P33 fix：若列表已打开（构造函数或先前调用已打开），幂等返回——不再 Reset
     // 同一 allocator，避免 E_FAIL（allocator 仍在 GPU 使用中）。
-    if (ctx && ctx->listOpen) return true;
-    return beginCommandListWithWait(ctx, 0, err);
+    if (ctx->listOpen) return true;
+    // P33 fix（帧序倒置修复）：命令列表的 begin/Reset 现在由**主线程**在自己的
+    // 帧开始时负责（渲染线程只做 Close + ExecuteCommandLists + Present）。
+    // Reset allocator 前必须等 GPU 执行完上次使用同一 allocator 的命令列表：
+    // allocator 索引 = fenceValue % 3，同一 allocator 上次被使用是在 3 次提交之前，
+    // 其提交后的 fenceValue = 当前 fenceValue - 2 → 等 fenceValue-2 即可安全 Reset，
+    // 且比等 prevFenceValue 少一个整帧的停顿。
+    UINT64 waitVal = ctx->fenceValue >= 2 ? (ctx->fenceValue - 2) : 0;
+    return beginCommandListWithWait(ctx, waitVal, err);
 }
 
 bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::string& err) {
@@ -1377,11 +1658,29 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
         return false;
     }
     ctx->listOpen = 0;
+    // P44 fix：gOpenListCount 必须与 listOpen 严格一一对应。
+    // 此前 endCommandList 只置 listOpen=0 而不递减计数，导致一次性
+    // （device==null）encoder 的 close() 路径（先 end 后 destroy）永远
+    // 泄漏计数：destroy 时 listOpen 已为 0，不再递减 → 计数单调上涨 →
+    // flushPendingDeletes 饥饿 → 加载末期一次性释放大批对象时崩溃。
+    // 现在统一由“listOpen 1→0”的唯一收口点递减；submit / destroy / 渲染
+    // 线程 abort 路径不再重复递减。注意此处**不**触发 flush——延迟删除
+    // 必须等到渲染线程 present fence 之后（见 renderThread post-present）。
+    if (gOpenListCount > 0) --gOpenListCount;
+    dbgLog("endCommandList: openList now=%d ctx=%p", gOpenListCount, (void*)ctx);
     return true;
 }
 
 UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     if (!ctx) { err = "submitCommandList: null ctx"; return 0; }
+    // P33 fix：命令列表未打开说明本帧没有任何录制内容。此时若仍执行
+    // ExecuteCommandLists，会把**上一条已提交的命令列表**再执行一遍
+    // （D3D12 中重复执行同一条 list 是合法的，但会重复写入同一批资源）。
+    // 这里按“空帧”处理：不执行，但仍返回当前 queue fence 让调用方继续 present。
+    if (!ctx->listOpen) {
+        dbgLog("submitCommandList: no open list — skip execute (empty frame) ctx=%p", (void*)ctx);
+        return gCtx.queueFenceValue > 0 ? gCtx.queueFenceValue : 1;
+    }
     if (!endCommandList(ctx, err)) return 0;
     UINT64 value = ctx->fenceValue + 1;
     // P15 诊断：每 30 帧打印 submit 摘要（含 fence 值 + queueFence）
@@ -1434,8 +1733,8 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
     // 注意：flushPendingDeletes() 不在 submit 时调用，而是延迟到渲染线程
     // presentSurface + present fence signal 之后执行，确保 GPU 工作（含 display
     // controller flip）完成后才释放延迟删除对象。
-    if (gOpenListCount > 0) --gOpenListCount;
-    dbgLog("submitCommandList: openList now=%d", gOpenListCount);
+    // P44 fix：openList 的递减已统一由 endCommandList（listOpen 1→0 的唯一
+    // 收口点）完成，此处不再重复递减（否则会双重递减导致计数提前归零）。
     return gCtx.queueFenceValue;
 }
 
@@ -3899,6 +4198,9 @@ HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：已提交，
 // 渲染线程函数
 static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    // P33 诊断：记录渲染线程 OS 线程 id，便于与崩溃报告里的 tid 对照，
+    // 判断异常发生在渲染线程还是主线程。
+    dbgLogInfo("renderThread: started tid=%lu", (unsigned long)GetCurrentThreadId());
 
     while (true) {
         // 步骤 1：等待主线程请求开始新帧（500ms 超时 + 每轮检查 gRenderRunning 退出）
@@ -3914,92 +4216,20 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         CommandContext* ctx = gAsyncRenderCtx;
         std::string err;
 
-        // P40：使用 per-command-list fence 值（而非 queue fence）作为等待目标。
-        // queue fence 仅表示命令已入队，per-list fence 保证 GPU 真正执行完毕。
-        UINT64 waitForValue = ctx->prevFenceValue;
-        dbgLog("renderThread: begin wait=%llu ctx=%p",
-            (unsigned long long)waitForValue, (void*)ctx);
+        // P33 fix（帧序倒置修复）：命令录制发生在主线程调用 submit() **之前**，
+        // 因此渲染线程绝不能再 Reset allocator / command list —— 那会把主线程刚录制
+        // 的全部命令（render pass / clear / blit / draw）丢掉，back buffer 永远不被
+        // 写入，Present 只能显示未初始化内容（窗口闪烁各种颜色的根因）。
+        //
+        // 现在本线程只负责：Close + ExecuteCommandLists + Present。
+        // allocator 的 Reset 与列表 begin 由主线程在帧开始时调用 beginCommandList
+        // 完成（内部按 fenceValue-2 等待 allocator 不再被 GPU 占用）。
+        dbgLog("renderThread: wake ctx=%p listOpen=%d", (void*)ctx, ctx->listOpen);
 
-        // 步骤 2：acquireSurface（阻塞等显示器）
-        Dx12Surface* surf = getActiveSurface();
-        if (surf == nullptr || !gRenderRunning) {
-            // 初始化阶段无 surface，休眠 100ms 后重试
-            Sleep(100);
-            SetEvent(gEvtSubmitDone);
-            continue;
-        }
-        // P34：连续 acquire 失败计数器——用于指数退避，避免无意义的高速循环
-        static int acquireFailCount = 0;
-        if (!acquireSurface(surf, err)) {
-            acquireFailCount++;
-            // 前 3 次快速重试（swapchain 可能正在 ResizeBuffers）；
-            // 之后指数退避，防止日志爆炸和 CPU 空转。
-            if (acquireFailCount <= 3) {
-                dbgLog("renderThread: acquireSurface FAILED(%d): %s", acquireFailCount, err.c_str());
-                // P41：surface 可能被销毁/重建，清除上下文让主线程用新 surface 重试
-                if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
-                SetEvent(gEvtSubmitDone);
-                continue;
-            }
-            // 超过 3 次失败：退避 + 诊断
-            UINT waitMs = (acquireFailCount <= 10) ? (1 << (acquireFailCount - 3)) : 100;
-            if (acquireFailCount == 4 || acquireFailCount == 10) {
-                dbgLog("renderThread: acquireSurface STUCK(%d): %s surf=%p idx=%d bbCount=%u",
-                    acquireFailCount, err.c_str(), (void*)surf,
-                    surf->currentImageIndex, (UINT)surf->backBuffers.size());
-            }
-            // P41：长时间 acquire 失败也清除上下文
-            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
-            Sleep(waitMs);
-            SetEvent(gEvtSubmitDone);
-            continue;
-        }
-        acquireFailCount = 0;  // P34：成功 acquire 后重置计数器
-        dbgLog("renderThread: acquired surface idx=%d", surf->currentImageIndex);
+        // 步骤 2/3：acquireSurface 与 GPU fence 等待均已移交主线程
+        // （dx12AcquireSurface + beginCommandList），本线程不再触碰 allocator/list。
 
-        // 步骤 3：等 GPU 完成前两帧，再 Reset allocator（非阻塞，失败则跳过）
-        if (waitForValue > 0) {
-            dbgLog("renderThread: waitQFence=%llu", (unsigned long long)waitForValue);
-            if (!waitForQueueFenceValue(waitForValue, 500, err)) {
-                dbgLog("renderThread: GPU wait timeout, skipping frame");
-                // P41 fix：不清除 surface（render thread 仍持有引用，销毁会导致 use-after-free）
-                // 仅清除上下文让下一个 asyncBeginFrame 可以重试
-                if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
-                SetEvent(gEvtSubmitDone);
-                continue;
-            }
-        }
-
-        // 步骤 4a：关闭构造函数打开的旧 command list（释放 allocator），否则 beginCommandListWithWait
-        //          的 Reset 会因 allocator InUse 而返回 E_FAIL。
-        dbgLog("renderThread: begin endCommandList");
-        bool discardedOpenList = ctx->listOpen != 0;
-        if (!endCommandList(ctx, err)) {
-            dbgLog("renderThread: endCommandList FAILED: %s", err.c_str());
-            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
-            SetEvent(gEvtSubmitDone);
-            continue;
-        }
-        // 这里关闭的是构造阶段/上一轮遗留、且不会进入 submit 的旧命令列表；
-        // 它曾在 beginCommandListWithWait 中计入 gOpenListCount，需要显式归还。
-        if (discardedOpenList && gOpenListCount > 0) {
-            --gOpenListCount;
-            dbgLog("renderThread: discarded stale openList now=%d", gOpenListCount);
-            if (gOpenListCount == 0) flushPendingDeletes();
-        }
-        dbgLog("renderThread: done endCommandList");
-
-        // 步骤 4b：begin command list（Reset allocator + list）
-        dbgLog("renderThread: begin beginCommandListWithWait");
-        if (!beginCommandListWithWait(ctx, waitForValue, err)) {
-            dbgLog("renderThread: beginCommandList FAILED: %s", err.c_str());
-            // P41 fix：不清除 surface（allocato rReset 失败不代表 surface 无效）
-            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
-            SetEvent(gEvtSubmitDone);
-            continue;
-        }
-
-        // 步骤 5：通知主线程可以 push 命令了
+        // 步骤 5：通知主线程命令已可提交
         dbgLog("renderThread: signaling recordingReady ctx=%p", (void*)ctx);
         SetEvent(gEvtRecordingReady);
 
@@ -4016,8 +4246,9 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
                 dbgLog("renderThread: commandsReady timeout after %ds, aborting frame ctx=%p",
                     commandsWaitLoops * 500 / 1000, (void*)ctx);
                 if (ctx->listOpen) {
+                    // P44 fix：endCommandList 内部已统一递减 gOpenListCount，
+                    // 此处不再重复递减。
                     endCommandList(ctx, err);
-                    if (gOpenListCount > 0) --gOpenListCount;
                 }
                 gAsyncRenderCtx = nullptr;
                 SetEvent(gEvtSubmitDone);
@@ -4041,13 +4272,14 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // per-backbuffer fence
         Dx12Surface* s = getActiveSurface();
-        if (s) {
-            int idx = s->currentImageIndex;
-            if (idx >= 0 && idx < (int)kSurfaceBufferCount) {
-                if (s->surfaceFences.size() < (size_t)kSurfaceBufferCount)
-                    s->surfaceFences.resize(kSurfaceBufferCount, 0);
-                s->surfaceFences[(size_t)idx] = gCtx.queueFenceValue;
-            }
+        // P33 fix：back buffer index 必须在 presentSurface 之前捕获——presentSurface
+        // 结尾会把 currentImageIndex 重置为 -1（释放 backbuffer 所有权），之后再读
+        // 就只能拿到 -1，导致 surfaceFences / surfacePresentFences 永远写不进去。
+        const int bbIdx = (s && s->currentImageIndex >= 0) ? s->currentImageIndex : -1;
+        if (s && bbIdx >= 0) {
+            if (s->surfaceFences.size() < (size_t)kSurfaceBufferCount)
+                s->surfaceFences.resize(kSurfaceBufferCount, 0);
+            s->surfaceFences[(size_t)bbIdx] = gCtx.queueFenceValue;
         }
 
         DBG_LOG_DEBUG("renderThread: submit done v=%llu qf=%llu",
@@ -4055,23 +4287,21 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // present（presentSurface 返回 void）
         dbgLog("renderThread: about to presentSurface qf=%llu bbIdx=%d",
-            (unsigned long long)gCtx.queueFenceValue,
-            (int)(getActiveSurface() ? getActiveSurface()->currentImageIndex : -1));
+            (unsigned long long)gCtx.queueFenceValue, bbIdx);
         presentSurface(getActiveSurface());
+        // P33 fix：本帧 Present 已由本线程完成。标记给 Java 侧 present()，
+        // 让它在 submit() 返回后跳过重复 Present（重复 Present 会让 swapchain
+        // 连续 flip 两次，显示到未渲染的 back buffer → 窗口闪烁各种颜色）。
+        gAsyncOwnsPresent = true;
 
         // P33 fix：signal per-surface present fence，确保 Display Controller 完成
         // flip 后再销毁 surface。deviceWaitIdle 仅等命令队列，不等待 display controller。
-        {
-            Dx12Surface* ps = getActiveSurface();
-            if (ps) {
-                UINT64 pv = ++gCtx.queueFenceValue;
-                gCtx.queue->Signal(gCtx.queueFence.Get(), pv);
-                if (ps->surfacePresentFences.size() < (size_t)kSurfaceBufferCount)
-                    ps->surfacePresentFences.resize(kSurfaceBufferCount, 0);
-                int pidx = ps->currentImageIndex;
-                if (pidx >= 0 && pidx < kSurfaceBufferCount)
-                    ps->surfacePresentFences[(size_t)pidx] = pv;
-            }
+        if (s && bbIdx >= 0) {
+            UINT64 pv = ++gCtx.queueFenceValue;
+            gCtx.queue->Signal(gCtx.queueFence.Get(), pv);
+            if (s->surfacePresentFences.size() < (size_t)kSurfaceBufferCount)
+                s->surfacePresentFences.resize(kSurfaceBufferCount, 0);
+            s->surfacePresentFences[(size_t)bbIdx] = pv;
         }
 
         // P33 fix：在 present fence signal 之后才 flush 延迟删除对象，确保所有
@@ -4096,6 +4326,8 @@ std::thread gRenderThread;
 bool gRenderRunning = false;
 // P33：当前正在处理的 ctx（外部可访问，供诊断读回检测 ASYNC 管道活跃）
 CommandContext* gAsyncRenderCtx = nullptr;
+// P33：本帧 Present 已由渲染线程完成（Java 侧 present() 需跳过，避免重复 Present）
+bool gAsyncOwnsPresent = false;
 
 // 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。
 // 用于 destroySurface 场景：确保渲染线程不再并发操作 swapchain 后再调用 deviceWaitIdle。
@@ -4116,8 +4348,14 @@ bool initAsyncRenderer(UINT workerCount) {
     if (!ensureDevice(initErr)) return false;
     if (gRenderRunning) return true;
 
-    // 创建四个 manual-reset events
-    gEvtBeginFrame    = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    // P33 fix：gEvtBeginFrame 必须是 **auto-reset**（每帧一次的触发信号）。
+    // 若用 manual-reset 且无人 Reset，渲染线程完成一帧后回到等待点会立刻再次通过
+    // （信号仍有效），在主线程尚未 asyncRenderBeginFrame 的情况下自旋进入下一帧；
+    // 此时 gAsyncRenderCtx 可能已被 asyncRenderWaitComplete 置空、或 ctx 已被
+    // destroyCommandEncoder 释放，渲染线程随即在 waitForFenceValue 里解引用悬垂
+    // 指针 → 0xC0000005（ACCESS_VIOLATION）。
+    // 其余三个事件保持 manual-reset（广播语义：多个等待者需同时被唤醒）。
+    gEvtBeginFrame     = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     gEvtRecordingReady = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
     gEvtCommandsReady  = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
     gEvtSubmitDone     = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
@@ -4166,14 +4404,25 @@ void destroyAsyncRenderer() {
 }
 
 bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
-    if (!gRenderRunning) { err = "asyncRenderBeginFrame: renderer not running"; return false; }
+    if (!gRenderRunning) {
+        // 渲染线程未运行 → 本帧必然走 SYNC 路径，Java 侧 present() 必须真正
+        // 执行 Present，因此清除上一帧遗留的所有权标记。
+        gAsyncOwnsPresent = false;
+        err = "asyncRenderBeginFrame: renderer not running";
+        return false;
+    }
     if (getActiveSurface() == nullptr) {
         // 初始化阶段无 surface（窗口未创建），回退到同步路径
         dbgLogInfo("asyncRenderBeginFrame: no active surface, fallback sync");
+        gAsyncOwnsPresent = false;
         return false;
     }
     if (gAsyncRenderCtx != nullptr) { err = "asyncRenderBeginFrame: previous frame not complete"; return false; }
     gAsyncRenderCtx = ctx;
+    // P33 fix：新一帧开始，撤销上一帧的 Present 所有权标记。本帧稍后由渲染线程
+    // present 后重新置 true；若本帧走 SYNC fallback（不经过本函数），标记保持
+    // false，Java 侧 present() 会正常执行真正的 Present。
+    gAsyncOwnsPresent = false;
     // Reset events for this frame
     ResetEvent(gEvtRecordingReady);
     ResetEvent(gEvtCommandsReady);

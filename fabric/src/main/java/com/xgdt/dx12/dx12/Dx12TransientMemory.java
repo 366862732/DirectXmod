@@ -39,6 +39,14 @@ public class Dx12TransientMemory implements TransientMemory {
     private final Deque<List<Dx12GpuBuffer>> frames = new ArrayDeque<>();
     private List<Dx12GpuBuffer> frame = new ArrayList<>();
     private boolean closed;
+    /**
+     * 懒加载打开命令列表的回调（由 {@link Dx12CommandEncoderBackend#ensureListOpen} 提供）。
+     * 上传（copyBufferToBuffer）属于命令录制操作，必须在 listOpen=1 时执行。
+     * 资源重载（如 {@code CubeMapTexture.doLoad}）会在帧外调用 uploadStaging，
+     * 此时上一帧已提交、命令列表已关闭，若不重新打开就会抛
+     * "dx12CopyBuffer: copyBufferToBuffer: no open command list" → 资源包加载失败。
+     */
+    private final Runnable ensureListOpen;
 
     // allocateGpuMapped ring buffer
     private final Dx12GpuBuffer[] uboRing = new Dx12GpuBuffer[UBO_RING_COUNT];
@@ -47,8 +55,9 @@ public class Dx12TransientMemory implements TransientMemory {
     /** 当前路的已用字节数（从 0 开始单调递增，达到 BLOCK_SIZE 时 rotate）。 */
     private long uboRingOffset = 0;
 
-    Dx12TransientMemory(long ctx) {
+    Dx12TransientMemory(long ctx, Runnable ensureListOpen) {
         this.ctx = ctx;
+        this.ensureListOpen = ensureListOpen;
         // 预分配 3 路 UPLOAD 缓冲（同 MappableRingBuffer 构造时的 3 个 buffer）
         for (int i = 0; i < UBO_RING_COUNT; i++) {
             uboRing[i] = new Dx12GpuBuffer(
@@ -158,6 +167,7 @@ public class Dx12TransientMemory implements TransientMemory {
         }
         Dx12GpuBuffer gpu = new Dx12GpuBuffer(usage | GpuBuffer.USAGE_COPY_DST, total);
         this.register(gpu);
+        this.ensureListOpen.run();  // 帧外上传（资源重载）需先打开命令列表
         Dx12Native.dx12CopyBuffer(this.ctx, staging.handle(), 0, gpu.handle(), 0, total);
         return gpu.slice();
     }
@@ -183,6 +193,7 @@ public class Dx12TransientMemory implements TransientMemory {
         }
         Dx12GpuBuffer gpu = new Dx12GpuBuffer(usage | GpuBuffer.USAGE_COPY_DST, total);
         this.register(gpu);
+        this.ensureListOpen.run();  // 帧外上传（资源重载）需先打开命令列表
         Dx12Native.dx12CopyBuffer(this.ctx, staging.handle(), 0, gpu.handle(), 0, total);
 
         List<GpuBufferSlice> result = new ArrayList<>(data.size());

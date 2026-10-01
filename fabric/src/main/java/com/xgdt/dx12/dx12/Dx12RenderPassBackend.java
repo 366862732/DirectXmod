@@ -337,11 +337,15 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void enableScissor(int x, int y, int width, int height) {
-        // P31：flipY 模式下，shader 已将几何 Y 轴翻转，scissor 坐标需同步翻转以保持裁剪区域对齐。
-        // newW = outputHeight - y - height，使 scissor 原点从左下角转为左上角（与 shader 翻转后一致）。
-        int scissorY = this.flipY ? (this.outputHeight - y - height) : y;
-        if (!Dx12Native.dx12SetScissor(this.ctx, x, scissorY, width, height)) {
-            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, scissorY, width, height);
+        // D3D12 与 Vulkan 的 scissor 矩形语义完全一致（左上角为原点，Y 轴向下），
+        // 调用方（GuiRenderer / GuiItemAtlas / RenderType 的 scissorState）已经完成
+        // 「GUI 自底向上 → 左上原点」的 Y 转换（如 window.height - bottom），因此这里
+        // 必须原样直通（与官方 VulkanRenderPass.enableScissor 一致）。
+        //
+        // 此前的 flipY 二次镜像（outputHeight - y - height）会与 shader 的 gl_Position.y
+        // 取反再叠加一次翻转，令 GUI 裁剪区镜像，造成 UI 元素错位、按钮底图/图标串图。
+        if (!Dx12Native.dx12SetScissor(this.ctx, x, y, width, height)) {
+            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, y, width, height);
         }
     }
 

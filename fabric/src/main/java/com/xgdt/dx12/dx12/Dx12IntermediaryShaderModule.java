@@ -313,9 +313,11 @@ public record Dx12IntermediaryShaderModule(
                 long address = pointer.get(0);
                 String hlsl = MemoryUtil.memUTF8(address);
                 // P7 诊断：打印 raw spvc 输出，确认 }}; 来自 spvc 还是注入逻辑
-                if (name.contains("gui") || name.contains("debug") || name.contains("position")
+                // P29：全量 HLSL dump 是同步 I/O 洪泛（每帧数千行），仅 verbose 模式输出。
+                if (Dx12Native.LOG_VERBOSE
+                        && (name.contains("gui") || name.contains("debug") || name.contains("position")
                         || name.contains("animate") || name.contains("sprite") || name.contains("text")
-                        || name.contains("entity") || name.contains("item")) {
+                        || name.contains("entity") || name.contains("item"))) {
                     System.err.println("[dx12-java] [" + name + "] RAW spvc HLSL:\n" + hlsl);
                 }
                 // Fix S2：语义通过 spvc_compiler_hlsl_add_vertex_attribute_remap 在编译前注入，
@@ -323,9 +325,11 @@ public record Dx12IntermediaryShaderModule(
                 String result = hlsl;
                 // P7 诊断：打印 raw spvc 输出，确认语义已正确生成
                 // P27：条件同步包含 animate/sprite，确保 animate_sprite_blit 的完整 HLSL 也输出
-                if (name.contains("gui") || name.contains("debug") || name.contains("position")
+                // P29：同 RAW dump，全量 HLSL 仅 verbose 模式输出，避免同步 I/O 洪泛。
+                if (Dx12Native.LOG_VERBOSE
+                        && (name.contains("gui") || name.contains("debug") || name.contains("position")
                         || name.contains("animate") || name.contains("sprite") || name.contains("text")
-                        || name.contains("entity") || name.contains("item")) {
+                        || name.contains("entity") || name.contains("item"))) {
                     System.err.println("[dx12-java] [" + name + "] spvc HLSL (no inject):\n" + result);
                 }
                 return result;
