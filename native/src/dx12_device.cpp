@@ -73,7 +73,12 @@ constexpr UINT kSamplerHeapSize = 2048;
 // GPU 命令列表在提交后仍会持续读取这些描述符直到 fence 完成。
 // 三帧飞行（N、N+1、N+2 同时在空中），需要 4 个半区确保帧 N+2 写时
 // 不会覆盖帧 N（GPU 仍在读）所使用的半区。
-constexpr UINT kDrawHeapPerFrame = 32768;
+// P33 async：每帧段槽位数 = 同步 ring 保留区 + 各 worker 分区之和。
+// 开启异步分区后，每段起始 kAsyncSyncRingReserve 个槽位归同步路径 ring，
+// 其余 kAsyncWorkerSlotsPerSection 个槽位按 worker 均分（见
+// PartitionedDescriptorAllocator::init）。两区严格互不重叠，故此处必须等于
+// 二者之和，否则 worker 分区会越界写入相邻帧段。
+constexpr UINT kDrawHeapPerFrame = kAsyncSyncRingReserve + kAsyncWorkerSlotsPerSection;
 constexpr UINT kDrawHeapSections = 4;
 constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * kDrawHeapSections;
 

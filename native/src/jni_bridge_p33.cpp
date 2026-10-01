@@ -568,6 +568,29 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncPrepareTextureViews(
     return JNI_TRUE;
 }
 
+// 与 dx12AsyncPrepareCBVBuffers 同源：把这一批 draw 的索引缓冲在主列表上过渡到
+// INDEX_BUFFER（bundle 内禁止 ResourceBarrier）。语义与 setIndexBuffer 一致；
+// 状态已匹配时 transitionBufferTo 为空操作。
+// 注意：顶点缓冲（VERTEX_AND_CONSTANT_BUFFER）由 dx12AsyncPrepareCBVBuffers 一并处理，
+// 因为目标状态与 CBV 相同。
+JNIEXPORT jboolean JNICALL
+Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncPrepareIndexBuffers(
+    JNIEnv* env, jclass, jlong ctx, jlongArray buffers) {
+    CommandContext* c = toPtr<CommandContext>(ctx);
+    if (!c || !c->listOpen || !buffers) return JNI_FALSE;
+    const jsize n = env->GetArrayLength(buffers);
+    if (n <= 0) return JNI_TRUE;
+    std::vector<jlong> raw((size_t)n);
+    env->GetLongArrayRegion(buffers, 0, n, raw.data());
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    for (jsize i = 0; i < n; ++i) {
+        Dx12Object* buf = toPtr<Dx12Object>(raw[(size_t)i]);
+        if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) continue;
+        transitionBufferTo(c, buf, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    }
+    return JNI_TRUE;
+}
+
 // ===========================================================================
 // 主 Command List 执行器
 // ===========================================================================

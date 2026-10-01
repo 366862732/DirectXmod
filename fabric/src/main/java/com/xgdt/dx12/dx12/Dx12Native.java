@@ -309,8 +309,15 @@ public final class Dx12Native {
     /**
      * 在派发 bundle 之前，把这一批 draw 用到的 CBV 缓冲在主列表上过渡到
      * VERTEX_AND_CONSTANT_BUFFER（bundle 内禁止 ResourceBarrier）。
+     * 顶点缓冲的目标状态与此相同，故一并传入本方法。
      */
     public static native boolean dx12AsyncPrepareCBVBuffers(long ctx, long[] buffers);
+
+    /**
+     * 在派发 bundle 之前，把这一批 draw 的索引缓冲在主列表上过渡到
+     * INDEX_BUFFER（bundle 内禁止 ResourceBarrier）。
+     */
+    public static native boolean dx12AsyncPrepareIndexBuffers(long ctx, long[] buffers);
 
     /**
      * 在派发 bundle 之前，把这一批 draw 采样用到的纹理视图在主列表上过渡到

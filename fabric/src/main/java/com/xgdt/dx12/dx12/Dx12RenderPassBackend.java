@@ -548,6 +548,11 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         final long[] bView = new long[bBuf.length];
         java.util.LinkedHashSet<Long> cbvBuffers = new java.util.LinkedHashSet<>();
         java.util.LinkedHashSet<Long> textureViews = new java.util.LinkedHashSet<>();
+        // bundle 内禁止 barrier：顶点/索引缓冲也必须在主列表上先过渡（与串行路径的
+        // setVertexBuffer/setIndexBuffer 一致）。顶点缓冲目标状态与 CBV 相同，
+        // 汇入同一个集合；索引缓冲单独一组，过渡到 INDEX_BUFFER。
+        java.util.LinkedHashSet<Long> vbBuffers = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<Long> indexBuffers = new java.util.LinkedHashSet<>();
 
         for (int d = 0; d < n; d++) {
             RenderPass.Draw<T> draw = draws.get(d);
@@ -563,6 +568,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             }
             idxBuf[d] = ((Dx12GpuBuffer) indexBuffer).handle();
             idxType[d] = indexType == IndexType.INT ? 1 : 0;
+            indexBuffers.add(idxBuf[d]);
             idxCount[d] = draw.indexCount();
             firstIdx[d] = draw.firstIndex();
             baseVert[d] = draw.baseVertex();
@@ -577,6 +583,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             vbBuf[d] = ((Dx12GpuBuffer) vbBuffer).handle();
             vbOff[d] = vb.offset();
             vbStride[d] = stride;
+            vbBuffers.add(vbBuf[d]);
 
             int o = d * bc;
             for (int j = 0; j < bc; j++) {
@@ -606,9 +613,12 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (frameSlot < 0 || frameValue < 0) {
             return false;
         }
-        // bundle 内禁止 barrier：本批所有 CBV 缓冲 / 纹理视图先在主列表上完成过渡。
-        // 过渡失败则说明主列表状态异常，直接回退串行（串行路径会自行 transition）。
+        // bundle 内禁止 barrier：本批所有 CBV 缓冲 / 顶点缓冲 / 索引缓冲 / 纹理视图
+        // 先在主列表上完成过渡。过渡失败则说明主列表状态异常，直接回退串行
+        // （串行路径会自行 transition）。
+        cbvBuffers.addAll(vbBuffers);
         if (!Dx12Native.dx12AsyncPrepareCBVBuffers(this.ctx, toLongArray(cbvBuffers))
+            || !Dx12Native.dx12AsyncPrepareIndexBuffers(this.ctx, toLongArray(indexBuffers))
             || !Dx12Native.dx12AsyncPrepareTextureViews(this.ctx, toLongArray(textureViews))) {
             return false;
         }
