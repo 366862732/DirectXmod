@@ -67,6 +67,19 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private static int dx12DebugLightmapTick = 0;
     private static int dx12DebugLightmapDumps = 0;
 
+    // -----------------------------------------------------------------------
+    // P3 帧时间插桩（仅 DX12_LOG_VERBOSE=1 时启用，正常游玩零开销）
+    // 目的：量化 submit() 内部各同步阶段（RECORDING_READY 握手 / 等提交完成）
+    // 与帧间隔的耗时，用于判断多帧飞行 FrameManager 的实际可回收收益。
+    // -----------------------------------------------------------------------
+    private static final int PROF_INTERVAL = 300;
+    private static long gProfAsyncFrames = 0;
+    private static long gProfLastSubmitNs = 0;
+    private static long gProfIntervalNs = 0;
+    private static long gProfRecordingReadyNs = 0;
+    private static long gProfWaitSubmitNs = 0;
+    private static long gProfTotalNs = 0;
+
     public Dx12CommandEncoderBackend() {
         this(null);
     }
@@ -109,6 +122,11 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
 
     private static long bufferHandle(GpuBuffer buffer) {
         return ((Dx12GpuBuffer) buffer).handle();
+    }
+
+    /** P3 插桩：纳秒 -> 毫秒，保留两位小数。 */
+    private static double profMs(double ns) {
+        return Math.round(ns * 1e-6 * 100.0) / 100.0;
     }
 
     // -----------------------------------------------------------------------
@@ -468,8 +486,10 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 步骤 2：请求渲染线程开始新帧
         boolean asyncStarted = Dx12Native.dx12AsyncRenderBeginFrame(this.ctx);
         if (!asyncStarted) {
-            System.err.println("[dx12-java] submit: SYNC fallback (no active surface or previous frame pending) fence=" + fenceBefore);
-            System.err.flush();
+            if (Dx12Native.LOG_VERBOSE) {
+                System.err.println("[dx12-java] submit: SYNC fallback (no active surface or previous frame pending) fence=" + fenceBefore);
+                System.err.flush();
+            }
             // 无 active surface（初始化阶段或窗口未创建），回退到同步路径
             // 同步路径：确保命令列表已打开（幂等：已打开则跳过 Reset），录制命令、提交
             Dx12Native.dx12BeginCommandList(this.ctx);
@@ -486,36 +506,39 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 渲染线程只负责 Close + Execute + Present。
         // 注意：不在此调用 dx12BeginCommandList（列表已由录制阶段打开）。
         this.inAsyncSubmit = true;
-        System.err.println("[dx12-java] submit: ASYNC path fence=" + fenceBefore);
-        System.err.flush();
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] submit: ASYNC path fence=" + fenceBefore);
+            System.err.flush();
+        }
 
-        // 步骤 3：等待渲染线程到达 RECORDING_READY（带超时保护，防止死锁）
-        long startTime = System.nanoTime();
-        long timeoutNs = 5_000_000_000L; // 5 秒超时（原10秒太长，会拖慢整体响应）
-        while (!Dx12Native.dx12AsyncRenderIsRecordingReady(this.ctx)) {
-            long elapsed = System.nanoTime() - startTime;
-            if (elapsed > timeoutNs) {
-                // P41：渲染线程卡死，降级到 SYNC 模式避免整个游戏崩溃
-                System.err.println("[dx12] [P41] asyncRenderIsRecordingReady timeout after "
-                    + (elapsed / 1_000_000) + "ms — falling back to SYNC, ctx=0x"
-                    + Long.toHexString(this.ctx));
-                System.err.flush();
-                // 清除 gAsyncRenderCtx，防止下一个 asyncBeginFrame 被 "previous frame not complete" 拒绝
-                Dx12Native.dx12ClearAsyncRenderCtx();
-                Dx12Native.dx12BeginCommandList(this.ctx);
-                Dx12Native.dx12Submit(this.ctx);
-                this.transientMemory.rotate();
-                List<Runnable> run = this.pendingCallbacks;
-                this.pendingCallbacks.clear();
-                for (Runnable callback : run) { callback.run(); }
-                return;
-            }
-            try {
-                Thread.sleep(1);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("[dx12] asyncRenderIsRecordingReady interrupted", e);
-            }
+        // P3 插桩：记录本帧起点与相对上一帧的间隔（仅 LOG_VERBOSE 生效）。
+        final boolean prof = Dx12Native.LOG_VERBOSE;
+        final long profStart = System.nanoTime();
+        if (prof) {
+            gProfIntervalNs = gProfLastSubmitNs != 0 ? profStart - gProfLastSubmitNs : 0;
+            gProfLastSubmitNs = profStart;
+        }
+
+        // 步骤 3：等待渲染线程到达 RECORDING_READY。
+        // 用 native 阻塞等待（WaitForSingleObject）取代原 sleep(1) 轮询：后者每帧在
+        // 帧关键路径上引入约 1ms 的调度器休眠开销；阻塞等待为微秒级。超时保护不变。
+        long profT0 = prof ? System.nanoTime() : 0L;
+        boolean recordingReady = Dx12Native.dx12AsyncRenderWaitRecordingReady(this.ctx, 5_000L);
+        if (prof) gProfRecordingReadyNs += System.nanoTime() - profT0;
+        if (!recordingReady) {
+            // P41：渲染线程卡死，降级到 SYNC 模式避免整个游戏崩溃
+            System.err.println("[dx12] [P41] asyncRenderWaitRecordingReady timeout after 5000ms — falling back to SYNC, ctx=0x"
+                + Long.toHexString(this.ctx));
+            System.err.flush();
+            // 清除 gAsyncRenderCtx，防止下一个 asyncBeginFrame 被 "previous frame not complete" 拒绝
+            Dx12Native.dx12ClearAsyncRenderCtx();
+            Dx12Native.dx12BeginCommandList(this.ctx);
+            Dx12Native.dx12Submit(this.ctx);
+            this.transientMemory.rotate();
+            List<Runnable> run = this.pendingCallbacks;
+            this.pendingCallbacks.clear();
+            for (Runnable callback : run) { callback.run(); }
+            return;
         }
 
         // 步骤 4：命令已由上层框架在此 submit() 之前录制完毕（render pass、clear、copy、draw）
@@ -525,7 +548,9 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         Dx12Native.dx12AsyncSendCommandsReady(this.ctx);
 
         // 步骤 6：等待渲染线程完成提交 + present
+        long profT1 = prof ? System.nanoTime() : 0L;
         boolean completed = Dx12Native.dx12AsyncRenderWaitComplete(this.ctx, 10000);
+        if (prof) gProfWaitSubmitNs += System.nanoTime() - profT1;
         if (!completed) {
             System.err.println("[dx12] [P33] asyncRenderWaitComplete timeout! ctx=0x"
                 + Long.toHexString(this.ctx));
@@ -586,6 +611,22 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             System.err.println("[dx12-java] submit(async): frame=" + fenceBefore
                 + " ctx=" + Long.toHexString(this.ctx));
             System.err.flush();
+        }
+        // P3 插桩：每 PROF_INTERVAL 帧输出一次各阶段耗时均值（ms）。
+        if (prof) {
+            ++gProfAsyncFrames;
+            gProfTotalNs += System.nanoTime() - profStart;
+            if (gProfAsyncFrames % PROF_INTERVAL == 0) {
+                double inv = 1.0 / PROF_INTERVAL;
+                System.err.println("[dx12-java] P3 prof n=" + PROF_INTERVAL
+                    + " frameInterval=" + profMs(gProfIntervalNs * inv)
+                    + "ms recordingReady=" + profMs(gProfRecordingReadyNs * inv)
+                    + "ms waitSubmit=" + profMs(gProfWaitSubmitNs * inv)
+                    + "ms submitTotal=" + profMs(gProfTotalNs * inv) + "ms");
+                System.err.flush();
+                gProfIntervalNs = 0; gProfRecordingReadyNs = 0;
+                gProfWaitSubmitNs = 0; gProfTotalNs = 0;
+            }
         }
         this.inAsyncSubmit = false;
     }

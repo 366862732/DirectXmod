@@ -326,6 +326,9 @@ bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
 bool asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs, std::string& err);
 // 非阻塞：查询渲染线程是否已到达 "recording ready" 阶段。
 bool asyncRenderIsRecordingReady(CommandContext* ctx);
+// 阻塞：等待渲染线程到达 "recording ready" 阶段（超时 ms）。
+// 取代 Java 侧 Thread.sleep(1) 轮询：消除每帧 ~1ms 的调度器休眠开销。
+bool asyncRenderWaitRecordingReady(CommandContext* ctx, UINT64 timeoutMs);
 // 主线程通知渲染线程：所有命令已入队（设置 gEvtCommandsReady）。
 void asyncSendCommandsReady(CommandContext* ctx);
 // 主动清除 gAsyncRenderCtx（供 Java 侧超时降级时同步调用）。

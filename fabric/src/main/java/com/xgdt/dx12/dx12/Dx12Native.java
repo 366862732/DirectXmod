@@ -198,6 +198,13 @@ public final class Dx12Native {
     public static native boolean dx12AsyncRenderIsRecordingReady(long ctx);
 
     /**
+     * 阻塞：等待渲染线程到达 "recording ready" 阶段（或超时）。
+     * 取代主线程的 sleep(1) 轮询——该轮询每帧引入 ~1ms 的调度器休眠开销，
+     * 直接落在帧关键路径上。正常情况本等待为微秒级。
+     */
+    public static native boolean dx12AsyncRenderWaitRecordingReady(long ctx, long timeoutMs);
+
+    /**
      * 阻塞：等到本帧提交完成（或超时）。
      * 渲染线程在 acquireSurface → 等 GPU → beginCommandList → 收到 COMMANDS_READY →
      * end + submit + present → 发 SUBMIT_DONE 信号后返回。

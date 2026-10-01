@@ -189,10 +189,21 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         // 抵消这些 pass 的 invertY=true 正交投影在 D3D12（NDC Y 向上）下多出的一次 Y 镜像。
         // scissor 由 Dx12RenderPassBackend 原样直通，无需再翻转。
         // 注意：这些管线在 flipY=false 时保持原始着色器，主世界 3D 渲染方向不受影响。
+        //
+        // Fix ATLAS-BAKE-VFLIP（图集烘制 Y 镜像）：ANIMATE_SPRITE_BLIT /
+        // ANIMATE_SPRITE_INTERPOLATE 仅在 TextureAtlas.uploadInitialContents /
+        // SpriteContents.drawToAtlas 使用，即把每个 sprite 的 scratch 贴图经
+        // ortho2D(0, W, 0, H) 渲染进 TextureAtlas 的 mipViews（usage=15，**无深度附件**）。
+        // 根因与 lightmap / P31 相同：GL/Vulkan 下 ortho2D 的 y=0 落在纹理 v=0，而 D3D12
+        // 相反（v=0 在顶部）→ 整张图集内容整体 Y 镜像。此后所有按 sprite UV 采样图集的
+        // GUI 图标/按钮/血条、方块与物品纹理都会"串图 / 错位 / 缺失"。
+        // 该 pass 无深度附件，被 P31 的 flipY 判定（usage==13 且带深度）排除，故对这两个
+        // 仅用于图集烘制的管线**无条件**注入 gl_Position.y 翻转。
         String pipelineLocation = pipeline.getLocation().toString();
-        boolean needsYFlip = flipY && (pipelineLocation.contains("animate_sprite")
-            || pipelineLocation.contains("entity_cutout")
-            || pipelineLocation.contains("item_cutout"));
+        boolean isAtlasBake = pipelineLocation.contains("animate_sprite");
+        boolean needsYFlip = isAtlasBake
+            || (flipY && (pipelineLocation.contains("entity_cutout")
+                || pipelineLocation.contains("item_cutout")));
         // P28 诊断：打印 pipelineLocation + flipY + needsYFlip，便于追踪注入路径（P29：仅 verbose 输出）
         if (Dx12Native.LOG_VERBOSE) {
             System.err.println("[dx12-java] [P28] " + pipelineLocation + " flipY=" + flipY + " needsYFlip=" + needsYFlip);

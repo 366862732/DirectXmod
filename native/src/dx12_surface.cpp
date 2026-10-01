@@ -700,7 +700,8 @@ void presentSurface(Dx12Surface* s) {
         dbgLog("presentSurface: FAILED %s", hrText(hr).c_str());
         s->suboptimal = true;
     } else {
-        dbgLog("presentSurface: ok (syncInterval=%u)", syncInterval);
+        // 每帧成功路径：默认级别下静默（stderr/文件写位于帧关键路径上）。
+        dbgLogDebug("presentSurface: ok (syncInterval=%u)", syncInterval);
         s->suboptimal = false;  // 正常 present 清除 suboptimal 标记
     }
 }

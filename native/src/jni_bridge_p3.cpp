@@ -395,6 +395,13 @@ JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncRenderIsR
         reinterpret_cast<dx12mc::CommandContext*>(ctx));
 }
 
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncRenderWaitRecordingReady(
+    JNIEnv* env, jclass, jlong ctx, jlong timeoutMs) {
+    return dx12mc::asyncRenderWaitRecordingReady(
+        reinterpret_cast<dx12mc::CommandContext*>(ctx), (UINT64)timeoutMs)
+        ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncSendCommandsReady(
     JNIEnv* env, jclass, jlong ctx) {
     dx12mc::asyncSendCommandsReady(

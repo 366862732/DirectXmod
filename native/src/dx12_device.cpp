@@ -1555,14 +1555,14 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
     if (waitForValue > 0) {
         UINT64 cv = 0ULL;
         if (gCtx.queueFence) cv = gCtx.queueFence->GetCompletedValue();
-        dbgLog("beginCommandListWithWait: checking qf=%llu cv=%llu qfVal=%llu",
+        dbgLogDebug("beginCommandListWithWait: checking qf=%llu cv=%llu qfVal=%llu",
             (unsigned long long)waitForValue, cv,
             (unsigned long long)gCtx.queueFenceValue);
         if (!waitForQueueFenceValue(waitForValue, 5'000'000'000ULL, err)) {
             dbgLog("beginCommandListWithWait: wait FAILED: %s", err.c_str());
             return false;
         }
-        dbgLog("beginCommandListWithWait: wait done");
+        dbgLogDebug("beginCommandListWithWait: wait done");
     }
     // P40：等待 per-command-list fence 完成，确保 GPU 已实际执行完引用该
     // allocator 的所有命令，再 Reset——避免 allocator->Reset() 内部 hang。
@@ -1572,23 +1572,23 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
             dbgLog("beginCommandListWithWait: per-list fence wait FAILED: %s", fenceErr.c_str());
             return false;
         }
-        dbgLog("beginCommandListWithWait: per-list fence wait done val=%llu",
+        dbgLogDebug("beginCommandListWithWait: per-list fence wait done val=%llu",
             (unsigned long long)waitForValue);
     }
-    dbgLog("beginCommandListWithWait: begin allocator reset");
+    dbgLogDebug("beginCommandListWithWait: begin allocator reset");
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) { err = "beginCommandListWithWait: allocator Reset " + hrText(hr); return false; }
-    dbgLog("beginCommandListWithWait: allocator reset ok");
-    dbgLog("beginCommandListWithWait: begin list reset");
+    dbgLogDebug("beginCommandListWithWait: allocator reset ok");
+    dbgLogDebug("beginCommandListWithWait: begin list reset");
     hr = ctx->commandList->Reset(ctx->currentAllocator().Get(), nullptr);
     if (FAILED(hr)) { err = "beginCommandListWithWait: list Reset " + hrText(hr); return false; }
-    dbgLog("beginCommandListWithWait: list reset ok");
-    dbgLog("beginCommandListWithWait: pre-increment ctx=%p", (void*)ctx);
+    dbgLogDebug("beginCommandListWithWait: list reset ok");
+    dbgLogDebug("beginCommandListWithWait: pre-increment ctx=%p", (void*)ctx);
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
     ctx->colorTargetsWritten = false;  // 新 command list 从零开始追踪绘制状态
     ++gOpenListCount;  // 延迟销毁：登记打开计数，submit 完成前不释放资源
-    dbgLog("beginCommandListWithWait: post-increment openList=%d ctx=%p", gOpenListCount, (void*)ctx);
+    dbgLogDebug("beginCommandListWithWait: post-increment openList=%d ctx=%p", gOpenListCount, (void*)ctx);
     // submit 阻塞等待 GPU 完成（见 submitCommandList），此处清空 resourceState
     // 后一切资源视为初始态是正确且保守的（D3D12 驱动会按实际 GPU 状态纠正）。
     ctx->resourceState.clear();
@@ -1667,7 +1667,7 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
     // 线程 abort 路径不再重复递减。注意此处**不**触发 flush——延迟删除
     // 必须等到渲染线程 present fence 之后（见 renderThread post-present）。
     if (gOpenListCount > 0) --gOpenListCount;
-    dbgLog("endCommandList: openList now=%d ctx=%p", gOpenListCount, (void*)ctx);
+    dbgLogDebug("endCommandList: openList now=%d ctx=%p", gOpenListCount, (void*)ctx);
     return true;
 }
 
@@ -1711,7 +1711,7 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
         // P40：记录 per-command-list fence 值，确保 GPU 实际执行完引用该
         // allocator 的所有命令后再 Reset——这是避免 hang 的关键同步点。
         ctx->prevFenceValue = value;
-        dbgLog("renderThread: submitCommandList done ctx=%p value=%llu qf=%llu lastQF=%llu",
+        dbgLogDebug("renderThread: submitCommandList done ctx=%p value=%llu qf=%llu lastQF=%llu",
             (void*)ctx, (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue,
             (unsigned long long)ctx->lastSubmitQueueFence);
     }
@@ -4197,7 +4197,11 @@ HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：已提交，
 
 // 渲染线程函数
 static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    // 主线程每帧都会阻塞等待本线程完成提交，因此本线程处于帧关键路径上。
+    // 原为 THREAD_PRIORITY_LOWEST，会被 MC 的区块构建 worker 抢占，拉长主线程
+    // 的等待时间；提升到 NORMAL 以减少每帧固定同步开销。工作内容仍是
+    // Close + Execute + Present，不会与主线程长时间竞争 CPU。
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
     // P33 诊断：记录渲染线程 OS 线程 id，便于与崩溃报告里的 tid 对照，
     // 判断异常发生在渲染线程还是主线程。
     dbgLogInfo("renderThread: started tid=%lu", (unsigned long)GetCurrentThreadId());
@@ -4224,22 +4228,25 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         // 现在本线程只负责：Close + ExecuteCommandLists + Present。
         // allocator 的 Reset 与列表 begin 由主线程在帧开始时调用 beginCommandList
         // 完成（内部按 fenceValue-2 等待 allocator 不再被 GPU 占用）。
-        dbgLog("renderThread: wake ctx=%p listOpen=%d", (void*)ctx, ctx->listOpen);
+        // P30/P45：以下握手日志处于**每帧关键路径**（主线程阻塞等待本线程），
+        // 且发生在 SetEvent(RecordingReady) 之前——stderr/文件写会直接拉长主线程
+        // 的等待时间。默认日志级别（WARN=1）下必须静默，故降为 DEBUG（级别 3）。
+        dbgLogDebug("renderThread: wake ctx=%p listOpen=%d", (void*)ctx, ctx->listOpen);
 
         // 步骤 2/3：acquireSurface 与 GPU fence 等待均已移交主线程
         // （dx12AcquireSurface + beginCommandList），本线程不再触碰 allocator/list。
 
         // 步骤 5：通知主线程命令已可提交
-        dbgLog("renderThread: signaling recordingReady ctx=%p", (void*)ctx);
+        dbgLogDebug("renderThread: signaling recordingReady ctx=%p", (void*)ctx);
         SetEvent(gEvtRecordingReady);
 
         // 步骤 6：等待主线程完成命令录制（超时保护：5s 后放弃当前帧）
-        dbgLog("renderThread: waiting for gEvtCommandsReady ctx=%p", (void*)ctx);
+        dbgLogDebug("renderThread: waiting for gEvtCommandsReady ctx=%p", (void*)ctx);
         int commandsWaitLoops = 0;
         for (;;) {
             if (!gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
-            if (r == WAIT_OBJECT_0) { dbgLog("renderThread: commandsReady ctx=%p", (void*)ctx); break; }
+            if (r == WAIT_OBJECT_0) { dbgLogDebug("renderThread: commandsReady ctx=%p", (void*)ctx); break; }
             if (r == WAIT_TIMEOUT && !gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
             // P41：超时保护——5s 内未收到 CommandsReady，说明主线程卡死，放弃本帧
             if (++commandsWaitLoops >= 10) {
@@ -4286,7 +4293,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue);
 
         // present（presentSurface 返回 void）
-        dbgLog("renderThread: about to presentSurface qf=%llu bbIdx=%d",
+        dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
             (unsigned long long)gCtx.queueFenceValue, bbIdx);
         presentSurface(getActiveSurface());
         // P33 fix：本帧 Present 已由本线程完成。标记给 Java 侧 present()，
@@ -4306,12 +4313,12 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // P33 fix：在 present fence signal 之后才 flush 延迟删除对象，确保所有
         // GPU 工作（含 display controller flip）完成后才释放资源，避免 CORRUPTION。
-        dbgLog("renderThread: post-present qf=%llu openList=%d",
+        dbgLogDebug("renderThread: post-present qf=%llu openList=%d",
             (unsigned long long)gCtx.queueFenceValue, gOpenListCount);
         if (gOpenListCount == 0) flushPendingDeletes();
 
         // 步骤 8：通知主线程提交完成
-        dbgLog("renderThread: frame done, looping back");
+        dbgLogDebug("renderThread: frame done, looping back");
         SetEvent(gEvtSubmitDone);
     }
 
@@ -4429,7 +4436,7 @@ bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err) {
     ResetEvent(gEvtSubmitDone);
     // Signal start
     SetEvent(gEvtBeginFrame);
-    dbgLog("asyncRenderBeginFrame: signaled beginFrame ctx=%p prevFence=%llu",
+    dbgLogDebug("asyncRenderBeginFrame: signaled beginFrame ctx=%p prevFence=%llu",
         (void*)ctx, (unsigned long long)ctx->prevFenceValue);
     return true;
 }
@@ -4455,6 +4462,16 @@ bool asyncRenderIsRecordingReady(CommandContext* ctx) {
     // 检查 RECORDING_READY 是否已设置
     // 用 0 timeout 查询（非阻塞）
     DWORD r = WaitForSingleObject(gEvtRecordingReady, 0);
+    return r == WAIT_OBJECT_0;
+}
+
+bool asyncRenderWaitRecordingReady(CommandContext* ctx, UINT64 timeoutMs) {
+    (void)ctx;
+    if (!gRenderRunning) return false;
+    // 阻塞等待渲染线程发出 RECORDING_READY（每帧一开始就置位，正常为微秒级）。
+    // 直接用 WaitForSingleObject 取代 Java 的 sleep(1) 轮询：休眠 1ms 会带来
+    // 调度器/timer 粒度级别的固定开销，而本等待在主线程的帧关键路径上。
+    DWORD r = WaitForSingleObject(gEvtRecordingReady, (DWORD)timeoutMs);
     return r == WAIT_OBJECT_0;
 }
 
