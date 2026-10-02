@@ -233,6 +233,8 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
     s->swapChain = swapChain3;
+    // P65：记录实际 tier 是否带 ALLOW_TEARING（sd.Flags 此时 = 成功 tier 的 flags）。
+    s->allowTearing = (sd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
     // 注意：不在此处 setActiveSurface！surface 必须在 configureSurface 完成后
     // 才设为 active，否则渲染线程会在 backBuffers 为空时尝试 acquire 导致无限循环。
     return s;
@@ -387,6 +389,8 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
             return false;
         }
         dbgLog("configureSurface: recreated swapchain %dx%d", width, height);
+        // P65：切换窗口/全屏重建后刷新 tearing 能力（sd.Flags = 本次成功 tier 的 flags）。
+        s->allowTearing = (sd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
     }
 
     // 仅在成功路径上更新尺寸：失败时保持旧尺寸，避免后续调用因 s->width/s->height
@@ -674,10 +678,17 @@ void presentSurface(Dx12Surface* s) {
     if (!s || !s->swapChain) {
         return;
     }
-    // IMMEDIATE=0 -> Present(0,0)；FIFO_RELAXED=3 -> Present(1, ALLOW_TEARING)；
+    // IMMEDIATE=0 -> Present(0, ALLOW_TEARING)；FIFO_RELAXED=3 -> Present(1, 0)；
     // 其余（FIFO=2 等）-> Present(1, 0)。
+    //
+    // P65（全屏掉帧根因）：flip model 下，**全屏**（独立翻转/独占）时 syncInterval=0
+    // 但不带 DXGI_PRESENT_ALLOW_TEARING 的 Present 仍被 DXGI 同步到垂直刷新——
+    // 实测 1920x1081 每帧 Present 阻塞 ~5.6ms（~150FPS），而窗口模式走 DWM 合成
+    // Present 立即返回（~0.15ms）故无此问题。传入 ALLOW_TEARING 后全屏不再同步到
+    // vblank（等价官方 Vulkan 的 IMMEDIATE present，实测官方全屏 1022FPS）。
+    // 前提：swapchain 创建时带 ALLOW_TEARING（s->allowTearing），且 syncInterval==0。
     UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
-    UINT flags = (s->presentMode == 3) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    UINT flags = (s->presentMode == 0 && s->allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
     // P3.2 诊断：每帧检查 Backbuffer 格式和尺寸是否与窗口匹配
     if (!s->backBuffers.empty()) {
@@ -693,8 +704,8 @@ void presentSurface(Dx12Surface* s) {
         }
     }
     if ((s->currentImageIndex + 1) % 30 == 0) {
-        dbgLogInfo("presentSurface: idx=%d sync=%u suboptimal=%d",
-            (int)s->currentImageIndex, syncInterval, (int)s->suboptimal);
+        dbgLogInfo("presentSurface: idx=%d sync=%u flags=%u tearing=%d suboptimal=%d",
+            (int)s->currentImageIndex, syncInterval, flags, (int)s->allowTearing, (int)s->suboptimal);
     }
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，

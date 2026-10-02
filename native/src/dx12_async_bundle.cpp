@@ -127,6 +127,13 @@ void BundleRecorder::setDescriptorTable(UINT slot, D3D12_GPU_DESCRIPTOR_HANDLE h
     ++m_stats.descriptorUpdates;
 }
 
+void BundleRecorder::setRootConstantBufferView(UINT rootIndex,
+    D3D12_GPU_VIRTUAL_ADDRESS address) {
+    if (!m_recording) return;
+    m_bundle->SetGraphicsRootConstantBufferView(rootIndex, address);
+    ++m_stats.commandsRecorded;
+}
+
 void BundleRecorder::setVertexBuffers(UINT startSlot, UINT count,
     const D3D12_VERTEX_BUFFER_VIEW* views) {
     if (!m_recording || !views || count == 0) return;

@@ -93,6 +93,8 @@ public:
     // 按所属管线的修正 stride 覆盖 slot 的顶点步长；无记录时返回 0（调用方回退传入值）。
     UINT correctedStride(int slot) const;
     void setDescriptorTable(UINT slot, D3D12_GPU_DESCRIPTOR_HANDLE handle);
+    // B：CBV 的 root descriptor（地址烘焙进命令列表，不经过描述符堆）。
+    void setRootConstantBufferView(UINT rootIndex, D3D12_GPU_VIRTUAL_ADDRESS address);
     void setVertexBuffers(UINT startSlot, UINT count,
         const D3D12_VERTEX_BUFFER_VIEW* views);
     void setIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view);

@@ -454,6 +454,9 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     public static long gProfSrvVary = 0;          // 逐 draw 变化的 SRV 数
     public static long gProfSrvSame = 0;          // 逐 draw 不变的 SRV 数
     public static long gProfVbSlotSame = 0;       // vbSlot 全批一致的 draw 数
+    // B（拆根签名）：SRV 汇入单个 descriptor table 后整段只写一份，要求整批 SRV
+    // 绑定完全一致；不一致的批回退串行。此计数器统计回退批次数。
+    public static long gProfSrvVaryFallbacks = 0;
 
     @Override
     public void drawIndexed(int indexCount, int instanceCount, int firstIndex,
@@ -593,8 +596,12 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         }
         final long profP0 = Dx12Native.PROF ? System.nanoTime() : 0L;
         final int[] bType = new int[bc];
+        // 绑定名在整批内恒定：预先取出，避免在 n 层循环里重复 List.get + name()。
+        final String[] bName = new String[bc];
         for (int j = 0; j < bc; j++) {
-            Dx12BindGroupEntry.Type type = bindings.get(j).type();
+            Dx12BindGroupEntry e = bindings.get(j);
+            bName[j] = e.name();
+            Dx12BindGroupEntry.Type type = e.type();
             if (type == Dx12BindGroupEntry.Type.TEXEL_BUFFER) {
                 return false;  // 分区堆没有 texel buffer SRV 写入原语 -> 串行
             }
@@ -631,12 +638,17 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         // 一致时描述符块只需写一份，每 draw 省掉 bc 次 CreateConstantBufferView/
         // CopyDescriptorsSimple 与一次 SetGraphicsRootDescriptorTable。
         boolean blockUniform = true;
+        // B（拆根签名）：CBV 走 root descriptor（可逐 draw 变化），SRV 汇入单个
+        // descriptor table 且整段只写一份 -> 只要求 SRV 在整批内恒定。
+        boolean srvUniform = true;
 
+        // 方法引用在整批内恒定：提到循环外，避免每 draw 一次 lambda 对象分配。
+        final RenderPass.UniformUploader uniformSetter = this::setUniform;
         for (int d = 0; d < n; d++) {
             RenderPass.Draw<T> draw = draws.get(d);
             BiConsumer<T, RenderPass.UniformUploader> uploader = draw.uniformUploaderConsumer();
             if (uploader != null) {
-                uploader.accept(uniformArgument, this::setUniform);
+                uploader.accept(uniformArgument, uniformSetter);
             }
             GpuBuffer indexBuffer = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
             IndexType indexType = draw.indexType() != null ? draw.indexType() : defaultIndexType;
@@ -665,7 +677,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
             int o = d * bc;
             for (int j = 0; j < bc; j++) {
-                String name = bindings.get(j).name();
+                String name = bName[j];
                 if (bType[j] == 0) {
                     GpuBufferSlice value = this.uniforms.get(name);
                     if (value == null || value.buffer().isClosed()) {
@@ -681,20 +693,26 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                         return false;
                     }
                     bView[o + j] = texture.view().handle();
-                    textureViews.add(bView[o + j]);
+                    // SRV 视图集合不在此累加：srvUniform 保证整批一致，稍后只按
+                    // draw 0 收集，省掉 n×srvCount 次装箱入集合。
                 }
             }
-            // P59：与 draw 0 的块比对；任一不同即放弃「共享描述符」快路径。
-            if (blockUniform && d > 0) {
+            // P59/B：与 draw 0 的块比对。blockUniform = 整块一致（CBV+SRV）；
+            // srvUniform = 仅 SRV 一致（B 方案下 CBV 走 root descriptor，可逐 draw
+            // 变化，但 SRV 表整段只写一份，故要求 SRV 恒定）。
+            if (d > 0 && (blockUniform || srvUniform)) {
                 for (int j = 0; j < bc; j++) {
                     final int q = o + j;
                     if (bType[j] == 0) {
-                        if (bBuf[q] != bBuf[j] || bOff[q] != bOff[j] || bLen[q] != bLen[j]) {
+                        if (blockUniform && (bBuf[q] != bBuf[j] || bOff[q] != bOff[j]
+                            || bLen[q] != bLen[j])) {
                             blockUniform = false;
-                            break;
                         }
                     } else if (bView[q] != bView[j]) {
                         blockUniform = false;
+                        srvUniform = false;
+                    }
+                    if (!blockUniform && !srvUniform) {
                         break;
                     }
                 }
@@ -773,6 +791,22 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             }
         }
 
+        // B（拆根签名）：SRV 汇入单个 descriptor table 且整段只写一份，要求整批 SRV
+        // 绑定完全一致；否则回退串行（串行路径逐 draw 推送描述符，语义正确）。
+        if (!srvUniform) {
+            if (Dx12Native.PROF) {
+                gProfSrvVaryFallbacks++;
+            }
+            return false;
+        }
+        // srvUniform 成立 => 整批 SRV 与 draw 0 一致，主列表过渡只需收集 draw 0 的
+        // srvCount 个视图。
+        for (int j = 0; j < bc; j++) {
+            if (bType[j] != 0) {
+                textureViews.add(bView[j]);
+            }
+        }
+
         final int frameSlot = async.frameSlot(this.ctx);
         final long frameValue = async.frameValue(this.ctx);
         if (frameSlot < 0 || frameValue < 0) {
@@ -796,11 +830,17 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         final long alloc = async.descriptorAlloc();
         final long pipelineHandle = pl.handle();
         final boolean useDepth = this.hasDepth && pl.info().getDepthStencilState() != null;
-        // 单分区只吃 worker 0 的描述符区域（每帧段 3072 槽），故对槽位数设上限，
-        // 超限则退回并行分区；分配失败也会安全回退到串行逐 draw。
-        // P59：绑定一致时整批只需 bc 个槽，单分区几乎总能容纳。
+        // B（拆根签名）：CBV 走 root descriptor，不占描述符堆槽位；每段（单分区内联或
+        // 每个并行 worker）只需 srvCount 个槽放 SRV 表。故单分区几乎总能容纳整批。
         final boolean sharedDesc = blockUniform;
-        final long slotsNeeded = sharedDesc ? bc : (long) n * bc;
+        int srvCount = 0;
+        for (int j = 0; j < bc; j++) {
+            if (bType[j] != 0) {
+                srvCount++;
+            }
+        }
+        // 分配器将 count==0 视为失败，用 1 兜底（无 SRV 的管线实际不写任何描述符）。
+        final int slotsNeeded = Math.max(1, srvCount);
         final boolean singleBundle = BUNDLE_MODE > 0
             || (BUNDLE_MODE == 0 && n <= SERIAL_BUNDLE_MAX_DRAWS && slotsNeeded <= 2048);
         if (Dx12Native.PROF) {
@@ -894,10 +934,9 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     if (count <= 0) {
                         return;
                     }
-                    // 一次性为本段分配全部槽位，避免每 draw 一次 JNI 调用。
-                    // P59：绑定一致时每段只需 bc 个槽。
+                    // 一次性为本段分配 SRV 表槽位（CBV 走 root descriptor，不占槽）。
                     int base = Dx12Native.dx12AsyncDescriptorAllocate(alloc, frameSlot,
-                        worker, sharedDesc ? bc : count * bc);
+                        worker, slotsNeeded);
                     // P57：整段合并为单次 JNI（此前每 draw ~8 次穿越：bc 次写描述符 +
                     // 取 GPU 句柄 + 根描述符表 + 索引/顶点缓冲 + DrawIndexed）。
                     if (base < 0

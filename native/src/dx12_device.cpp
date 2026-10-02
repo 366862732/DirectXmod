@@ -111,25 +111,41 @@ size_t gFreeBufferBytes = 0;
 std::mutex gFreeBufferMutex;  // 保护 gFreeBuffers / gFreeBufferBytes
 constexpr size_t kMaxFreeBufferBytes = 96ull * 1024 * 1024;  // 96MB 封顶
 
-// buffer 的 D3D12 资源容量（与 createBuffer 的 desc.Width 一致：256 对齐）。
+// buffer 的 D3D12 资源容量（真实资源宽度；回退到逻辑 size 的 256 对齐）。
+// 复用后 obj->size 会被设为更小的请求值，必须用资源真实宽度记账/匹配，
+// 否则池内条目容量被低估，后续更大请求无法命中。
 UINT64 bufferCapacity(const Dx12Object* o) {
+    if (o->resource) {
+        return (UINT64)o->resource->GetDesc().Width;
+    }
     return ((UINT64)o->size + 255ULL) & ~255ULL;
 }
 
-// 从复用池取出 (heapType, 容量) 完全匹配的 buffer；无匹配返回 nullptr。
+// 从复用池取出容量 >= 请求值的 buffer（best-fit，最小可用者）；无匹配返回 nullptr。
+// 之前要求容量完全相等，而实体渲染的 StagedVertexBuffer 尺寸逐帧变化 → 几乎每帧
+// 全部 miss、走 CreateCommittedResource（D3D12 最小分配粒度 64KB + DEFAULT 堆
+// 零初始化，是主线程最大热点）。改为「不小于请求值即可复用」，底层资源更大无害
+// （消费方用的是 obj->size 逻辑长度）。
 Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
     std::lock_guard<std::mutex> lk(gFreeBufferMutex);
+    size_t best = SIZE_MAX;
+    UINT64 bestCap = 0;
     for (size_t i = 0; i < gFreeBuffers.size(); ++i) {
         PooledBuffer& pb = gFreeBuffers[i];
-        if (pb.obj->heapType == heapType && bufferCapacity(pb.obj) == capacity) {
-            Dx12Object* obj = pb.obj;
-            gFreeBufferBytes -= capacity;
-            gFreeBuffers[i] = gFreeBuffers.back();
-            gFreeBuffers.pop_back();
-            return obj;
+        if (pb.obj->heapType != heapType) continue;
+        UINT64 cap = bufferCapacity(pb.obj);
+        if (cap < capacity) continue;
+        if (best == SIZE_MAX || cap < bestCap) {
+            best = i;
+            bestCap = cap;
         }
     }
-    return nullptr;
+    if (best == SIZE_MAX) return nullptr;
+    Dx12Object* obj = gFreeBuffers[best].obj;
+    gFreeBufferBytes -= bestCap;
+    gFreeBuffers[best] = gFreeBuffers.back();
+    gFreeBuffers.pop_back();
+    return obj;
 }
 
 // 把 fence 已覆盖的 buffer 归还复用池；超容量则真释放。
@@ -1703,6 +1719,11 @@ bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::str
     // 颜色纹理当 RT 绑定 → 黑屏）。
     gNextFrameRtv = 0;
     gNextDsv = 0;
+    // P64：帧级 RTV/DSV 句柄随堆槽位清零而失效；setPipeline 快速路径同理（新 list 无
+    // 已绑定的 PSO/根签名）。必须与本 list 的生命周期严格一致。
+    ctx->rtvCache.clear();
+    ctx->dsvCache.clear();
+    ctx->cachedPso = nullptr;
     ID3D12DescriptorHeap* drawHeaps[] = { gCtx.drawHeap.Get() };
     ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
     return true;
@@ -2084,6 +2105,48 @@ static D3D12_DEPTH_STENCIL_VIEW_DESC makeDsvDesc(Dx12Object* tex, int mip) {
     return d;
 }
 
+// P64：取（或创建）(资源, mip) 对应的帧级瞬态 RTV。同一命令列表内复用同一 CPU 句柄，
+// 免去重复的 CreateRenderTargetView 驱动调用。句柄有效性由 beginCommandList 中
+// gNextFrameRtv 清零 + rtvCache.clear() 同步保证（两者必须同点发生）。
+static bool frameRtvFor(CommandContext* ctx, Dx12Object* tex, int mip,
+    D3D12_CPU_DESCRIPTOR_HANDLE& out, std::string& err) {
+    RtvDsvKey key{ tex->resource.Get(), (UINT)mip };
+    auto it = ctx->rtvCache.find(key);
+    if (it != ctx->rtvCache.end()) { out = it->second; return true; }
+    if (gNextFrameRtv >= kFrameRtvHeapSize) {
+        err = "frameRtvFor: frame rtv heap exhausted";
+        return false;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
+    ++gNextFrameRtv;
+    D3D12_RENDER_TARGET_VIEW_DESC desc = makeRtvDesc(tex, mip);
+    gCtx.device->CreateRenderTargetView(tex->resource.Get(), &desc, cpu);
+    ctx->rtvCache.emplace(key, cpu);
+    out = cpu;
+    return true;
+}
+
+// P64：DSV 版（语义同上，句柄来自 dsvHeap）。
+static bool frameDsvFor(CommandContext* ctx, Dx12Object* tex, int mip,
+    D3D12_CPU_DESCRIPTOR_HANDLE& out, std::string& err) {
+    RtvDsvKey key{ tex->resource.Get(), (UINT)mip };
+    auto it = ctx->dsvCache.find(key);
+    if (it != ctx->dsvCache.end()) { out = it->second; return true; }
+    if (gNextDsv >= kDsvHeapSize) {
+        err = "frameDsvFor: dsv heap exhausted";
+        return false;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
+    ++gNextDsv;
+    D3D12_DEPTH_STENCIL_VIEW_DESC desc = makeDsvDesc(tex, mip);
+    gCtx.device->CreateDepthStencilView(tex->resource.Get(), &desc, cpu);
+    ctx->dsvCache.emplace(key, cpu);
+    out = cpu;
+    return true;
+}
+
 bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
     float r, float g, float b, float a, std::string& err) {
     if (!ctx || !ctx->listOpen) { err = "clearColorTexture: no open command list"; return false; }
@@ -2094,17 +2157,15 @@ bool clearColorTexture(CommandContext* ctx, Dx12Object* tex,
         err = "clearColorTexture: texture lacks RENDER_ATTACHMENT"; return false;
     }
     // P24：帧级瞬态 RTV（frameRtvHeap），每帧从 0 复用，不与 backbuffer RTV 冲突。
-    if (gNextFrameRtv >= kFrameRtvHeapSize) { err = "clearColorTexture: frame rtv heap exhausted"; return false; }
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
-    ++gNextFrameRtv;
-    D3D12_RENDER_TARGET_VIEW_DESC desc = makeRtvDesc(tex, 0);
-    gCtx.device->CreateRenderTargetView(tex->resource.Get(), &desc, cpu);
+    // P64：同一命令列表内 (资源, mip=0) 的 RTV 走缓存，只创建一次。
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    if (!frameRtvFor(ctx, tex, 0, cpu, err)) return false;
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = { r, g, b, a };
     ctx->commandList->ClearRenderTargetView(cpu, color, 0, nullptr);
-    // P11：显式回切 COMMON（RENDER_TARGET 不会随命令列表完成 decay）。
-    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    // P64：不再回切 COMMON。若随后 beginRenderPass 以同一纹理为附件，可省去
+    // COMMON→RENDER_TARGET 的重复 barrier；否则由 endCommandList 的收尾循环统一
+    // 回切（该循环已覆盖 RENDER_TARGET/DEPTH_WRITE 等非提升状态）。
     return true;
 }
 
@@ -2114,17 +2175,13 @@ bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth,
     if (!tex || tex->kind != Dx12Object::Kind::Texture) {
         err = "clearDepthTexture: invalid texture"; return false;
     }
-    if (gNextDsv >= kDsvHeapSize) { err = "clearDepthTexture: dsv heap exhausted"; return false; }
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
-    ++gNextDsv;
-    D3D12_DEPTH_STENCIL_VIEW_DESC desc = makeDsvDesc(tex, 0);
-    gCtx.device->CreateDepthStencilView(tex->resource.Get(), &desc, cpu);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    if (!frameDsvFor(ctx, tex, 0, cpu, err)) return false;
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     ctx->commandList->ClearDepthStencilView(cpu,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 0, nullptr);
-    // P11：显式回切 COMMON（DEPTH_WRITE 不会随命令列表完成 decay）。
-    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    // P64：不再回切 COMMON（同 clearColorTexture：后续 beginRenderPass 复用 DEPTH_WRITE，
+    // 彻底未用的由 endCommandList 收尾回切）。
     return true;
 }
 
@@ -2139,17 +2196,13 @@ bool clearColorTextureRegion(CommandContext* ctx, Dx12Object* tex,
         err = "clearColorTextureRegion: texture lacks RENDER_ATTACHMENT"; return false;
     }
     if (w <= 0 || h <= 0) return true;  // 空区域：无事可做
-    if (gNextFrameRtv >= kFrameRtvHeapSize) { err = "clearColorTextureRegion: frame rtv heap exhausted"; return false; }
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
-    ++gNextFrameRtv;
-    D3D12_RENDER_TARGET_VIEW_DESC desc = makeRtvDesc(tex, 0);
-    gCtx.device->CreateRenderTargetView(tex->resource.Get(), &desc, cpu);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    if (!frameRtvFor(ctx, tex, 0, cpu, err)) return false;
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = { r, g, b, a };
     D3D12_RECT rc{ x, y, x + w, y + h };
     ctx->commandList->ClearRenderTargetView(cpu, color, 1, &rc);
-    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    // P64：不回切 COMMON（与 clearColorTexture 一致，交由 endCommandList 收尾）。
     return true;
 }
 
@@ -2160,17 +2213,13 @@ bool clearDepthTextureRegion(CommandContext* ctx, Dx12Object* tex, double depth,
         err = "clearDepthTextureRegion: invalid texture"; return false;
     }
     if (w <= 0 || h <= 0) return true;  // 空区域：无事可做
-    if (gNextDsv >= kDsvHeapSize) { err = "clearDepthTextureRegion: dsv heap exhausted"; return false; }
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
-    ++gNextDsv;
-    D3D12_DEPTH_STENCIL_VIEW_DESC desc = makeDsvDesc(tex, 0);
-    gCtx.device->CreateDepthStencilView(tex->resource.Get(), &desc, cpu);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    if (!frameDsvFor(ctx, tex, 0, cpu, err)) return false;
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_RECT rc{ x, y, x + w, y + h };
     ctx->commandList->ClearDepthStencilView(cpu,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, (FLOAT)depth, 0, 1, &rc);
-    transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
+    // P64：不回切 COMMON（与 clearDepthTexture 一致，交由 endCommandList 收尾）。
     return true;
 }
 
@@ -2369,15 +2418,11 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         // P24：帧级瞬态 RTV（frameRtvHeap），每帧从 0 复用，不与 backbuffer RTV
         // 冲突。此前共用 rtvHeap + gNextRtv 导致每帧覆盖 surface 的 backbuffer RTV，
         // blit 的 OMSetRenderTargets 绑到颜色纹理 → 资源状态 0xC0 错误 → 黑屏。
-        if (gNextFrameRtv >= kFrameRtvHeapSize) { err = "beginRenderPass: frame rtv heap exhausted"; return false; }
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += (SIZE_T)gNextFrameRtv * gCtx.rtvInc;
-        ++gNextFrameRtv;
         // P3b fix：RTV 绑定 view 的真实 mip slice（官方对每个 mipViews[level]
-        // 发起 render pass 逐级写入图集 mip1..N）。
+        // 发起 render pass 逐级写入图集 mip1..N）。P64：(资源, mip) 走缓存。
         int mip = colorMips ? colorMips[i] : 0;
-        D3D12_RENDER_TARGET_VIEW_DESC rdesc = makeRtvDesc(tex, mip);
-        gCtx.device->CreateRenderTargetView(tex->resource.Get(), &rdesc, cpu);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+        if (!frameRtvFor(ctx, tex, mip, cpu, err)) return false;
         rtvs.push_back(cpu);
         ctx->activeColorTargets.push_back(tex);
         // P27：beginRenderPass 加载期可调用数千次，逐条 dbgLog 写文件拖死主线程，
@@ -2404,14 +2449,8 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         if (depthView->kind != Dx12Object::Kind::Texture) {
             err = "beginRenderPass: invalid depth attachment"; return false;
         }
-        if (gNextDsv >= kDsvHeapSize) { err = "beginRenderPass: dsv heap exhausted"; return false; }
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += (SIZE_T)gNextDsv * gCtx.dsvInc;
-        ++gNextDsv;
-        // P3b fix：DSV 绑定真实 mip slice（默认 0，语义不变）。
-        D3D12_DEPTH_STENCIL_VIEW_DESC ddesc = makeDsvDesc(depthView, depthMip);
-        gCtx.device->CreateDepthStencilView(depthView->resource.Get(), &ddesc, cpu);
-        dsv = cpu;
+        // P3b fix：DSV 绑定真实 mip slice（默认 0，语义不变）。P64：(资源, mip) 走缓存。
+        if (!frameDsvFor(ctx, depthView, depthMip, dsv, err)) return false;
         hasDsv = true;
         ctx->activeDepthTarget = depthView;
         transitionTextureTo(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -2423,7 +2462,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews,
         // GREATER_EQUAL 深度测试丢弃几乎所有片元 → 全黑屏。
         // 正确行为：LOAD 不 clear（保持 pre-clear 值），仅显式 CLEAR 时 clear。
         if (depthClearFlag) {
-            ctx->commandList->ClearDepthStencilView(cpu,
+            ctx->commandList->ClearDepthStencilView(dsv,
                 D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                 (FLOAT)depthClearValue, 0, 0, nullptr);
             // P27：降级（数千次 pass 调用 × 高频写文件）。
@@ -2667,20 +2706,29 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     if (!compileShaderBytecode(vsBytes, "vertex", "vs_5_1", vsBlob, err)) return nullptr;
     if (!compileShaderBytecode(psBytes, "fragment", "ps_5_1", psBlob, err)) return nullptr;
 
-    // 2) root signature：单 descriptor table（CBV/SRV 混合，register=条目序号）
-    //    + static sampler（仅 SAMPLED_IMAGE 条目，register=同一序号）
-    std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
+    // 2) root signature：CBV 走 root descriptor（每 draw 直接
+    //    SetGraphicsRootConstantBufferView，地址烘焙进命令列表，零描述符堆写入）；
+    //    SRV 汇入单个 descriptor table（每批只写一次 + 一次
+    //    SetGraphicsRootDescriptorTable）+ static sampler（仅 SAMPLED_IMAGE 条目）。
+    //    root 参数索引：第 k 个 CBV -> k（按 binding 顺序稠密编号），SRV 表 -> cbvCount。
+    //    shader register 仍取 binding 的 reg（= 条目序号），与 HLSL 声明一一对应。
+    std::vector<uint8_t> cbvRegs;
+    std::vector<D3D12_DESCRIPTOR_RANGE> srvRanges;
     std::vector<D3D12_STATIC_SAMPLER_DESC> staticSamplers;
-    ranges.reserve(desc.bindings.size());
+    cbvRegs.reserve(desc.bindings.size());
+    srvRanges.reserve(desc.bindings.size());
     for (const PipelineDesc::Binding& b : desc.bindings) {
+        if (b.type == 0) {
+            cbvRegs.push_back(b.reg);
+            continue;
+        }
         D3D12_DESCRIPTOR_RANGE r{};
         r.NumDescriptors = 1;
         r.RegisterSpace = 0;
         r.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
         r.BaseShaderRegister = b.reg;
-        r.RangeType = (b.type == 0) ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
-                                    : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges.push_back(r);
+        r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRanges.push_back(r);
         if (b.type == 1) {
             D3D12_STATIC_SAMPLER_DESC s{};
             s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -2699,16 +2747,30 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
             staticSamplers.push_back(s);
         }
     }
-    D3D12_ROOT_DESCRIPTOR_TABLE table{};
-    table.NumDescriptorRanges = (UINT)ranges.size();
-    table.pDescriptorRanges = ranges.empty() ? nullptr : ranges.data();
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    param.DescriptorTable = table;
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    // srvRanges 必须先填满再取 data()（否则 params 内的指针会因扩容而悬空）。
+    std::vector<D3D12_ROOT_PARAMETER> params;
+    params.reserve(cbvRegs.size() + 1);
+    for (uint8_t reg : cbvRegs) {
+        D3D12_ROOT_PARAMETER p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p.Descriptor.ShaderRegister = reg;
+        p.Descriptor.RegisterSpace = 0;
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(p);
+    }
+    if (!srvRanges.empty()) {
+        D3D12_ROOT_DESCRIPTOR_TABLE table{};
+        table.NumDescriptorRanges = (UINT)srvRanges.size();
+        table.pDescriptorRanges = srvRanges.data();
+        D3D12_ROOT_PARAMETER p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable = table;
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(p);
+    }
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 1;
-    rsDesc.pParameters = &param;
+    rsDesc.NumParameters = (UINT)params.size();
+    rsDesc.pParameters = params.empty() ? nullptr : params.data();
     rsDesc.NumStaticSamplers = (UINT)staticSamplers.size();
     rsDesc.pStaticSamplers = staticSamplers.empty() ? nullptr : staticSamplers.data();
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -3149,12 +3211,20 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     ID3D12PipelineState* pso = hasDepth ? pipeline->withDepth.Get() : pipeline->withoutDepth.Get();
     if (!pso) pso = pipeline->withDepth.Get();  // 无深度渲染但管线未建 withoutDepth 时回退
     if (!pipeline->rootSignature) { err = "setPipeline: null root signature"; return false; }
+    // P64：快速路径——同一命令列表内重复设置同一 PSO 时，root signature / PSO /
+    // topology 三者均未变，跳过 3 次驱动调用（GUI/串行路径同一管线连续 draw 常见）。
+    // 比较 PSO 裸指针：管线被销毁重建会得到新的 ID3D12PipelineState，不会误命中。
+    if (pso == ctx->cachedPso) {
+        ctx->currentPipeline = pipeline;  // 保持 setVertexBuffer 的 stride 修正
+        return true;
+    }
     // P6 崩溃修复（第 5 轮）：D3D12 规定使用任何 root 参数（SetGraphicsRootDescriptorTable
     // 等）前必须先 SetGraphicsRootSignature。此前缺失 → UMD 首次真实 draw 时对 NULL root
     // signature 解引用崩溃（hs_err：NVIDIA UMD 内读 NULL+0x2b88，AV，PC 0x7ffcd70e8fa3）。
     ctx->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
     ctx->commandList->SetPipelineState(pso);
     ctx->currentPipeline = pipeline;
+    ctx->cachedPso = pso;
     // P6 纯色黑屏修复：D3D12 命令列表初始 topology 是 UNDEFINED，必须显式
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
     D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
@@ -3232,7 +3302,17 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     if (!ctx || !ctx->listOpen) { err = "pushDescriptors: no open command list"; return false; }
     UINT count = (UINT)bindings.size();
     if (count == 0) return true;
-    if (ctx->nextDrawSlot + count > syncRingCapacity()) {
+    // B：CBV 走 root descriptor（不占堆槽位），只有 SRV 需要写瞬时描述符堆。
+    UINT cbvCount = 0;
+    UINT srvCount = 0;
+    for (const DrawBinding& b : bindings) {
+        if (b.type == 0) {
+            ++cbvCount;
+        } else {
+            ++srvCount;
+        }
+    }
+    if (ctx->nextDrawSlot + srvCount > syncRingCapacity()) {
         err = "pushDescriptors: draw descriptor heap exhausted for this frame";
         return false;
     }
@@ -3259,36 +3339,33 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += base;
+    // 稠密编号：cbvIdx -> root 参数索引；srvIdx -> SRV 堆槽 / SRV 表内序号。
+    UINT cbvIdx = 0;
+    UINT srvIdx = 0;
     for (UINT i = 0; i < count; ++i) {
-        D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)i * gCtx.drawInc };
         const DrawBinding& b = bindings[i];
         DBG_LOG_DEBUG("pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d",
             (unsigned)i, (int)b.type, (void*)b.buffer, (void*)b.view,
             (long long)b.offset, (long long)b.length, b.texelFormat);
         switch (b.type) {
-            case 0: {  // CBV（offset 须 256 对齐；SizeInBytes 向上取整 256）
+            case 0: {  // CBV -> root descriptor（地址烘焙进命令列表，不写描述符堆）
                 if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
                     dbgLog("pushDesc[%u] INVALID CBV buffer", (unsigned)i);
                     err = "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i);
                     return false;
                 }
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
-                cbv.BufferLocation = b.buffer->resource->GetGPUVirtualAddress() + (UINT64)b.offset;
-                UINT64 cbvSize = (UINT64)b.length;
-                cbvSize = (cbvSize + 255) & ~255ULL;
-                if (cbvSize == 0) cbvSize = 256;
-                cbv.SizeInBytes = (UINT)cbvSize;
+                D3D12_GPU_VIRTUAL_ADDRESS va =
+                    b.buffer->resource->GetGPUVirtualAddress() + (UINT64)b.offset;
                 // P20：诊断 CBV 地址（每帧首 pushDescriptors 打印）
                 static UINT64 lastPdFrame = 0;
                 if ((UINT64)ctx->fenceValue != lastPdFrame) {
                     lastPdFrame = (UINT64)ctx->fenceValue;
-                    dbgLogDebug("pushDesc CBV[%u]: bufGVA=%llx off=%lld cbvLoc=%llx cbvSize=%llu heap=%d",
+                    dbgLogDebug("pushDesc CBV[%u]: bufGVA=%llx off=%lld rootVA=%llx heap=%d",
                         (unsigned)i,
                         (unsigned long long)b.buffer->resource->GetGPUVirtualAddress(),
                         (long long)b.offset,
-                        (unsigned long long)cbv.BufferLocation,
-                        (unsigned long long)cbvSize,
+                        (unsigned long long)va,
                         (int)b.buffer->heapType);
                     // P21：额外诊断 binding[1]（DynamicTransforms UBO）的 offset，确认 shader 读取位置
                     if (i == 0 && count > 1) {
@@ -3299,10 +3376,12 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                             (int)(b1.buffer ? b1.buffer->heapType : -1));
                     }
                 }
-                gCtx.device->CreateConstantBufferView(&cbv, dst);
+                ctx->commandList->SetGraphicsRootConstantBufferView(cbvIdx, va);
+                ++cbvIdx;
                 break;
             }
             case 1: {  // SRV：复制 texture view 的现有描述符
+                D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)srvIdx * gCtx.drawInc };
                 if (!b.view || b.view->cpuHandle.ptr == 0) {
                     dbgLog("pushDesc[%u] INVALID view", (unsigned)i);
                     err = "pushDescriptors: missing view for SRV entry " + std::to_string(i);
@@ -3359,9 +3438,11 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 }
                 gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                ++srvIdx;
                 break;
             }
             case 2: {  // SRV：texel buffer
+                D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)srvIdx * gCtx.drawInc };
                 if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer || !b.buffer->resource) {
                     dbgLog("pushDesc[%u] INVALID texel buffer", (unsigned)i);
                     err = "pushDescriptors: invalid texel buffer handle";
@@ -3382,6 +3463,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 srv.Buffer.FirstElement = (UINT)(b.offset / elementBytes);
                 srv.Buffer.NumElements = (UINT)(b.length / elementBytes);
                 gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(), &srv, dst);
+                ++srvIdx;
                 break;
             }
             default:
@@ -3389,22 +3471,26 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 return false;
         }
     }
+    ctx->nextDrawSlot += srvCount;
+    // SRV 表位于 root 参数索引 cbvCount（在 CBV root descriptor 之后）。
     // gpuRoot 必须指向本帧实际写入位置（ring buffer 偏移 base），
     // 而不是 heap 起始处。否则多帧飞环时每帧的命令列表都把根表绑定到
     // 同一 GPU 地址（heap start），导致 GPU 读到前帧残留的描述符 → 黑屏。
-    D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot =
-        gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
-    gpuRoot.ptr += base;
-    ctx->nextDrawSlot += count;
-    // P20：诊断 root descriptor table 绑定地址（指向本帧写入位置）
-    static UINT64 lastGpuFrame = 0;
-    if ((UINT64)ctx->fenceValue != lastGpuFrame) {
-        lastGpuFrame = (UINT64)ctx->fenceValue;
-        dbgLogDebug("pushDesc SET_ROOT_TABLE: heapBase=%llx writeBase=%llx slotCount=%u",
-            (unsigned long long)gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart().ptr,
-            (unsigned long long)base, (unsigned)count);
+    if (srvCount > 0) {
+        D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot =
+            gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
+        gpuRoot.ptr += base;
+        // P20：诊断 root descriptor table 绑定地址（指向本帧写入位置）
+        static UINT64 lastGpuFrame = 0;
+        if ((UINT64)ctx->fenceValue != lastGpuFrame) {
+            lastGpuFrame = (UINT64)ctx->fenceValue;
+            dbgLogDebug("pushDesc SET_ROOT_TABLE[%u]: heapBase=%llx writeBase=%llx slotCount=%u",
+                cbvCount,
+                (unsigned long long)gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart().ptr,
+                (unsigned long long)base, (unsigned)srvCount);
+        }
+        ctx->commandList->SetGraphicsRootDescriptorTable(cbvCount, gpuRoot);
     }
-    ctx->commandList->SetGraphicsRootDescriptorTable(0, gpuRoot);
     return true;
 }
 

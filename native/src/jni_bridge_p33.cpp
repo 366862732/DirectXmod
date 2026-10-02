@@ -429,11 +429,12 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleDrawIndexedIndirect(
 }
 
 // P57：把 worker 分区内「每个 draw 的写描述符 + 根描述符表 + 索引/顶点缓冲 +
-// DrawIndexed」合并为单次 JNI 调用。此前每 draw 需 ~8 次 JNI（bc 次
-// DescriptorWriteCBV/SRV + DescriptorGpuHandle + SetDescriptorTable +
-// SetIndexBuffer + SetVertexBuffer + DrawIndexed），347 draws/帧 → 约 2700 次/帧
-// 穿越，是并行 worker（batch workers=0.2–0.37ms/帧）与主线程 Unsafe.park 的主要
-// 成本。语义与逐个调用完全一致：任何参数非法 → 返回 false，Java 侧丢弃 bundle
+// DrawIndexed」合并为单次 JNI 调用。
+// B（拆根签名）：CBV 走 root descriptor（SetGraphicsRootConstantBufferView，地址
+// 烘焙进命令列表）；SRV 汇入单个 descriptor table，整段只写一份 + 一次
+// SetGraphicsRootDescriptorTable。因此每 draw 的描述符堆写入为 0，每段仅需
+// srvCount 个槽位（此前为 n*bc，是 workers≈0.26ms/帧 的主体）。
+// 语义与逐个调用完全一致：任何参数非法 → 返回 false，Java 侧丢弃 bundle
 // 并回退串行路径重录。
 JNIEXPORT jboolean JNICALL
 Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleRecordPartition(
@@ -472,64 +473,157 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleRecordPartition(
         return JNI_FALSE;
     }
 
-    const int n = (int)count;
     const int bcount = (int)bc;
-    for (int i = 0; i < n; ++i) {
-        const int d = (int)startDraw + i;
-        const int slot = (int)baseSlot + i * bcount;
-        const int o = d * bcount;
+    const int n = (int)count;
+    // CBV -> root 参数索引（按 binding 顺序稠密编号）；SRV -> SRV 表内序号。
+    int cbvCount = 0;
+    int srvCount = 0;
+    for (int j = 0; j < bcount; ++j) {
+        if (bType.p[j] == 0) {
+            ++cbvCount;
+        } else {
+            ++srvCount;
+        }
+    }
+    // B：SRV 描述符块 + 根描述符表整段只写一次（此前每 draw 写 bc 个）。
+    if (srvCount > 0) {
+        int s = 0;
         for (int j = 0; j < bcount; ++j) {
-            const UINT ds = (UINT)(slot + j);
-            if (bType.p[j] == 0) {  // CBV
-                Dx12Object* buf = toPtr<Dx12Object>(bBuf.p[o + j]);
-                if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
-                    logFail("dx12AsyncBundleRecordPartition: invalid CBV buffer");
-                    return JNI_FALSE;
-                }
-                const jlong off = bOff.p[o + j];
-                const jlong size = bLen.p[o + j];
-                if (off < 0 || size < 0) return JNI_FALSE;
-                if (!a->writeCBV(ds, buf->resource.Get(), (UINT64)off, (UINT64)size)) {
-                    return JNI_FALSE;
-                }
-            } else {  // SRV：复制纹理视图已存在的描述符
-                Dx12Object* v = toPtr<Dx12Object>(bView.p[o + j]);
-                if (!v || v->cpuHandle.ptr == 0) {
-                    logFail("dx12AsyncBundleRecordPartition: invalid SRV view");
-                    return JNI_FALSE;
-                }
-                if (!a->writeDescriptor(ds, v->cpuHandle)) return JNI_FALSE;
+            if (bType.p[j] == 0) {
+                continue;
+            }
+            Dx12Object* v = toPtr<Dx12Object>(bView.p[j]);
+            if (!v || v->cpuHandle.ptr == 0) {
+                logFail("dx12AsyncBundleRecordPartition: invalid SRV view");
+                return JNI_FALSE;
+            }
+            if (!a->writeDescriptor((UINT)(baseSlot + s), v->cpuHandle)) {
+                return JNI_FALSE;
+            }
+            ++s;
+        }
+        r->setDescriptorTable((UINT)cbvCount, a->gpuHandle((UINT)baseSlot));
+    }
+
+    // P63：P62 诊断显示整批 draw 100% 共享同一 VB/IB（drawMultipleIndexed 的语义即
+    // 「一个 VB + 一个 IB，多组 (indexCount, baseVertex)」）。先探测一致性，一致则把
+    // 索引/顶点缓冲设置提到循环外只做一次，每 draw 省 2 次 IASet* 录制（整批 ~n×2 次）。
+    bool vbIbUniform = true;
+    {
+        const int d0 = (int)startDraw;
+        const int dLast = (int)(startDraw + n) - 1;
+        for (int d = d0 + 1; d <= dLast; ++d) {
+            if (idxBuf.p[d] != idxBuf.p[d0] || idxType.p[d] != idxType.p[d0]
+                || vbBuf.p[d] != vbBuf.p[d0] || vbOff.p[d] != vbOff.p[d0]
+                || vbStride.p[d] != vbStride.p[d0] || vbSlot.p[d] != vbSlot.p[d0]) {
+                vbIbUniform = false;
+                break;
             }
         }
-        r->setDescriptorTable(0, a->gpuHandle((UINT)slot));
+    }
 
-        Dx12Object* idx = toPtr<Dx12Object>(idxBuf.p[d]);
-        if (!idx || idx->kind != Dx12Object::Kind::Buffer || !idx->resource) {
-            logFail("dx12AsyncBundleRecordPartition: invalid index buffer");
-            return JNI_FALSE;
+    // P64：常量 CBV 提升。P62b 实测每批 bc 个绑定中 4 个 CBV 里仅 1 个逐 draw 变化，
+    // 其余整批恒定。恒定者只需在循环前设置一次（root descriptor 地址直接烘焙进命令
+    // 列表）；循环内只重设变化者 → 每 draw 录制命令从 cbvCount+1 降到 varyCount+1。
+    // varyMask 第 i 位 = 第 i 个 CBV 绑定（稠密编号）在整批内变化。绑定数 > 64 时保守
+    // 视为全部变化（不优化，语义不变）。
+    UINT64 varyMask = 0;
+    if (cbvCount <= 64) {
+        int ci = 0;
+        for (int j = 0; j < bcount; ++j) {
+            if (bType.p[j] != 0) {
+                continue;
+            }
+            const int o0 = (int)startDraw * bcount + j;
+            for (int i = 1; i < n; ++i) {
+                const int oi = ((int)startDraw + i) * bcount + j;
+                if (bBuf.p[oi] != bBuf.p[o0] || bOff.p[oi] != bOff.p[o0]) {
+                    varyMask |= (UINT64)1 << ci;
+                    break;
+                }
+            }
+            ++ci;
         }
-        D3D12_INDEX_BUFFER_VIEW ib{};
-        ib.BufferLocation = idx->resource->GetGPUVirtualAddress();
-        ib.SizeInBytes = (UINT)idx->size;
-        ib.Format = idxType.p[d] == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-        r->setIndexBuffer(&ib);
+    } else {
+        varyMask = ~(UINT64)0;
+    }
+    // 恒定 CBV：循环前一次性设置。
+    {
+        int ci = 0;
+        for (int j = 0; j < bcount; ++j) {
+            if (bType.p[j] != 0) {
+                continue;
+            }
+            if (varyMask & ((UINT64)1 << ci)) { ++ci; continue; }
+            const int o0 = (int)startDraw * bcount + j;
+            Dx12Object* buf = toPtr<Dx12Object>(bBuf.p[o0]);
+            if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
+                logFail("dx12AsyncBundleRecordPartition: invalid CBV buffer");
+                return JNI_FALSE;
+            }
+            const jlong off = bOff.p[o0];
+            if (off < 0) return JNI_FALSE;
+            r->setRootConstantBufferView((UINT)ci,
+                buf->resource->GetGPUVirtualAddress() + (UINT64)off);
+            ++ci;
+        }
+    }
 
-        Dx12Object* vb = toPtr<Dx12Object>(vbBuf.p[d]);
-        const jlong voff = vbOff.p[d];
-        if (!vb || vb->kind != Dx12Object::Kind::Buffer || !vb->resource
-            || voff < 0 || (UINT64)voff >= (UINT64)vb->size) {
-            logFail("dx12AsyncBundleRecordPartition: invalid vertex buffer");
-            return JNI_FALSE;
+    for (int i = 0; i < n; ++i) {
+        const int d = (int)startDraw + i;
+        const int o = d * bcount;
+        // B：CBV 走 root descriptor——地址烘焙进命令列表，零描述符堆写入。
+        // P64：跳过整批恒定的 CBV（已在循环前设置）。
+        int cbvIdx = 0;
+        for (int j = 0; j < bcount; ++j) {
+            if (bType.p[j] != 0) {
+                continue;
+            }
+            if (!(varyMask & ((UINT64)1 << cbvIdx))) {
+                ++cbvIdx;
+                continue;
+            }
+            Dx12Object* buf = toPtr<Dx12Object>(bBuf.p[o + j]);
+            if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
+                logFail("dx12AsyncBundleRecordPartition: invalid CBV buffer");
+                return JNI_FALSE;
+            }
+            const jlong off = bOff.p[o + j];
+            if (off < 0) return JNI_FALSE;
+            r->setRootConstantBufferView((UINT)cbvIdx,
+                buf->resource->GetGPUVirtualAddress() + (UINT64)off);
+            ++cbvIdx;
         }
-        D3D12_VERTEX_BUFFER_VIEW vbv{};
-        vbv.BufferLocation = vb->resource->GetGPUVirtualAddress() + (UINT64)voff;
-        vbv.SizeInBytes = (UINT)(vb->size - (UINT64)voff);
-        // 与同步路径 / dx12AsyncBundleSetVertexBuffer 一致：优先用管线修正 stride。
-        UINT effStride = (UINT)vbStride.p[d];
-        const UINT corrected = r->correctedStride((int)vbSlot.p[d]);
-        if (corrected > 0) effStride = corrected;
-        vbv.StrideInBytes = effStride;
-        r->setVertexBuffers((UINT)vbSlot.p[d], 1, &vbv);
+
+        if (!vbIbUniform || i == 0) {
+            Dx12Object* idx = toPtr<Dx12Object>(idxBuf.p[d]);
+            if (!idx || idx->kind != Dx12Object::Kind::Buffer || !idx->resource) {
+                logFail("dx12AsyncBundleRecordPartition: invalid index buffer");
+                return JNI_FALSE;
+            }
+            D3D12_INDEX_BUFFER_VIEW ib{};
+            ib.BufferLocation = idx->resource->GetGPUVirtualAddress();
+            ib.SizeInBytes = (UINT)idx->size;
+            ib.Format = idxType.p[d] == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+            r->setIndexBuffer(&ib);
+
+            Dx12Object* vb = toPtr<Dx12Object>(vbBuf.p[d]);
+            const jlong voff = vbOff.p[d];
+            if (!vb || vb->kind != Dx12Object::Kind::Buffer || !vb->resource
+                || voff < 0 || (UINT64)voff >= (UINT64)vb->size) {
+                logFail("dx12AsyncBundleRecordPartition: invalid vertex buffer");
+                return JNI_FALSE;
+            }
+            D3D12_VERTEX_BUFFER_VIEW vbv{};
+            vbv.BufferLocation = vb->resource->GetGPUVirtualAddress() + (UINT64)voff;
+            vbv.SizeInBytes = (UINT)(vb->size - (UINT64)voff);
+            // 与同步路径 / dx12AsyncBundleSetVertexBuffer 一致：优先用管线修正 stride。
+            UINT effStride = (UINT)vbStride.p[d];
+            const UINT corrected = r->correctedStride((int)vbSlot.p[d]);
+            if (corrected > 0) effStride = corrected;
+            vbv.StrideInBytes = effStride;
+            r->setVertexBuffers((UINT)vbSlot.p[d], 1, &vbv);
+        }
 
         r->drawIndexedInstanced((UINT)idxCount.p[d], 1, (UINT)firstIdx.p[d],
             (INT)baseVert.p[d], 0);
@@ -537,12 +631,10 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleRecordPartition(
     return JNI_TRUE;
 }
 
-// P59：当一批 draw 的绑定完全一致（区块 renderGroup 的典型情形：同一 PSO、同一
-// uniform 切片、同一组纹理），描述符块只需写一份。此函数把描述符写到
-// [baseSlot, baseSlot+bc) 一次、根描述符表也只设一次，然后对每个 draw 仅下发
-// 索引/顶点缓冲 + DrawIndexed。相比 RecordPartition，每 draw 省掉 bc 次
-// CreateConstantBufferView/CopyDescriptorsSimple 与一次 SetGraphicsRootDescriptorTable，
-// 这是 workers≈0.2ms/帧 的主要构成。
+// P59/B：当一批 draw 的绑定完全一致（区块 renderGroup 的典型情形：同一 PSO、同一
+// uniform 切片、同一组纹理），CBV 与 SRV 都只需设置一次。SRV 汇入单个 descriptor
+// table，写到 [baseSlot, baseSlot+srvCount) 一次；CBV 走 root descriptor，在循环前
+// 设置一次。随后对每个 draw 仅下发索引/顶点缓冲 + DrawIndexed，描述符堆写入为 0。
 // 描述符数组（jbType/jbBuf/jbOff/jbLen/jbView）只读取前 bc 项（即 draw 0 的块）。
 JNIEXPORT jboolean JNICALL
 Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleRecordPartitionShared(
@@ -582,31 +674,52 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12AsyncBundleRecordPartitionShared(
     }
 
     const int bcount = (int)bc;
-    // 写一份描述符块（draw 0 的绑定），此后所有 draw 共用该根描述符表。
+    // B（拆根签名）：CBV -> root descriptor，SRV -> 单个 descriptor table。
+    // 全批绑定一致，故 SRV 描述符块只写一份（draw 0 的绑定），CBV 也只设一次。
+    int cbvCount = 0;
+    int srvCount = 0;
     for (int j = 0; j < bcount; ++j) {
-        const UINT ds = (UINT)(baseSlot + j);
-        if (bType.p[j] == 0) {  // CBV
+        if (bType.p[j] == 0) {
+            ++cbvCount;
+        } else {
+            ++srvCount;
+        }
+    }
+    if (srvCount > 0) {
+        int s = 0;
+        for (int j = 0; j < bcount; ++j) {
+            if (bType.p[j] == 0) {
+                continue;
+            }
+            Dx12Object* v = toPtr<Dx12Object>(bView.p[j]);
+            if (!v || v->cpuHandle.ptr == 0) {
+                logFail("dx12AsyncBundleRecordPartitionShared: invalid SRV view");
+                return JNI_FALSE;
+            }
+            if (!a->writeDescriptor((UINT)(baseSlot + s), v->cpuHandle)) return JNI_FALSE;
+            ++s;
+        }
+        r->setDescriptorTable((UINT)cbvCount, a->gpuHandle((UINT)baseSlot));
+    }
+    // CBV 走 root descriptor：全批共享，循环前设置一次。
+    {
+        int cbvIdx = 0;
+        for (int j = 0; j < bcount; ++j) {
+            if (bType.p[j] != 0) {
+                continue;
+            }
             Dx12Object* buf = toPtr<Dx12Object>(bBuf.p[j]);
             if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
                 logFail("dx12AsyncBundleRecordPartitionShared: invalid CBV buffer");
                 return JNI_FALSE;
             }
             const jlong off = bOff.p[j];
-            const jlong size = bLen.p[j];
-            if (off < 0 || size < 0) return JNI_FALSE;
-            if (!a->writeCBV(ds, buf->resource.Get(), (UINT64)off, (UINT64)size)) {
-                return JNI_FALSE;
-            }
-        } else {  // SRV：复制纹理视图已存在的描述符
-            Dx12Object* v = toPtr<Dx12Object>(bView.p[j]);
-            if (!v || v->cpuHandle.ptr == 0) {
-                logFail("dx12AsyncBundleRecordPartitionShared: invalid SRV view");
-                return JNI_FALSE;
-            }
-            if (!a->writeDescriptor(ds, v->cpuHandle)) return JNI_FALSE;
+            if (off < 0) return JNI_FALSE;
+            r->setRootConstantBufferView((UINT)cbvIdx,
+                buf->resource->GetGPUVirtualAddress() + (UINT64)off);
+            ++cbvIdx;
         }
     }
-    r->setDescriptorTable(0, a->gpuHandle((UINT)baseSlot));
 
     const int n = (int)count;
     for (int i = 0; i < n; ++i) {
@@ -755,6 +868,9 @@ Java_com_xgdt_dx12_dx12_Dx12Native_dx12ExecuteBundle(
         return JNI_FALSE;
     }
     c->commandList->ExecuteBundle(b);
+    // P64：bundle 内设置的 PSO/根签名不会回滚到父列表，之后父列表的绑定状态不再可知 →
+    // 作废 setPipeline 快速路径缓存，强制下一次 setPipeline 重新下发。
+    c->cachedPso = nullptr;
     return JNI_TRUE;
 }
 

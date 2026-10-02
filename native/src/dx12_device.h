@@ -222,6 +222,22 @@ void unmapBuffer(Dx12Object* buffer);
 // （双 ring + 等 value-2 会差一帧：帧 N+2 复用帧 N 的 allocator 但只等了 N-1。）
 // ---------------------------------------------------------------------------
 struct Dx12Pipeline;  // forward，CommandContext 持有其裸指针
+
+// P64：帧级瞬态 RTV/DSV 缓存键。(资源指针, mip) 唯一决定视图内容（见 makeRtvDesc）。
+struct RtvDsvKey {
+    ID3D12Resource* resource;
+    UINT mip;
+    bool operator==(const RtvDsvKey& o) const {
+        return resource == o.resource && mip == o.mip;
+    }
+};
+struct RtvDsvKeyHash {
+    size_t operator()(const RtvDsvKey& k) const {
+        return std::hash<void*>()((void*)k.resource)
+            ^ (std::hash<UINT>()(k.mip) * 0x9E3779B97F4A7C15ULL);
+    }
+};
+
 struct CommandContext {
     ComPtr<ID3D12CommandAllocator> allocators[3];   // 三帧飞行，等待 value-2 后复用
     // P55：command list 也改为 3 路 ring（此前只有单条 list，导致主线程必须等上一帧
@@ -288,6 +304,18 @@ struct CommandContext {
 
     // P6：当前绑定的管线，用于 setVertexBuffer 查找修正 stride
     Dx12Pipeline* currentPipeline = nullptr;
+
+    // P64：setPipeline 快速路径。同一命令列表内以相同 PSO 重复调用时，root signature /
+    // PSO / topology 均未变，可跳过 3 次驱动调用。ExecuteBundle 后置空（bundle 内设置的
+    // PSO 不回滚到父列表，父列表状态可能已变）。
+    ID3D12PipelineState* cachedPso = nullptr;
+
+    // P64：帧级瞬态 RTV/DSV 描述符缓存。beginRenderPass/clear* 在本命令列表内对同一
+    // (资源, mip) 只创建一次视图；此前每次调用都 CreateRenderTargetView/
+    // CreateDepthStencilView（数百次/帧的驱动调用）。beginCommandList 清空
+    // （gNextFrameRtv/gNextDsv 同点清零，句柄随之失效）。
+    std::unordered_map<RtvDsvKey, D3D12_CPU_DESCRIPTOR_HANDLE, RtvDsvKeyHash> rtvCache;
+    std::unordered_map<RtvDsvKey, D3D12_CPU_DESCRIPTOR_HANDLE, RtvDsvKeyHash> dsvCache;
 
     ComPtr<ID3D12CommandAllocator>& currentAllocator() {
         return allocators[currentListSlot];
@@ -583,7 +611,8 @@ struct DrawBinding {
     int texelFormat = 0;            // TEXEL SRV 的 GpuFormat ordinal
     Dx12Object* view = nullptr;     // SAMPLED_IMAGE 的 texture view
 };
-// 把 bindings 写入本帧 drawHeap 瞬时槽位并 SetGraphicsRootDescriptorTable(0)。
+// B（拆根签名）：CBV 走 root descriptor（SetGraphicsRootConstantBufferView，不占堆
+// 槽位），SRV 写入本帧 drawHeap 瞬时槽位并 SetGraphicsRootDescriptorTable(cbvCount)。
 bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings,
     std::string& err);
 
@@ -619,6 +648,10 @@ struct Dx12Surface {
     // 尚未写入的 buffer（全 0 假黑屏）。blit 成功时记录此处。
     int lastBlitIndex = -1;
     bool suboptimal = false;
+    // P65：实际创建的 swapchain 是否带 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING（tier1 成功）。
+    // 仅当为 true 时才能在 Present 时传 DXGI_PRESENT_ALLOW_TEARING，否则 Present
+    // 返回 DXGI_ERROR_INVALID_CALL。窗口/全屏切换可能重建 swapchain，故每次创建后更新。
+    bool allowTearing = false;
     std::vector<ComPtr<ID3D12Resource>> backBuffers;
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvHandles;  // 由 rtvHeap 分配
     // P18：per-backbuffer fence 值。submitCommandList 记录本帧写入的 fence 值，

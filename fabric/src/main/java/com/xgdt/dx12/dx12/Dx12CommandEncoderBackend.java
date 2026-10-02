@@ -695,6 +695,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                     + " | batches=" + Dx12RenderPassBackend.gProfBatches
                     + " sharedDesc=" + Dx12RenderPassBackend.gProfSharedDescBatches
                     + " singleBundle=" + Dx12RenderPassBackend.gProfSingleBundles
+                    + " srvVaryFallback=" + Dx12RenderPassBackend.gProfSrvVaryFallbacks
                     + " slots=" + Dx12RenderPassBackend.gProfSlotsTotal
                     + " | P62b bc=" + Dx12RenderPassBackend.gProfBcTotal
                     + " cbvVary=" + Dx12RenderPassBackend.gProfCbvVary
@@ -721,6 +722,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                 Dx12RenderPassBackend.gProfBatches = 0;
                 Dx12RenderPassBackend.gProfSharedDescBatches = 0;
                 Dx12RenderPassBackend.gProfSingleBundles = 0;
+                Dx12RenderPassBackend.gProfSrvVaryFallbacks = 0;
                 Dx12RenderPassBackend.gProfSlotsTotal = 0;
                 Dx12RenderPassBackend.gProfBcTotal = 0;
                 Dx12RenderPassBackend.gProfCbvVary = 0;
