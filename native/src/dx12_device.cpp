@@ -354,7 +354,8 @@ void flushPendingDeletes(bool force) {
     }
     gPdDeletingTotal = (long)local.size();
     if (gPdDeletingTotal > 0) {
-        dbgLog("flushPendingDeletes: begin count=%ld deferred=%lld gpuDone=%llu",
+        // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
+        dbgLogDebug("flushPendingDeletes: begin count=%ld deferred=%lld gpuDone=%llu",
             gPdDeletingTotal, (long long)pendingDeletesCount(),
             (unsigned long long)gpuDone);
     }
@@ -378,7 +379,8 @@ void flushPendingDeletes(bool force) {
     gPdDeletingIndex = -1;
     gPdDeletingTotal = 0;
     InterlockedExchange(&gPdInProgress, 0);
-    dbgLog("flushPendingDeletes: done");
+    // 逐帧诊断 → DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
+    dbgLogDebug("flushPendingDeletes: done");
 }
 
 // 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
@@ -4185,7 +4187,8 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
     srvGpu.ptr += base;
     cmd->SetGraphicsRootDescriptorTable(0, srvGpu);
-    dbgLog("blitBindSourceTexture: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
+    // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
+    dbgLogDebug("blitBindSourceTexture: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
         ctx->drawHeapSlotBase, ctx->nextDrawSlot, (unsigned long long)srvGpu.ptr);
     return true;
 }
@@ -4317,6 +4320,24 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         DBG_LOG_DEBUG("renderThread: submit done v=%llu qf=%llu",
             (unsigned long long)value, (unsigned long long)gCtx.queueFenceValue);
 
+        // P48（多帧飞行）：命令已入队（ExecuteCommandLists + Signal 完成）。
+        // 主线程只需知道「命令已提交」即可继续录制下一帧，**不必**再等 Present
+        // 返回——把 submitDone 提前到 present 之前置位，让主线程的下一帧录制与
+        // 本帧 Present 重叠执行（Present 实测 0.13-1.7ms，原为主线程每帧死等）。
+        // 正确性由两点保证：
+        //  1) back buffer 的 acquire 已推迟到 blit 之前，且 acquireSurface 会等待
+        //     上一帧 Present 完成（gPresentCv），不会两帧写同一 back buffer；
+        //  2) beginCommandList 等待本帧的 per-list fence 完成，命令列表不会被
+        //     主线程在 GPU 执行期间 Reset。
+        // P33 fix：标记本帧 Present 由本线程完成，让 Java 侧 present() 跳过重复
+        // Present（重复 Present 会让 swapchain 连续 flip 两次 → 窗口闪烁各种颜色）。
+        gAsyncOwnsPresent = true;
+        {
+            std::lock_guard<std::mutex> lk(gPresentMtx);
+            ++gSubmittedFrames;
+        }
+        SetEvent(gEvtSubmitDone);
+
         // present（presentSurface 返回 void）
         dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
             (unsigned long long)gCtx.queueFenceValue, bbIdx);
@@ -4334,10 +4355,12 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
                 sProfWaitCmdMs = sProfSubmitMs = sProfPresentMs = 0.0;
             }
         }
-        // P33 fix：本帧 Present 已由本线程完成。标记给 Java 侧 present()，
-        // 让它在 submit() 返回后跳过重复 Present（重复 Present 会让 swapchain
-        // 连续 flip 两次，显示到未渲染的 back buffer → 窗口闪烁各种颜色）。
-        gAsyncOwnsPresent = true;
+        // P48：Present 完成，放行主线程的 back buffer acquire。
+        {
+            std::lock_guard<std::mutex> lk(gPresentMtx);
+            ++gPresentedFrames;
+        }
+        gPresentCv.notify_all();
 
         // P33 fix：signal per-surface present fence，确保 Display Controller 完成
         // flip 后再销毁 surface。deviceWaitIdle 仅等命令队列，不等待 display controller。
@@ -4355,9 +4378,9 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             (unsigned long long)gCtx.queueFenceValue, gOpenListCount);
         if (gOpenListCount == 0) flushPendingDeletes();
 
-        // 步骤 8：通知主线程提交完成
+        // 步骤 8：本帧结束。submitDone 已在本帧 present **之前**置位（P48 多帧飞行），
+        // 以便主线程的下一帧录制与本帧 Present 重叠，这里不再重复置位。
         dbgLogDebug("renderThread: frame done, looping back");
-        SetEvent(gEvtSubmitDone);
     }
 
     return 0;
@@ -4374,6 +4397,23 @@ CommandContext* gAsyncRenderCtx = nullptr;
 // P33：本帧 Present 已由渲染线程完成（Java 侧 present() 需跳过，避免重复 Present）
 bool gAsyncOwnsPresent = false;
 
+// P48（多帧飞行）：等待所有已提交帧完成 Present。
+// 主线程的 back buffer acquire 已推迟到 blit 之前（见 Dx12GpuSurface），
+// 此时上一帧 Present 通常早已完成（渲染线程耗时 ≪ 主线程录制耗时）→ 通常 0ms。
+// 若渲染线程落后则在此短暂阻塞——这是必要的正确性保证：GetCurrentBackBufferIndex
+// 只在 Present 之后轮转，提前 acquire 会拿到同一个 back buffer（两帧写同一处
+// → 闪帧/撕裂）。超时（100ms）后放行并告警，避免渲染线程异常时主线程永久挂起。
+void waitForPendingPresents() {
+    if (!gRenderRunning) return;
+    std::unique_lock<std::mutex> lk(gPresentMtx);
+    if (gPresentedFrames >= gSubmittedFrames) return;
+    if (!gPresentCv.wait_for(lk, std::chrono::milliseconds(100),
+            [] { return gPresentedFrames >= gSubmittedFrames || !gRenderRunning; })) {
+        dbgLog("waitForPendingPresents: TIMEOUT submitted=%llu presented=%llu (render thread stalled)",
+            (unsigned long long)gSubmittedFrames, (unsigned long long)gPresentedFrames);
+    }
+}
+
 // 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。
 // 用于 destroySurface 场景：确保渲染线程不再并发操作 swapchain 后再调用 deviceWaitIdle。
 void waitForRenderThreadSubmit() {
@@ -4386,6 +4426,10 @@ void waitForRenderThreadSubmit() {
     if (r != WAIT_OBJECT_0) {
         dbgLog("waitForRenderThreadSubmit: timeout (render thread may be stuck)");
     }
+    // P48：submitDone 现在在 Present **之前**置位，这里再等 Present 真正完成，
+    // 保证后续 destroySurface 的 swapchain 操作（ResizeBuffers/Release）不与
+    // 并发的 Present 竞争。
+    waitForPendingPresents();
 }
 
 bool initAsyncRenderer(UINT workerCount) {
@@ -4414,6 +4458,12 @@ bool initAsyncRenderer(UINT workerCount) {
     }
 
     gAsyncRenderCtx = nullptr;
+    // P48：重置 Present 护栏计数（submit / present 各一，保持平衡）。
+    {
+        std::lock_guard<std::mutex> lk(gPresentMtx);
+        gSubmittedFrames = 0;
+        gPresentedFrames = 0;
+    }
     gRenderRunning = true;
     gRenderThread = std::thread([]() {
         DWORD ret = renderThreadFunc(nullptr);

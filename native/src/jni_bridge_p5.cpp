@@ -75,7 +75,8 @@ JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12AcquireSurface
         std::fprintf(stderr, "[dx12] dx12AcquireSurface: %s\n", err.c_str());
         return JNI_FALSE;
     }
-    dbgLog("acquireSurface: ok surface=%p", toSurface(surface));
+    // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
+    dbgLogDebug("acquireSurface: ok surface=%p", toSurface(surface));
     return JNI_TRUE;
 }
 
@@ -99,7 +100,8 @@ JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PresentSurface(
     // → 表现为窗口闪烁各种颜色。这里消费该标记并跳过重复 Present。
     if (gAsyncOwnsPresent) {
         gAsyncOwnsPresent = false;
-        dbgLog("dx12PresentSurface: skipped (async render thread already presented) surface=%p",
+        // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
+        dbgLogDebug("dx12PresentSurface: skipped (async render thread already presented) surface=%p",
             toSurface(surface));
         return;
     }

@@ -320,6 +320,11 @@ bool initAsyncRenderer(UINT workerCount);
 void destroyAsyncRenderer();
 // 等待渲染线程完成当前帧（不销毁线程，仅同步到 gEvtSubmitDone 触发后）
 void waitForRenderThreadSubmit();
+// P48（多帧飞行）：等待所有已提交帧完成 Present。acquireSurface 在真正调用
+// GetCurrentBackBufferIndex 之前必须调用它——Present 未完成时 index 不会轮转，
+// 提前 acquire 会拿到同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。
+// 正常情况（主线程录制耗时 ≫ 渲染线程 Present 耗时）返回 0ms。
+void waitForPendingPresents();
 // 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
 bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
 // 阻塞：等到本帧提交完成（或超时 ms）。

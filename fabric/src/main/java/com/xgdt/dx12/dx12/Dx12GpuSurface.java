@@ -28,6 +28,16 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
     private int debugReadbackCounter;
     /** P6 诊断：缓存最近一次 blit 的 color texture handle，用于直接读回验证。 */
     private long lastColorTextureHandle = 0L;
+    /**
+     * P48（多帧飞行）：{@link #acquireNextTexture()} 不再立即 acquire back buffer，而是把
+     * 真实 acquire 推迟到 blit 之前（{@link #ensureAcquired()}）。
+     * MC 每帧顺序为 acquire → 整帧录制（~4-5ms）→ blit → submit → present，原实现在帧首
+     * （acquire）就阻塞等待上一帧 Present 完成（实测 0.13-1.7ms）；推迟后该等待与本帧录制
+     * 重叠，通常为 0ms。GpuSurface 包装层的 hasImageAcquired 不受影响（isAcquired 仍为 true）。
+     */
+    private boolean acquireDeferred = false;
+    /** 推迟的 acquire 已失败：下一帧 acquireNextTexture 抛 SurfaceException 触发 MC 重建 surface。 */
+    private boolean acquireDeferredFailed = false;
 
     public Dx12GpuSurface(long hwnd) {
         this.handle = Dx12Native.dx12CreateSurface(hwnd);
@@ -45,6 +55,9 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
 
     @Override
     public void configure(GpuSurface.Configuration config) throws SurfaceException {
+        // P48：reconfigure 会 ResizeBuffers，作废任何未完成的推迟 acquire。
+        this.acquireDeferred = false;
+        this.acquireDeferredFailed = false;
         boolean ok = Dx12Native.dx12ConfigureSurface(this.handle, config.width(), config.height(),
             config.presentMode().ordinal());
         System.err.println("[dx12-java] configureSurface: " + config.width() + "x" + config.height()
@@ -62,13 +75,41 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
 
     @Override
     public void acquireNextTexture() throws SurfaceException {
-        if (!Dx12Native.dx12AcquireSurface(this.handle)) {
-            throw new SurfaceException("Failed to acquire DX12 back buffer");
+        // P48：上一帧推迟的 acquire 失败过 → 现在补报，让 MC 走 surfaceIsInvalid →
+        // reconfigure 路径（在 blit 处抛异常会直接崩游戏）。
+        if (this.acquireDeferredFailed) {
+            this.acquireDeferredFailed = false;
+            throw new SurfaceException("Failed to acquire DX12 back buffer (deferred)");
         }
+        // P48（多帧飞行）：不在此处立即 acquire，推迟到 blit 之前——见 ensureAcquired()。
+        this.acquireDeferred = true;
+    }
+
+    /**
+     * P48（多帧飞行）：在真正需要 back buffer 之前（blit 时）才执行 acquire。
+     * 此时本帧录制已完成，上一帧 Present 通常早已结束 → acquire 内部的等待为 0ms。
+     * 返回 false 表示 acquire 失败，本帧跳过 blit（画面停留上一帧，不崩游戏）。
+     */
+    private boolean ensureAcquired() {
+        if (!this.acquireDeferred) {
+            return true;
+        }
+        this.acquireDeferred = false;
+        if (Dx12Native.dx12AcquireSurface(this.handle)) {
+            return true;
+        }
+        System.err.println("[dx12-java] [P48] deferred acquire failed — skipping blit this frame");
+        System.err.flush();
+        this.acquireDeferredFailed = true;
+        return false;
     }
 
     @Override
     public void blitFromTexture(CommandEncoderBackend commandEncoder, GpuTextureView textureView) {
+        // P48：真实 acquire 推迟到这里（本帧录制已完成 → 上一帧 Present 早已结束）。
+        if (!ensureAcquired()) {
+            return;
+        }
         Dx12CommandEncoderBackend encoder = (Dx12CommandEncoderBackend) commandEncoder;
         // 传 texture.handle()（底层纹理对象），而非 view.handle()（SRV view 对象）。
         // view 是 texture 的视图包装，CopyTextureRegion 需要的是纹理资源本身。
@@ -132,6 +173,10 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
      * 需要调用方先 acquireNextTexture()，本方法记录命令后返回。
      */
     public void clearToRed(Dx12CommandEncoderBackend encoder) {
+        // P48：real acquire 推迟到此处（与 blitFromTexture 一致）。
+        if (!ensureAcquired()) {
+            return;
+        }
         Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, 0L);
     }
 
@@ -144,6 +189,8 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
      * 优先使用 dx12GetBackBufferHandle 获取当前 acquire 的 back buffer，
      * 避免使用缓存的 lastColorTextureHandle（可能是旧渲染 pass 的残留）。 */
     public long getColorTextureHandle() {
+        // P48：诊断路径也需保证推后的 acquire 已执行，否则读回的是上一帧的 back buffer。
+        ensureAcquired();
         long bb = Dx12Native.dx12GetBackBufferHandle(handle);
         return bb != 0 ? bb : lastColorTextureHandle;
     }

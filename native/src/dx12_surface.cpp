@@ -420,12 +420,20 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         err = "surface not created";
         return false;
     }
-    dbgLog("acquireSurface: enter surface=%p", (void*)s);
+    // P48（多帧飞行）：Present 尚未完成时 GetCurrentBackBufferIndex 不会轮转，会返回
+    // 上一帧已 Present 的同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。真实 acquire
+    // 已推迟到 blit 之前（Java Dx12GpuSurface.ensureAcquired），此时本帧录制已完成，
+    // 上一帧 Present 通常早已结束 → 通常 0ms。同步/SYNC 路径（渲染线程未运行）下
+    // waitForPendingPresents 内部直接返回，无额外开销。
+    waitForPendingPresents();
+    // 以下两条为逐帧诊断（原为 dbgLog，每帧 2 次 stderr+文件 flush，实测 ~0.1-0.2ms/条，
+    // 属帧关键路径纯开销）→ 降为 DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
+    dbgLogDebug("acquireSurface: enter surface=%p", (void*)s);
     // P34 诊断：记录 GetCurrentBackBufferIndex 的原始返回值和 HRESULT
     UINT rawIdx = s->swapChain->GetCurrentBackBufferIndex();
     s->currentImageIndex = (int)rawIdx;
     UINT bbCount = (UINT)s->backBuffers.size();
-    dbgLog("acquireSurface: rawIdx=%u bbCount=%u currentImageIndex=%d",
+    dbgLogDebug("acquireSurface: rawIdx=%u bbCount=%u currentImageIndex=%d",
         rawIdx, bbCount, s->currentImageIndex);
     if (s->currentImageIndex < 0 ||
         s->currentImageIndex >= (int)bbCount) {
