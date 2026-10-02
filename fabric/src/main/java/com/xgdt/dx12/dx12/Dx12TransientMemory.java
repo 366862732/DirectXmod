@@ -45,11 +45,16 @@ public class Dx12TransientMemory implements TransientMemory {
     /** P54：staging 块的基准大小（对齐官方 TransientBlockAllocator 的 512KB）。 */
     private static final long STAGING_BLOCK_SIZE = 512L * 1024L;
     /**
-     * P54：块内子分配的最小对齐。D3D12 的 CopyBufferRegion 与纹理行拷贝对偏移有
-     * 对齐要求（256 覆盖 CBV / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT），取 256 保证
-     * 非零偏移仍然合法。浪费的填充极有限（每块可容纳 2048 个小分配）。
+     * P54：块内子分配的最小对齐。上传块同时服务 buffer 拷贝（{@code writeToBuffer}）
+     * 与纹理上传（{@code writeToTexture}/{@code copyBufferToTexture}）。后者在 native
+     * 侧以 {@code D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT} 的 {@code Offset=srcOffset}
+     * 直接做 {@code CopyTextureRegion}，而 D3D12 要求 Placement 偏移是
+     * {@code D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT}（512）的倍数。改动前每个 staging
+     * 缓冲都是新建的（偏移恒为 0），块分配后必须显式保证 512 对齐，否则纹理上传偏移
+     * 只有 256 对齐会触发校验失败/内容错乱。浪费的填充极有限（512KB 块可容纳 1024 个
+     * 小分配）。
      */
-    private static final long MIN_BLOCK_ALIGNMENT = 256L;
+    private static final long MIN_BLOCK_ALIGNMENT = 512L;
 
     private final long ctx;
     private final Deque<List<Dx12GpuBuffer>> frames = new ArrayDeque<>();

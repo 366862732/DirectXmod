@@ -381,6 +381,13 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     public void copyBufferToTexture(GpuBufferSlice source, int sourceX, int sourceY,
         int sourceWidth, int sourceHeight, GpuTexture destination, int destinationX,
         int destinationY, int copyWidth, int copyHeight, int mipLevel, int arrayLayer) {
+        // P54 fix：必须显式确保命令列表已打开。此前该路径依赖 uploadStaging 内部的
+        // staging->DEFAULT 拷贝顺带调用 ensureListOpen；P54 将 uploadStaging 改为纯
+        // CPU 侧的块内映射写入（不再录制任何 GPU 命令）后，这里就会在帧外资源重载
+        // （SpriteContents mip 上传 / 图集动画）时抛
+        // "dx12CopyBufferToTexture: no open command list" → 图集/字体纹理上传失败
+        // → 白屏 + 五颜六色闪烁。
+        this.ensureListOpen();
         int texelSize = destination.getFormat().blockSize();
         long skipTexels = (long) sourceX + (long) sourceY * sourceWidth;
         long skipBytes = skipTexels * texelSize;

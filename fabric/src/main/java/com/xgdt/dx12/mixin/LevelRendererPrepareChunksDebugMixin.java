@@ -20,7 +20,8 @@ public class LevelRendererPrepareChunksDebugMixin {
     private void dx12_prepareChunkRendersDebug(org.joml.Matrix4fc modelViewMatrix,
             CallbackInfoReturnable<net.minecraft.client.renderer.chunk.ChunkSectionsToRender> cir) {
         dx12_prepareFrameCount++;
-        if (dx12_prepareFrameCount % 60 != 0 && dx12_prepareFrameCount <= 5) return;
+        // P54 fix：原条件逻辑反了，count>5 后每帧都打印（+ 每帧反射）→ 同步 I/O 热点。
+        if (dx12_prepareFrameCount > 5 && dx12_prepareFrameCount % 60 != 0) return;
 
         // Access visibleSections via reflection (package-private field in decompiled source)
         int visibleCount = 0;

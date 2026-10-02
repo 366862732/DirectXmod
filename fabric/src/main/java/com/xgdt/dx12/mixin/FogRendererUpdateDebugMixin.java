@@ -20,7 +20,8 @@ public class FogRendererUpdateDebugMixin {
     @Inject(method = "updateBuffer", at = @At("TAIL"), remap = false)
     private void dx12_fogUpdateDebug(FogData fog, CallbackInfo ci) {
         dx12_fogUpdateCount++;
-        if (dx12_fogUpdateCount % 60 != 0 && dx12_fogUpdateCount <= 5) return;
+        // P54 fix：原条件逻辑反了，count>5 后每帧都打印（+ 每帧反射）→ 同步 I/O 热点。
+        if (dx12_fogUpdateCount > 5 && dx12_fogUpdateCount % 60 != 0) return;
 
         float rs = -1f, re = -1f, es = -1f, ee = -1f;
         try {
