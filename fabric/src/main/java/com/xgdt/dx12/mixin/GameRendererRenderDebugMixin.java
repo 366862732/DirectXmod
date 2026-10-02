@@ -1,6 +1,7 @@
 package com.xgdt.dx12.mixin;
 
 import com.xgdt.dx12.dx12.Dx12Device;
+import com.xgdt.dx12.dx12.Dx12Native;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
@@ -35,6 +36,11 @@ public class GameRendererRenderDebugMixin {
 
     @Inject(method = "render", at = @At("HEAD"), remap = false)
     private void dx12_renderDebug(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
+        // P50：默认关闭。此前每帧无条件 stderr println + flush（单会话 ~1.7 万行），
+        // 是渲染线程最大的 CPU 开销之一。改为仅 DX12_LOG_VERBOSE=1 时启用。
+        if (!Dx12Native.LOG_VERBOSE) {
+            return;
+        }
         // Always print on every frame so we can confirm GameRenderer.render() fires
         boolean resourcesLoaded = this.minecraft.isGameLoadFinished();
         boolean levelNotNull = this.minecraft.level != null;

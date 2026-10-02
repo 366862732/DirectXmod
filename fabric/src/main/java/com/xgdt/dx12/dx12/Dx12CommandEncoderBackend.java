@@ -352,8 +352,11 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     public void copyToBuffer(GpuBufferSlice source, GpuBufferSlice target) {
         // P33：确保命令列表已打开
         this.ensureListOpen();
-        // P22 诊断：记录 copyToBuffer 参数，排查缓冲区大小不足
-        if (System.err instanceof java.io.PrintStream) {
+        // P22 诊断：记录 copyToBuffer 参数，排查缓冲区大小不足（P29：仅 verbose）。
+        // 注意：copyToBuffer 由图集/区块/实体的 StagingBuffer 上传路径每帧调用数十次，
+        // 且 System.err.printf 会绕过 log4j 直写控制台，无条件打印会造成每帧同步 I/O
+        // （P53 采样中表现为 writeBytes 热点）——必须门控。
+        if (Dx12Native.LOG_VERBOSE) {
             System.err.printf("[dx12-java] copyToBuf srcBuf=%x srcOff=%d srcLen=%d dstBuf=%x dstOff=%d%n",
                 bufferHandle(source.buffer()), (int)source.offset(), (int)source.length(),
                 bufferHandle(target.buffer()), (int)target.offset());

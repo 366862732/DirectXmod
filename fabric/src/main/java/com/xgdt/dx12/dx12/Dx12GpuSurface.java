@@ -106,8 +106,10 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
 
     @Override
     public void blitFromTexture(CommandEncoderBackend commandEncoder, GpuTextureView textureView) {
+        Dx12RenderProf.begin(Dx12RenderProf.BLIT);
         // P48：真实 acquire 推迟到这里（本帧录制已完成 → 上一帧 Present 早已结束）。
         if (!ensureAcquired()) {
+            Dx12RenderProf.end(Dx12RenderProf.BLIT);
             return;
         }
         Dx12CommandEncoderBackend encoder = (Dx12CommandEncoderBackend) commandEncoder;
@@ -116,6 +118,7 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
         Dx12GpuTexture tex = (Dx12GpuTexture) ((Dx12GpuTextureView) textureView).texture();
         this.lastColorTextureHandle = tex.handle();
         Dx12Native.dx12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle());
+        Dx12RenderProf.end(Dx12RenderProf.BLIT);
         // P6 诊断：blit 后从颜色纹理读回 3x3 像素（waitIdle 保证 GPU 已完成）。
         // 直接读 lastColorTextureHandle（shader 输出目标），而非 surface back buffer（被 blit 覆盖前可能含旧数据）。
         // P29：读回内部 deviceWaitIdle（每 30 帧同步气泡），仅 DX12_LOG_VERBOSE=1 时启用。
@@ -182,7 +185,9 @@ public class Dx12GpuSurface implements GpuSurfaceBackend {
 
     @Override
     public void present() {
+        Dx12RenderProf.begin(Dx12RenderProf.PRESENT);
         Dx12Native.dx12PresentSurface(handle);
+        Dx12RenderProf.end(Dx12RenderProf.PRESENT);
     }
 
     /** P6 诊断：供 Dx12Backend.selfTestSurface 在 fence 完成后读取 color texture。

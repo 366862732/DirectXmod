@@ -22,9 +22,12 @@
 // 注意：DIAG_CLEAR 路径仅应在 selfTestSurface / testRenderLoop 中临时启用。
 // 游戏正常流程必须保持为 0，否则每帧清屏会覆盖渲染内容。
 #define DIAG_CLEAR_BACKBUFFER_TO_GREEN 0
-// P20: 启用后每 30 帧在 blit 后读回源纹理像素，诊断着色器输出颜色。
-// 结论：纯绿 = shader 正确；全黑 = shader 未写入或深度/裁剪问题；旧数据 = 渲染 pass 未执行。
-#define DIAG_READBACK_COLOR_TEX 1
+// P20: 启用后每 30 帧在 blit 前读回源纹理像素，诊断着色器输出颜色。
+// 结论（已获取）：纯绿 = shader 正确；全黑 = shader 未写入或深度/裁剪问题；旧数据 = 渲染 pass 未执行。
+// P49：默认关闭。该诊断每次执行都 deviceWaitIdle（整卡同步）+ 分配一整个 back buffer
+// 大小的 staging 缓冲 + 9 条 dbgLog（每条含 stderr 与日志文件 flush），且在 Release 中
+// 每 30 帧无条件触发——会周期性打断 P48 多帧飞行的 CPU/GPU 重叠。需要时改为 1 重编译。
+#define DIAG_READBACK_COLOR_TEX 0
 
 #include <string>
 #include <vector>
@@ -527,7 +530,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     // 源纹理可能是本帧渲染 pass 的输出（RENDER_TARGET/DEPTH_WRITE），或刚
     // 上传完的 COMMON；按跟踪状态过渡到 COPY_SOURCE 再拷贝。
     if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
-#ifdef DIAG_READBACK_COLOR_TEX
+#if DIAG_READBACK_COLOR_TEX
     // P20 诊断：在 CopyTextureRegion 之前读回源纹理像素，确认 shader 输出颜色。
     // 必须在拷贝前执行——CopyTextureRegion 是"读源写目标"原子操作，拷贝后源
     // 内容已不可读；且后续帧可能复用该纹理导致 COMMON→COPY_SOURCE barrier 错配。

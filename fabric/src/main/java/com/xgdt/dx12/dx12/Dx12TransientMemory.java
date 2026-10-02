@@ -16,11 +16,18 @@ import net.fabricmc.api.Environment;
  * D3D12-backed {@link TransientMemory}, mirroring the official
  * {@code VulkanTransientMemory} lifecycle.
  *
- * <p>P3 simplification: every allocation creates a fresh D3D12 committed buffer
- * (no block allocator yet). Buffers allocated during one frame are retained for
- * {@link #FRAMES_IN_FLIGHT} frames (matching the native double-buffered submit)
- * and released on {@link #rotate()}, which the encoder calls on every
- * {@code submit()}.
+ * <p>P54：staging 上传路径改用「块分配器」而非每次分配都新建 D3D12 committed buffer。
+ * 此前 {@code uploadStaging} 每次调用都会 {@code new Dx12GpuBuffer} 两次（一个 UPLOAD
+ * staging + 一个 DEFAULT 目标），而 {@code CommandEncoder.writeToBuffer} 每帧调用数十次
+ * → 每帧上百次 {@code dx12CreateBuffer}（P53 采样中 {@code Dx12Native.dx12CreateBuffer}
+ * 占渲染线程 ~16%）。官方 {@code VulkanTransientMemory} 用 512KB
+ * {@code TransientBlockAllocator} 复用块，本类按同样的思路在**帧内 bump 分配**：
+ * 一个 512KB 的 UPLOAD 块按偏移切分给多次上传，块随帧 {@link #rotate()} 在
+ * {@link #FRAMES_IN_FLIGHT} 帧后释放。
+ *
+ * <p>Buffers allocated during one frame are retained for {@link #FRAMES_IN_FLIGHT}
+ * frames (matching the native double-buffered submit) and released on
+ * {@link #rotate()}, which the encoder calls on every {@code submit()}.
  *
  * <p>{@code allocateGpuMapped} uses a ring buffer of 3 UPLOAD heap buffers
  *（镜像 {@code MappableRingBuffer} 的 3 路轮换）：每帧 rotate() 切换到下一路，
@@ -34,6 +41,15 @@ public class Dx12TransientMemory implements TransientMemory {
     private static final int UBO_RING_COUNT = 3;
     /** 每路 allocateGpuMapped 缓冲大小（4KB，足够容纳多组 std140 uniform 块）。 */
     private static final long UBO_RING_BLOCK_SIZE = 4096L;
+
+    /** P54：staging 块的基准大小（对齐官方 TransientBlockAllocator 的 512KB）。 */
+    private static final long STAGING_BLOCK_SIZE = 512L * 1024L;
+    /**
+     * P54：块内子分配的最小对齐。D3D12 的 CopyBufferRegion 与纹理行拷贝对偏移有
+     * 对齐要求（256 覆盖 CBV / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT），取 256 保证
+     * 非零偏移仍然合法。浪费的填充极有限（每块可容纳 2048 个小分配）。
+     */
+    private static final long MIN_BLOCK_ALIGNMENT = 256L;
 
     private final long ctx;
     private final Deque<List<Dx12GpuBuffer>> frames = new ArrayDeque<>();
@@ -54,6 +70,10 @@ public class Dx12TransientMemory implements TransientMemory {
     private int uboRingIdx = 0;
     /** 当前路的已用字节数（从 0 开始单调递增，达到 BLOCK_SIZE 时 rotate）。 */
     private long uboRingOffset = 0;
+
+    // P54：本帧 staging bump 块（UPLOAD heap，主机可见）
+    private Dx12GpuBuffer stagingBlock;
+    private long stagingBlockUsed = 0L;
 
     Dx12TransientMemory(long ctx, Runnable ensureListOpen) {
         this.ctx = ctx;
@@ -81,10 +101,8 @@ public class Dx12TransientMemory implements TransientMemory {
     @Override
     public GpuBufferSlice.MappedView allocateStaging(long size, long alignment,
         @GpuBuffer.Usage int usage, long minimumAllocation, long elementSize) {
-        Dx12GpuBuffer buffer = new Dx12GpuBuffer(
-            usage | GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, size);
-        this.register(buffer);
-        return buffer.map(0, size, false, true);
+        long offset = allocateInStagingBlock(size, alignment);
+        return this.stagingBlock.map(offset, size, false, true);
     }
 
     @Override
@@ -117,11 +135,27 @@ public class Dx12TransientMemory implements TransientMemory {
     @Override
     public GpuBufferSlice uploadStaging(List<ByteBuffer> data, long alignment,
         @GpuBuffer.Usage int usage, long minimumAllocation, long elementSize) {
+        // P54：不再为每次上传新建 DEFAULT 目标缓冲 + UPLOAD staging 缓冲，而是直接把
+        // 数据写进本帧的 512KB UPLOAD 块，返回块内切片供调用方做一次 CopyBufferRegion。
+        // 官方 VulkanCommandEncoder.writeToBuffer 同样只做「staging -> 目标」一次拷贝。
         long total = 0;
         for (ByteBuffer buffer : data) {
             total += buffer.remaining();
         }
-        return this.upload(data, usage, total);
+        if (total == 0) {
+            throw new IllegalArgumentException("Cannot upload zero bytes");
+        }
+        if (Dx12Native.LOG_VERBOSE) {
+            checkForNanInfinity(data, "uploadStaging");
+        }
+        long offset = allocateInStagingBlock(total, alignment);
+        try (GpuBufferSlice.MappedView view = this.stagingBlock.map(offset, total, false, true)) {
+            ByteBuffer dst = view.data();
+            for (ByteBuffer buffer : data) {
+                dst.put(buffer.duplicate());
+            }
+        }
+        return this.stagingBlock.slice(offset, total);
     }
 
     @Override
@@ -137,7 +171,25 @@ public class Dx12TransientMemory implements TransientMemory {
     @Override
     public List<GpuBufferSlice> multiUploadStaging(List<ByteBuffer> data,
         long alignment, @GpuBuffer.Usage int usage) {
-        return this.multiUpload(data, usage);
+        if (data.isEmpty()) {
+            return List.of();
+        }
+        if (Dx12Native.LOG_VERBOSE) {
+            checkForNanInfinity(data, "multiUploadStaging");
+        }
+        // P54：每个输入在本帧 staging 块内独立占一段，全部返回块内切片。
+        List<GpuBufferSlice> result = new ArrayList<>(data.size());
+        for (ByteBuffer buffer : data) {
+            int length = buffer.remaining();
+            long offset = allocateInStagingBlock(length, alignment);
+            if (length > 0) {
+                try (GpuBufferSlice.MappedView view = this.stagingBlock.map(offset, length, false, true)) {
+                    view.data().put(buffer.duplicate());
+                }
+            }
+            result.add(this.stagingBlock.slice(offset, length));
+        }
+        return result;
     }
 
     @Override
@@ -147,15 +199,44 @@ public class Dx12TransientMemory implements TransientMemory {
     }
 
     /**
+     * P54：在本帧 staging 块内按 {@code alignment}（至少
+     * {@link #MIN_BLOCK_ALIGNMENT}）bump 分配 {@code size} 字节，返回块内偏移。
+     * 当前块放不下时新开一块（新块登记到本帧，随帧在 {@link #FRAMES_IN_FLIGHT}
+     * 帧后释放）。
+     */
+    private long allocateInStagingBlock(long size, long alignment) {
+        long align = Math.max(MIN_BLOCK_ALIGNMENT, alignment);
+        long offset = roundUp(this.stagingBlockUsed, align);
+        if (this.stagingBlock == null || offset + size > this.stagingBlock.size()) {
+            long blockSize = Math.max(STAGING_BLOCK_SIZE, roundUp(size, align));
+            this.stagingBlock = new Dx12GpuBuffer(
+                GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, blockSize);
+            this.register(this.stagingBlock);
+            this.stagingBlockUsed = 0L;
+            offset = 0L;
+        }
+        this.stagingBlockUsed = offset + size;
+        return offset;
+    }
+
+    private static long roundUp(long value, long alignment) {
+        return (value + alignment - 1L) / alignment * alignment;
+    }
+
+    /**
      * Upload a set of CPU buffers into a single GPU-side (DEFAULT heap) buffer:
      * write them into one UPLOAD staging buffer, then one CopyBufferRegion.
+     *
+     * <p>P54：此路径仅供 {@code uploadGpu}/{@code multiUploadGpu} 使用（MC 未调用），
+     * 仍保持每次新建缓冲的简单实现。
      */
     private GpuBufferSlice upload(List<ByteBuffer> data, int usage, long total) {
         if (total == 0) {
             throw new IllegalArgumentException("Cannot upload zero bytes");
         }
-        // P22: 在写入前检测 NaN/Infinity，定位污染源（BufferBuilder 未初始化尾部浮点）。
-        checkForNanInfinity(data, "upload");
+        if (Dx12Native.LOG_VERBOSE) {
+            checkForNanInfinity(data, "upload");
+        }
         Dx12GpuBuffer staging = new Dx12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, total);
         this.register(staging);
@@ -181,7 +262,9 @@ public class Dx12TransientMemory implements TransientMemory {
         if (total == 0) {
             return List.of();
         }
-        checkForNanInfinity(data, "multiUpload");
+        if (Dx12Native.LOG_VERBOSE) {
+            checkForNanInfinity(data, "multiUpload");
+        }
         Dx12GpuBuffer staging = new Dx12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, total);
         this.register(staging);
@@ -212,6 +295,9 @@ public class Dx12TransientMemory implements TransientMemory {
      *
      * <p>注意：某些合法数据（如 self-test 的 0xFC,0xFD,0xFE,0xFF 字节模式）按
      * float 读恰为 NaN，因此这里仅提示一次，避免逐帧刷屏，也不应阻断上传。
+     *
+     * <p>P54：该扫描会遍历全部待上传 float，属上传热路径上的纯诊断开销，
+     * 现仅在 {@code DX12_LOG_VERBOSE=1} 时执行。
      */
     private static void checkForNanInfinity(List<ByteBuffer> data, String method) {
         if (nanWarned) return;
@@ -256,6 +342,11 @@ public class Dx12TransientMemory implements TransientMemory {
                 buffer.close();
             }
         }
+        // P54：新帧重新开始块内 bump 分配。上一帧的 staging 块已登记进 frames 队列，
+        // 会随最旧帧在 FRAMES_IN_FLIGHT 帧后统一 close()——此时 GPU 早已执行完引用
+        // 它的拷贝命令（native submit 保证）。
+        this.stagingBlock = null;
+        this.stagingBlockUsed = 0L;
         // Rotate the UBO ring buffer：每帧切到下一路，确保不同帧的 uniform 数据不重叠。
         this.uboRingIdx = (this.uboRingIdx + 1) % UBO_RING_COUNT;
         this.uboRingOffset = 0;
@@ -266,9 +357,10 @@ public class Dx12TransientMemory implements TransientMemory {
             return;
         }
         this.closed = true;
-        System.err.println("[dx12-java] transientMemory.close: current=" + this.frame.size()
-            + " queuedFrames=" + this.frames.size());
-        System.err.flush();
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] transientMemory.close: current=" + this.frame.size()
+                + " queuedFrames=" + this.frames.size());
+        }
         for (Dx12GpuBuffer buffer : this.frame) {
             buffer.close();
         }
@@ -279,7 +371,8 @@ public class Dx12TransientMemory implements TransientMemory {
             }
         }
         this.frames.clear();
-        System.err.println("[dx12-java] transientMemory.close: done");
-        System.err.flush();
+        if (Dx12Native.LOG_VERBOSE) {
+            System.err.println("[dx12-java] transientMemory.close: done");
+        }
     }
 }

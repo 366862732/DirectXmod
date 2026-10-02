@@ -1,5 +1,6 @@
 package com.xgdt.dx12.mixin;
 
+import com.xgdt.dx12.dx12.Dx12Native;
 import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -9,12 +10,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * Injected at Minecraft.runTick() HEAD to log level / gameLoadFinished state
  * each frame, so we can see when (or if) they ever become non-null/true.
+ *
+ * P50：默认关闭。此前每帧无条件执行 5 次反射 getDeclaredField + stderr println/flush，
+ * 单会话产生 ~1.7 万行日志，是渲染线程最大的 CPU 开销之一。改为仅 DX12_LOG_VERBOSE=1 时启用。
  */
 @Mixin(Minecraft.class)
 public class MinecraftRunTickDebugMixin {
 
     @Inject(method = "runTick", at = @At("HEAD"), remap = false)
     private void dx12_runTickDebug(boolean advanceGameTime, CallbackInfo ci) {
+        if (!Dx12Native.LOG_VERBOSE) {
+            return;
+        }
         Minecraft mc = (Minecraft) (Object) this;
         java.lang.reflect.Field levelField, tickCountField, loadField, pendingField, serverField;
         Object level = null;

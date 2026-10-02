@@ -14,7 +14,17 @@
         "LevelRendererPrepareChunksDebugMixin",
         "CameraUpdateDebugMixin",
         "FogRendererUpdateDebugMixin",
-        "SectionRenderDispatcherGetSliceDebugMixin"
+        "SectionRenderDispatcherGetSliceDebugMixin",
+        "MinecraftRenderFrameProfMixin",
+        "GameRendererProfMixin",
+        "GuiRendererProfMixin",
+        "LevelRendererProfMixin",
+        "SectionRenderDispatcherProfMixin",
+        "ChunkSectionsToRenderProfMixin",
+        "SectionOcclusionGraphProfMixin",
+        "FeatureRenderDispatcherProfMixin",
+        "PreparedFrameProfMixin",
+        "FrameGraphBuilderProfMixin"
     ],
     "injectors": {
         "defaultRequire": 1
