@@ -435,6 +435,25 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
     public static long gProfWorkersNs = 0;    // dispatch 8 worker + CountDownLatch.await
     public static long gProfExecuteNs = 0;    // ExecuteBundle 回放
     public static long gProfFallbacks = 0;    // 并行录制失败回退串行次数
+    // P62 诊断：统计区块批量内各 draw 是否共享顶点/索引缓冲。若共享，则可用
+    // ExecuteIndirect（单次 indirect 覆盖整批，配合统一 VB/IB 绑定）替代逐 draw
+    // 录制，直接消掉 workers（bundle 内 1086 次 DrawIndexed）那 0.24ms。
+    public static long gProfSharedBatchDraws = 0; // 参与统计的 draw 总数
+    public static long gProfSameVbBuf = 0;        // vbBuf[d]==vbBuf[0] 的 draw 数
+    public static long gProfSameVbOff = 0;        // 且 vbOff[d]==vbOff[0]
+    public static long gProfSameIbBuf = 0;        // idxBuf[d]==idxBuf[0]
+    public static long gProfSameIdxType = 0;      // 且 idxType 一致
+    public static long gProfBatches = 0;          // 走批量路径的批次数
+    public static long gProfSharedDescBatches = 0; // 其中 blockUniform=true（P59 共享描述符）
+    public static long gProfSingleBundles = 0;    // 其中单分区内联录制数
+    public static long gProfSlotsTotal = 0;       // 累计描述符槽位需求
+    // P62b：逐 binding 变异性 —— 决定描述符写入能否从 n*bc 降到 n*变动数。
+    public static long gProfBcTotal = 0;          // Σ bc
+    public static long gProfCbvVary = 0;          // 逐 draw 变化的 CBV 数
+    public static long gProfCbvSame = 0;          // 逐 draw 不变的 CBV 数
+    public static long gProfSrvVary = 0;          // 逐 draw 变化的 SRV 数
+    public static long gProfSrvSame = 0;          // 逐 draw 不变的 SRV 数
+    public static long gProfVbSlotSame = 0;       // vbSlot 全批一致的 draw 数
 
     @Override
     public void drawIndexed(int indexCount, int instanceCount, int firstIndex,
@@ -495,6 +514,35 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     /** 低于此批量时并行调度开销高于收益，直接走串行路径。 */
     private static final int PARALLEL_MIN_DRAWS = 24;
+
+    /**
+     * P58：并行调度的固定开销（8 线程唤醒 + CountDownLatch）约 0.2ms/帧，且与 worker
+     * 数无关（实测 4 worker 相对 8 worker 无收益）。因此当一批 draw 的 native 录制量
+     * 不足以摊薄该开销时，改为「在调用线程内联录一个 bundle」——同样只走一次
+     * {@code dx12AsyncBundleRecordPartition} JNI，但省去线程池往返。
+     */
+    private static final int SERIAL_BUNDLE_MAX_DRAWS = 512;
+
+    /** DX12_BUNDLE_MODE=serial/parallel 可强制单分区或并行分区；缺省按批量自适应。 */
+    private static final int BUNDLE_MODE = parseBundleMode();
+
+    private static int parseBundleMode() {
+        String raw = System.getenv("DX12_BUNDLE_MODE");
+        if (raw == null || raw.isBlank()) {
+            raw = System.getProperty("dx12.bundleMode");
+        }
+        if (raw == null) {
+            return 0;
+        }
+        raw = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        if (raw.equals("serial") || raw.equals("1")) {
+            return 1;
+        }
+        if (raw.equals("parallel") || raw.equals("0")) {
+            return -1;
+        }
+        return 0;
+    }
 
     @SuppressWarnings("unchecked")
     private static <T> List<RenderPass.Draw<T>> materialize(Collection<RenderPass.Draw<T>> draws) {
@@ -579,6 +627,10 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         // 汇入同一个集合；索引缓冲单独一组，过渡到 INDEX_BUFFER。
         java.util.LinkedHashSet<Long> vbBuffers = new java.util.LinkedHashSet<>();
         java.util.LinkedHashSet<Long> indexBuffers = new java.util.LinkedHashSet<>();
+        // P59：检测整批 draw 的绑定是否完全一致（区块 renderGroup 的典型情形）。
+        // 一致时描述符块只需写一份，每 draw 省掉 bc 次 CreateConstantBufferView/
+        // CopyDescriptorsSimple 与一次 SetGraphicsRootDescriptorTable。
+        boolean blockUniform = true;
 
         for (int d = 0; d < n; d++) {
             RenderPass.Draw<T> draw = draws.get(d);
@@ -632,6 +684,93 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                     textureViews.add(bView[o + j]);
                 }
             }
+            // P59：与 draw 0 的块比对；任一不同即放弃「共享描述符」快路径。
+            if (blockUniform && d > 0) {
+                for (int j = 0; j < bc; j++) {
+                    final int q = o + j;
+                    if (bType[j] == 0) {
+                        if (bBuf[q] != bBuf[j] || bOff[q] != bOff[j] || bLen[q] != bLen[j]) {
+                            blockUniform = false;
+                            break;
+                        }
+                    } else if (bView[q] != bView[j]) {
+                        blockUniform = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (Dx12Native.PROF) {
+            // P62 诊断：本批是否共享 VB/IB（第二遍纯比对，仅 PROF 时执行）。
+            boolean sameVb = true;
+            boolean sameVbOff = true;
+            boolean sameIb = true;
+            boolean sameType = true;
+            boolean sameSlot = true;
+            for (int d = 1; d < n; d++) {
+                if (vbBuf[d] != vbBuf[0]) {
+                    sameVb = false;
+                }
+                if (vbOff[d] != vbOff[0]) {
+                    sameVbOff = false;
+                }
+                if (idxBuf[d] != idxBuf[0]) {
+                    sameIb = false;
+                }
+                if (idxType[d] != idxType[0]) {
+                    sameType = false;
+                }
+                if (vbSlot[d] != vbSlot[0]) {
+                    sameSlot = false;
+                }
+            }
+            gProfSharedBatchDraws += n;
+            if (sameVb) {
+                gProfSameVbBuf += n;
+            }
+            if (sameVb && sameVbOff) {
+                gProfSameVbOff += n;
+            }
+            if (sameIb) {
+                gProfSameIbBuf += n;
+            }
+            if (sameIb && sameType) {
+                gProfSameIdxType += n;
+            }
+            if (sameSlot) {
+                gProfVbSlotSame += n;
+            }
+            // P62b：统计每个 binding 是否逐 draw 变化（blockUniform 为 all-or-nothing，
+            // 这里要的是逐 binding 明细：若只有 1 个 CBV 变化，则可把不变的 SRV 只写
+            // 一份，描述符写入量从 n*bc 降到 n*变动数）。
+            gProfBcTotal += bc;
+            for (int j = 0; j < bc; j++) {
+                boolean vary = false;
+                for (int d = 1; d < n; d++) {
+                    if (bType[j] == 0) {
+                        if (bBuf[d * bc + j] != bBuf[j] || bOff[d * bc + j] != bOff[j]
+                            || bLen[d * bc + j] != bLen[j]) {
+                            vary = true;
+                            break;
+                        }
+                    } else if (bView[d * bc + j] != bView[j]) {
+                        vary = true;
+                        break;
+                    }
+                }
+                if (bType[j] == 0) {
+                    if (vary) {
+                        gProfCbvVary++;
+                    } else {
+                        gProfCbvSame++;
+                    }
+                } else if (vary) {
+                    gProfSrvVary++;
+                } else {
+                    gProfSrvSame++;
+                }
+            }
         }
 
         final int frameSlot = async.frameSlot(this.ctx);
@@ -657,7 +796,81 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         final long alloc = async.descriptorAlloc();
         final long pipelineHandle = pl.handle();
         final boolean useDepth = this.hasDepth && pl.info().getDepthStencilState() != null;
-        final int workerCount = Math.max(1, Math.min(async.workerCount(), n));
+        // 单分区只吃 worker 0 的描述符区域（每帧段 3072 槽），故对槽位数设上限，
+        // 超限则退回并行分区；分配失败也会安全回退到串行逐 draw。
+        // P59：绑定一致时整批只需 bc 个槽，单分区几乎总能容纳。
+        final boolean sharedDesc = blockUniform;
+        final long slotsNeeded = sharedDesc ? bc : (long) n * bc;
+        final boolean singleBundle = BUNDLE_MODE > 0
+            || (BUNDLE_MODE == 0 && n <= SERIAL_BUNDLE_MAX_DRAWS && slotsNeeded <= 2048);
+        if (Dx12Native.PROF) {
+            gProfBatches++;
+            if (sharedDesc) {
+                gProfSharedDescBatches++;
+            }
+            if (singleBundle) {
+                gProfSingleBundles++;
+            }
+            gProfSlotsTotal += slotsNeeded;
+        }
+        int workerCount = singleBundle ? 1
+            : Math.max(1, Math.min(async.workerCount(), n));
+        if (workerCount == 1) {
+            // P58：单分区——在调用线程内联录一个 bundle。与并行路径共用同一条
+            // 录制原语 + 同一描述符分区，只是省掉线程池往返。
+            long bundle = 0;
+            boolean ok = false;
+            try {
+                final int base = Dx12Native.dx12AsyncDescriptorAllocate(alloc, frameSlot, 0,
+                    (int) slotsNeeded);
+                ok = base >= 0
+                    && Dx12Native.dx12AsyncBundleBegin(pool, 0, frameSlot, frameValue)
+                    && Dx12Native.dx12AsyncBundleSetPipelineState(pool, 0, pipelineHandle,
+                        useDepth)
+                    && (blockUniform
+                        ? Dx12Native.dx12AsyncBundleRecordPartitionShared(alloc, pool, 0, base,
+                            bc, 0, n,
+                            bType, bBuf, bOff, bLen, bView,
+                            idxBuf, idxType, idxCount, firstIdx, baseVert,
+                            vbSlot, vbBuf, vbOff, vbStride)
+                        : Dx12Native.dx12AsyncBundleRecordPartition(alloc, pool, 0, base, bc,
+                            0, n,
+                            bType, bBuf, bOff, bLen, bView,
+                            idxBuf, idxType, idxCount, firstIdx, baseVert,
+                            vbSlot, vbBuf, vbOff, vbStride));
+                if (ok) {
+                    bundle = Dx12Native.dx12AsyncBundleEnd(pool, 0);
+                }
+            } catch (Throwable t) {
+                bundle = 0;
+            }
+            if (!ok || bundle == 0) {
+                Dx12Native.dx12AsyncBundleEnd(pool, 0);  // 复位录制器
+                gProfFallbacks++;
+                // P62：worker 0 分区每帧仅 3072 槽（24576/8），而单分区内联录制是
+                // bump 累积的——一帧内多批（区块 3 批 × ~2032 槽 ≈ 6100）必然把区域
+                // 耗尽 → 此前直接 return false 会掉进「全串行逐 draw JNI」路径
+                // （每 draw 一次 pushDescriptors + 3 次 JNI），实测 drawIndexedCalls
+                // 从 13/帧暴涨到 345/帧。改为升级到真正的并行分区（各 worker 独立
+                // 区域），代价仅 ~0.2ms 调度开销，远低于串行逐 draw。
+                workerCount = Math.max(2, Math.min(async.workerCount(), n));
+                if (Dx12Native.LOG_VERBOSE) {
+                    LOGGER.warn("drawMultipleIndexed: single-bundle alloc failed,"
+                        + " escalating to parallel (draws={}, bindings={}, frameSlot={})",
+                        n, bc, frameSlot);
+                }
+            } else {
+                final long profRec = Dx12Native.PROF ? System.nanoTime() : 0L;
+                if (profRec != 0L) gProfWorkersNs += profRec - profP2;
+                if (!Dx12Native.dx12ExecuteBundle(this.ctx, bundle)) {
+                    throw new IllegalStateException("dx12ExecuteBundle failed (single bundle)");
+                }
+                if (profRec != 0L) gProfExecuteNs += System.nanoTime() - profRec;
+                // bundle 内改写了根描述符表/PSO 等父列表状态，强制下次撤销快速路径。
+                this.anyDescriptorDirty = true;
+                return true;
+            }
+        }
         final int perWorker = (n + workerCount - 1) / workerCount;
         final long[] bundles = new long[workerCount];
         final java.util.concurrent.atomic.AtomicBoolean failed =
@@ -682,44 +895,29 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                         return;
                     }
                     // 一次性为本段分配全部槽位，避免每 draw 一次 JNI 调用。
+                    // P59：绑定一致时每段只需 bc 个槽。
                     int base = Dx12Native.dx12AsyncDescriptorAllocate(alloc, frameSlot,
-                        worker, count * bc);
+                        worker, sharedDesc ? bc : count * bc);
+                    // P57：整段合并为单次 JNI（此前每 draw ~8 次穿越：bc 次写描述符 +
+                    // 取 GPU 句柄 + 根描述符表 + 索引/顶点缓冲 + DrawIndexed）。
                     if (base < 0
                         || !Dx12Native.dx12AsyncBundleBegin(pool, worker, frameSlot,
                             frameValue)
                         || !Dx12Native.dx12AsyncBundleSetPipelineState(pool, worker,
-                            pipelineHandle, useDepth)) {
+                            pipelineHandle, useDepth)
+                        || !(sharedDesc
+                            ? Dx12Native.dx12AsyncBundleRecordPartitionShared(
+                                alloc, pool, worker, base, bc, start, count,
+                                bType, bBuf, bOff, bLen, bView,
+                                idxBuf, idxType, idxCount, firstIdx, baseVert,
+                                vbSlot, vbBuf, vbOff, vbStride)
+                            : Dx12Native.dx12AsyncBundleRecordPartition(
+                                alloc, pool, worker, base, bc, start, count,
+                                bType, bBuf, bOff, bLen, bView,
+                                idxBuf, idxType, idxCount, firstIdx, baseVert,
+                                vbSlot, vbBuf, vbOff, vbStride))) {
                         failed.set(true);
                         return;
-                    }
-                    for (int i = 0; i < count; i++) {
-                        int d = start + i;
-                        int slot = base + i * bc;
-                        int o = d * bc;
-                        for (int j = 0; j < bc; j++) {
-                            boolean written = bType[j] == 0
-                                ? Dx12Native.dx12AsyncDescriptorWriteCBV(alloc, slot + j,
-                                    bBuf[o + j], bOff[o + j], bLen[o + j])
-                                : Dx12Native.dx12AsyncDescriptorWriteSRV(alloc, slot + j,
-                                    bView[o + j]);
-                            if (!written) {
-                                failed.set(true);
-                                return;
-                            }
-                        }
-                        long gpuHandle = Dx12Native.dx12AsyncDescriptorGpuHandle(alloc, slot);
-                        if (gpuHandle == 0
-                            || !Dx12Native.dx12AsyncBundleSetDescriptorTable(pool, worker, 0,
-                                gpuHandle)
-                            || !Dx12Native.dx12AsyncBundleSetIndexBuffer(pool, worker,
-                                idxBuf[d], idxType[d])
-                            || !Dx12Native.dx12AsyncBundleSetVertexBuffer(pool, worker,
-                                vbSlot[d], vbBuf[d], vbOff[d], vbStride[d])
-                            || !Dx12Native.dx12AsyncBundleDrawIndexed(pool, worker,
-                                idxCount[d], 1, firstIdx[d], baseVert[d], 0)) {
-                            failed.set(true);
-                            return;
-                        }
                     }
                     bundles[worker] = Dx12Native.dx12AsyncBundleEnd(pool, worker);
                     if (bundles[worker] == 0) {

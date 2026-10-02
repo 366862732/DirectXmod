@@ -305,6 +305,34 @@ public final class Dx12Native {
     public static native boolean dx12AsyncBundleDrawIndexedIndirect(long pool, int worker,
         long commands, long offset, int drawCount);
 
+    /**
+     * P57：把 worker 分区内每个 draw 的「写 bc 个描述符 → 取 GPU 句柄 → 根描述符表 →
+     * 索引缓冲 → 顶点缓冲 → DrawIndexedInstanced(1)」合并为单次 JNI 调用。draw 索引
+     * 以全局 {@code d = startDraw + i} 取数组（bBuf/bView 等按 {@code d*bc + j} 索引），
+     * 描述符槽位为 {@code baseSlot + i*bc}。任何参数非法返回 false，调用方回退串行。
+     */
+    public static native boolean dx12AsyncBundleRecordPartition(
+        long alloc, long pool, int worker,
+        int baseSlot, int bc, int startDraw, int count,
+        int[] bType,
+        long[] bBuf, long[] bOff, long[] bLen, long[] bView,
+        long[] idxBuf, int[] idxType, int[] idxCount, int[] firstIdx, int[] baseVert,
+        int[] vbSlot, long[] vbBuf, long[] vbOff, int[] vbStride);
+
+    /**
+     * P59：当一批 draw 的绑定完全一致时，描述符块只写一份。描述符数组只读取前
+     * {@code bc} 项（draw 0 的块），根描述符表也只设一次；随后对每个 draw 仅下发
+     * 索引/顶点缓冲 + DrawIndexedInstanced(1)。相比 {@link #dx12AsyncBundleRecordPartition}
+     * 每 draw 省掉 bc 次描述符写与一次根表写。
+     */
+    public static native boolean dx12AsyncBundleRecordPartitionShared(
+        long alloc, long pool, int worker,
+        int baseSlot, int bc, int startDraw, int count,
+        int[] bType,
+        long[] bBuf, long[] bOff, long[] bLen, long[] bView,
+        long[] idxBuf, int[] idxType, int[] idxCount, int[] firstIdx, int[] baseVert,
+        int[] vbSlot, long[] vbBuf, long[] vbOff, int[] vbStride);
+
     /** 在既有（主）命令列表上按顺序回放一个 bundle。 */
     public static native boolean dx12ExecuteBundle(long ctx, long bundle);
 

@@ -47,6 +47,16 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
      * 因此不会与主线程的录制竞争同一 allocator。
      */
     private boolean inAsyncSubmit = false;
+    /**
+     * P61（多帧飞行-延迟结算）：本帧提交已交给渲染线程、但尚未结算完成。
+     *
+     * <p>原实现在 submit() 末尾阻塞等待 dx12AsyncRenderWaitComplete（渲染线程
+     * Close+Execute+Signal，实测 0.09-0.11ms/帧），该等待落在帧关键路径上。
+     * 现在改为把结算推迟到下一帧真正开始录制时（{@link #ensureListOpen()}）——
+     * 中间隔着 MC 的 extract（P50 实测 0.19-0.28ms），渲染线程早已完成提交，
+     * 主线程基本不再阻塞。
+     */
+    private boolean pendingSubmit = false;
     /** P27：图集合成 pass 结束后 dump 图集纹理（定位按钮纹理错乱）。 */
     private static final int MAX_ATLAS_DUMPS = 14;
     private static final java.util.Set<Long> gDumpedAtlas = new java.util.HashSet<>();
@@ -109,10 +119,39 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
      * fenceValue-2 等待 GPU 释放该 allocator）并 Reset 命令列表，随后录制命令。
      */
     private void ensureListOpen() {
+        // P61：结算上一帧挂起的提交。必须在读取 listOpen **之前**完成——渲染线程
+        // 的 submitCommandList 会 Close 旧列表（listOpen 1→0），若先读 listOpen
+        // 可能读到它尚未 Close 的中间态而跳过 begin，主线程随即写进一条正在被
+        // 渲染线程关闭/提交的列表（数据竞争）。
+        settlePendingSubmit();
         if (!Dx12Native.dx12IsListOpen(this.ctx)) {
             // P33 fix：ASYNC 路径下 begin/Reset 由主线程负责（渲染线程不再触碰
             // allocator/list），因此这里直接打开即可，不存在与渲染线程竞争的问题。
             Dx12Native.dx12BeginCommandList(this.ctx);
+        }
+    }
+
+    /**
+     * P61：结算上一帧挂起的异步提交（{@link #pendingSubmit}）。
+     *
+     * <p>调用点必须早于下一帧的 dx12BeginCommandList：beginCommandList 会读写
+     * ctx 的 fenceValue / currentListSlot / commandList / resourceState，这些状态
+     * 同时被渲染线程的 submitCommandList（Close + ExecuteCommandLists + Signal）
+     * 修改，未结算就 Reset 会产生数据竞争。
+     */
+    private void settlePendingSubmit() {
+        if (!this.pendingSubmit) {
+            return;
+        }
+        this.pendingSubmit = false;
+        final boolean prof = Dx12Native.PROF;
+        long t0 = prof ? System.nanoTime() : 0L;
+        boolean completed = Dx12Native.dx12AsyncRenderWaitComplete(this.ctx, 10_000L);
+        if (prof) gProfWaitSubmitNs += System.nanoTime() - t0;
+        if (!completed) {
+            System.err.println("[dx12] [P33] asyncRenderWaitComplete timeout! ctx=0x"
+                + Long.toHexString(this.ctx));
+            System.err.flush();
         }
     }
 
@@ -490,6 +529,11 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         //       否则会丢弃主线程已录制的整帧命令，back buffer 永远不被写入，
         //       Present 只能显示未初始化内容（窗口闪烁各种颜色的根因）。
 
+        // P61：先结算上一帧挂起的提交。正常路径已由 ensureListOpen() 结算，此处
+        // 兜底（上一帧若没有任何绘制命令就不会走到 ensureListOpen）。必须早于
+        // dx12AsyncRenderBeginFrame：后者要求 gAsyncRenderCtx 已被 waitComplete 置空。
+        settlePendingSubmit();
+
         // P15 诊断：记录提交前的 fence 值
         long fenceBefore = Dx12Native.dx12GetFenceValue(this.ctx);
 
@@ -558,15 +602,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
         // 步骤 5：通知渲染线程所有命令已入队
         Dx12Native.dx12AsyncSendCommandsReady(this.ctx);
 
-        // 步骤 6：等待渲染线程完成提交 + present
-        long profT1 = prof ? System.nanoTime() : 0L;
-        boolean completed = Dx12Native.dx12AsyncRenderWaitComplete(this.ctx, 10000);
-        if (prof) gProfWaitSubmitNs += System.nanoTime() - profT1;
-        if (!completed) {
-            System.err.println("[dx12] [P33] asyncRenderWaitComplete timeout! ctx=0x"
-                + Long.toHexString(this.ctx));
-            System.err.flush();
-        }
+        // 步骤 6（P61 多帧飞行-延迟结算）：本帧**不再**阻塞等待渲染线程完成提交。
+        // 渲染线程此刻开始 Close+Execute+Signal+Present；主线程直接返回，把结算
+        // 推迟到下一帧 ensureListOpen()/submit() 开头——中间隔着 MC 的 extract
+        //（P50 实测 0.19-0.28ms），届时渲染线程早已完成，等待≈0。
+        // 正确性：结算仍早于下一次 beginCommandList（见 settlePendingSubmit）。
+        this.pendingSubmit = true;
 
         // 步骤 7：post-submit 清理（与旧同步 submit 保持一致）
         this.transientMemory.rotate();
@@ -645,7 +686,22 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                     + "ms prepare=" + profMs(Dx12RenderPassBackend.gProfPrepareNs * inv)
                     + "ms workers=" + profMs(Dx12RenderPassBackend.gProfWorkersNs * inv)
                     + "ms execute=" + profMs(Dx12RenderPassBackend.gProfExecuteNs * inv)
-                    + "ms fallbacks=" + (Dx12RenderPassBackend.gProfFallbacks * inv));
+                    + "ms fallbacks=" + (Dx12RenderPassBackend.gProfFallbacks * inv)
+                    + " | P62 batchDraws=" + Dx12RenderPassBackend.gProfSharedBatchDraws
+                    + " vbSame=" + Dx12RenderPassBackend.gProfSameVbBuf
+                    + " vbSameOff=" + Dx12RenderPassBackend.gProfSameVbOff
+                    + " ibSame=" + Dx12RenderPassBackend.gProfSameIbBuf
+                    + " ibSameType=" + Dx12RenderPassBackend.gProfSameIdxType
+                    + " | batches=" + Dx12RenderPassBackend.gProfBatches
+                    + " sharedDesc=" + Dx12RenderPassBackend.gProfSharedDescBatches
+                    + " singleBundle=" + Dx12RenderPassBackend.gProfSingleBundles
+                    + " slots=" + Dx12RenderPassBackend.gProfSlotsTotal
+                    + " | P62b bc=" + Dx12RenderPassBackend.gProfBcTotal
+                    + " cbvVary=" + Dx12RenderPassBackend.gProfCbvVary
+                    + " cbvSame=" + Dx12RenderPassBackend.gProfCbvSame
+                    + " srvVary=" + Dx12RenderPassBackend.gProfSrvVary
+                    + " srvSame=" + Dx12RenderPassBackend.gProfSrvSame
+                    + " vbSlotSame=" + Dx12RenderPassBackend.gProfVbSlotSame);
                 System.err.flush();
                 Dx12RenderPassBackend.gProfMultiBatches = 0;
                 Dx12RenderPassBackend.gProfMultiDraws = 0;
@@ -657,6 +713,21 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                 Dx12RenderPassBackend.gProfWorkersNs = 0;
                 Dx12RenderPassBackend.gProfExecuteNs = 0;
                 Dx12RenderPassBackend.gProfFallbacks = 0;
+                Dx12RenderPassBackend.gProfSharedBatchDraws = 0;
+                Dx12RenderPassBackend.gProfSameVbBuf = 0;
+                Dx12RenderPassBackend.gProfSameVbOff = 0;
+                Dx12RenderPassBackend.gProfSameIbBuf = 0;
+                Dx12RenderPassBackend.gProfSameIdxType = 0;
+                Dx12RenderPassBackend.gProfBatches = 0;
+                Dx12RenderPassBackend.gProfSharedDescBatches = 0;
+                Dx12RenderPassBackend.gProfSingleBundles = 0;
+                Dx12RenderPassBackend.gProfSlotsTotal = 0;
+                Dx12RenderPassBackend.gProfBcTotal = 0;
+                Dx12RenderPassBackend.gProfCbvVary = 0;
+                Dx12RenderPassBackend.gProfCbvSame = 0;
+                Dx12RenderPassBackend.gProfSrvVary = 0;
+                Dx12RenderPassBackend.gProfSrvSame = 0;
+                Dx12RenderPassBackend.gProfVbSlotSame = 0;
                 gProfIntervalNs = 0; gProfRecordingReadyNs = 0;
                 gProfWaitSubmitNs = 0; gProfTotalNs = 0;
             }
@@ -669,6 +740,14 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             System.err.println("[dx12-java] close: begin");
             System.err.flush();
         }
+        // P61：close 前必须结算挂起的异步提交。两条路径都危险：
+        //   1. 临时 encoder（device == null）：close() 末尾立即 dx12DestroyCommandEncoder，
+        //      若渲染线程仍在 Close+Execute+Signal 该 ctx，销毁会与其竞争 → 悬空/崩溃。
+        //   2. 共享 encoder：Dx12Device.close() 在 encoder.close() 之后同样立即
+        //      dx12DestroyCommandEncoder。
+        // 结算后 gAsyncRenderCtx 已置空，渲染线程不再触碰本 ctx，EndRenderPass/
+        // EndCommandList/Destroy 才是安全的。
+        settlePendingSubmit();
         if (this.currentRenderPass != null) {
             Dx12Native.dx12EndRenderPass(this.ctx);
             this.currentRenderPass = null;

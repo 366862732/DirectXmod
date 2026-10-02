@@ -28,6 +28,8 @@ public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline,
     private final Dx12IntermediaryShaderModule fragmentShader; // 用于 buildBindings() 推导
     private final String vertexHlsl;
     private final String fragmentHlsl;
+    /** P59：bindings 在管线生命周期内恒定，缓存以避免每帧重复构建（含 stream/集合分配）。 */
+    private volatile List<Dx12BindGroupEntry> cachedBindings;
 
     public Dx12CompiledRenderPipeline(RenderPipeline info, long handle,
         Dx12IntermediaryShaderModule vertexShader,
@@ -54,6 +56,10 @@ public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline,
      * 逻辑镜像 {@link Dx12ShaderCompiler#addToBindGroup}。
      */
     public List<Dx12BindGroupEntry> buildBindings() {
+        List<Dx12BindGroupEntry> cached = this.cachedBindings;
+        if (cached != null) {
+            return cached;
+        }
         List<BindGroupLayout.UniformDescription> allUniforms =
             BindGroupLayout.flattenUniforms(this.info.getBindGroupLayouts());
         List<String> allSamplers =
@@ -83,7 +89,9 @@ public final class Dx12CompiledRenderPipeline implements CompiledRenderPipeline,
                 }
             }
         }
-        return entries;
+        List<Dx12BindGroupEntry> result = List.copyOf(entries);
+        this.cachedBindings = result;
+        return result;
     }
 
     @Override

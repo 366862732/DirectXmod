@@ -76,9 +76,34 @@ public class Dx12TransientMemory implements TransientMemory {
     /** 当前路的已用字节数（从 0 开始单调递增，达到 BLOCK_SIZE 时 rotate）。 */
     private long uboRingOffset = 0;
 
-    // P54：本帧 staging bump 块（UPLOAD heap，主机可见）
+    // P54：staging 块池（UPLOAD heap，主机可见）。
+    // 早期实现每帧 rotate() 都把 stagingBlock 置空 → 下一帧首次上传必然
+    // new Dx12GpuBuffer → 每帧至少一次 CreateCommittedResource（P53 采样中
+    // dx12CreateBuffer 仍占 ~9%）。改为 3 路块池轮转：帧 N 用完的块归还到 P[N%3]，
+    // 该池最早在帧 N+3 才再次被取用，天然保证「块被复用时 GPU 早已执行完帧 N 的
+    // 拷贝」（3 > FRAMES_IN_FLIGHT=2，与既有 frames 队列的退役语义一致）。
+    private static final int STAGING_POOL_COUNT = 3;
+    /** 单路池常驻字节上限：超出者不入池，改走 frame 生命周期延迟释放，防止常驻内存失控。 */
+    private static final long MAX_POOL_BYTES_PER_POOL = 4L * 1024L * 1024L;
+    /** 超过该大小的单次上传块不入池，避免个别超大上传把常驻内存抬上去。 */
+    private static final long MAX_POOLED_BLOCK_SIZE = 8L * 1024L * 1024L;
+
+    private final List<ArrayDeque<Dx12GpuBuffer>> stagingPools = List.of(
+        new ArrayDeque<>(), new ArrayDeque<>(), new ArrayDeque<>());
+    /** 各池当前常驻字节数（与 {@link #stagingPools} 一一对应，用于容量控制）。 */
+    private final long[] stagingPoolBytes = new long[STAGING_POOL_COUNT];
+    private int stagingPoolIdx = 0;
+    /** 本帧正在填充的 staging 块；为空表示本帧尚未分配。 */
     private Dx12GpuBuffer stagingBlock;
+    /** 当前 staging 块是否可以归还进池（超大块不入池，交由 frames 生命周期释放）。 */
+    private boolean stagingBlockPooled = false;
     private long stagingBlockUsed = 0L;
+    /**
+     * 本帧内「写满后被替换下来」的入池块。{@link #stagingBlock} 只保存当前正在填充的
+     * 那一块；一帧内若上传量超过单块容量会出现多块，其余块暂存于此，待 {@link #rotate()}
+     * 一并归还池（超大块在分配时已登记进 frame，无需在此跟踪）。
+     */
+    private final List<Dx12GpuBuffer> retiredPooledStagingBlocks = new ArrayList<>();
 
     Dx12TransientMemory(long ctx, Runnable ensureListOpen) {
         this.ctx = ctx;
@@ -206,22 +231,58 @@ public class Dx12TransientMemory implements TransientMemory {
     /**
      * P54：在本帧 staging 块内按 {@code alignment}（至少
      * {@link #MIN_BLOCK_ALIGNMENT}）bump 分配 {@code size} 字节，返回块内偏移。
-     * 当前块放不下时新开一块（新块登记到本帧，随帧在 {@link #FRAMES_IN_FLIGHT}
-     * 帧后释放）。
+     * 当前块放不下时把旧块暂存起来、再取一块新的。新块优先复用本路池中的空闲块，
+     * 池空（或块过小）才新建；超大块不入池，登记进本帧随 frame 生命周期释放。
      */
     private long allocateInStagingBlock(long size, long alignment) {
         long align = Math.max(MIN_BLOCK_ALIGNMENT, alignment);
+        if (this.stagingBlock == null) {
+            this.stagingBlock = acquireStagingBlock(size, align);
+        }
         long offset = roundUp(this.stagingBlockUsed, align);
-        if (this.stagingBlock == null || offset + size > this.stagingBlock.size()) {
-            long blockSize = Math.max(STAGING_BLOCK_SIZE, roundUp(size, align));
-            this.stagingBlock = new Dx12GpuBuffer(
-                GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, blockSize);
-            this.register(this.stagingBlock);
-            this.stagingBlockUsed = 0L;
+        if (offset + size > this.stagingBlock.size()) {
+            // 当前块写满：入池块暂存待 rotate 归还，超大块已登记 frame，均无需在此 close。
+            if (this.stagingBlockPooled) {
+                this.retiredPooledStagingBlocks.add(this.stagingBlock);
+            }
+            this.stagingBlock = acquireStagingBlock(size, align);
             offset = 0L;
         }
         this.stagingBlockUsed = offset + size;
         return offset;
+    }
+
+    /**
+     * 取得一块 staging（UPLOAD heap）并设置 {@link #stagingBlockPooled}：
+     * <ul>
+     *   <li>需要的大小 ≤ {@link #MAX_POOLED_BLOCK_SIZE}：优先复用本路池中足够大的块，
+     *       否则新建一块（入池管理，不登记 frame）；</li>
+     *   <li>更大：不入池，新建后登记进本帧，随 frame 在 {@link #FRAMES_IN_FLIGHT} 帧后释放。</li>
+     * </ul>
+     */
+    private Dx12GpuBuffer acquireStagingBlock(long size, long align) {
+        long blockSize = Math.max(STAGING_BLOCK_SIZE, roundUp(size, align));
+        if (blockSize > MAX_POOLED_BLOCK_SIZE) {
+            this.stagingBlockPooled = false;
+            Dx12GpuBuffer big = new Dx12GpuBuffer(
+                GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, blockSize);
+            this.register(big);
+            return big;
+        }
+        this.stagingBlockPooled = true;
+        ArrayDeque<Dx12GpuBuffer> pool = this.stagingPools.get(this.stagingPoolIdx);
+        Dx12GpuBuffer pooled = pool.pollFirst();
+        if (pooled != null) {
+            this.stagingPoolBytes[this.stagingPoolIdx] -= pooled.size();
+            if (pooled.size() >= size) {
+                return pooled;
+            }
+            // 池中块过小（仅在本路块尺寸演化时出现）：丢弃后新建更大块。此块已退役
+            // ≥STAGING_POOL_COUNT 帧，GPU 早已执行完它的拷贝，close 安全。
+            pooled.close();
+        }
+        return new Dx12GpuBuffer(
+            GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_COPY_SRC, blockSize);
     }
 
     private static long roundUp(long value, long alignment) {
@@ -340,6 +401,9 @@ public class Dx12TransientMemory implements TransientMemory {
         if (this.closed) {
             return;
         }
+        // P54：归还本帧用过的 staging 块到本路池。必须在 frame 入队**之前**处理：
+        // 超出池容量的块会被登记进本帧，从而随该帧在 FRAMES_IN_FLIGHT 帧后 close。
+        recycleStagingBlocks();
         this.frames.addLast(this.frame);
         this.frame = new ArrayList<>();
         while (this.frames.size() > FRAMES_IN_FLIGHT) {
@@ -347,14 +411,37 @@ public class Dx12TransientMemory implements TransientMemory {
                 buffer.close();
             }
         }
-        // P54：新帧重新开始块内 bump 分配。上一帧的 staging 块已登记进 frames 队列，
-        // 会随最旧帧在 FRAMES_IN_FLIGHT 帧后统一 close()——此时 GPU 早已执行完引用
-        // 它的拷贝命令（native submit 保证）。
-        this.stagingBlock = null;
-        this.stagingBlockUsed = 0L;
         // Rotate the UBO ring buffer：每帧切到下一路，确保不同帧的 uniform 数据不重叠。
         this.uboRingIdx = (this.uboRingIdx + 1) % UBO_RING_COUNT;
         this.uboRingOffset = 0;
+    }
+
+    /**
+     * P54：把本帧用过的入池 staging 块归还到本路池，并轮转 {@link #stagingPoolIdx}。
+     * 本路下一次被取用是在 {@link #STAGING_POOL_COUNT}（=3）帧之后，晚于
+     * {@link #FRAMES_IN_FLIGHT}（=2），因此块被复用时 GPU 早已执行完引用它的拷贝命令。
+     * 超出 {@link #MAX_POOL_BYTES_PER_POOL} 的块不入池，改登记进本帧延迟释放，避免常驻内存失控。
+     */
+    private void recycleStagingBlocks() {
+        if (this.stagingBlockPooled && this.stagingBlock != null) {
+            this.retiredPooledStagingBlocks.add(this.stagingBlock);
+        }
+        ArrayDeque<Dx12GpuBuffer> pool = this.stagingPools.get(this.stagingPoolIdx);
+        long bytes = this.stagingPoolBytes[this.stagingPoolIdx];
+        for (Dx12GpuBuffer block : this.retiredPooledStagingBlocks) {
+            if (bytes + block.size() <= MAX_POOL_BYTES_PER_POOL) {
+                pool.offerLast(block);
+                bytes += block.size();
+            } else {
+                this.frame.add(block);
+            }
+        }
+        this.retiredPooledStagingBlocks.clear();
+        this.stagingPoolBytes[this.stagingPoolIdx] = bytes;
+        this.stagingBlock = null;
+        this.stagingBlockUsed = 0L;
+        this.stagingBlockPooled = false;
+        this.stagingPoolIdx = (this.stagingPoolIdx + 1) % STAGING_POOL_COUNT;
     }
 
     void close() {
@@ -376,6 +463,21 @@ public class Dx12TransientMemory implements TransientMemory {
             }
         }
         this.frames.clear();
+        // P54：池内常驻块与尚未归还的当前块/退役块不在 frames 队列里，需显式释放。
+        for (ArrayDeque<Dx12GpuBuffer> pool : this.stagingPools) {
+            for (Dx12GpuBuffer buffer : pool) {
+                buffer.close();
+            }
+            pool.clear();
+        }
+        if (this.stagingBlockPooled && this.stagingBlock != null) {
+            this.stagingBlock.close();
+        }
+        for (Dx12GpuBuffer buffer : this.retiredPooledStagingBlocks) {
+            buffer.close();
+        }
+        this.retiredPooledStagingBlocks.clear();
+        this.stagingBlock = null;
         if (Dx12Native.LOG_VERBOSE) {
             System.err.println("[dx12-java] transientMemory.close: done");
         }

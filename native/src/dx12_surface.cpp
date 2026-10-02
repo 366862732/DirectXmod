@@ -520,7 +520,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         srcTex = nullptr;  // 标记为无源纹理，走纯 clear 路径
     }
 
-    ID3D12GraphicsCommandList* cmd = ctx->commandList.Get();
+    ID3D12GraphicsCommandList* cmd = ctx->commandList;
     ID3D12Resource* dst = s->backBuffers[(size_t)s->currentImageIndex].Get();
     UINT w = s->width;
     UINT h = s->height;

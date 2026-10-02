@@ -87,6 +87,65 @@ std::vector<UINT> gFreeSamplerSlots;
 std::mutex gPendingMutex;   // 保护 gPendingDeletes
 std::mutex gFreeSlotMutex;  // 保护 gFreeSrvSlots / gFreeSamplerSlots
 
+// ---------------------------------------------------------------------------
+// P60：Buffer 复用池（deferred-free allocator）。
+//
+// 现象：稳态采样显示主线程热点是 dx12CreateBuffer（每采样窗 20–31 次），
+// 调用链 StagedVertexBuffer$GpuBufferPool.endFrame → close → dx12DestroyResource
+// → 下一帧 acquire 池空 → Dx12GpuBuffer.<init> → dx12CreateBuffer。官方池每帧
+// 都会 close 掉 available 池（其 Vulkan 实现下重新分配来自廉价的内存池，故无碍），
+// 而我们的 close 会真正走 CreateCommittedResource：D3D12 最小分配粒度 64KB，
+// DEFAULT 堆还需驱动侧零初始化 → 每帧风暴。
+//
+// 方案：复用既有「fence 门控延迟删除」路径——flushPendingDeletes 释放
+// Kind::Buffer 时不再 delete，而是把对象转入按 (heapType, 256 对齐容量) 分档的
+// 空闲池；createBuffer 优先取出复用其 ID3D12Resource。
+// 安全性：入池仅发生在 requiredFence 已被 queue fence 覆盖之后（GPU 已不再引用
+// 该资源），故复用无 hazard。容量封顶，超限即真释放，避免长会话内存膨胀。
+// ---------------------------------------------------------------------------
+struct PooledBuffer {
+    Dx12Object* obj;  // 保持存活的对象（resource 已 Unmap、无在飞引用）
+};
+std::vector<PooledBuffer> gFreeBuffers;
+size_t gFreeBufferBytes = 0;
+std::mutex gFreeBufferMutex;  // 保护 gFreeBuffers / gFreeBufferBytes
+constexpr size_t kMaxFreeBufferBytes = 96ull * 1024 * 1024;  // 96MB 封顶
+
+// buffer 的 D3D12 资源容量（与 createBuffer 的 desc.Width 一致：256 对齐）。
+UINT64 bufferCapacity(const Dx12Object* o) {
+    return ((UINT64)o->size + 255ULL) & ~255ULL;
+}
+
+// 从复用池取出 (heapType, 容量) 完全匹配的 buffer；无匹配返回 nullptr。
+Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
+    std::lock_guard<std::mutex> lk(gFreeBufferMutex);
+    for (size_t i = 0; i < gFreeBuffers.size(); ++i) {
+        PooledBuffer& pb = gFreeBuffers[i];
+        if (pb.obj->heapType == heapType && bufferCapacity(pb.obj) == capacity) {
+            Dx12Object* obj = pb.obj;
+            gFreeBufferBytes -= capacity;
+            gFreeBuffers[i] = gFreeBuffers.back();
+            gFreeBuffers.pop_back();
+            return obj;
+        }
+    }
+    return nullptr;
+}
+
+// 把 fence 已覆盖的 buffer 归还复用池；超容量则真释放。
+void recyclePooledBuffer(Dx12Object* obj) {
+    UINT64 capacity = bufferCapacity(obj);
+    {
+        std::lock_guard<std::mutex> lk(gFreeBufferMutex);
+        if (gFreeBufferBytes + capacity <= kMaxFreeBufferBytes) {
+            gFreeBuffers.push_back(PooledBuffer{obj});
+            gFreeBufferBytes += capacity;
+            return;
+        }
+    }
+    delete obj;
+}
+
 // 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
 // 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
 // 定义在匿名 namespace 外，以便 destroySurface 等跨编译单元调用。
@@ -372,6 +431,13 @@ void flushPendingDeletes(bool force) {
             } else if (o->kind == Dx12Object::Kind::Sampler) {
                 gFreeSamplerSlots.push_back((UINT)o->descSlot);
             }
+        }
+        // P60：Buffer 转入复用池（而非 delete），供 createBuffer 复用底层
+        // ID3D12Resource，消除每帧 CreateCommittedResource 风暴。force=true
+        // （设备销毁）时仍直接释放，避免残留资源。
+        if (!force && o->kind == Dx12Object::Kind::Buffer) {
+            recyclePooledBuffer(o);
+            continue;
         }
         delete o;
     }
@@ -952,6 +1018,20 @@ Dx12Object* createBuffer(int usage, long long size, std::string& err) {
     if (size <= 0) { err = "buffer size must be positive"; return nullptr; }
 
     D3D12_HEAP_TYPE heapType = pickBufferHeapType(usage);
+
+    // P60：优先复用池中 (heapType, 容量) 完全匹配的空闲 buffer，跳过
+    // CreateCommittedResource（D3D12 最小分配粒度 64KB + DEFAULT 堆零初始化）。
+    // 池内对象均为 fence 已覆盖（GPU 不再引用）者，复用安全。
+    const UINT64 alignedSize = ((UINT64)size + 255ULL) & ~255ULL;
+    if (Dx12Object* reused = takePooledBuffer(heapType, alignedSize)) {
+        reused->usage = usage;
+        reused->size = size;
+        reused->mappedPtr = nullptr;
+        DBG_LOG_DEBUG("createBuffer: reused pooled buffer size=%lld usage=0x%x",
+            (long long)size, usage);
+        return reused;
+    }
+
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = heapType;
 
@@ -959,7 +1039,7 @@ Dx12Object* createBuffer(int usage, long long size, std::string& err) {
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     // P6：统一 256 对齐分配（D3D12 资源分配粒度本就 64KB，无额外浪费），
     // 保证任意 uniform 切片的 CBV（SizeInBytes 向上取整 256）不越界。
-    desc.Width = ((UINT64)size + 255) & ~255ULL;
+    desc.Width = alignedSize;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -1405,7 +1485,7 @@ void transitionTo(CommandContext* ctx, ID3D12Resource* res,
         if (!needTransition(from, to)) return;
     }
     if (from == to) return;
-    resourceBarrier(ctx->commandList.Get(), res, from, to);
+    resourceBarrier(ctx->commandList, res, from, to);
     m[res] = to;
 }
 
@@ -1487,12 +1567,17 @@ CommandContext* createCommandEncoder(std::string& err) {
             err = "createCommandEncoder: CreateCommandAllocator failed"; return nullptr;
         }
     }
-    if (FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ctx->allocators[0].Get(), nullptr, IID_PPV_ARGS(&ctx->commandList)))) {
-        err = "createCommandEncoder: CreateCommandList failed"; return nullptr;
+    // P55：创建 3 条 command list，与 3 个 allocator 一一对应（多帧飞行）。
+    for (int i = 0; i < 3; ++i) {
+        if (FAILED(gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ctx->allocators[i].Get(), nullptr, IID_PPV_ARGS(&ctx->commandLists[i])))) {
+            err = "createCommandEncoder: CreateCommandList failed"; return nullptr;
+        }
+        // 初始 closed 状态；beginCommandList 时 Reset。
+        ctx->commandLists[i]->Close();
     }
-    // 初始 closed 状态；beginCommandList 时 Reset。
-    ctx->commandList->Close();
+    ctx->currentListSlot = 0;
+    ctx->commandList = ctx->commandLists[0].Get();
     if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence)))) {
         err = "createCommandEncoder: CreateFence failed"; return nullptr;
     }
@@ -1533,15 +1618,22 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     // P33 fix：若列表已打开（构造函数或先前调用已打开），幂等返回——不再 Reset
     // 同一 allocator，避免 E_FAIL（allocator 仍在 GPU 使用中）。
     if (ctx->listOpen) return true;
-    // P33 fix（帧序倒置修复）：命令列表的 begin/Reset 现在由**主线程**在自己的
-    // 帧开始时负责（渲染线程只做 Close + ExecuteCommandLists + Present）。
-    // P48（多帧飞行）：Reset 前必须确保 GPU 已执行完**上一条**命令列表。
-    // 旧代码等 fenceValue-2（三 allocator ring 的余量假设）——那只在"主线程每帧
-    // 都等 Present 完成"的严格一帧飞行下才成立。现在 Present 与主线程解耦，
-    // 必须等 ctx->fenceValue（= 最近一次提交的 per-list fence）：该 fence 在
-    // ExecuteCommandLists 之后 signal，完成即表示命令列表已不被 GPU 引用，
-    // 可以安全 Reset。等待通常只有几十微秒（GPU 远快于 CPU 录制）。
-    UINT64 waitVal = ctx->fenceValue;
+    // P55（command list 三路 ring）：选一个 ring 槽位 = fenceValue % 3。
+    // 此前只有单条 commandList，主线程必须等**上一帧**（fenceValue）GPU 执行完
+    // 才能 Reset 同一条 list，导致 CPU 录制与 GPU 执行完全串行（实测 GPU 33%/
+    // CPU 29% 却只跑到 ~680 FPS）。现在 list 与 allocator 一一对应同一槽位，
+    // 录制帧 N 时用的是帧 N-3 的槽位，只需等该槽位**上一次**提交的 per-list
+    // fence（slotFence[slot]）完成，即可与最近两帧的 GPU 执行重叠。
+    UINT slot = (UINT)(ctx->fenceValue % 3u);
+    ctx->currentListSlot = slot;
+    ctx->commandList = ctx->commandLists[slot].Get();
+    // P55：DX12_CMD_RING=0 回退为旧的串行行为（等最近一次提交的 per-list fence，
+    // 即帧 N-1），便于 AB 对比/出问题快速回退。默认开启三路 ring。
+    static const bool sCmdRing = [] {
+        const char* v = getenv("DX12_CMD_RING");
+        return !(v && v[0] == '0');
+    }();
+    UINT64 waitVal = sCmdRing ? ctx->slotFence[slot] : ctx->fenceValue;
     return beginCommandListWithWait(ctx, waitVal, err);
 }
 
@@ -1628,7 +1720,7 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
         if (it->second & (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                          | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
             if (it->second != D3D12_RESOURCE_STATE_COMMON)
-                resourceBarrier(ctx->commandList.Get(), it->first, it->second,
+                resourceBarrier(ctx->commandList, it->first, it->second,
                     D3D12_RESOURCE_STATE_COMMON);
             it = ctx->resourceState.erase(it);
         } else {
@@ -1651,7 +1743,7 @@ bool endCommandList(CommandContext* ctx, std::string& err) {
         if (it->second == target) {
             it = ctx->resourceState.erase(it);
         } else {
-            resourceBarrier(ctx->commandList.Get(), it->first, it->second, target);
+            resourceBarrier(ctx->commandList, it->first, it->second, target);
             it = ctx->resourceState.erase(it);
         }
     }
@@ -1698,9 +1790,12 @@ UINT64 submitCommandList(CommandContext* ctx, std::string& err) {
             (unsigned long long)gCtx.queueFenceValue);
     }
     DBG_LOG_DEBUG("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
-    ID3D12CommandList* lists[] = { ctx->commandList.Get() };
+    ID3D12CommandList* lists[] = { ctx->commandList };
     gCtx.queue->ExecuteCommandLists(1, lists);
     value = ++ctx->fenceValue;
+    // P55：记录本槽位（currentListSlot）最后一次提交的 per-list fence，供 3 帧后
+    // 的 beginCommandList 等待该槽位 GPU 执行完成后再 Reset 其 list/allocator。
+    ctx->slotFence[ctx->currentListSlot] = value;
     DBG_LOG_DEBUG("submit: executed, Signal v=%llu", (unsigned long long)value);
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
         err = "submitCommandList: Signal failed"; return 0;
@@ -1772,8 +1867,13 @@ UINT64 currentFenceValue(CommandContext* ctx) {
 
 // 全局队列 fence 等待（createFence token 的 awaitCompletion）：等待对象是
 // 设备级 queueFence，目标值 = 创建时 queueFenceValue+1，下一次任意 ctx 的
-// 提交后完成（官方"共享 encoder 的 submit index"语义）。每调用用独立的 event，
-// 避免多线程并发等待同一事件互相干扰。
+// 提交后完成（官方"共享 encoder 的 submit index"语义）。
+// P60：改为每线程复用一个 auto-reset 事件（原实现每次调用 CreateEventW +
+// CloseHandle；该路径由 StagedVertexBuffer 每帧大量轮询触发，是 dx12WaitForFence
+// 热度来源）。因同一事件上可能残留更早（更低 fence 值）的 SetEventOnCompletion
+// 注册，等待返回后必须回读 GetCompletedValue 复核，避免把"更早的值到达"误判为
+// 本次目标已完成（否则会提前回收在飞 buffer）。auto-reset 事件在每次
+// WaitForSingleObject 消费后自动复位，故复核失败可安全重试。
 bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err) {
     if (!gCtx.queueFence) {
         err = "waitForQueueFenceValue: queue fence not initialized";
@@ -1783,29 +1883,47 @@ bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err) {
     dbgLogDebug("waitQFence: value=%llu completed=%llu", (unsigned long long)value,
         (unsigned long long)cv);
     if (cv >= value) return true;
-    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!evt) { err = "waitForQueueFenceValue: CreateEvent failed"; return false; }
-    HRESULT hr = gCtx.queueFence->SetEventOnCompletion(value, evt);
-    if (FAILED(hr)) {
-        CloseHandle(evt);
-        err = "waitForQueueFenceValue: SetEventOnCompletion " + hrText(hr);
+    // P60 快路径：零超时 = 纯轮询（官方 GpuFence.awaitCompletion(0) 语义，官方
+    // StagedVertexBuffer 回收 buffer 依赖它）。已确认未完成，直接返回 false，
+    // 不创建事件对象——原路径每次都会 CreateEventW/SetEventOnCompletion/
+    // WaitForSingleObject(0)/CloseHandle。
+    if (timeoutNs == 0) {
+        err = "waitForQueueFenceValue: timed out after 0ns";
         return false;
+    }
+    static thread_local HANDLE t_queueFenceEvent = nullptr;
+    if (!t_queueFenceEvent) {
+        t_queueFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!t_queueFenceEvent) {
+            err = "waitForQueueFenceValue: CreateEvent failed";
+            return false;
+        }
     }
     // 上限钳制：Java awaitCompletion(Long.MAX_VALUE) 换算后的纳秒数溢出 DWORD，
     // 直接 cast 会得到很小的毫秒数（把"永久等待"变成瞬时轮询）。钳到 ~49.7 天。
     UINT64 ms64 = (timeoutNs + 999999ULL) / 1000000ULL;
     DWORD ms = ms64 > 0xFFFFFFF0ULL ? 0xFFFFFFF0ULL : (DWORD)ms64;
-    if (WaitForSingleObject(evt, ms) != WAIT_OBJECT_0) {
-        CloseHandle(evt);
-        err = "waitForQueueFenceValue: timed out after " + std::to_string(timeoutNs) + "ns";
-        dbgLog("waitQFence: TIMEOUT value=%llu completed=%llu",
-            (unsigned long long)value,
-            (unsigned long long)gCtx.queueFence->GetCompletedValue());
-        return false;
+    for (;;) {
+        HRESULT hr = gCtx.queueFence->SetEventOnCompletion(value, t_queueFenceEvent);
+        if (FAILED(hr)) {
+            err = "waitForQueueFenceValue: SetEventOnCompletion " + hrText(hr);
+            return false;
+        }
+        DWORD wr = WaitForSingleObject(t_queueFenceEvent, ms);
+        // 回读复核：事件可能被同一事件上更早的注册误触发。
+        if (gCtx.queueFence->GetCompletedValue() >= value) {
+            DBG_LOG_DEBUG("waitQFence: OK value=%llu", (unsigned long long)value);
+            return true;
+        }
+        if (wr != WAIT_OBJECT_0) {
+            err = "waitForQueueFenceValue: timed out after " + std::to_string(timeoutNs) + "ns";
+            dbgLog("waitQFence: TIMEOUT value=%llu completed=%llu",
+                (unsigned long long)value,
+                (unsigned long long)gCtx.queueFence->GetCompletedValue());
+            return false;
+        }
+        // 被更早注册误触发：继续等待本次目标值。
     }
-    CloseHandle(evt);
-    DBG_LOG_DEBUG("waitQFence: OK value=%llu", (unsigned long long)value);
-    return true;
 }
 
 UINT64 currentQueueFenceValue() {
@@ -1911,47 +2029,14 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
         srcOffset + size > src->size || dstOffset + size > dst->size) {
         err = "copyBufferToBuffer: range out of bounds"; return false;
     }
-    // P23 诊断：UPLOAD heap staging buffer 可能含 NaN（BufferBuilder position.w 未初始化）。
-    // 注意：拷贝操作必须保持字节精确，绝不能改写源数据——字节模式可能恰好构成 NaN 位形
-    // （例如 0xFC,0xFD,0xFE,0xFF 按小端 float 读即 NaN），改写会导致数据静默损坏
-    // （曾导致 self-test readback mismatch at 252）。这里只统计并记录，不做任何修改。
-    if (src->heapType == D3D12_HEAP_TYPE_UPLOAD && size >= 16) {
-        void* ptr = nullptr;
-        if (SUCCEEDED(src->resource->Map(0, nullptr, &ptr))) {
-            const float* f = (const float*)((const uint8_t*)ptr + srcOffset);
-            int n = std::min((int)(size / 4), 256);  // 最多检查前 256 个 float
-            int nanCount = 0;
-            for (int i = 0; i < n; ++i) {
-                if (std::isnan(f[i]) || std::isinf(f[i])) ++nanCount;
-            }
-            src->resource->Unmap(0, nullptr);
-            if (nanCount > 0) {
-                dbgLogDebug("copyBuf: DETECTED %d NaN/Inf in UPLOAD src=%p off=%lld size=%lld (not modified)",
-                    nanCount, (void*)src, (long long)srcOffset, (long long)size);
-            }
-        }
-    }
+    // P56：移除 P6/P23 遗留的两段 UPLOAD 源诊断（每次拷贝都 Map + 扫描/格式化 + Unmap）。
+    // 它们不受日志级别保护、在 Release 中依然无条件执行，而顶点/UBO 上传正是每帧高频
+    // 路径（StagedVertexBuffer / GlobalSettingsUniform / UberGpuBuffer），曾把 dx12CopyBuffer
+    // 抬到 P53 热点约 12%。语义不变：CopyBufferRegion 本就不改写源数据。
     transitionBufferTo(ctx, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
     ctx->commandList->CopyBufferRegion(dst->resource.Get(), (UINT64)dstOffset,
         src->resource.Get(), (UINT64)srcOffset, (UINT64)size);
-    // P6 诊断：dump UPLOAD staging 内容（真实数据源头）。
-    if (src->heapType == D3D12_HEAP_TYPE_UPLOAD && size >= 16) {
-        void* ptr = nullptr;
-        if (SUCCEEDED(src->resource->Map(0, nullptr, &ptr))) {
-            const float* f = (const float*)((const uint8_t*)ptr + srcOffset);
-            int n = std::min((int)(size / 4), 16);
-            std::string fs;
-            for (int i = 0; i < n; ++i) {
-                char b[32];
-                snprintf(b, sizeof(b), " %.2f", f[i]);
-                fs += b;
-            }
-            DBG_LOG_DEBUG("copyBuf: src=%p(UPLOAD) dst=%p off=%lld size=%lld floats=[%s ]",
-                (void*)src, (void*)dst, (long long)srcOffset, (long long)size, fs.c_str());
-            src->resource->Unmap(0, nullptr);
-        }
-    }
     return true;
 }
 

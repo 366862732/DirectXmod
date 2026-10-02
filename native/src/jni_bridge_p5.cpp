@@ -98,10 +98,18 @@ JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PresentSurface(
     // Java 侧 GpuSurface.present() 在 encoder.submit() 之后调用本函数，若再 Present
     // 一次，swapchain 会连续 flip 两次，其中一帧的 back buffer 从未被渲染写入
     // → 表现为窗口闪烁各种颜色。这里消费该标记并跳过重复 Present。
-    if (gAsyncOwnsPresent) {
+    // P61（多帧飞行-延迟结算）：Java 侧 submit() 不再阻塞等渲染线程完成，于是
+    // GpuSurface.present()（紧跟 submit()）可能在渲染线程 SetEvent(submitDone) 之前
+    // 就执行——此刻 gAsyncOwnsPresent 尚未置位，若只看该标记就会**重复 Present**：
+    // 主线程的 Present 与渲染线程的 ExecuteCommandLists/Present 并发操作同一 swapchain
+    // → DEVICE_REMOVED 0x887A0005（native.log: "presentSurface: FAILED HRESULT 0x887A0005"）。
+    // gAsyncRenderCtx 由 asyncRenderBeginFrame 置为本帧 ctx，直到**下一帧**结算
+    // （settlePendingSubmit → dx12AsyncRenderWaitComplete）才清空；因此只要它非空，
+    // 就说明本帧已交给渲染线程、Present 必由其完成，主线程必须跳过。
+    if (gAsyncOwnsPresent || gAsyncRenderCtx != nullptr) {
         gAsyncOwnsPresent = false;
         // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
-        dbgLogDebug("dx12PresentSurface: skipped (async render thread already presented) surface=%p",
+        dbgLogDebug("dx12PresentSurface: skipped (async render thread owns present) surface=%p",
             toSurface(surface));
         return;
     }

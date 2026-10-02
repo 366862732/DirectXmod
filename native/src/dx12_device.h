@@ -224,12 +224,25 @@ void unmapBuffer(Dx12Object* buffer);
 struct Dx12Pipeline;  // forward，CommandContext 持有其裸指针
 struct CommandContext {
     ComPtr<ID3D12CommandAllocator> allocators[3];   // 三帧飞行，等待 value-2 后复用
-    ComPtr<ID3D12GraphicsCommandList> commandList;
+    // P55：command list 也改为 3 路 ring（此前只有单条 list，导致主线程必须等上一帧
+    // GPU 执行完才能 Reset 同一条 list → CPU 录制与 GPU 执行被完全串行化，
+    // 实测 GPU 仅 33%、CPU 仅 29% 却只跑到 ~680 FPS）。现在 list 与 allocator 一一
+    // 对应同一槽位，主线程录制帧 N 时用的是与帧 N-3 相同的槽位，只需等该槽位的 fence。
+    ComPtr<ID3D12GraphicsCommandList> commandLists[3];
     ComPtr<ID3D12Fence> fence;
     UINT64 fenceValue = 0;              // 最近一次 Signal 的值（从 1 开始递增）
     HANDLE fenceEvent = nullptr;        // SetEventOnCompletion 用
     int listOpen = 0;                   // command list 是否已 begin
     int inRenderPass = 0;               // 渲染 pass 是否打开
+
+    // P55：本帧使用的 ring 槽位（begin 时按 fenceValue%3 固定，submit 时据此记录 fence）。
+    UINT currentListSlot = 0;
+    // P55：各槽位最后一次提交的 per-list fence 值。begin 时等本槽位的值，
+    // 保证该槽位的 list/allocator 不再被 GPU 引用后再 Reset。
+    UINT64 slotFence[3] = {0, 0, 0};
+    // P55：指向 commandLists[currentListSlot] 的裸指针，供全部录制调用点直接使用
+    // （保持原有 `ctx->commandList->Foo()` 写法不变）。由 beginCommandListWithWait 指向当前槽位。
+    ID3D12GraphicsCommandList* commandList = nullptr;
 
     // P11：当前渲染 pass 的活跃附件。endRenderPass 必须把它们从
     // RENDER_TARGET/DEPTH_WRITE 显式回切 COMMON——这两种状态属"非可提升状态"，
@@ -277,7 +290,7 @@ struct CommandContext {
     Dx12Pipeline* currentPipeline = nullptr;
 
     ComPtr<ID3D12CommandAllocator>& currentAllocator() {
-        return allocators[fenceValue % 3];
+        return allocators[currentListSlot];
     }
 };
 
