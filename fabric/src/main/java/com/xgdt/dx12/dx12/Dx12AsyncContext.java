@@ -34,11 +34,19 @@ public final class Dx12AsyncContext implements AutoCloseable {
     private static final String PROP_WORKERS = "dx12.async.workers";
     /** 与 native kMaxAsyncWorkers 一致。 */
     private static final int MAX_WORKERS = 8;
-    /** 默认 worker 数：每帧段 32768 槽，同步 ring 保留 8192，每 worker 6144 槽。 */
-    private static final int DEFAULT_WORKERS = 4;
+    /** 默认 worker 数：每帧段 24576 槽给 worker 分区，8 worker 时每区 3072 槽。 */
+    private static final int DEFAULT_WORKERS = 8;
 
-    /** 全局开关：默认开启。 */
-    static final boolean ENABLED = !"0".equals(System.getProperty(PROP_ENABLE, "1"));
+    /** 全局开关：默认开启。环境变量 DX12_ASYNC=0 优先，其次系统属性 -Ddx12.async=0。 */
+    static final boolean ENABLED = resolveEnabled();
+
+    private static boolean resolveEnabled() {
+        String env = System.getenv("DX12_ASYNC");
+        if (env != null && !env.isBlank()) {
+            return !"0".equals(env.trim());
+        }
+        return !"0".equals(System.getProperty(PROP_ENABLE, "1"));
+    }
 
     private static volatile @Nullable Dx12AsyncContext instance;
 
@@ -108,10 +116,14 @@ public final class Dx12AsyncContext implements AutoCloseable {
 
     private static int parseWorkerCount() {
         int n = DEFAULT_WORKERS;
-        String prop = System.getProperty(PROP_WORKERS);
-        if (prop != null) {
+        // 环境变量优先（PCL 等启动器不方便传 -D），其次系统属性；均非法则回退默认。
+        String raw = System.getenv("DX12_ASYNC_WORKERS");
+        if (raw == null || raw.isBlank()) {
+            raw = System.getProperty(PROP_WORKERS);
+        }
+        if (raw != null) {
             try {
-                n = Integer.parseInt(prop.trim());
+                n = Integer.parseInt(raw.trim());
             } catch (NumberFormatException ignored) {
                 // 非法值回退默认
             }

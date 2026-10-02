@@ -26,6 +26,12 @@ public final class Dx12Native {
      */
     public static final boolean LOG_VERBOSE = "1".equals(System.getenv("DX12_LOG_VERBOSE"));
 
+    /**
+     * 帧时间插桩开关（P3）：设置环境变量 DX12_PROF=1 开启，默认关闭。
+     * 与 LOG_VERBOSE 分离——后者会附带大量诊断日志，会干扰计时。
+     */
+    public static final boolean PROF = LOG_VERBOSE || "1".equals(System.getenv("DX12_PROF"));
+
     static {
         loadNativeLibrary();
     }
@@ -38,33 +44,18 @@ public final class Dx12Native {
             Files.createDirectories(dllDir);
             Path dllPath = dllDir.resolve(libName);
 
-            // 若本地 dx12mod/dx12_mc.dll 比 JAR 资源更新，则跳过提取，直接使用本地文件。
-            // 开发时可快速部署新 DLL 而无需重建 JAR。
+            // 与 JAR 内资源做**内容比对**：只有本地文件与 JAR 内字节完全相同时才
+            // 跳过提取，否则一律用 JAR 里的 DLL 覆盖本地。
+            // 早期用「本地 mtime 更新 且 大小相同」判定，但 JAR 条目时间戳固定为
+            // 1980 epoch、且不同内容的 DLL 可能大小恰好相同 —— 会导致新 DLL 被旧
+            // 本地文件挡住（曾导致 native 改动一直不生效）。
             boolean useJarDll = true;
             if (Files.exists(dllPath)) {
                 try (InputStream in = Dx12Native.class.getResourceAsStream("/" + libName)) {
                     if (in != null) {
                         byte[] jarBytes = in.readAllBytes();
-                        long jarModified = -1;
-                        java.net.URL loc = Dx12Native.class.getProtectionDomain()
-                                .getCodeSource().getLocation();
-                        if (loc.getProtocol().equals("jar")) {
-                            String path = loc.getPath();
-                            int ex = path.indexOf('!');
-                            if (ex > 0) path = path.substring(5, ex);
-                            java.util.zip.ZipFile zf = new java.util.zip.ZipFile(path);
-                            java.util.Enumeration<?> ents = zf.entries();
-                            while (ents.hasMoreElements()) {
-                                java.util.zip.ZipEntry e = (java.util.zip.ZipEntry) ents.nextElement();
-                                if (e.getName().equals(libName)) { jarModified = e.getTime(); break; }
-                            }
-                            zf.close();
-                        }
-                        // 注意：Gradle 打包时 JAR 内条目使用固定时间戳（1980 epoch），
-                        // 因此“本地更新”几乎恒成立。必须同时要求大小一致，否则 JAR 里
-                        // 换了新 DLL 也会被旧的本地文件挡住（曾导致新 DLL 一直不生效）。
-                        if (jarModified >= 0 && dllPath.toFile().lastModified() > jarModified
-                                && dllPath.toFile().length() == jarBytes.length) {
+                        byte[] localBytes = Files.readAllBytes(dllPath);
+                        if (java.util.Arrays.equals(jarBytes, localBytes)) {
                             useJarDll = false;
                         }
                     }

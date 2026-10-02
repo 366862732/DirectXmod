@@ -420,9 +420,26 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         }
     }
 
+    // ---- P3 插桩：绘制热路径的调用次数与主线程墙钟耗时（DX12_PROF=1 时由
+    // Dx12CommandEncoderBackend 每 300 帧汇总打印并清零）。用于判断帧时间到底
+    // 花在「mod 的绘制/提交路径」还是「MC 自身逻辑」上。
+    public static long gProfMultiBatches = 0;      // drawMultipleIndexed 批次数
+    public static long gProfMultiDraws = 0;        // 批次内 draw 总数
+    public static long gProfMultiPathNs = 0;       // 批量入口主线程墙钟耗时
+    public static long gProfDrawIndexedCalls = 0;  // drawIndexed 调用次数
+    public static long gProfDrawIndexedNs = 0;     // drawIndexed（pushDescriptors + JNI）耗时
+    // P3b：把并行批量路径拆成四段，定位主线程串行开销（8 worker 相对 4 worker 无收益，
+    // 说明瓶颈在主线程串行段而非 worker 并行度）。
+    public static long gProfBuildNs = 0;      // materialize + 逐 draw 参数/描述符取值
+    public static long gProfPrepareNs = 0;    // dx12AsyncPrepare{CBV,Index,Texture} 三连 JNI
+    public static long gProfWorkersNs = 0;    // dispatch 8 worker + CountDownLatch.await
+    public static long gProfExecuteNs = 0;    // ExecuteBundle 回放
+    public static long gProfFallbacks = 0;    // 并行录制失败回退串行次数
+
     @Override
     public void drawIndexed(int indexCount, int instanceCount, int firstIndex,
         int vertexOffset, int firstInstance) {
+        final long profT0 = Dx12Native.PROF ? System.nanoTime() : 0L;
         // P17 诊断：记录每次 drawIndexed 调用（P29：仅 verbose）
         if (Dx12Native.LOG_VERBOSE && System.err instanceof java.io.PrintStream) {
             // 尝试获取当前绑定的顶点缓冲信息
@@ -438,6 +455,10 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (!Dx12Native.dx12DrawIndexed(this.ctx, indexCount, instanceCount,
             firstIndex, vertexOffset, firstInstance)) {
             throw new IllegalStateException("dx12DrawIndexed failed");
+        }
+        if (profT0 != 0L) {
+            gProfDrawIndexedCalls++;
+            gProfDrawIndexedNs += System.nanoTime() - profT0;
         }
     }
 
@@ -522,6 +543,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (bc == 0) {
             return false;
         }
+        final long profP0 = Dx12Native.PROF ? System.nanoTime() : 0L;
         final int[] bType = new int[bc];
         for (int j = 0; j < bc; j++) {
             Dx12BindGroupEntry.Type type = bindings.get(j).type();
@@ -617,6 +639,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (frameSlot < 0 || frameValue < 0) {
             return false;
         }
+        final long profP1 = Dx12Native.PROF ? System.nanoTime() : 0L;
+        if (profP1 != 0L) gProfBuildNs += profP1 - profP0;
         // bundle 内禁止 barrier：本批所有 CBV 缓冲 / 顶点缓冲 / 索引缓冲 / 纹理视图
         // 先在主列表上完成过渡。过渡失败则说明主列表状态异常，直接回退串行
         // （串行路径会自行 transition）。
@@ -626,6 +650,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             || !Dx12Native.dx12AsyncPrepareTextureViews(this.ctx, toLongArray(textureViews))) {
             return false;
         }
+        final long profP2 = Dx12Native.PROF ? System.nanoTime() : 0L;
+        if (profP2 != 0L) gProfPrepareNs += profP2 - profP1;
 
         final long pool = async.bundlePool();
         final long alloc = async.descriptorAlloc();
@@ -715,6 +741,8 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
             Thread.currentThread().interrupt();
             failed.set(true);
         }
+        final long profP3 = Dx12Native.PROF ? System.nanoTime() : 0L;
+        if (profP3 != 0L) gProfWorkersNs += profP3 - profP2;
 
         if (failed.get()) {
             // 丢弃已录制的 bundle，交回串行路径重录（分区内的描述符随后会被覆盖）。
@@ -724,6 +752,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                 }
             }
             Dx12AsyncContext.countFallback();
+            gProfFallbacks++;
             if (Dx12Native.LOG_VERBOSE) {
                 LOGGER.warn("drawMultipleIndexed: parallel recording failed, falling back to serial"
                     + " (draws={}, bindings={}, worker={}/{})", n, bc, frameSlot, workerCount);
@@ -736,6 +765,7 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
                 throw new IllegalStateException("dx12ExecuteBundle failed for worker " + w);
             }
         }
+        if (Dx12Native.PROF) gProfExecuteNs += System.nanoTime() - profP3;
         // bundle 内改写了根描述符表/PSO 等父列表状态，强制下次撤销 anyDescriptorDirty 快速路径，
         // 让后续 draw 重新推送描述符（否则会复用 bundle 留下的根表）。
         this.anyDescriptorDirty = true;
@@ -758,36 +788,42 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         if (this.pipeline == null || !this.pipeline.isValid()) {
             throw new IllegalStateException("drawMultipleIndexed called without a valid pipeline");
         }
+        final long profT0 = Dx12Native.PROF ? System.nanoTime() : 0L;
         List<RenderPass.Draw<T>> batch = materialize(draws);
         // P33：批量足够大时走并行 bundle 录制（worker pool）；任何条件不满足或录制失败
         // 都回退到下面的串行路径，保证功能等价。
-        if (this.tryParallelDrawMultipleIndexed(batch, defaultIndexBuffer,
-                defaultIndexType, uniformArgument)) {
-            return;
+        boolean parallel = this.tryParallelDrawMultipleIndexed(batch, defaultIndexBuffer,
+            defaultIndexType, uniformArgument);
+        if (!parallel) {
+            for (RenderPass.Draw<T> draw : batch) {
+                BiConsumer<T, RenderPass.UniformUploader> uploader = draw.uniformUploaderConsumer();
+                if (uploader != null) {
+                    uploader.accept(uniformArgument, this::setUniform);
+                }
+                GpuBuffer indexBuffer = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
+                IndexType indexType = draw.indexType() != null ? draw.indexType() : defaultIndexType;
+                if (indexBuffer == null || indexType == null) {
+                    throw new IllegalStateException("No index buffer was set for draw");
+                }
+                this.setIndexBuffer(indexBuffer, indexType);
+                this.setVertexBuffer(draw.slot(), draw.vertexBuffer().slice());
+                // P22 诊断：打印每个 Draw 的顶点缓冲信息（P29：仅 verbose）
+                if (Dx12Native.LOG_VERBOSE) {
+                    GpuBufferSlice vbSlice = draw.vertexBuffer().slice();
+                    long vbBufSize = vbSlice.buffer().size();
+                    System.err.printf("[dx12-java] drawMulti slot=%d idxCount=%d vbBufSize=%d vbOff=%d vbLen=%d pipeline=%s%n",
+                        draw.slot(), draw.indexCount(), (int)vbBufSize, (int)vbSlice.offset(), (int)vbSlice.length(),
+                        this.pipeline.info().getLocation());
+                    System.err.flush();
+                }
+                this.pushDescriptors();
+                this.drawIndexed(draw.indexCount(), 1, draw.firstIndex(), draw.baseVertex(), 0);
+            }
         }
-        for (RenderPass.Draw<T> draw : batch) {
-            BiConsumer<T, RenderPass.UniformUploader> uploader = draw.uniformUploaderConsumer();
-            if (uploader != null) {
-                uploader.accept(uniformArgument, this::setUniform);
-            }
-            GpuBuffer indexBuffer = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
-            IndexType indexType = draw.indexType() != null ? draw.indexType() : defaultIndexType;
-            if (indexBuffer == null || indexType == null) {
-                throw new IllegalStateException("No index buffer was set for draw");
-            }
-            this.setIndexBuffer(indexBuffer, indexType);
-            this.setVertexBuffer(draw.slot(), draw.vertexBuffer().slice());
-            // P22 诊断：打印每个 Draw 的顶点缓冲信息（P29：仅 verbose）
-            if (Dx12Native.LOG_VERBOSE) {
-                GpuBufferSlice vbSlice = draw.vertexBuffer().slice();
-                long vbBufSize = vbSlice.buffer().size();
-                System.err.printf("[dx12-java] drawMulti slot=%d idxCount=%d vbBufSize=%d vbOff=%d vbLen=%d pipeline=%s%n",
-                    draw.slot(), draw.indexCount(), (int)vbBufSize, (int)vbSlice.offset(), (int)vbSlice.length(),
-                    this.pipeline.info().getLocation());
-                System.err.flush();
-            }
-            this.pushDescriptors();
-            this.drawIndexed(draw.indexCount(), 1, draw.firstIndex(), draw.baseVertex(), 0);
+        if (profT0 != 0L) {
+            gProfMultiBatches++;
+            gProfMultiDraws += batch.size();
+            gProfMultiPathNs += System.nanoTime() - profT0;
         }
     }
 

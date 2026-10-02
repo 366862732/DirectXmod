@@ -68,7 +68,7 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
     private static int dx12DebugLightmapDumps = 0;
 
     // -----------------------------------------------------------------------
-    // P3 帧时间插桩（仅 DX12_LOG_VERBOSE=1 时启用，正常游玩零开销）
+    // P3 帧时间插桩（仅 DX12_PROF=1 时启用，正常游玩零开销）
     // 目的：量化 submit() 内部各同步阶段（RECORDING_READY 握手 / 等提交完成）
     // 与帧间隔的耗时，用于判断多帧飞行 FrameManager 的实际可回收收益。
     // -----------------------------------------------------------------------
@@ -511,11 +511,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
             System.err.flush();
         }
 
-        // P3 插桩：记录本帧起点与相对上一帧的间隔（仅 LOG_VERBOSE 生效）。
-        final boolean prof = Dx12Native.LOG_VERBOSE;
+        // P3 插桩：记录本帧起点与相对上一帧的间隔（仅 DX12_PROF=1 生效）。
+        final boolean prof = Dx12Native.PROF;
         final long profStart = System.nanoTime();
         if (prof) {
-            gProfIntervalNs = gProfLastSubmitNs != 0 ? profStart - gProfLastSubmitNs : 0;
+            // 累加而非覆盖：否则只统计到最后一个间隔。
+            if (gProfLastSubmitNs != 0) gProfIntervalNs += profStart - gProfLastSubmitNs;
             gProfLastSubmitNs = profStart;
         }
 
@@ -623,7 +624,29 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                     + "ms recordingReady=" + profMs(gProfRecordingReadyNs * inv)
                     + "ms waitSubmit=" + profMs(gProfWaitSubmitNs * inv)
                     + "ms submitTotal=" + profMs(gProfTotalNs * inv) + "ms");
+                // P3 绘制热路径：判断帧时间花在 mod 绘制路径还是 MC 自身逻辑。
+                System.err.println("[dx12-java] P3 draw: batches/frame=" + (Dx12RenderPassBackend.gProfMultiBatches * inv)
+                    + " draws/frame=" + (Dx12RenderPassBackend.gProfMultiDraws * inv)
+                    + " batchPath=" + profMs(Dx12RenderPassBackend.gProfMultiPathNs * inv) + "ms"
+                    + " drawIndexedCalls/frame=" + (Dx12RenderPassBackend.gProfDrawIndexedCalls * inv)
+                    + " drawIndexed=" + profMs(Dx12RenderPassBackend.gProfDrawIndexedNs * inv) + "ms");
+                // P3b：并行批量路径四段拆分（主线程串行 vs worker 并行）。
+                System.err.println("[dx12-java] P3 batch: build=" + profMs(Dx12RenderPassBackend.gProfBuildNs * inv)
+                    + "ms prepare=" + profMs(Dx12RenderPassBackend.gProfPrepareNs * inv)
+                    + "ms workers=" + profMs(Dx12RenderPassBackend.gProfWorkersNs * inv)
+                    + "ms execute=" + profMs(Dx12RenderPassBackend.gProfExecuteNs * inv)
+                    + "ms fallbacks=" + (Dx12RenderPassBackend.gProfFallbacks * inv));
                 System.err.flush();
+                Dx12RenderPassBackend.gProfMultiBatches = 0;
+                Dx12RenderPassBackend.gProfMultiDraws = 0;
+                Dx12RenderPassBackend.gProfMultiPathNs = 0;
+                Dx12RenderPassBackend.gProfDrawIndexedCalls = 0;
+                Dx12RenderPassBackend.gProfDrawIndexedNs = 0;
+                Dx12RenderPassBackend.gProfBuildNs = 0;
+                Dx12RenderPassBackend.gProfPrepareNs = 0;
+                Dx12RenderPassBackend.gProfWorkersNs = 0;
+                Dx12RenderPassBackend.gProfExecuteNs = 0;
+                Dx12RenderPassBackend.gProfFallbacks = 0;
                 gProfIntervalNs = 0; gProfRecordingReadyNs = 0;
                 gProfWaitSubmitNs = 0; gProfTotalNs = 0;
             }

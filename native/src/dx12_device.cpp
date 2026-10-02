@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -561,10 +563,12 @@ bool ensureDevice(std::string& errorOut) {
     if (gCtx.device && gCtx.srvHeap && gCtx.srvCpuHeap && gCtx.rtvHeap &&
         gCtx.frameRtvHeap && gCtx.dsvHeap && gCtx.samplerHeap && gCtx.drawHeap) return true;
 
-    // 诊断：先启用 D3D12 调试层（Win10/11 自带；失败则无调试层继续）。
-    // 启用后非法 API 调用 / 描述符越界等会写入 InfoQueue，设备移除时可读回定位。
+    // 诊断：D3D12 调试层默认**关闭**。调试层会对每次 API 调用做完整状态校验，
+    // 实测使绘制热路径每 draw 多出约 3µs（~800ns/命令），是帧率的主要瓶颈之一。
+    // 需要排查设备移除 / 描述符越界 / 状态错误时，设 DX12_DEBUG_LAYER=1 重新启用。
     bool debugEnabled = false;
-    {
+    const char* dbgLayerEnv = std::getenv("DX12_DEBUG_LAYER");
+    if (dbgLayerEnv && dbgLayerEnv[0] == '1') {
         ComPtr<ID3D12Debug> debug;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
             debug->EnableDebugLayer();
@@ -1529,11 +1533,13 @@ bool beginCommandList(CommandContext* ctx, std::string& err) {
     if (ctx->listOpen) return true;
     // P33 fix（帧序倒置修复）：命令列表的 begin/Reset 现在由**主线程**在自己的
     // 帧开始时负责（渲染线程只做 Close + ExecuteCommandLists + Present）。
-    // Reset allocator 前必须等 GPU 执行完上次使用同一 allocator 的命令列表：
-    // allocator 索引 = fenceValue % 3，同一 allocator 上次被使用是在 3 次提交之前，
-    // 其提交后的 fenceValue = 当前 fenceValue - 2 → 等 fenceValue-2 即可安全 Reset，
-    // 且比等 prevFenceValue 少一个整帧的停顿。
-    UINT64 waitVal = ctx->fenceValue >= 2 ? (ctx->fenceValue - 2) : 0;
+    // P48（多帧飞行）：Reset 前必须确保 GPU 已执行完**上一条**命令列表。
+    // 旧代码等 fenceValue-2（三 allocator ring 的余量假设）——那只在"主线程每帧
+    // 都等 Present 完成"的严格一帧飞行下才成立。现在 Present 与主线程解耦，
+    // 必须等 ctx->fenceValue（= 最近一次提交的 per-list fence）：该 fence 在
+    // ExecuteCommandLists 之后 signal，完成即表示命令列表已不被 GPU 引用，
+    // 可以安全 Reset。等待通常只有几十微秒（GPU 远快于 CPU 录制）。
+    UINT64 waitVal = ctx->fenceValue;
     return beginCommandListWithWait(ctx, waitVal, err);
 }
 
@@ -4193,7 +4199,18 @@ namespace {
 HANDLE gEvtBeginFrame     = nullptr;  // 主线程→渲染线程：开始新帧
 HANDLE gEvtRecordingReady = nullptr;  // 渲染线程→主线程：可以 push 命令了
 HANDLE gEvtCommandsReady  = nullptr;  // 主线程→渲染线程：所有命令已入队
-HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：已提交，可循环
+HANDLE gEvtSubmitDone     = nullptr;  // 渲染线程→主线程：命令已提交（不再等 Present）
+
+// P48（多帧飞行）：Present 完成护栏。
+// 主线程不再每帧等 Present 返回，因此它可能在上一帧 Present 尚未完成时就去
+// acquire 下一个 back buffer。GetCurrentBackBufferIndex 只在 Present 之后轮转，
+// 提前 acquire 会拿到同一个 buffer（两帧写同一处 → 闪帧/撕裂）。
+// acquireSurface 在真正 acquire 前等待「已提交帧数 == 已完成 Present 帧数」，
+// 通常为 0ms（主线程录制耗时 ≫ 渲染线程 Present 耗时）。
+std::mutex gPresentMtx;
+std::condition_variable gPresentCv;
+UINT64 gSubmittedFrames = 0;   // 已完成 ExecuteCommandLists 的帧数
+UINT64 gPresentedFrames = 0;   // 已完成 Present 的帧数
 
 // 渲染线程函数
 static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
@@ -4242,6 +4259,12 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // 步骤 6：等待主线程完成命令录制（超时保护：5s 后放弃当前帧）
         dbgLogDebug("renderThread: waiting for gEvtCommandsReady ctx=%p", (void*)ctx);
+        // P3-native 插桩（DX12_PROF=1）：把主线程观测到的 waitSubmit 拆成
+        // 「等主线程命令就绪 / Close+Execute+Signal / Present」三段，定位耗时归属。
+        static const bool sProf = (getenv("DX12_PROF") != nullptr);
+        static UINT64 sProfFrames = 0;
+        static double sProfWaitCmdMs = 0.0, sProfSubmitMs = 0.0, sProfPresentMs = 0.0;
+        const double tProfWait0 = sProf ? nowMs() : 0.0;
         int commandsWaitLoops = 0;
         for (;;) {
             if (!gRenderRunning) { destroySurfaceNoWaitIdle(getActiveSurface()); return 0; }
@@ -4264,8 +4287,10 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         }
 
         // 步骤 7：end + submit + present
+        const double tProfWait1 = sProf ? nowMs() : 0.0;
         std::string submitErr;
         UINT64 value = submitCommandList(ctx, submitErr);
+        const double tProfSubmit1 = sProf ? nowMs() : 0.0;
         if (value == 0) {
             dbgLog("renderThread: submitCommandList FAILED: %s", submitErr.c_str());
             // P41 fix：不清除 surface（submit 失败不代表 surface 无效）
@@ -4296,6 +4321,19 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
             (unsigned long long)gCtx.queueFenceValue, bbIdx);
         presentSurface(getActiveSurface());
+        // P3-native 插桩：累加三段耗时，每 300 帧打印一次均值。
+        if (sProf) {
+            const double tProfPresent1 = nowMs();
+            sProfWaitCmdMs += tProfWait1 - tProfWait0;
+            sProfSubmitMs += tProfSubmit1 - tProfWait1;
+            sProfPresentMs += tProfPresent1 - tProfSubmit1;
+            if (++sProfFrames % 300 == 0) {
+                const double inv = 1.0 / 300.0;
+                dbgLog("P3-native prof n=300: waitCommands=%.2fms close+exec+signal=%.2fms present=%.2fms",
+                    sProfWaitCmdMs * inv, sProfSubmitMs * inv, sProfPresentMs * inv);
+                sProfWaitCmdMs = sProfSubmitMs = sProfPresentMs = 0.0;
+            }
+        }
         // P33 fix：本帧 Present 已由本线程完成。标记给 Java 侧 present()，
         // 让它在 submit() 返回后跳过重复 Present（重复 Present 会让 swapchain
         // 连续 flip 两次，显示到未渲染的 back buffer → 窗口闪烁各种颜色）。
