@@ -42,10 +42,19 @@ constexpr UINT kAsyncFrameSlots = 4;
 // 单帧槽内可划分的 worker 分区上限。
 constexpr UINT kMaxAsyncWorkers = 8;
 // 每个帧槽起始处保留给同步路径 ring 的槽位数（blit / 小批量同步 draw）。
-// 取 32768 = 未启用异步时同步路径原本可用的每帧槽位数（原 kDrawHeapPerFrame），
-// 保证开启 P33 后同步路径容量不缩水，避免 GUI/实体等大量单 draw 路径
-// 触发 "draw descriptor heap exhausted for this frame" 异常。
-constexpr UINT kAsyncSyncRingReserve = 32768;
+// 原值 32768 只够常规帧（GUI/实体/天空等单 draw 路径）：每次 pushDescriptors
+// 里每个 SRV 绑定都要在 ring 中占 1 个瞬时描述符槽位。但**图集上传**
+// （TextureAtlas.uploadInitialContents）会在同一条**未提交**的命令列表内录制
+// mipLevelCount × staticSprites.size() 个 draw，且整轮资源重载的所有图集上传
+// 共用共享 encoder 的同一个命令列表（帧循环尚未开始、期间不 submit），累计槽位
+// 需求远超 32768。大型整合包（blocks 图集 4096x4096x4 + 多个 mod 图集）实测在
+// 第 11 个图集上传时耗尽 → "draw descriptor heap exhausted for this frame"
+// → pushDescriptors 返回 false → 启动崩溃（Issue #10）。
+// 提升到 131072（> 单次重载累计 draw 的保守上界，且每帧段
+// kDrawHeapPerFrame = 131072 + 24576 = 155648，×4 段 = 622592 槽位仍远低于
+// CBV_SRV_UAV 堆 1,000,000 上限）。worker 分区容量由
+// kAsyncWorkerSlotsPerSection 决定，不受此值影响。
+constexpr UINT kAsyncSyncRingReserve = 131072;
 // 每个帧槽内供 worker 并行录制使用的槽位总数（= 各 worker 分区之和）。
 // 与 kAsyncSyncRingReserve 相加即为每帧段的槽位数（dx12_device.cpp 的
 // kDrawHeapPerFrame），二者严格互不重叠。容量不足时 worker 回退串行录制，

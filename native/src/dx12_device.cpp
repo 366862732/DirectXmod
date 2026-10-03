@@ -178,10 +178,15 @@ UINT gNextSampler = 0;
 // 峰值会同时持有数千个 texture view（旧 view 在 pending 删除队列尚未归还
 // 槽位 + 新 view 批量创建），4096 槽位实测耗尽 → 资源包被移除 → GUI draws
 // 为空 → 渲染目标只剩 clear 色 → 黑屏（按钮有声音）。D3D12 CBV_SRV_UAV
-// SHADER_VISIBLE 堆上限 1,000,000（Tier1），65536 槽位内存约 2MB/堆（含
-// CPU 镜像堆），一次性开大彻底消除该崩溃点；free-list 槽位复用仍保留，
-// 覆盖长期会话的泄漏兜底。
-constexpr UINT kSrvHeapSize = 65536;
+// SHADER_VISIBLE 堆上限 1,000,000（Tier1），一次性开大彻底消除该崩溃点；
+// free-list 槽位复用仍保留，覆盖长期会话的泄漏兜底。
+// Issue #10：图集上传期间 TextureAtlas.uploadInitialContents 会为每个
+// sprite 的每个 mip 级各创建一个 GpuTextureView（mipLevelCount ×
+// staticSprites.size() 个），且整轮资源重载期间共享 encoder 的命令列表一直
+// 未提交（gOpenListCount>0）→ 延迟删除的 view 槽位无法回收 → 累计 view 数
+// 等于累计 draw 数。原 65536 在大整合包下同样接近耗尽（此前的 32768 ring
+// 崩溃即发生在此阈值之前）。提升到 262144，为累计 view 留出约 4 倍余量。
+constexpr UINT kSrvHeapSize = 262144;
 constexpr UINT kRtvHeapSize = 2048;
 // P24：帧级瞬态 RTV 堆容量。单帧 render pass 附件 + clear 数量远小于 256；
 // 每帧从 0 复用（submit 阻塞等待 GPU 完成，CPU 侧重写描述符安全）。
@@ -3313,7 +3318,13 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
         }
     }
     if (ctx->nextDrawSlot + srvCount > syncRingCapacity()) {
-        err = "pushDescriptors: draw descriptor heap exhausted for this frame";
+        // 诊断：带上槽位画像，便于定位是哪条路径的 burst 超限（图集上传等）。
+        err = "pushDescriptors: draw descriptor heap exhausted for this frame (next="
+            + std::to_string((long long)ctx->nextDrawSlot)
+            + " need=" + std::to_string((long long)srvCount)
+            + " cap=" + std::to_string((long long)syncRingCapacity())
+            + " section=" + std::to_string((long long)kDrawHeapPerFrame)
+            + " fence=" + std::to_string((long long)ctx->fenceValue) + ")";
         return false;
     }
     // P16 诊断：每帧首 pushDescriptors 打印 binding 数量（确认 uniform/texture 被推送）

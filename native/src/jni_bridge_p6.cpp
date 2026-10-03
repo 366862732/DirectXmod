@@ -107,6 +107,19 @@ JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PushDescriptor
     std::string err;
     if (!pushDescriptors(toCtx(ctx), bindings, err)) {
         logFail("dx12PushDescriptors", err);
+        // Issue #10：Java 侧此前只看到 "dx12PushDescriptors failed"，native 侧的
+        // 具体原因（描述符堆耗尽 / view 失效 / CBV 非法 等）仅 fprintf(stderr)，
+        // 不会进入游戏日志 → 无法定位失败分支。这里把原因作为
+        // IllegalStateException 抛回 Java（JNI 异常在从 native 返回 Java 时生效，
+        // Java 调用点后续的通用 throw 不再执行）。
+        if (env) {
+            jclass cls = env->FindClass("java/lang/IllegalStateException");
+            if (cls) {
+                std::string msg = "dx12PushDescriptors failed: " + err;
+                env->ThrowNew(cls, msg.c_str());
+                env->DeleteLocalRef(cls);
+            }
+        }
         return JNI_FALSE;
     }
     return JNI_TRUE;
