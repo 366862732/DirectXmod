@@ -2737,9 +2737,15 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         if (b.type == 1) {
             D3D12_STATIC_SAMPLER_DESC s{};
             s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-            s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-            s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-            s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            // 地址模式用 WRAP 对齐 MC 的默认采样器（AbstractTexture 为 REPEAT/REPEAT）。
+            // 此前用 CLAMP 会让任何 UV 超出 [0,1] 的纹理采样退化到边缘像素：天气粒子
+            // (rain/snow) 的 v = y*0.25 + offset 可达 16~40，被 CLAMP 后整根雨柱都取
+            // 边缘行 → 渲染成贯穿屏幕的实心竖条（BUG：雨一条一条）。改为 WRAP 后 v 正常
+            // 平铺，恢复短虚线雨滴。对 UV 已在 [0,1] 内的纹理（图集/字体/lightmap）
+            // WRAP 与 CLAMP 等价，无副作用。
+            s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
             s.MipLODBias = 0.0f;
             s.MaxAnisotropy = 1;
             s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;

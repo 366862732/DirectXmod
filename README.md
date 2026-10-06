@@ -444,4 +444,9 @@ gradlew clean build
 
 ## 许可证
 
-MIT License
+本项目采用 **Apache License 2.0** 协议。
+
+- 你可以自由使用、修改、分发本项目，包括商业用途。
+- 分发时必须保留本项目的版权声明、许可证文本和 NOTICE 文件中的归属信息。
+- 不得使用本项目的名称或作者名义为衍生品做背书或推广。
+- 详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

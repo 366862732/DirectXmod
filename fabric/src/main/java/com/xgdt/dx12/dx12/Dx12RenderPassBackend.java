@@ -337,15 +337,17 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
 
     @Override
     public void enableScissor(int x, int y, int width, int height) {
-        // D3D12 与 Vulkan 的 scissor 矩形语义完全一致（左上角为原点，Y 轴向下），
-        // 调用方（GuiRenderer / GuiItemAtlas / RenderType 的 scissorState）已经完成
-        // 「GUI 自底向上 → 左上原点」的 Y 转换（如 window.height - bottom），因此这里
-        // 必须原样直通（与官方 VulkanRenderPass.enableScissor 一致）。
+        // RenderPass.enableScissor 沿用经典 OpenGL 约定：原点在左下角、Y 轴向上。
+        // 调用方（GuiRenderer / GuiItemAtlas / RenderType 的 scissorState）传入的 y 已按
+        // 该约定做过「GUI 自顶向下 → 自底向上」转换（如 window.height - bottom）。
         //
-        // 此前的 flipY 二次镜像（outputHeight - y - height）会与 shader 的 gl_Position.y
-        // 取反再叠加一次翻转，令 GUI 裁剪区镜像，造成 UI 元素错位、按钮底图/图标串图。
-        if (!Dx12Native.dx12SetScissor(this.ctx, x, y, width, height)) {
-            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, y, width, height);
+        // 而 D3D12 的 RSSetScissorRects 使用左上角原点、Y 轴向下，两者恰好互为垂直镜像，
+        // 故此处必须再翻转一次（outputHeight - y - height）才能落到 D3D12 坐标系。
+        // 若原样直通，裁剪区会沿屏幕中线镜像：列表项被上移裁剪（选中框缺上边框、首行文字
+        // 被切），表现为「标签整体上移」。
+        int scissorY = this.outputHeight - y - height;
+        if (!Dx12Native.dx12SetScissor(this.ctx, x, scissorY, width, height)) {
+            LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, scissorY, width, height);
         }
     }
 
