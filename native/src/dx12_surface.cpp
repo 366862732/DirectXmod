@@ -44,6 +44,185 @@ std::string hrText(HRESULT hr) {
     return buf;
 }
 
+// 把当前线程消息队列抽干 ms 毫秒。CreateSwapChainForHwnd 返回 E_ACCESSDENIED
+// (0x80070005) 时多为瞬态：窗口刚由 GLFW 创建、DWM 尚未完成重定向，或被第三方
+// 覆盖层/输入法短暂占用。泵消息 + 短等待后重试即可成功（本机实测偶发，重试必成）。
+void pumpWindowMessages(int ms) {
+    const DWORD deadline = GetTickCount() + (DWORD)(ms > 0 ? ms : 0);
+    MSG msg;
+    for (;;) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (GetTickCount() >= deadline) break;
+        Sleep(8);
+    }
+}
+
+// swapchain 创建结果（含 DirectComposition 回退资源）。
+struct SwapChainBundle {
+    ComPtr<IDXGISwapChain1> swapChain;
+    bool composition = false;   // true = 由 CreateSwapChainForComposition 创建
+    bool allowTearing = false;  // 仅 HWND + ALLOW_TEARING tier 为 true
+    ComPtr<IDCompositionDevice> dcompDevice;
+    ComPtr<IDCompositionTarget> dcompTarget;
+    ComPtr<IDCompositionVisual> dcompVisual;
+};
+
+// 动态解析 dcomp.dll 的 DCompositionCreateDevice（避免链接期依赖 dcomp.lib）。
+typedef HRESULT(WINAPI* PFN_DCompositionCreateDevice)(IUnknown*, REFIID, void**);
+PFN_DCompositionCreateDevice resolveDCompCreateDevice() {
+    static PFN_DCompositionCreateDevice fn = []() -> PFN_DCompositionCreateDevice {
+        HMODULE mod = LoadLibraryW(L"dcomp.dll");
+        if (!mod) return nullptr;
+        return reinterpret_cast<PFN_DCompositionCreateDevice>(
+            GetProcAddress(mod, "DCompositionCreateDevice"));
+    }();
+    return fn;
+}
+
+// 解绑/绑定 composition visual 的内容。DirectComposition 会持有 swapchain 的
+// backbuffer 引用，因此在 ResizeBuffers / 释放 swapchain 前必须先
+// SetContent(nullptr) + Commit，否则 ResizeBuffers 返回 DXGI_ERROR_INVALID_CALL。
+bool setCompositionContent(IDCompositionVisual* visual, IDCompositionDevice* dev,
+    IUnknown* content, std::string& err) {
+    if (!visual || !dev) { err = "composition visual/device null"; return false; }
+    HRESULT hr = visual->SetContent(content);
+    if (FAILED(hr)) { err = "IDCompositionVisual::SetContent failed " + hrText(hr); return false; }
+    hr = dev->Commit();
+    if (FAILED(hr)) { err = "IDCompositionDevice::Commit failed " + hrText(hr); return false; }
+    return true;
+}
+
+// 为本 HWND 建立 DirectComposition 合成链（device/target/visual）。
+bool initComposition(HWND win, SwapChainBundle& b, std::string& err) {
+    PFN_DCompositionCreateDevice createDevice = resolveDCompCreateDevice();
+    if (!createDevice) {
+        err = "dcomp.dll / DCompositionCreateDevice unavailable";
+        return false;
+    }
+    HRESULT hr = createDevice(nullptr, __uuidof(IDCompositionDevice),
+        reinterpret_cast<void**>(b.dcompDevice.GetAddressOf()));
+    if (FAILED(hr)) { err = "DCompositionCreateDevice failed " + hrText(hr); return false; }
+    hr = b.dcompDevice->CreateTargetForHwnd(win, TRUE, b.dcompTarget.GetAddressOf());
+    if (FAILED(hr)) { err = "IDCompositionDevice::CreateTargetForHwnd failed " + hrText(hr); return false; }
+    hr = b.dcompDevice->CreateVisual(b.dcompVisual.GetAddressOf());
+    if (FAILED(hr)) { err = "IDCompositionDevice::CreateVisual failed " + hrText(hr); return false; }
+    hr = b.dcompTarget->SetRoot(b.dcompVisual.Get());
+    if (FAILED(hr)) { err = "IDCompositionTarget::SetRoot failed " + hrText(hr); return false; }
+    return true;
+}
+
+// 创建 composition swapchain 并把内容绑定到 visual 上。
+bool createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* queue,
+    UINT width, UINT height, SwapChainBundle& b, std::string& err) {
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = width > 0 ? width : 1;
+    sd.Height = height > 0 ? height : 1;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.Stereo = FALSE;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = kSurfaceBufferCount;
+    sd.Scaling = DXGI_SCALING_STRETCH;                 // composition 仅支持 STRETCH
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;  // composition 支持 SEQUENTIAL/DISCARD
+    sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;      // composition 不接受 UNSPECIFIED
+    sd.Flags = 0;                                      // composition 不支持 ALLOW_TEARING
+    HRESULT hr = factory2->CreateSwapChainForComposition(queue, &sd, nullptr, &b.swapChain);
+    if (FAILED(hr)) { err = "CreateSwapChainForComposition failed " + hrText(hr); return false; }
+    if (!setCompositionContent(b.dcompVisual.Get(), b.dcompDevice.Get(), b.swapChain.Get(), err))
+        return false;
+    b.composition = true;
+    b.allowTearing = false;
+    return true;
+}
+
+// 为窗口创建 swapchain：
+//   1) 首选 CreateSwapChainForHwnd：多 tier（FLIP_DISCARD±TEARING / FLIP_SEQUENTIAL）
+//      并重试 3 轮（E_ACCESSDENIED 多为瞬态）；
+//   2) 全部被拒时回退 CreateSwapChainForComposition + DirectComposition（不绑定 HWND）。
+// reuse 非空且已是 composition 模式时直接复用其 composition 对象重建——对同一 HWND
+// 重复 CreateTargetForHwnd 会返回 DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED。
+bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue,
+    HWND win, UINT width, UINT height, const SwapChainBundle* reuse,
+    SwapChainBundle& out, std::string& err) {
+    static constexpr struct { DXGI_SWAP_EFFECT effect; UINT flags; const char* label; } kTiers[] = {
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD,    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, "FLIP_DISCARD+TEARING" },
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD,    0,                                  "FLIP_DISCARD"         },
+        { DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 0,                                  "FLIP_SEQUENTIAL"      },
+    };
+
+    if (!reuse || !reuse->composition) {
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = 1;   // 占位；configureSurface 时 ResizeBuffers 到实际尺寸
+        sd.Height = 1;
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.Stereo = FALSE;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = kSurfaceBufferCount;
+        sd.Scaling = DXGI_SCALING_STRETCH;
+        sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+
+        const int kPasses = 3;
+        HRESULT lastHr = E_FAIL;
+        for (int pass = 0; pass < kPasses && !out.swapChain; ++pass) {
+            if (pass > 0) {
+                dbgLog("createSwapChainForWindow: all HWND tiers failed (last hr=0x%08X), "
+                    "retry pass=%d (pump %dms)", (unsigned)lastHr, pass, pass * 60);
+                pumpWindowMessages(pass * 60);
+            }
+            for (const auto& tier : kTiers) {
+                sd.SwapEffect = tier.effect;
+                sd.Flags = tier.flags;
+                HRESULT hr = factory->CreateSwapChainForHwnd(queue, win, &sd, nullptr, nullptr,
+                    &out.swapChain);
+                if (SUCCEEDED(hr)) {
+                    out.allowTearing = (tier.flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+                    std::fprintf(stderr, "[dx12] swapchain OK (tier=%s pass=%d)\n", tier.label, pass);
+                    break;
+                }
+                lastHr = hr;
+                std::fprintf(stderr, "[dx12] swapchain tier %s failed hr=%08X (pass=%d)\n",
+                    tier.label, (unsigned)hr, pass);
+            }
+        }
+    } else {
+        dbgLog("createSwapChainForWindow: composition surface -> recreate composition directly");
+    }
+
+    if (out.swapChain) return true;
+
+    // DirectComposition 回退
+    if (win == nullptr) {
+        err = "swapchain creation failed: HWND invalid, cannot use composition fallback";
+        return false;
+    }
+    ComPtr<IDXGIFactory2> factory2;
+    if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory2)))) {
+        err = "swapchain creation failed (HWND tiers) and factory lacks IDXGIFactory2";
+        return false;
+    }
+
+    std::string cErr;
+    if (reuse && reuse->composition) {
+        out.dcompDevice = reuse->dcompDevice;
+        out.dcompTarget = reuse->dcompTarget;
+        out.dcompVisual = reuse->dcompVisual;
+        setCompositionContent(out.dcompVisual.Get(), out.dcompDevice.Get(), nullptr, cErr);
+    } else if (!initComposition(win, out, cErr)) {
+        err = "swapchain HWND tiers failed; composition fallback failed: " + cErr;
+        return false;
+    }
+    if (!createCompositionSwapChain(factory2.Get(), queue, width, height, out, cErr)) {
+        err = "swapchain HWND tiers failed; composition fallback failed: " + cErr;
+        return false;
+    }
+    std::fprintf(stderr, "[dx12] composition swapchain OK (%ux%u)\n", width, height);
+    return true;
+}
+
 // 取 surface 的 back buffer index 对应的 RTV（blit 后可用；P5 自检不用）。
 }  // namespace
 
@@ -116,12 +295,12 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     }
     // #endregion
 
-    // P33 修复：GLFW30 窗口类带 CS_OWNDC 标志时，CreateSwapChainForHwnd 返回
-    // E_ACCESSDENIED。通过动态加载 IDXGIFactory5::CreateSwapChainForComposition
-    // 作为 fallback——该 API 不绑定 HWND，再用 MakeWindowAssociation 关联到目标窗口。
+    // P33：CreateSwapChainForHwnd 在部分环境下对所有 tier 返回 E_ACCESSDENIED
+    // (0x80070005，见 Issue #11)。GLFW 窗口类固定带 CS_OWNDC，此处仅作信息记录；
+    // 真正的兜底是 createSwapChainForWindow() 内的多 tier 重试 + Composition 回退。
     if (win != nullptr && (classStyle & CS_OWNDC) != 0) {
-        std::fprintf(stderr, "[dx12] createSurface: detected CS_OWNDC, will use "
-            "CreateSwapChainForComposition fallback\n");
+        std::fprintf(stderr, "[dx12] createSurface: window class has CS_OWNDC (GLFW); "
+            "composition fallback available if HWND tiers are denied\n");
     }
 
     ComPtr<IDXGIFactory4> factory;
@@ -157,72 +336,52 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         (void*)ctx.adapter.Get());
     std::fflush(stderr);
 
-    DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = 1;                    // 占位；configure() 时 ResizeBuffers 到实际尺寸
-    sd.Height = 1;
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // 与 MC RGBA8 中间纹理同族，CopyTextureRegion 可直接拷贝
     // P3.1 诊断：打印 SwapChain 格式，确认不是深度/单通道格式
     dbgLog("configureSurface: swapchain format=DXGI_FORMAT_R8G8B8A8_UNORM (scFmt=%d)",
         (int)DXGI_FORMAT_R8G8B8A8_UNORM);
-    sd.Stereo = FALSE;
-    sd.SampleDesc.Count = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = kSurfaceBufferCount;
-    sd.Scaling = DXGI_SCALING_STRETCH;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;  // FIFO_RELAXED 需要
 
-    // P33 CS_OWNDC workaround：多级 fallback
-    // Tier 1: FLIP_DISCARD + ALLOW_TEARING（正常路径，FIFO_RELAXED 需要）
-    // Tier 2: FLIP_DISCARD 无 ALLOW_TEARING（CS_OWNDC 窗口可能需要）
-    static constexpr struct { DXGI_SWAP_EFFECT effect; UINT flags; const char* label; } kSwapChainTiers[] = {
-        { DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, "FLIP_DISCARD+TEARING" },
-        { DXGI_SWAP_EFFECT_FLIP_DISCARD, 0,                                  "FLIP_DISCARD"       },
-    };
-
-    ComPtr<IDXGISwapChain1> swapChain1;
     // P33：诊断——打印 HWND 值，帮助排查 E_ACCESSDENIED 问题。
     std::fprintf(stderr, "[dx12] dx12CreateSurface: hwnd=0x%llx queue=0x%p\n",
         (unsigned long long)hwnd, (void*)ctx.queue.Get());
     std::fflush(stderr);
 
-    {
-        bool created = false;
-        for (size_t t = 0; t < sizeof(kSwapChainTiers) / sizeof(kSwapChainTiers[0]); ++t) {
-            sd.SwapEffect = kSwapChainTiers[t].effect;
-            sd.Flags = kSwapChainTiers[t].flags;
-            hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(hwnd),
-                &sd, nullptr, nullptr, &swapChain1);
-            if (SUCCEEDED(hr)) {
-                std::fprintf(stderr, "[dx12] dx12CreateSurface: swapchain OK (tier=%s)\n",
-                    kSwapChainTiers[t].label);
-                created = true;
-                break;
-            }
-            std::fprintf(stderr, "[dx12] dx12CreateSurface: tier %s failed hr=%08X, trying next\n",
-                kSwapChainTiers[t].label, (unsigned)hr);
-        }
-        if (!created) {
-            // 打印调试层消息辅助诊断
-            if (ctx.infoQueue) {
-                UINT64 n = ctx.infoQueue->GetNumStoredMessages();
-                for (UINT64 i = 0; i < n && i < 20; ++i) {
-                    SIZE_T len = 0;
-                    if (FAILED(ctx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
-                    std::vector<char> buf(len > 0 ? len : 1);
-                    D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-                    if (SUCCEEDED(ctx.infoQueue->GetMessage((UINT)i, msg, &len))) {
-                        std::fprintf(stderr, "[dx12] InfoQueue[%u] %s\n",
-                            (unsigned)i, msg->pDescription ? msg->pDescription : "");
-                    }
-                }
-                ctx.infoQueue->ClearStoredMessages();
-            }
-            err = "CreateSwapChainForHwnd failed (all tiers) " + hrText(hr);
-            return nullptr;
+    // 初始尺寸：composition 回退路径需要真实客户区尺寸；HWND 路径仍用 1x1 占位
+    // （由 configureSurface 的 ResizeBuffers 调整到目标尺寸）。
+    UINT initW = 1, initH = 1;
+    if (win != nullptr) {
+        RECT crc{};
+        if (GetClientRect(win, &crc) && crc.right > crc.left && crc.bottom > crc.top) {
+            initW = (UINT)(crc.right - crc.left);
+            initH = (UINT)(crc.bottom - crc.top);
         }
     }
+
+    // P33：CreateSwapChainForHwnd 在部分环境（Issue #11：NVIDIA 独显 + Intel 核显
+    // 笔记本，所有 tier 返回 E_ACCESSDENIED 0x80070005）会被拒绝。先多 tier + 重试，
+    // 仍失败则回退 CreateSwapChainForComposition + DirectComposition（不绑定 HWND）。
+    SwapChainBundle bundle;
+    std::string scErr;
+    if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win,
+            initW, initH, nullptr, bundle, scErr)) {
+        // 打印调试层消息辅助诊断
+        if (ctx.infoQueue) {
+            UINT64 n = ctx.infoQueue->GetNumStoredMessages();
+            for (UINT64 i = 0; i < n && i < 20; ++i) {
+                SIZE_T len = 0;
+                if (FAILED(ctx.infoQueue->GetMessage((UINT)i, nullptr, &len))) continue;
+                std::vector<char> buf(len > 0 ? len : 1);
+                D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                if (SUCCEEDED(ctx.infoQueue->GetMessage((UINT)i, msg, &len))) {
+                    std::fprintf(stderr, "[dx12] InfoQueue[%u] %s\n",
+                        (unsigned)i, msg->pDescription ? msg->pDescription : "");
+                }
+            }
+            ctx.infoQueue->ClearStoredMessages();
+        }
+        err = scErr;
+        return nullptr;
+    }
+    ComPtr<IDXGISwapChain1> swapChain1 = bundle.swapChain;
 
     ComPtr<IDXGISwapChain3> swapChain3;
     if (FAILED(swapChain1.As(&swapChain3))) {
@@ -233,8 +392,12 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
     s->swapChain = swapChain3;
-    // P65：记录实际 tier 是否带 ALLOW_TEARING（sd.Flags 此时 = 成功 tier 的 flags）。
-    s->allowTearing = (sd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    s->compositionMode = bundle.composition;
+    s->dcompDevice = bundle.dcompDevice;
+    s->dcompTarget = bundle.dcompTarget;
+    s->dcompVisual = bundle.dcompVisual;
+    // P65：记录实际创建是否带 ALLOW_TEARING（composition swapchain 不支持 tearing）。
+    s->allowTearing = bundle.allowTearing;
     // 注意：不在此处 setActiveSurface！surface 必须在 configureSurface 完成后
     // 才设为 active，否则渲染线程会在 backBuffers 为空时尝试 acquire 导致无限循环。
     return s;
@@ -300,9 +463,19 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         s->swapChain->Present(0, 0);
         s->currentImageIndex = -1;
     }
+    // composition 模式：DirectComposition 持有 backbuffer 引用，ResizeBuffers /
+    // 释放 swapchain 前必须先解绑 visual 内容并 Commit，否则报 INVALID_CALL。
+    if (s->compositionMode) {
+        std::string uErr;
+        if (!setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), nullptr, uErr)) {
+            dbgLog("configureSurface: unbind composition content failed: %s", uErr.c_str());
+        }
+    }
     // 使用 swap chain 创建时的格式，而非 s->format（后者可能因内存损坏/误用而变为无效值，
     // 导致 ResizeBuffers 以 0x887A0001 (DXGI_ERROR_INVALID_CALL) 失败）。
     const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // composition swapchain 不支持 ALLOW_TEARING，ResizeBuffers 必须传 0。
+    const UINT scFlags = s->compositionMode ? 0 : DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
     // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
@@ -313,7 +486,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
             std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
         }
         hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, (UINT)width, (UINT)height,
-            scFmt, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+            scFmt, scFlags);
         if (SUCCEEDED(hr)) {
             dbgLog("configureSurface: ResizeBuffers ok (retry=%d)", retry);
             break;
@@ -340,57 +513,53 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
         s->currentImageIndex = -1;
         s->lastBlitIndex = -1;
 
-        // 重建 swapchain（与 createSurface 相同的描述符，但尺寸正确）
+        // 重建 swapchain（与 createSurface 相同的策略：HWND 多 tier + 重试，
+        // 全部被拒则回退 composition）。
         ComPtr<IDXGIFactory4> factory;
         hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
         if (FAILED(hr)) {
             err = "CreateDXGIFactory1 failed " + hrText(hr);
             return false;
         }
-        DXGI_SWAP_CHAIN_DESC1 sd{};
-        sd.Width = (UINT)width;
-        sd.Height = (UINT)height;
-        sd.Format = scFmt;
-        sd.Stereo = FALSE;
-        sd.SampleDesc.Count = 1;
-        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount = kSurfaceBufferCount;
-        sd.Scaling = DXGI_SCALING_STRETCH;
-        sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-
-        // 多级 fallback（与 createSurface 相同逻辑）
-        static constexpr struct { DXGI_SWAP_EFFECT effect; UINT flags; const char* label; } kRecreateTiers[] = {
-            { DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, "FLIP_DISCARD+TEARING" },
-            { DXGI_SWAP_EFFECT_FLIP_DISCARD, 0,                                  "FLIP_DISCARD"       },
-        };
-
-        ComPtr<IDXGISwapChain1> swapChain1;
-        bool recreated = false;
-        for (size_t t = 0; t < sizeof(kRecreateTiers) / sizeof(kRecreateTiers[0]); ++t) {
-            sd.SwapEffect = kRecreateTiers[t].effect;
-            sd.Flags = kRecreateTiers[t].flags;
-            hr = factory->CreateSwapChainForHwnd(ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
-                &sd, nullptr, nullptr, &swapChain1);
-            if (SUCCEEDED(hr)) {
-                std::fprintf(stderr, "[dx12] configureSurface: recreate OK (tier=%s %dx%d)\n",
-                    kRecreateTiers[t].label, width, height);
-                recreated = true;
-                break;
-            }
-            std::fprintf(stderr, "[dx12] configureSurface: recreate tier %s failed hr=%08X\n",
-                kRecreateTiers[t].label, (unsigned)hr);
+        // 已是 composition 模式时复用现有 composition 对象（对同一 HWND 重复
+        // CreateTargetForHwnd 会返回 WINDOW_ALREADY_COMPOSED），直接重建 swapchain。
+        SwapChainBundle reuse;
+        if (s->compositionMode) {
+            reuse.composition = true;
+            reuse.dcompDevice = s->dcompDevice;
+            reuse.dcompTarget = s->dcompTarget;
+            reuse.dcompVisual = s->dcompVisual;
         }
-        if (!recreated) {
-            err = "CreateSwapChainForHwnd (recreate) failed (all tiers) " + hrText(hr);
+        SwapChainBundle bundle;
+        std::string rErr;
+        if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(),
+                reinterpret_cast<HWND>(s->hwnd), (UINT)width, (UINT)height,
+                s->compositionMode ? &reuse : nullptr, bundle, rErr)) {
+            err = rErr + " (recreate)";
             return false;
         }
-        if (FAILED(swapChain1.As(&s->swapChain))) {
+        if (FAILED(bundle.swapChain.As(&s->swapChain))) {
             err = "swapchain does not support IDXGISwapChain3";
             return false;
         }
-        dbgLog("configureSurface: recreated swapchain %dx%d", width, height);
-        // P65：切换窗口/全屏重建后刷新 tearing 能力（sd.Flags = 本次成功 tier 的 flags）。
-        s->allowTearing = (sd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        s->compositionMode = bundle.composition;
+        s->dcompDevice = bundle.dcompDevice;
+        s->dcompTarget = bundle.dcompTarget;
+        s->dcompVisual = bundle.dcompVisual;
+        s->allowTearing = bundle.allowTearing;
+        dbgLog("configureSurface: recreated swapchain %dx%d (composition=%d)",
+            width, height, (int)s->compositionMode);
+    }
+
+    // composition 模式：把 visual 内容重新绑回（ResizeBuffers 后的同一 swapchain，
+    // 或重建后的新 swapchain）。
+    if (s->compositionMode) {
+        std::string bErr;
+        if (!setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(),
+                s->swapChain.Get(), bErr)) {
+            err = "configureSurface: rebind composition content failed: " + bErr;
+            return false;
+        }
     }
 
     // 仅在成功路径上更新尺寸：失败时保持旧尺寸，避免后续调用因 s->width/s->height

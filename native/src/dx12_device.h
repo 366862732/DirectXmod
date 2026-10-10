@@ -18,6 +18,7 @@
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
+#include <dcomp.h>
 #include <wrl/client.h>
 
 #include <cstdint>
@@ -652,6 +653,15 @@ struct Dx12Surface {
     // 仅当为 true 时才能在 Present 时传 DXGI_PRESENT_ALLOW_TEARING，否则 Present
     // 返回 DXGI_ERROR_INVALID_CALL。窗口/全屏切换可能重建 swapchain，故每次创建后更新。
     bool allowTearing = false;
+    // P33 fallback：CreateSwapChainForHwnd 被拒（E_ACCESSDENIED 0x80070005，见
+    // Issue #11）时改用 CreateSwapChainForComposition + DirectComposition 呈现。
+    // compositionMode=true 时 swapChain 由 CreateSwapChainForComposition 创建，
+    // 画面经 dcompVisual 合成到窗口；此时不支持 ALLOW_TEARING。
+    // 声明顺序保证析构时先释放 visual/target/device 再释放 swapChain。
+    bool compositionMode = false;
+    ComPtr<IDCompositionDevice> dcompDevice;
+    ComPtr<IDCompositionTarget> dcompTarget;
+    ComPtr<IDCompositionVisual> dcompVisual;
     std::vector<ComPtr<ID3D12Resource>> backBuffers;
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvHandles;  // 由 rtvHeap 分配
     // P18：per-backbuffer fence 值。submitCommandList 记录本帧写入的 fence 值，
