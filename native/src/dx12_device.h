@@ -106,6 +106,13 @@ struct DeviceContext {
     std::string adapterName;
     ComPtr<IDXGIAdapter> adapter;  // 与 device 绑定的 DXGI adapter（用于 CreateDXGIFactoryForAdapter）
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+    // P66：DX12 Ultimate（FL 12_2）能力探测结果。仅用于诊断与后续光线追踪实验，
+    // 现有渲染路径不依赖这些字段。
+    ComPtr<ID3D12Device5> device5;  // DXR 入口（RaytracingTier >= 1.0 时非空）
+    int raytracingTier = 0;         // 0=不支持, 10=DXR 1.0, 11=DXR 1.1
+    int meshShaderTier = 0;         // 0=不支持, 1=Tier 1
+    int vrsTier = 0;                // 0/1/2
+    int samplerFeedbackTier = 0;    // 0/1
     UINT64 timestampFrequency = 0;  // 从 GetTimestampFrequency 获取（DeviceInfo.timestampPeriod 用）
     ComPtr<ID3D12CommandQueue> queue;   // 图形队列（提交命令用）
 
@@ -159,6 +166,19 @@ void destroyDevice();
 
 // JNI 层访问设备上下文（读 adapterName/featureLevel）。
 DeviceContext& deviceContextForJni();
+// P66：设备能力摘要（feature level / DXR / mesh shader / VRS / sampler feedback）。
+std::string deviceCapabilities();
+// P67：DXR 冒烟测试（BLAS + TLAS + RTPSO + DispatchRays + readback）。
+// 返回一行结果摘要（PASS / MISMATCH / FAIL ...），不改动既有渲染状态。
+std::string runDxrSmokeTest();
+// P67：可见光追演示（棋盘 + 彩盒场景）。ensureDxrDemo 幂等初始化；
+// dxrDemoDispatch 在给定命令列表上执行 DispatchRays（会临时切换描述符堆，
+// 调用方随后必须恢复自己的堆），输出纹理最终处于 PIXEL_SHADER_RESOURCE。
+bool ensureDxrDemo(std::string& err);
+bool dxrDemoDispatch(ID3D12GraphicsCommandList* list, double timeSec, std::string& err);
+ID3D12Resource* dxrDemoOutputTexture();
+// 设备销毁时释放演示资源（下次 ensureDxrDemo 会在新设备上重建）。
+void resetDxrDemo();
 // P33 fix：flush 延迟删除对象，在 destroySurface 等 present fence 后调用，
 // 确保 GPU 工作完成后再释放资源。
 // P46：默认只释放 queue fence 已确认完成的条目（不阻塞）；force=true 时
@@ -581,6 +601,10 @@ const BlitPipeline* getBlitPipeline();
 // P22: 在 srvHeap 为 srcTex 分配 SRV 槽位并设置根描述符表（srvGpu 已绑定）。
 // 调用方无需关心 srvHeap 内部细节。
 bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
+    ID3D12GraphicsCommandList* cmd, std::string& err);
+// P67：把裸 ID3D12Resource（如 DXR 输出纹理）绑定到 blit 管线的 t0。
+// 与 blitBindSourceTexture 的区别：不做状态过渡（调用方保证已是 SRV 状态）。
+bool blitBindRawTextureSRV(CommandContext* ctx, ID3D12Resource* res,
     ID3D12GraphicsCommandList* cmd, std::string& err);
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <sstream>
 // Diagnostic: fill backbuffer with colored clear instead of copying src texture.
 // Uncomment to test whether the backbuffer通路 itself works.
@@ -155,8 +156,11 @@ bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue,
 
     if (!reuse || !reuse->composition) {
         DXGI_SWAP_CHAIN_DESC1 sd{};
-        sd.Width = 1;   // 占位；configureSurface 时 ResizeBuffers 到实际尺寸
-        sd.Height = 1;
+        // 用调用方给的实际尺寸创建（重建 swapchain 时即为目标尺寸）。之前固定 1x1 占位，
+        // 依赖 configureSurface 再 ResizeBuffers；一旦重建分支走完就再也不会 Resize，
+        // 1x1 的 backbuffer 被 DWM 拉伸到整个窗口 → 纯灰屏。
+        sd.Width = width > 0 ? width : 1;
+        sd.Height = height > 0 ? height : 1;
         sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         sd.Stereo = FALSE;
         sd.SampleDesc.Count = 1;
@@ -476,6 +480,13 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     // composition swapchain 不支持 ALLOW_TEARING，ResizeBuffers 必须传 0。
     const UINT scFlags = s->compositionMode ? 0 : DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    // D3D12 flip-model 硬性要求：ResizeBuffers 前必须释放对旧 back buffer 的所有引用，
+    // 否则返回 DXGI_ERROR_INVALID_CALL，且重试永远不会成功（DWM 竞争与引用计数无关）。
+    // 之前此处保留了 backBuffers 的 ComPtr 与 rtvHandles，导致窗口第一次放大时
+    // ResizeBuffers 必然失败 → 走重建分支 → 重建出的 swapchain 是 1x1 占位尺寸 →
+    // 画面被拉伸成一片纯灰色，且之后尺寸被记为放大后尺寸而永不修复。
+    s->backBuffers.clear();
+    s->rtvHandles.clear();
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
     // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
@@ -779,12 +790,43 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     //   6. RENDER_TARGET → PRESENT（backbuffer）
     //   7. 源纹理 → COMMON（下一帧准备）
     {
+        // P67：可见光追演示（默认关闭，DX12_RT_DEMO=1 开启）。
+        // 演示已实机验证跑通；默认不占用渲染开销、不遮挡 UI。
+        bool rtReady = false;
+        static const bool rtDemoEnabled = []() {
+            const char* v = std::getenv("DX12_RT_DEMO");
+            return v && v[0] == '1';
+        }();
+        if (rtDemoEnabled) {
+            std::string rtErr;
+            if (ensureDxrDemo(rtErr) && dxrDemoDispatch(cmd, nowMs() * 0.001, rtErr)) {
+                rtReady = true;
+            } else if (!rtErr.empty()) {
+                static bool rtErrLogged = false;
+                if (!rtErrLogged) {
+                    rtErrLogged = true;
+                    dbgLog("DXR demo: %s", rtErr.c_str());
+                }
+            }
+            // dxrDemoDispatch 切换到了自己的描述符堆，必须恢复本帧 drawHeap，
+            // 否则随后的 blit 根表绑定会落到错误的堆上。
+            ID3D12DescriptorHeap* heaps[] = { deviceContextForJni().drawHeap.Get() };
+            cmd->SetDescriptorHeaps(1, heaps);
+        }
+
         // 1. PRESENT → RENDER_TARGET
         // 使用 transitionTo 而非裸 barrier：将 dst 纳入 ctx->resourceState 跟踪，
         // 使 endCommandList 的 PRESENT 清理循环能正确回切到 COMMON。
         // 初始锚点用 COMMON（flip model 下实际为 PRESENT，但 PRESENT→RENDER_TARGET
         // 与 COMMON→RENDER_TARGET 等价，driver 会忽略冗余 PRESENT→PRESENT barrier）。
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        // 显式设置全屏 viewport/scissor：blit 依赖命令列表遗留状态不可靠，
+        // 且后续 RT 小窗需要在此基础上缩放。
+        D3D12_VIEWPORT fullVp{ 0.0f, 0.0f, (FLOAT)w, (FLOAT)h, 0.0f, 1.0f };
+        D3D12_RECT fullRect{ 0, 0, (LONG)w, (LONG)h };
+        cmd->RSSetViewports(1, &fullVp);
+        cmd->RSSetScissorRects(1, &fullRect);
 
         // 2. 绑定 RTV 和根签名
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
@@ -814,6 +856,37 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         dbgLogDebug("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
         cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
         dbgLogDebug("blitSurface: drawIndexed done");
+
+        // P67：右下角小窗展示光追结果（RT 纹理 -> blit 管线 -> backbuffer）。
+        if (rtReady) {
+            ID3D12Resource* rtTex = dxrDemoOutputTexture();
+            const UINT margin = 12;
+            UINT ow = w / 4;
+            UINT oh = ow * 9 / 16;   // 与 512x288 输出同比例
+            if (rtTex && ow >= 32 && oh >= 18 && ow + margin <= w && oh + margin <= h) {
+                D3D12_VIEWPORT rtVp{};
+                rtVp.TopLeftX = (FLOAT)(w - ow - margin);
+                rtVp.TopLeftY = (FLOAT)(h - oh - margin);
+                rtVp.Width = (FLOAT)ow;
+                rtVp.Height = (FLOAT)oh;
+                rtVp.MinDepth = 0.0f;
+                rtVp.MaxDepth = 1.0f;
+                D3D12_RECT rtRect{ (LONG)rtVp.TopLeftX, (LONG)rtVp.TopLeftY,
+                                   (LONG)(rtVp.TopLeftX + (FLOAT)ow),
+                                   (LONG)(rtVp.TopLeftY + (FLOAT)oh) };
+                cmd->RSSetViewports(1, &rtVp);
+                cmd->RSSetScissorRects(1, &rtRect);
+                // 输出纹理已由 dxrDemoDispatch 置为 PIXEL_SHADER_RESOURCE，直接绑定。
+                if (blitBindRawTextureSRV(ctx, rtTex, cmd, err)) {
+                    cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                } else {
+                    dbgLog("blitSurface: RT overlay bind FAILED: %s", err.c_str());
+                }
+                // 恢复全屏视口，避免影响同 list 后续绘制。
+                cmd->RSSetViewports(1, &fullVp);
+                cmd->RSSetScissorRects(1, &fullRect);
+            }
+        }
 
         // 6. RENDER_TARGET → PRESENT
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);

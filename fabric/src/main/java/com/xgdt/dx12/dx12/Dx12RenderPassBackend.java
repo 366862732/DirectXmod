@@ -345,7 +345,14 @@ public class Dx12RenderPassBackend implements RenderPassBackend {
         // 故此处必须再翻转一次（outputHeight - y - height）才能落到 D3D12 坐标系。
         // 若原样直通，裁剪区会沿屏幕中线镜像：列表项被上移裁剪（选中框缺上边框、首行文字
         // 被切），表现为「标签整体上移」。
-        int scissorY = this.outputHeight - y - height;
+        //
+        // P31b：离屏图集 pass（flipY=true）例外——该 pass 的顶点已在 shader 里做过
+        // gl_Position.y 取反，内容本身就被绘制到「垂直镜像」的位置，因此 scissor 必须
+        // 与原样 GL 坐标保持一致，不能再翻转一次。GuiItemAtlas 的逐槽位 scissor 就是
+        // 这种情况：若此处再翻转，16×16 的槽位裁剪区会与镜像后的绘制内容错开
+        // （实测物品图集整张为空 → 创造模式物品栏所有格子无图标）。
+        // 同理，GuiItemAtlas 的槽位 clear 区域在 native 侧也是原样直通，与此一致。
+        int scissorY = this.flipY ? y : this.outputHeight - y - height;
         if (!Dx12Native.dx12SetScissor(this.ctx, x, scissorY, width, height)) {
             LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, scissorY, width, height);
         }

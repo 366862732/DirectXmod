@@ -119,6 +119,9 @@ public class Dx12Device implements GpuDeviceBackend {
         this.defaultShaderSource = defaultShaderSource;
         String probe = Dx12Native.dx12CreateDevice();
         LOGGER.info("[dx12] Device probe + resource self-test: {}", probe);
+        LOGGER.info("[dx12] Capabilities: {}", Dx12Native.dx12GetCapabilities());
+        // P67：DXR 冒烟测试——验证 BLAS/TLAS/RTPSO/DispatchRays/readback 全链路。
+        LOGGER.info("[dx12] {}", Dx12Native.dx12RunDxrSmokeTest());
         long frequency = Dx12Native.dx12GetTimestampFrequency();
         if (frequency == 0) {
             LOGGER.warn("[dx12] GetTimestampFrequency returned 0; timestampPeriod=1.0");
@@ -548,19 +551,21 @@ public class Dx12Device implements GpuDeviceBackend {
             // 在有深度缓冲的 GUI atlas pass（flipY=true）中使用时，depthFunc=NEVER 导致所有 fragment
             // 深度测试失败 → 物品全黑消失。覆盖为 GREATER_EQUAL。
             DepthStencilState dss = pipeline.getDepthStencilState();
-            if (flipY && loc.contains("/item_cutout") && dss.depthTest() == CompareOp.NEVER_PASS) {
+            if (flipY && (loc.contains("/item_cutout") || loc.contains("/item_translucent"))
+                    && dss.depthTest() == CompareOp.NEVER_PASS) {
                 dss = new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, dss.writeDepth());
-                System.err.println("[dx12-java] [P31] item_cutout depthTest: NEVER_PASS→GREATER_EQUAL (flipY)");
+                System.err.println("[dx12-java] [P31] " + loc + " depthTest: NEVER_PASS→GREATER_EQUAL (flipY)");
                 System.err.flush();
             }
             writeDepthState(desc, dss);
         }
 
-        // P31：shader Y-flip 会反转三角形绕序（CCW→CW），若仍按 CullMode=BACK 剔除，所有三角形被判为背面。
-        // animate_sprite / entity_cutout / item_cutout 三类管线在 flipY=true 时均需关闭剔除。
+        // P31/P31c：shader Y-flip 会反转三角形绕序（CCW→CW），若仍按 CullMode=BACK 剔除，所有三角形被判为背面。
+        // flipY pass 内所有管线都注入了 Y 翻转（见 Dx12ShaderCompiler），因此必须统一关闭剔除；
+        // 仅按管线名匹配会漏掉 entity_solid / entity_translucent / entity_cutout_dissolve 等，
+        // 表现为玩家预览人物整体消失或内外翻转。
         boolean cull = pipeline.isCull();
-        boolean needsCullDisable = loc.contains("animate_sprite")
-            || (flipY && (loc.contains("/entity_cutout") || loc.contains("/item_cutout")));
+        boolean needsCullDisable = loc.contains("animate_sprite") || flipY;
         if (needsCullDisable) {
             cull = false;
             System.err.println("[dx12-java] [P31] cull=false for " + loc + " (flipY=" + flipY + ")");

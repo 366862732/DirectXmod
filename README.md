@@ -11,11 +11,13 @@
 
 ### 核心特点
 
-- **Mixin 注入**：12 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载/世界加载/区块/摄像机/雾效全链路诊断（见 [Mixin 注入点](#mixin-注入点)）
+- **Mixin 注入**：27 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载/世界加载/区块/摄像机/雾效全链路诊断 + 渲染性能 Prof 插桩 + 自定义视频设置界面替换（见 [Mixin 注入点](#mixin-注入点)）
 - **官方 GpuBackend 接口**：完整实现 `GpuBackend` / `GpuDeviceBackend` / `CommandEncoderBackend` / `RenderPassBackend` / `GpuSurfaceBackend` 等官方接口
 - **零自定义渲染循环**：不复写 `RenderSystem`，完全接管 Minecraft 官方的渲染流程
 - **Shaderc + Spvc 编译链**：GLSL → SPIR-V（shaderc）→ HLSL SM5.1（spvc）→ DXBC（D3DCompile）
 - **资源安全**：所有 D3D12 资源通过 Java 包装类（`Dx12Gpu*`）管理，随 Minecraft 生命周期自动释放
+- **DirectX 12.2 / RT 管线**：设备能力检测（FL 12_2，Raytracing Tier / Mesh Shader / VRS / Sampler Feedback）+ DXR 光追链路（BLAS → TLAS → RTPSO → `DispatchRays` + Shader Binding Table → UAV 读回），光追演示输出（512×288，棋盘地面 + 3 彩盒）作为像素资源叠加进光栅管线
+- **自定义视频设置界面**：`Dx12VideoSettingsScreen` 替换原版视频设置界面，Reese's Sodium Options 风格深色主题（整屏面板 / 顶部搜索 / 左侧分组导航 / 右侧选项行 / 底部 Apply-Done），直接读写原版 `Options` 的 `OptionInstance`，行为/存档/快捷键/重启提示不变，"图形 API" 行灰化并固定显示当前实际后端（DirectX 12）
 - **配置界面**：Fx12Config 持久化配置，Dx12SettingsScreen 设置界面，ModMenu 集成
 - **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
 - **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
@@ -51,6 +53,8 @@
 | **P32: Async Phase 1（C++）** | ✅ 已完成 | 异步 Fence/Bundle/Descriptor/Executor C++ 基础设施完成（487 行头文件 + 1253 行 cpp）；per-worker 镜像堆 + SetEventOnCompletion + COM 主线程释放；Java 侧异步包未纳入本次提交 |
 | **P33: JNI 异步描述符绑定** | ✅ 已完成 | jni_bridge_p33.cpp（605 行）新增异步描述符管理的 native 接口 |
 | **CS_OWNDC 窗口修复** | ✅ 已完成 | 修复 Windows CS_OWNDC 类窗口在 DX12 下 swapchain 创建失败的兼容性问题 |
+| **P66: DX12.2 设备能力检测** | ✅ 已完成 | 优先请求 FL 12_2（DX12 Ultimate），通过 `ID3D12Device5` 检测 Raytracing Tier（1.0/1.1）、Mesh Shader / VRS / Sampler Feedback，日志输出设备能力摘要 |
+| **P67: DXR 光追管线（冒烟测试 + 演示）** | ✅ 已完成 | BLAS → TLAS → RTPSO（RayGen/ClosestHit/AnyHit/Miss + Hit Group）→ `DispatchRays` + SBT → UAV 写回 → `CopyTextureRegion` 读回；单三角形冒烟测试独立 queue/fence 跑完即释放；可见演示 512×288（棋盘地面 + 3 彩盒，MaxTraceRecursionDepth=2），输出纹理作为 PIXEL_SHADER_RESOURCE 叠加进光栅管线；`dxrSmokeTestStandalone` / `dxrDemoStandalone` 诊断入口（dllexport） |
 
 ## 项目结构
 
@@ -63,7 +67,8 @@ dx12-lib-template-26.1.2/
 │   │   ├── config/
 │   │   │   └── Dx12Config.java     # 配置持久化（aa_mode 等，Properties 格式）
 │   │   ├── gui/
-│   │   │   └── Dx12SettingsScreen.java # AA 模式设置 GUI（None/FXAA/SMAA/TAA）
+│   │   │   ├── Dx12SettingsScreen.java  # AA 模式设置 GUI（None/FXAA/SMAA/TAA）
+│   │   │   └── Dx12VideoSettingsScreen.java # 自定义视频设置界面（RSO 深色主题，替换原版 VideoSettingsScreen，775 行）
 │   │   ├── mixin/
 │   │   │   ├── PreferredGraphicsApiMixin.java          # 将 D3D12 设为首选图形 API
 │   │   │   ├── GameRendererRenderDebugMixin.java       # P16: renderLevel 诊断（frame/resourcesLoaded等）
@@ -99,7 +104,7 @@ dx12-lib-template-26.1.2/
 │   │   └── Dx12DeviceTest.java           # 单元测试（渲染循环验证）
 │   ├── src/main/resources/
 │   │   ├── fabric.mod.json           # Fabric 模组描述（client + modmenu entrypoints）
-│   │   ├── gl4dx12.mixins.json       # Mixin 配置（9 个 mixin）
+│   │   ├── gl4dx12.mixins.json       # Mixin 配置（27 个 mixin，client）
 │   │   ├── dx12_mc.dll               # 原生 DLL（从 JAR 提取，运行时替换到 {user.dir}）
 │   │   └── assets/dx12mod/icon.png   # 模组图标（16x16）
 │   ├── libs/
@@ -117,6 +122,9 @@ dx12-lib-template-26.1.2/
 │   │   ├── jni_bridge_p5.cpp         # P5 交换链 + 读回 native（417 行）
 │   │   ├── jni_bridge_p6.cpp         # P6 绘制 native（159 行）
 │   │   ├── jni_bridge_p33.cpp        # P33 异步描述符管理 native（605 行）
+│   │   ├── dx12_raytracing.cpp       # P67 DXR 光追：冒烟测试 + 可见演示（BLAS/TLAS/RTPSO/DispatchRays，1305 行）
+│   │   ├── dxr_shader_bytes.h        # DXR 冒烟测试 lib_6_3 DXIL 着色器字节（g_dxrSmokeLib）
+│   │   ├── dxr_demo_bytes.h          # DXR 演示 lib_6_3 DXIL 着色器字节（g_dxrDemoLib，RayGen/ClosestHit/AnyHit/Miss）
 │   │   ├── dx12_async_bundle.h/.cpp  # Bundle 录制与执行（142/181 行）
 │   │   ├── dx12_async_descriptor.h/.cpp  # Per-worker 镜像描述符堆（109/104 行）
 │   │   ├── dx12_async_executor.h/.cpp    # 异步命令分发器（100/179 行）
@@ -199,7 +207,7 @@ Dx12CompiledRenderPipeline (handle ≠ 0 表示成功)
 
 ### Mixin 注入点
 
-12 个 Mixin 覆盖从 API 选择到世界加载/渲染全链路诊断：
+27 个 Mixin 覆盖从 API 选择到世界加载/渲染/视频设置界面全链路诊断 + 渲染性能 Prof 插桩：
 
 ```java
 // PreferredGraphicsApiMixin.java — 强制 D3D12 为首选
@@ -242,10 +250,70 @@ public abstract class PreferredGraphicsApiMixin {
 //   inject: FogRenderer.update() → 打印雾效配置与状态
 
 // SectionRenderDispatcherGetSliceDebugMixin.java — P30: 区块切片调度
-//   inject: SectionRenderDispatcher.getSlice() → 打印区块切片分配状态
+//   inject: SectionRenderDispatcher.getSlice() HEAD → 打印区块切片分配状态
+
+// GuiSetScreenMixin.java — 自定义视频设置界面
+//   @ModifyVariable(Gui.setScreen) HEAD → 当入参恰好是 VideoSettingsScreen 时，
+//   替换为 Dx12VideoSettingsScreen（RSO 深色主题）；其余界面不受影响
+
+// KonkreteRenderUtilsMixin.java / OptionsListHeaderMixin / OptionsListRowMixin
+//   视频设置界面行渲染与列表适配（header/row）
+
+// *ProfMixin.java（GameRenderer/GuiRenderer/LevelRenderer/MinecraftRenderFrame/
+//   FrameGraphBuilder/PreparedFrame/SectionRenderDispatcher/ChunkSectionsToRender/
+//   SectionOcclusionGraph/FeatureRenderDispatcher，共 10 个）— 渲染性能 Prof 插桩
+//   各渲染阶段计时 + 帧图构建诊断，输出耗时分布
 ```
 
 Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Backend`。
+
+## DirectX 12.2 / RT（光追）管线（P66 + P67）
+
+在 D3D12 光栅化后端之外，本项目额外打通了完整的 **DX12 Ultimate（FL 12_2 / DXR）** 光追链路，作为能力验证 + 渲染特性演示。
+
+### P66：设备能力检测
+
+设备创建时优先请求 FL 12_2（DX12 Ultimate），通过 `ID3D12Device5` 一次性探测并记录：
+
+- **Raytracing Tier**（1.0 / 1.1）
+- **Mesh Shader / VRS / Sampler Feedback** 能力
+- 结果写入 `DeviceContext`（`device5` / `raytracingTier` 等字段），并输出设备能力摘要日志
+
+`raytracingTier >= 1.0` 时 `device5` 非空，作为后续所有 RT 调用的入口。
+
+### P67：DXR 光追链路（冒烟测试 + 可见演示）
+
+完整跑通一条真实的 DirectX Raytracing 链路：
+
+```
+场景几何（三角形 mesh）
+  │
+  ▼
+BLAS（Bottom-Level AS）        ← 自研构建
+  │
+  ▼
+TLAS（Top-Level AS，1 实例）   ← 自研构建
+  │
+  ▼
+RTPSO（CreateStateObject）     ← DXIL 着色器库（lib_6_3，dxc 预编译）
+  │  RayGen / ClosestHit / AnyHit / Miss + HitGroup
+  │  MaxTraceRecursionDepth = 2
+  │
+  ▼
+DispatchRays（Shader Binding Table）
+  │
+  ▼
+UAV 写回 → CopyTextureRegion → Map readback（CPU 验证）
+```
+
+两种形态：
+
+| 形态 | 说明 |
+|------|------|
+| **冒烟测试** `runDxrSmokeTest()` | 单三角形 BLAS → 1 实例 TLAS → RTPSO → `DispatchRays(64×64)` → 读回验证；独立 queue/allocator/fence，跑完即释放 |
+| **可见演示** `initDxrDemo()` / `dxrDemoDispatch()` | 512×288 输出纹理 + 场景（棋盘地面 + 3 个彩盒，最多 48 三角形）；BLAS/TLAS 在首次 dispatch 时惰性构建，输出纹理作为 PIXEL_SHADER_RESOURCE 叠加进光栅管线 |
+
+诊断入口：`dxrSmokeTestStandalone()` / `dxrDemoStandalone()`（`dllexport`），可独立驱动验证。
 
 ## 已完成功能
 
@@ -275,6 +343,9 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 | **异步渲染 Bug 修复** | ✅ 已完成 | ASYNC-01（per-worker CPU-only 镜像堆）+ ASYNC-03（非阻塞 tryBeginFrame）+ ASYNC-04（SetEventOnCompletion 事件驱动）+ ASYNC-05（COM 资源主线程释放）+ ASYNC-09（CommandSignature 参数修复）+ ASYNC-10（PSO 边界切分 Bundle） |
 | **CS_OWNDC 兼容性** | ✅ 已完成 | Windows CS_OWNDC 类窗口的 DX12 swapchain 创建失败修复 |
 | **shader 诊断探针** | ✅ 已完成 | whitelight/uv2viz/lightmapviz 探针 + DIAG_GRAY/UV2_VIZ/LIGHTMAP_VIZ/DUMP_SHADER 等环境变量驱动 |
+| **P66 设备能力检测** | ✅ 已完成 | 优先请求 FL 12_2（DX12 Ultimate），经 `ID3D12Device5` 检测 Raytracing Tier / Mesh Shader / VRS / Sampler Feedback，输出能力摘要日志 |
+| **P67 DXR 光追管线** | ✅ 已完成 | BLAS → TLAS → RTPSO → `DispatchRays` + SBT → UAV 写回读回；单三角形冒烟测试 + 512×288 可见演示（棋盘地面 + 3 彩盒），输出叠加进光栅管线；`dxrSmokeTestStandalone` / `dxrDemoStandalone` 诊断入口 |
+| **自定义视频设置界面** | ✅ 已完成 | `Dx12VideoSettingsScreen`（775 行）替换原版 VideoSettingsScreen，RSO 深色主题（整屏面板/搜索栏/分组导航/选项行/底部按钮），直接读写原版 `OptionInstance`，"图形 API" 行灰化固定显示当前后端（DirectX 12） |
 
 ## 关键设计原则
 

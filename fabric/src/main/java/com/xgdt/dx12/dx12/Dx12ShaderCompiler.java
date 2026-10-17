@@ -184,9 +184,15 @@ public class Dx12ShaderCompiler implements AutoCloseable {
 
         String vertexHlsl = vertexWork.toHlsl(true);
         String fragmentHlsl = fragmentWork.toHlsl(false);
-        // P31：在 GUI 离屏 pass（flipY=true，仅 GuiItemAtlas / PictureInPicture 离屏图集）
-        // 中，对 entity_cutout / item_cutout / animate_sprite 管线注入 gl_Position.y 翻转，
-        // 抵消这些 pass 的 invertY=true 正交投影在 D3D12（NDC Y 向上）下多出的一次 Y 镜像。
+        // P31/P31c：在 GUI 离屏 pass（flipY=true，仅 GuiItemAtlas / PictureInPicture 离屏图集）
+        // 中，对该 pass 内**所有**管线注入 gl_Position.y 翻转，抵消这些 pass 的 invertY=true
+        // 正交投影在 D3D12（NDC Y 向上）下多出的一次 Y 镜像。
+        // P31c 之前只按名称匹配 entity_cutout / item_cutout / item_translucent，遗漏了：
+        //  - PIP 玩家预览实际使用 entity_solid / entity_translucent（人物上下颠倒）；
+        //  - 物品图集里旗帜/床/箱子/告示牌等方块实体物品走 entity_* 系列管线，未翻转后
+        //    被画到垂直镜像的槽位，blit 按原槽位 UV 采样 → 这些物品图标整片缺失。
+        // 由于 flipY 是「目标纹理 + 该 pass 的投影」属性，与该 pass 用哪条管线无关，
+        // 直接对整个 pass 生效最稳妥。
         // scissor 由 Dx12RenderPassBackend 原样直通，无需再翻转。
         // 注意：这些管线在 flipY=false 时保持原始着色器，主世界 3D 渲染方向不受影响。
         //
@@ -201,9 +207,7 @@ public class Dx12ShaderCompiler implements AutoCloseable {
         // 仅用于图集烘制的管线**无条件**注入 gl_Position.y 翻转。
         String pipelineLocation = pipeline.getLocation().toString();
         boolean isAtlasBake = pipelineLocation.contains("animate_sprite");
-        boolean needsYFlip = isAtlasBake
-            || (flipY && (pipelineLocation.contains("entity_cutout")
-                || pipelineLocation.contains("item_cutout")));
+        boolean needsYFlip = isAtlasBake || flipY;
         // P28 诊断：打印 pipelineLocation + flipY + needsYFlip，便于追踪注入路径（P29：仅 verbose 输出）
         if (Dx12Native.LOG_VERBOSE) {
             System.err.println("[dx12-java] [P28] " + pipelineLocation + " flipY=" + flipY + " needsYFlip=" + needsYFlip);

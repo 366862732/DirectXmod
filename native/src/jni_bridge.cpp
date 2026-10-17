@@ -46,15 +46,29 @@ JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateDevice(
     dx12mc::dbgLog("dx12: log level=%d (0=ERR 1=WARN 2=INFO 3=DEBUG), DX12_LOG_VERBOSE=%s",
         verbose && *verbose ? 3 : 1, verbose ? verbose : "off");
     auto& ctx = dx12mc::deviceContextForJni();
-    int level = ctx.featureLevel & 0xffff;
+    int level = (int)ctx.featureLevel;
     char levelName[64];
-    snprintf(levelName, sizeof(levelName), "D3D_FEATURE_LEVEL_%d_%d", level / 10, level % 10);
+    // FL 编码为 0xXY00（0xc200 = 12_2），必须按十六进制位取，不能用十进制除余。
+    snprintf(levelName, sizeof(levelName), "D3D_FEATURE_LEVEL_%d_%d",
+        (level >> 12) & 0xF, (level >> 8) & 0xF);
     std::string result = ctx.adapterName.empty() ? "<unknown adapter>" : ctx.adapterName;
     result += " (";
     result += levelName;
     result += "); ";
     result += dx12mc::runResourceSelfTest();
     return toJString(env, result);
+}
+
+// P66：返回设备能力摘要（featureLevel / DXR / mesh shader / VRS / sampler feedback）。
+JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetCapabilities(
+    JNIEnv* env, jclass) {
+    return toJString(env, dx12mc::deviceCapabilities());
+}
+
+// P67：DXR 冒烟测试（BLAS + TLAS + RTPSO + DispatchRays + readback）。
+JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12RunDxrSmokeTest(
+    JNIEnv* env, jclass) {
+    return toJString(env, dx12mc::runDxrSmokeTest());
 }
 
 JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateTexture(

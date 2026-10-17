@@ -20,6 +20,7 @@ include_directories("${JAVA_HOME}/include" "${JAVA_HOME}/include/win32")
 add_library(dx12_mc SHARED
     src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
+    src/dx12_raytracing.cpp
     src/dx12_async_executor.cpp
     src/dx12_async_bundle.cpp
     src/dx12_async_descriptor.cpp

@@ -666,6 +666,9 @@ bool ensureDevice(std::string& errorOut) {
     }
 
     const D3D_FEATURE_LEVEL levels[] = {
+        // P66：优先请求 FL 12_2（DX12 Ultimate：DXR 1.0/1.1、Mesh Shader、VRS、
+        // Sampler Feedback 全特性）。不支持时逐级回退，行为与之前一致。
+        D3D_FEATURE_LEVEL_12_2,
         D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
     };
@@ -692,6 +695,47 @@ bool ensureDevice(std::string& errorOut) {
     }
     gCtx.device = device;
     gCtx.adapterName = queryAdapterName(device.Get());
+    // P66：探测 DX12 Ultimate（FL 12_2）能力。这一步只做查询，不改变任何渲染路径；
+    // 目的是确认 DXR / Mesh Shader / VRS / Sampler Feedback 是否可用，为后续
+    // 光线追踪实验提供入口（ID3D12Device5）。
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5{};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,
+                &opts5, sizeof(opts5)))) {
+            gCtx.raytracingTier = (int)opts5.RaytracingTier;
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7{};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7,
+                &opts7, sizeof(opts7)))) {
+            gCtx.meshShaderTier = (int)opts7.MeshShaderTier;
+            gCtx.samplerFeedbackTier = (int)opts7.SamplerFeedbackTier;
+        }
+        // VRS 的能力位在 OPTIONS6（OPTIONS9 是 mesh shader 统计/原子操作等）。
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6,
+                &opts6, sizeof(opts6)))) {
+            gCtx.vrsTier = (int)opts6.VariableShadingRateTier;
+        }
+        if (gCtx.raytracingTier >= (int)D3D12_RAYTRACING_TIER_1_0) {
+            device.As(&gCtx.device5);
+        }
+        int fl = (int)gCtx.featureLevel;
+        // MeshShaderTier: 0=不支持 / 10=Tier 1；SamplerFeedbackTier: 0 / 90(0.9) / 100(1.0)。
+        const char* meshText = gCtx.meshShaderTier > 0 ? "1" : "none";
+        const char* sfText = gCtx.samplerFeedbackTier >= 100 ? "1.0"
+                           : (gCtx.samplerFeedbackTier >= 90 ? "0.9" : "none");
+        dbgLog("device: FL %d_%d, DXR tier %d.%d (device5=%d), mesh shader tier %s, "
+               "VRS tier %d, sampler feedback tier %s",
+            (fl >> 12) & 0xF, (fl >> 8) & 0xF,
+            gCtx.raytracingTier / 10, gCtx.raytracingTier % 10,
+            gCtx.device5 ? 1 : 0, meshText, gCtx.vrsTier, sfText);
+        if (gCtx.raytracingTier == 0) {
+            dbgLog("device: DXR not supported by this adapter/runtime");
+        } else if (!gCtx.device5) {
+            dbgLog("device: DXR tier %d reported but ID3D12Device5 unavailable",
+                gCtx.raytracingTier);
+        }
+    }
     // 存储与 device 绑定的 DXGI adapter（供 swapchain 创建使用，避免 factory/adapter 不匹配）。
     {
         LUID luid = device->GetAdapterLuid();
@@ -812,12 +856,28 @@ void destroyDevice() {
     // 进程退出前释放所有延迟删除对象（若此后不再有 submit，pending 不会
     // 被 flush，需在此兜底）。
     flushPendingDeletes(/*force=*/true);
+    resetDxrDemo();
     gCtx = DeviceContext{};
     dbgLog("destroyDevice: done");
 }
 
 DeviceContext& deviceContextForJni() {
     return gCtx;
+}
+
+std::string deviceCapabilities() {
+    int fl = (int)gCtx.featureLevel;
+    // MeshShaderTier: 0 / 10(Tier 1)；SamplerFeedbackTier: 0 / 90(0.9) / 100(1.0)。
+    const char* meshText = gCtx.meshShaderTier > 0 ? "1" : "none";
+    const char* sfText = gCtx.samplerFeedbackTier >= 100 ? "1.0"
+                       : (gCtx.samplerFeedbackTier >= 90 ? "0.9" : "none");
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "featureLevel=%d_%d;raytracing=%d.%d;device5=%d;meshShader=%s;vrs=%d;samplerFeedback=%s",
+        (fl >> 12) & 0xF, (fl >> 8) & 0xF,
+        gCtx.raytracingTier / 10, gCtx.raytracingTier % 10,
+        gCtx.device5 ? 1 : 0, meshText, gCtx.vrsTier, sfText);
+    return buf;
 }
 
 uintptr_t getDeviceHandle() {
@@ -4340,7 +4400,15 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     transitionTextureTo(ctx, srcTex,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
         | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return blitBindRawTextureSRV(ctx, srcTex->resource.Get(), cmd, err);
+}
 
+bool blitBindRawTextureSRV(CommandContext* ctx, ID3D12Resource* res,
+    ID3D12GraphicsCommandList* cmd, std::string& err) {
+    if (!ctx || !res) {
+        err = "blitBindRawTextureSRV: null ctx/resource";
+        return false;
+    }
     // P24 fix（黑屏根因之一）：SRV 必须写入命令列表当前设置的堆。
     // 此前在 srvHeap 分配 SRV 并直接 SetGraphicsRootDescriptorTable，但
     // beginCommandList 只 SetDescriptorHeaps({drawHeap}) → 每帧验证错误
@@ -4349,7 +4417,7 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     // 改为复用 pushDescriptors 的机制：把 SRV 写到本帧 drawHeap 瞬态槽位，
     // root table 绑定该槽位的 GPU 句柄（与命令列表当前堆一致）。
     if (ctx->nextDrawSlot + 1 > syncRingCapacity()) {
-        err = "blitBindSourceTexture: draw descriptor heap exhausted for this frame";
+        err = "blitBindRawTextureSRV: draw descriptor heap exhausted for this frame";
         return false;
     }
     SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
@@ -4357,7 +4425,7 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     srvCpu.ptr += base;
     ctx->nextDrawSlot += 1;
 
-    DXGI_FORMAT viewFmt = srcTex->resource->GetDesc().Format;
+    DXGI_FORMAT viewFmt = res->GetDesc().Format;
     switch (viewFmt) {
         case DXGI_FORMAT_D32_FLOAT:            viewFmt = DXGI_FORMAT_R32_FLOAT; break;
         case DXGI_FORMAT_D16_UNORM:            viewFmt = DXGI_FORMAT_R16_UNORM; break;
@@ -4369,14 +4437,14 @@ bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
     srvDesc.Texture2D.MostDetailedMip = 0;
-    gCtx.device->CreateShaderResourceView(srcTex->resource.Get(), &srvDesc, srvCpu);
+    gCtx.device->CreateShaderResourceView(res, &srvDesc, srvCpu);
 
     // 绑定根描述符表（表 0 = blit 的 SRV；drawHeap 已是命令列表当前设置的堆）。
     D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
     srvGpu.ptr += base;
     cmd->SetGraphicsRootDescriptorTable(0, srvGpu);
     // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
-    dbgLogDebug("blitBindSourceTexture: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
+    dbgLogDebug("blitBindRawTextureSRV: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
         ctx->drawHeapSlotBase, ctx->nextDrawSlot, (unsigned long long)srvGpu.ptr);
     return true;
 }

@@ -270,9 +270,12 @@ public class Dx12CommandEncoderBackend implements CommandEncoderBackend {
                 int usage = ((Dx12GpuTexture) first.textureView().texture()).usage();
                 if (usage == 13) {
                     flipY = true;
-                    System.err.println("[dx12-java] [P28] flipY=true for offscreen GUI atlas/PIP pass ("
-                        + w + "x" + h + ")");
-                    System.err.flush();
+                    // 每个离屏 pass 都会命中（实测单次启动 6 万+ 次），必须走 verbose 门控。
+                    if (Dx12Native.LOG_VERBOSE) {
+                        System.err.println("[dx12-java] [P28] flipY=true for offscreen GUI atlas/PIP pass ("
+                            + w + "x" + h + ")");
+                        System.err.flush();
+                    }
                 }
             }
         }

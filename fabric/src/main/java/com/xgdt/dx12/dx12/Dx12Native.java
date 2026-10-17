@@ -93,6 +93,18 @@ public final class Dx12Native {
      */
     public static native String dx12CreateDevice();
 
+    /**
+     * Query DX12 Ultimate capabilities (feature level / DXR / mesh shader / VRS /
+     * sampler feedback), e.g. "featureLevel=12_2;raytracing=1.1;device5=1;...".
+     */
+    public static native String dx12GetCapabilities();
+
+    /**
+     * Run the native DXR smoke test (single-triangle BLAS/TLAS, RTPSO,
+     * DispatchRays 64x64, GPU readback). Returns a one-line result summary.
+     */
+    public static native String dx12RunDxrSmokeTest();
+
     /** Create a texture; returns a native handle (long = Dx12Object*). */
     public static native long dx12CreateTexture(int usage, int format, int width,
         int height, int depthOrLayers, int mipLevels);

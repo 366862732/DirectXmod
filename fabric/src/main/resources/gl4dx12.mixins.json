@@ -25,7 +25,10 @@
         "FeatureRenderDispatcherProfMixin",
         "PreparedFrameProfMixin",
         "FrameGraphBuilderProfMixin",
-        "KonkreteRenderUtilsMixin"
+        "KonkreteRenderUtilsMixin",
+        "GuiSetScreenMixin",
+        "OptionsListRowMixin",
+        "OptionsListHeaderMixin"
     ],
     "injectors": {
         "defaultRequire": 1
