@@ -24,7 +24,8 @@
         "SectionOcclusionGraphProfMixin",
         "FeatureRenderDispatcherProfMixin",
         "PreparedFrameProfMixin",
-        "FrameGraphBuilderProfMixin"
+        "FrameGraphBuilderProfMixin",
+        "KonkreteRenderUtilsMixin"
     ],
     "injectors": {
         "defaultRequire": 1
