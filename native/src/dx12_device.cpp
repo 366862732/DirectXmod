@@ -1,4 +1,5 @@
 #include "dx12_device.h"
+#include "dx12_rt_scene.h"
 
 #include <dxgi.h>
 
@@ -857,6 +858,7 @@ void destroyDevice() {
     // 被 flush，需在此兜底）。
     flushPendingDeletes(/*force=*/true);
     resetDxrDemo();
+    rtResetAll();
     gCtx = DeviceContext{};
     dbgLog("destroyDevice: done");
 }
@@ -1033,6 +1035,11 @@ D3D12_RESOURCE_FLAGS textureFlags(int usage, int format) {
     if (usage & 8) {  // RENDER_ATTACHMENT
         flags |= hasDepthAspect(format) ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                                         : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    }
+    // P68：光影包的自定义位 32 = UAV（光追 pass 的 RWTexture2D 输出目标）。
+    // 原版 GpuTexture 没有 UAV 概念，这里复用其 usage 位域的空闲位。
+    if (usage & 32) {
+        flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
     return flags;
 }
@@ -2794,18 +2801,28 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         r.BaseShaderRegister = b.reg;
         r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRanges.push_back(r);
-        if (b.type == 1) {
+        if (b.type == 1 || b.type == 3) {
             D3D12_STATIC_SAMPLER_DESC s{};
-            s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-            // 地址模式用 WRAP 对齐 MC 的默认采样器（AbstractTexture 为 REPEAT/REPEAT）。
-            // 此前用 CLAMP 会让任何 UV 超出 [0,1] 的纹理采样退化到边缘像素：天气粒子
-            // (rain/snow) 的 v = y*0.25 + offset 可达 16~40，被 CLAMP 后整根雨柱都取
-            // 边缘行 → 渲染成贯穿屏幕的实心竖条（BUG：雨一条一条）。改为 WRAP 后 v 正常
-            // 平铺，恢复短虚线雨滴。对 UV 已在 [0,1] 内的纹理（图集/字体/lightmap）
-            // WRAP 与 CLAMP 等价，无副作用。
-            s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            // type=1：原版渲染路径（point + WRAP），对齐 MC 默认采样器；
+            // type=3：光影包后处理（linear + CLAMP），供全屏 pass 采样输入纹理。
+            s.Filter = b.type == 3
+                ? D3D12_FILTER_MIN_MAG_MIP_LINEAR
+                : D3D12_FILTER_MIN_MAG_MIP_POINT;
+            if (b.type == 3) {
+                s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            } else {
+                // 地址模式用 WRAP 对齐 MC 的默认采样器（AbstractTexture 为 REPEAT/REPEAT）。
+                // 此前用 CLAMP 会让任何 UV 超出 [0,1] 的纹理采样退化到边缘像素：天气粒子
+                // (rain/snow) 的 v = y*0.25 + offset 可达 16~40，被 CLAMP 后整根雨柱都取
+                // 边缘行 → 渲染成贯穿屏幕的实心竖条（BUG：雨一条一条）。改为 WRAP 后 v 正常
+                // 平铺，恢复短虚线雨滴。对 UV 已在 [0,1] 内的纹理（图集/字体/lightmap）
+                // WRAP 与 CLAMP 等价，无副作用。
+                s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            }
             s.MipLODBias = 0.0f;
             s.MaxAnisotropy = 1;
             s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
@@ -3457,6 +3474,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 ++cbvIdx;
                 break;
             }
+            case 3:   // type=3：SRV + 线性/CLAMP 静态采样器（光影包路径）
             case 1: {  // SRV：复制 texture view 的现有描述符
                 D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)srvIdx * gCtx.drawInc };
                 if (!b.view || b.view->cpuHandle.ptr == 0) {

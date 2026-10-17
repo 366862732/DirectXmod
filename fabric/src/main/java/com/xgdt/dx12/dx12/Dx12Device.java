@@ -99,6 +99,17 @@ public class Dx12Device implements GpuDeviceBackend {
     // （疯狂闪烁）。改为懒加载共享单例复现官方语义。
     private @Nullable Dx12CommandEncoderBackend sharedCommandEncoder;
 
+    /**
+     * 当前设备的共享编码器静态引用：供光影包渲染器等旁路录制方在
+     * {@code RenderSystem.getDevice().createCommandEncoder()} 只暴露包装类时取到
+     * 真正的 backend（原生 ctx 句柄）。
+     */
+    private static volatile @Nullable Dx12CommandEncoderBackend sharedEncoder;
+
+    public static @Nullable Dx12CommandEncoderBackend sharedEncoder() {
+        return sharedEncoder;
+    }
+
     // P4: pipeline + shader caches（镜像官方 VulkanDevice）
     private final Map<RenderPipeline, Dx12CompiledRenderPipeline> pipelineCache = new IdentityHashMap<>();
     /**
@@ -226,6 +237,7 @@ public class Dx12Device implements GpuDeviceBackend {
         if (encoder == null) {
             encoder = new Dx12CommandEncoderBackend(this);
             this.sharedCommandEncoder = encoder;
+            sharedEncoder = encoder;
         }
         return encoder;
     }
@@ -332,6 +344,7 @@ public class Dx12Device implements GpuDeviceBackend {
             encoder.close();
             Dx12Native.dx12DestroyCommandEncoder(encoder.nativeHandle());
             this.sharedCommandEncoder = null;
+            sharedEncoder = null;
         }
         appendJavaLog("device.close: after sharedEncoder.close");
         this.clearPipelineCache();

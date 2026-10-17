@@ -21,6 +21,7 @@ add_library(dx12_mc SHARED
     src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
     src/dx12_raytracing.cpp
+    src/dx12_rt_scene.cpp
     src/dx12_async_executor.cpp
     src/dx12_async_bundle.cpp
     src/dx12_async_descriptor.cpp
@@ -32,6 +33,7 @@ add_library(dx12_mc SHARED
     src/jni_bridge_p5.cpp
     src/jni_bridge_p6.cpp
     src/jni_bridge_p33.cpp
+    src/jni_bridge_p68.cpp
 )
 
 # d3dcompiler：D3DCompile 把 HLSL 编译为 DXBC（vs_5_1/ps_5_1）

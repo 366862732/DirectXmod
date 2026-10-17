@@ -5,6 +5,8 @@
     "client": [
         "PreferredGraphicsApiMixin",
         "GameRendererRenderDebugMixin",
+        "GameRendererShaderPackMixin",
+        "CloudRendererShaderPackMixin",
         "MinecraftRunDebugMixin",
         "MinecraftRunTickDebugMixin",
         "MinecraftSetLevelDebugMixin",
@@ -15,6 +17,7 @@
         "CameraUpdateDebugMixin",
         "FogRendererUpdateDebugMixin",
         "SectionRenderDispatcherGetSliceDebugMixin",
+        "SectionRenderDispatcherRtGeometryMixin",
         "MinecraftRenderFrameProfMixin",
         "GameRendererProfMixin",
         "GuiRendererProfMixin",

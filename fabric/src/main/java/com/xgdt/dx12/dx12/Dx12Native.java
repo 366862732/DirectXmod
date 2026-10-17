@@ -36,6 +36,11 @@ public final class Dx12Native {
         loadNativeLibrary();
     }
 
+    /** native 库是否加载成功（OpenGL 回退时为 false，调用 native 方法会抛 UnsatisfiedLinkError）。 */
+    public static boolean isLoaded() {
+        return loaded;
+    }
+
     private static void loadNativeLibrary() {
         if (loaded) return;
         try {
@@ -104,6 +109,52 @@ public final class Dx12Native {
      * DispatchRays 64x64, GPU readback). Returns a one-line result summary.
      */
     public static native String dx12RunDxrSmokeTest();
+
+    // -----------------------------------------------------------------------
+    // P68：世界几何光追（区块网格 → BLAS 缓存 + TLAS 重建 + DispatchRays）
+    // -----------------------------------------------------------------------
+
+    /**
+     * 上传/更新一个区块 section 的网格几何到光追场景。
+     *
+     * @param key           section 唯一键（SectionPos.asLong()）
+     * @param layer         ChunkSectionLayer.ordinal()（同一 section 各层是独立网格）
+     * @param cx,cy,cz      section 原点（区块坐标，TLAS 实例平移 = 坐标 * 16）
+     * @param vertexBuffer  CPU 侧 DirectByteBuffer（BLOCK 顶点，stride 40）
+     * @param vertexStride  顶点步长（字节）
+     * @param vertexCount   顶点数
+     * @param indexBuffer   CPU 侧 DirectByteBuffer（R16/R32 索引）
+     * @param indexCount    索引数
+     * @param index32       索引是否为 4 字节
+     */
+    public static native boolean dx12RtUpdateSection(long key, int layer,
+        int cx, int cy, int cz,
+        ByteBuffer vertexBuffer, int vertexStride, int vertexCount,
+        ByteBuffer indexBuffer, int indexCount, boolean index32);
+
+    /** 移除一个 section（区块卸载/重建）。 */
+    public static native boolean dx12RtRemoveSection(long key);
+
+    /** 清空整个光追场景（换维度/退出世界）。 */
+    public static native void dx12RtClearScene();
+
+    /** 提交当前帧的 BLAS 分帧构建 + TLAS 重建（需在命令上下文录制期间调用）。 */
+    public static native boolean dx12RtBuildScene(long ctx);
+
+    /**
+     * 录制一次 DispatchRays：以场景深度重建世界位置，输出可见性纹理。
+     *
+     * @param ctx           命令上下文句柄
+     * @param depthView     深度纹理视图句柄（t0）
+     * @param outTexture    输出纹理句柄（u0，需带 UAV 标志位）
+     * @param uniformBuffer uniform 缓冲句柄（b0）
+     * @param uniformOffset 本 pass 的 uniform 槽位字节偏移
+     */
+    public static native boolean dx12RtDispatch(long ctx, long depthView, long outTexture,
+        long uniformBuffer, int uniformOffset, int width, int height);
+
+    /** 返回 "sections=%d built=%d tris=%d tlas=%s" 统计串。 */
+    public static native String dx12RtStats();
 
     /** Create a texture; returns a native handle (long = Dx12Object*). */
     public static native long dx12CreateTexture(int usage, int format, int width,

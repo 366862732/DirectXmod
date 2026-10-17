@@ -5,6 +5,8 @@ import com.mojang.blaze3d.platform.VideoMode;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.xgdt.dx12.dx12.Dx12Native;
+import com.xgdt.dx12.shaderpack.ShaderPack;
+import com.xgdt.dx12.shaderpack.ShaderPackManager;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -87,6 +89,11 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
 
     private int closeX;
     private int closeY;
+
+    private int shaderButtonX;
+    private int shaderButtonY;
+    private int shaderButtonW;
+    private int shaderButtonH;
 
     private int applyX;
     private int applyY;
@@ -256,11 +263,18 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         this.applyX = this.doneX - 6 - this.applyW;
         this.applyY = this.doneY;
 
+        this.shaderButtonW = Math.min(220, this.contentW - 40);
+        this.shaderButtonH = 20;
+        this.shaderButtonX = this.contentX + (this.contentW - this.shaderButtonW) / 2;
+        this.shaderButtonY = this.contentY + 46;
+
         List<Row> shown = this.shownRows();
         if (this.isSupportPage()) {
             int visibleHeight = Math.max(0, this.contentY + this.contentH - this.supportListTop());
             this.maxScroll = Math.max(0,
                 this.supportEntries().size() * ROW_HEIGHT - visibleHeight);
+        } else if (this.isShaderPage()) {
+            this.maxScroll = 0;
         } else {
             int visibleHeight = Math.max(0, this.contentH - 26
                 - (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0));
@@ -335,6 +349,10 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             this.drawSupportPage(graphics);
             return;
         }
+        if (this.isShaderPage()) {
+            this.drawShaderPage(graphics, mouseX, mouseY);
+            return;
+        }
         List<Row> shown = this.shownRows();
         boolean restart = this.options.isRestartRequiredToApplyVideoSettings();
 
@@ -390,6 +408,44 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
 
     private boolean isSupportPage() {
         return this.search.isEmpty() && this.category == Category.DX_SUPPORT;
+    }
+
+    private boolean isShaderPage() {
+        return this.search.isEmpty() && this.category == Category.SHADERS;
+    }
+
+    private void drawShaderPage(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {
+        boolean chinese = this.isChinese();
+        int centerX = this.contentX + this.contentW / 2;
+        graphics.centeredText(this.font, this.category.label(chinese), centerX,
+            this.contentY + 4, TEXT);
+
+        ShaderPackManager manager = ShaderPackManager.getInstance();
+        ShaderPack pack = manager.activePack();
+        String status;
+        if (!manager.isEnabled() || pack == null) {
+            status = chinese ? "光影：已关闭" : "Shaders: Disabled";
+        } else {
+            status = (chinese ? "当前光影：" : "Active pack: ") + pack.displayName()
+                + "  (" + pack.manifest().passes().size() + (chinese ? " 个 pass)" : " passes)");
+        }
+        graphics.centeredText(this.font, Component.literal(status), centerX,
+            this.contentY + 24, manager.isEnabled() && pack != null ? ACCENT : TEXT_DIM);
+
+        this.drawButton(graphics,
+            chinese ? "打开光影设置…" : "Open Shader Pack Settings...",
+            this.shaderButtonX, this.shaderButtonY, this.shaderButtonW, this.shaderButtonH,
+            this.isInside(mouseX, mouseY, this.shaderButtonX, this.shaderButtonY,
+                this.shaderButtonW, this.shaderButtonH));
+
+        String hint = chinese
+            ? "光影包（.zip）放在 shaderpacks/ 目录，支持 Iris 风格的 shaders.properties。"
+            : "Shader packs (.zip) live in shaderpacks/ and use Iris-style shaders.properties.";
+        int y = this.shaderButtonY + this.shaderButtonH + 12;
+        for (String line : this.wrapText(hint, Math.max(80, this.contentW - 20))) {
+            graphics.centeredText(this.font, Component.literal(line), centerX, y, TEXT_DIM);
+            y += this.font.lineHeight + 1;
+        }
     }
 
     /** 跟随游戏语言：zh* 显示中文，其余显示英文。 */
@@ -716,10 +772,19 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 if (my >= navItemY && my < navItemY + 20) {
                     this.category = cat;
                     this.scroll = 0;
+                    if (cat == Category.SHADERS) {
+                        this.minecraft.setScreenAndShow(new Dx12ShaderPackScreen(this));
+                    }
                     return true;
                 }
                 navItemY += 22;
             }
+        }
+
+        if (this.isShaderPage() && this.isInside(mx, my, this.shaderButtonX,
+            this.shaderButtonY, this.shaderButtonW, this.shaderButtonH)) {
+            this.minecraft.setScreenAndShow(new Dx12ShaderPackScreen(this));
+            return true;
         }
 
         Row row = this.rowAt(mx, my);
@@ -978,6 +1043,7 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         DISPLAY("options.video.display.header", "显示", "Display"),
         QUALITY("options.video.quality.header", "质量", "Quality"),
         PREFERENCES("options.video.preferences.header", "偏好", "Preferences"),
+        SHADERS(null, "光影", "Shaders"),
         DX_SUPPORT(null, "DX 支持", "DX Support");
 
         private final String translationKey;
