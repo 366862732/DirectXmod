@@ -264,12 +264,14 @@ float endGalaxy(float3 rd, float amount)
 // 把环境光放大 4 倍后，云底才回到“灰白阴天”该有的亮度。
 #define HC_BASIC_SKYLIGHT     0.18
 #define HC_LIGHT_SCALE        2.0
-// 形状 octave 由参考的 6 降到 3：第 4~6 层特征只有 257/86/28.6 米，在
-// 500m~2km 的步进下本来就采不到，只会往云边撒 ±5% 的白噪点。
-// 0.9375 = (1-0.5^4)/((1-0.5)*0.2*10)，对应 3 层。
+// 形状 octave 用 4（参考为 6）：第 5~6 层特征只有 86/28.6 米，在 500m~2km
+// 步进下采不到，只会往云边撒白噪点；第 4 层（257 米）贡献 6.7%，给云边
+// 添一点起伏，缓解“像加了模糊滤镜”的观感。4 层权重和恰为 0.9375。
 #define HC_DENSITY_WEIGHTS    0.9375
 #define HC_SHADOW_WEIGHTS     0.9375
-#define HC_CLOUD_SPEED        (max(O_CLOUD_SPEED, 0.0) * 2.0)
+// 参考速度在 770m+ 的特征上几乎看不出移动（实测反馈“云是静态的”），
+// 默认档乘 4（约 32 m/s）让漂移可见；嫌快可调低“云速度”滑条。
+#define HC_CLOUD_SPEED        (max(O_CLOUD_SPEED, 0.0) * 4.0)
 #define HC_CLOUD_AMOUNT       (lerp(0.45, 0.95, saturate(O_CLOUD_COVER)) * 2.0)
 
 // 高度/角度索引范围对应 Helian-MMCO AtmosphereTransmittance.bin 的 texel 索引
@@ -918,7 +920,7 @@ float4 hcSampleRealisticCloud(float3 cloudPos, float3 sunDir, float3 atmosphere,
     float3 wind = HC_OCTAVE_SCALE * hcTime() * HC_CLOUD_SPEED * float3(10.0, -10.0, 5.0);
 
     float4 result = float4(0.0, 0.0, 0.0, 0.0);
-    result.w = hcCloudDensity(cloudPos, wind, cloudDistance2 * cloudDistanceInv, 3, HC_DENSITY_WEIGHTS);
+    result.w = hcCloudDensity(cloudPos, wind, cloudDistance2 * cloudDistanceInv, 4, HC_DENSITY_WEIGHTS);
     if (result.w > 1e-5)
     {
         // 只算太阳一路：参考实现的月光支路最终权重只有 0.006，可以忽略；
@@ -1099,28 +1101,163 @@ float3 skyGradient(float3 rd, float3 sunDir, float day, float sunsetAmt,
 // ---------------------------------------------------------------------------
 // 水面着色（只在主世界对“偏蓝”的表面生效）
 //
-// 框架没有水掩码，只能从颜色 + 深度反推；三个已知事实决定了这里的模型：
-//   1) 水下的深度缓冲落在海床/地形（逐方块）上——法线/世界坐标会跟着方块跳；
-//   2) 原版水面是逐方块平铺的 16x16 动画贴图——原画面只取“按视线距离缩放
-//      半径的模糊值”当隔着水看到的底；
-//   3) 竖直面（瀑布立面、崖壁、水下立柱）绝不能铺水膜：波纹采样用的 xz 在
-//      一根柱子上几乎不变，铺上去就是一整柱同值的竖条，连地形都会被糊成
-//      蓝白条纹（实测图）。
+// 判据（同 26.2 官方源码核实，2026-10 修正）：
+//   1) 水面走 translucent_terrain 管线，渲染进独立的 translucent 目标
+//      （其深度由 copyDepthFrom(main) 初始化，水面深度写在这份副本里，
+//      且从不拷回主缓冲），随后由 minecraft:transparency 后处理链把颜色
+//      合成进主色。主深度缓冲从未包含水面——SceneDepth 在水像素上读到的
+//      是“水后面的不透明面”（河床/海床/对岸），拿不到水表面位置；
+//   2) 因此判据只用两个信号：身后面的平坦度(flatness) + 画面水色蓝度
+//      ((b-r)/(b+r)，雪/冰/白云天然低蓝度被排除)。波动场锚点退化为身后
+//      落点（波纹理仍正确贴附世界系，仅相位整体偏移，观感无碍）；
+//   3) 原版水色来自真实材质与固体层深度——框架只有单层深度和原画面，
+//      以水面像素原色作为“透过水看到的底”的近似。
 //
-// 观感：近水平面铺水膜（波纹噪声法线 -> 菲涅尔 + 天空同源反射 + 太阳高光/
-// 碎金，视角方向从近平面射线反推），深浅由模糊底色的亮度决定（深海蓝 <->
-// 浅滩青绿），浅处混入吸收后的床色；陡面只把“饱和蓝”压暗一点（水下地形、
-// 瀑布），蓝白色地形（雪/浅岩在天空光下的偏蓝）保持原样。
+// 掩码 = 近水平(flatness) × 蓝度(blueness)，依 O_WATER_TINT 缩放（默认
+// 0.85 即 1.0，0 = 关闭）。水面本体 = 波法线(Water.glsl 照搬) -> 菲涅尔
+// 混合天空反射 + 水体吸收/散射 (Atmosphere.glsl waterFogTotal 照搬) +
+// 太阳高光。陡面不铺膜（波纹沿柱子不变会拉成竖条）。
 // ---------------------------------------------------------------------------
 
-// 波纹高度场：三层不同尺度与漂移方向的值噪声（近似 Gerstner 起伏）；
-// lod2 / lod3 按像素足迹衰减中/高频层，防止远处出现摩尔纹
-float waterWaveHeight(float2 p, float t, float lod2, float lod3)
+// ===========================================================================
+//  水面波场 —— 照搬 Helian-MMCO v1.2.0 (Sundial Lite edit, 原作 GeForceLegend)
+//  源文件对应:
+//    libs/Water.glsl          gerstnerApproxGeForceLegend / waterWaveHeight /
+//                             waterWaveNormal / waterWave (几何波法线)
+//    libs/Atmosphere.glsl     waterFogAbsorption / waterFogScattering /
+//                             waterFogTotal / miePhase / rayleighPhase
+//    programs/composite/Composite5.frag   水面合成(吸收散射/反射/菲涅尔)
+//    settings/GlobalSettings.glsl         WATER_WAVE_* / WATER_ABSORPTION_* 默认值
+//  已知替代(框架无 noisetex / 无 gbuffer / 无双深度):
+//    1. noisetex 64 格白噪声 → 整数哈希值噪声(同格距、同平滑、分布等价)
+//    2. 波法线: 原版对 5 层高度场求解析导数 → 同一高度场中心差分(e=0.008)
+//    3. 水体路径长(原版 = 水面点到固体层距离) → 常数近似
+//    4. 屏幕空间折射暂未迁移, 底取水面像素原色
+// ===========================================================================
+
+#define HC_PI                3.14159265358979
+#define HC_WAVE_SCALE        1.0
+#define HC_WAVE_HEIGHT       0.9
+#define HC_WAVE_STEEPNESS    0.4
+#define HC_WAVE_LAYERS_SCALE 1.4      // WATER_WAVE_LAYERS_SCALE
+#define HC_WAVE_LAYERS_FADE  0.6      // WATER_WAVE_LAYERS_FADE
+#define HC_WAVE_SPEED        1.0      // WATER_WAVE_SPEED
+
+// WATER_ABSORPTION (0.5, 0.1, 0.08) / WATER_SCATTERING (0.3, 0.6, 0.9)
+static const float3 HC_WATER_BETA = float3(0.5, 0.1, 0.08);
+static const float3 HC_WATER_SCAT = float3(0.3, 0.6, 0.9);
+
+// goldenRotate (Uniform.glsl): 黄金角 2.39996323 旋转
+static const float HC_GOLD_C = cos(2.39996323);
+static const float HC_GOLD_S = sin(2.39996323);
+
+float2 hcGoldenMul(float2 p)
 {
-    float h  = vnoise(p * 0.42 + float2(t * 0.050, t * 0.034)) * 0.55;
-    h += vnoise(p * 0.95 + float2(-t * 0.078, t * 0.061) + 13.7) * (0.30 * lod2);
-    h += vnoise(p * 2.10 + float2(t * 0.120, t * 0.145) + 41.3) * (0.15 * lod3);
-    return h;
+    return float2(HC_GOLD_C * p.x - HC_GOLD_S * p.y, HC_GOLD_S * p.x + HC_GOLD_C * p.y);
+}
+
+// noisetex 替代: 64 格白噪声双线性采样 = smoothstep 加权的值噪声
+float hcWaveNoise(float2 coord)
+{
+    float2 nc = coord * (0.003 * 64.0) + 0.5;
+    float2 whole = floor(nc);
+    float2 f = nc - whole;
+    float2 w = f * f * (3.0 - 2.0 * f);
+    int2 i = int2(whole);
+    float n00 = ihash12(i);
+    float n10 = ihash12(i + int2(1, 0));
+    float n01 = ihash12(i + int2(0, 1));
+    float n11 = ihash12(i + int2(1, 1));
+    return lerp(lerp(n00, n10, w.x), lerp(n01, n11, w.x), w.y);
+}
+
+// Water.glsl: gerstnerApproxGeForceLegend —— 周期变形的余弦波剖面
+float hcGerstner(float2 coord)
+{
+    const float s = 1.0 - 0.7 * HC_WAVE_STEEPNESS;
+    const float o1 = (1.0 - s) / HC_PI;
+    const float o2 = pow(o1, 1.0 / s);
+    const float cs = HC_PI / (pow(1.0 + o2, s) - o1);
+    float noise = hcWaveNoise(coord) * (6.0 * 0.5 / HC_PI);
+    float x = frac(coord.x * 0.5 / HC_PI + noise) * 2.0 - 1.0;
+    return cos(cs * pow(abs(x) + o2, s) - cs * o1);
+}
+
+// Water.glsl: waterWaveHeight —— 逐层黄金角旋转/缩放/衰减
+// (行进 3 层 / 法线 5 层, 对应 WATER_WAVE_HEIGHT_LAYERS/NORMAL_LAYERS)
+float hcWaveHeightLayers(float2 coord, int layers)
+{
+    coord *= 32.0;
+    float total = 0.0;
+    float w = 1.0;
+    float speed = 2.0 * hcTime() * HC_WAVE_SPEED;
+    for (int i = 0; i < layers; i++)
+    {
+        coord = hcGoldenMul(coord);
+        total += w * hcGerstner(coord - float2(speed, 0.0));
+        w *= HC_WAVE_LAYERS_FADE;
+        coord *= HC_WAVE_LAYERS_SCALE;
+    }
+    float totalWeight = (1.0 - HC_WAVE_LAYERS_FADE) / (1.0 - pow(HC_WAVE_LAYERS_FADE, (float)layers));
+    return total * totalWeight * 0.5 + 0.5;
+}
+
+// Water.glsl: waterWave —— 沿视线在波场内步进求交, 返回切空间法线
+// position = mcPos/32; tangentDir = 视线向量在切空间(T=+X, B=+Z, N=+Y)的坐标
+float3 hcWaterWave(float3 position, float3 tangentDir)
+{
+    position /= HC_WAVE_SCALE;
+    float3 coord = float3(position.xz - position.y, 1.0);
+
+    const float3 stepScale = float3(0.2 * HC_WAVE_HEIGHT / (HC_WAVE_SCALE * 32.0),
+                                    0.2 * HC_WAVE_HEIGHT / (HC_WAVE_SCALE * 32.0), 1.0);
+    float tangentDirZ = abs(tangentDir.z * rsqrt(dot(tangentDir, tangentDir)));
+    float3 stepSize = tangentDir * stepScale;
+    stepSize *= 0.2 / abs(stepSize.z);
+    tangentDirZ /= 0.2;
+
+    for (int i = 0; i < 5; i++)
+    {
+        coord += stepSize;
+        float sampleHeight = hcWaveHeightLayers(coord.xy, 3);
+        if (coord.z - sampleHeight < 0.0) { break; }
+    }
+    for (int j = 0; j < 5; j++)
+    {
+        float sampleHeight2 = hcWaveHeightLayers(coord.xy, 3);
+        float nextLength = coord.z - sampleHeight2;
+        float nextScale = nextLength * tangentDirZ;
+        coord += stepSize * nextScale;
+    }
+
+    // 原版 waterWaveNormal 的解析导数 → 同一高度场的中心差分
+    const float e = 0.008;
+    float hx = hcWaveHeightLayers(coord.xy + float2(e, 0.0), 5) - hcWaveHeightLayers(coord.xy - float2(e, 0.0), 5);
+    float hz = hcWaveHeightLayers(coord.xy + float2(0.0, e), 5) - hcWaveHeightLayers(coord.xy - float2(0.0, e), 5);
+    float2 sampleNormal = float2(hx, hz) / (2.0 * e);
+
+    return normalize(float3(sampleNormal * stepScale.xy, 1.0));
+}
+
+// Atmosphere.glsl: miePhase (作者私有近似, 照搬)
+float hcMiePhase(float cosAngle, float g, float g2)
+{
+    float x = rsqrt(1.0 + g2 - 2.0 * g * cosAngle);
+    return (3.0 / (8.0 * HC_PI)) * ((1.0 - g2) * (1.0 + cosAngle * cosAngle)) / (2.0 + g2) * x * x * x;
+}
+
+// 水面太阳高光 —— 对标 Common.glsl: sunlightSpecular 的 GGX 形状
+float hcWaterGlint(float NoH, float VoH, float NoV, float NoL, float rough)
+{
+    float a = max(rough * rough, 1e-5);
+    float a2 = a * a;
+    float d = (NoH * NoH) * (a2 - 1.0) + 1.0;
+    float D = a2 / max(HC_PI * d * d, 1e-7);
+    float lv = NoL * sqrt(max(NoV * NoV * (1.0 - a2) + a2, 1e-6));
+    float ll = NoV * sqrt(max(NoL * NoL * (1.0 - a2) + a2, 1e-6));
+    float V = 0.5 / max(lv + ll, 1e-6);
+    float F = 0.02 + 0.98 * pow(saturate(1.0 - VoH), 5.0);
+    return D * V * F;
 }
 
 float3 shadeWater(float4 scene, float2 uv, float2 ndc, float depth, float3 sunDir,
@@ -1133,105 +1270,166 @@ float3 shadeWater(float4 scene, float2 uv, float2 ndc, float depth, float3 sunDi
     }
     float3 rel = wpH.xyz / wpH.w;               // 相机相对世界坐标
     float3 worldPos = CameraPosition.xyz + rel;
+    float dist = length(rel);
 
-    // 表面朝向：深度缓冲里水下的几何其实是海床/地形
+    // ---- 水面判别（原版 = materialID；框架无 gbuffer，双判据兜底） ----
+    // 关键事实（26.2）：水面作为半透明地形渲染进独立 translucent 目标后再于
+    // transparency 后处理链合成进主色——scene_depth 在水像素上是"水后面的不透明
+    // 面"（河床/海床/对岸），读不到水表面本身。因此"水面高度带 frac≈0.888"判据
+    // 永远不成立，已废弃；波动场锚点也退化为身后落点（波纹理仍正确贴附世界系，
+    // 仅相位有整体偏移，观感无碍）。
+    // 1) 平坦：身后的面接近水平（河床/海床），陡面(瀑布/崖壁)不铺膜
     float3 nrm = cross(ddx(worldPos), ddy(worldPos));
     float ny = abs(nrm.y) / max(length(nrm), 1e-9);
     float flatness = smoothstep(0.80, 0.96, ny);
-
-    // 蓝色判定：水体的蓝来自吸收与天空反射，红通道明显更弱
+    // 2) 水体蓝度 (b-r)/(b+r)：水呈饱和蓝；雪/冰/白云是高亮度低饱和，天然排除
     float3 c = scene.rgb;
-    float blueness = smoothstep(0.035, 0.130, c.b - c.r);
-    if (blueness <= 0.004)
+    float blueRatio = (c.b - c.r) / max(c.b + c.r, 0.02);
+    float blueness = smoothstep(0.22, 0.40, blueRatio);
+
+    float amt = saturate(O_WATER_TINT / 0.85);          // 默认 0.85 -> 1.0，0 = 关闭
+    float mask = flatness * blueness * amt;
+    if (mask <= 0.0015)
     {
         return c;
     }
-    float mask = blueness * flatness;   // 水膜只铺近水平面
 
-    // ---- 波纹法线：高度场的有限差分梯度；步长随像素足迹放大 → 自动降频 ----
-    float t = fmod(Time.x, 3600.0);
-    float2 wp = worldPos.xz;
-    float2 fw = fwidth(wp);
-    float fp = max(fw.x, fw.y);                 // 世界单位/像素
-    float e = max(0.18, fp * 1.1);
-    float lod2 = 1.0 - smoothstep(0.9, 3.0, fp);   // 中频层
-    float lod3 = 1.0 - smoothstep(0.35, 1.3, fp);  // 高频层
+    // ---- 波法线（Water.glsl waterWave 照搬；切空间 T=+X, B=+Z, N=+Y） ----
+    float3 tangentDir = float3(rel.x, rel.z, rel.y);
+    float3 nTan = hcWaterWave(worldPos / 32.0, tangentDir);
+    float waveAmt = 0.25 + 0.75 * saturate(O_WATER_RIPPLES / 0.75);   // 默认 0.75 -> 1.0
+    float waveFade = 1.0 - smoothstep(48.0, 160.0, dist);             // 远处趋平（原版 fadeFactor 混合的等价）
+    float tilt = waveAmt * waveFade;
+    float3 nW = normalize(float3(nTan.x * tilt, nTan.z * tilt, nTan.y));
+    if (nW.y < 0.001)
+    {
+        return c;
+    }
 
-    float hx = waterWaveHeight(wp + float2(e, 0.0), t, lod2, lod3) - waterWaveHeight(wp - float2(e, 0.0), t, lod2, lod3);
-    float hz = waterWaveHeight(wp + float2(0.0, e), t, lod2, lod3) - waterWaveHeight(wp - float2(0.0, e), t, lod2, lod3);
+    float3 rayDir = normalize(rel);              // 相机 -> 表面
+    float3 viewDir = -rayDir;                    // 表面 -> 相机
+    float cosV = saturate(dot(nW, viewDir));
+    float3 zen = 0.0;
+    float3 hor = 0.0;
+    float3 haz = 0.0;
 
-    // 坡度上限约 0.4（此前把高度差当坡度用，水面被搞成了噪声镜子）
-    float slopeK = 0.08 + 0.34 * saturate(O_WATER_RIPPLES);
-    float3 nW = normalize(float3(-hx * slopeK, e * 2.0, -hz * slopeK));
+    // ---- 反射：天空（等效原版 composite4 天空 + composite0 SSR 的天空回退） ----
+    float3 rd = normalize(reflect(rayDir, nW));
+    float3 refl = skyGradient(rd, sunDir, day, sunsetAmt, zen, hor, haz);
+    // 反射方向上的太阳盘/辉光（与主天空同参数）——水面上的太阳光路
+    float3 sunCol = lerp(float3(1.00, 0.96, 0.88), SunsetColor.rgb * 1.35, sunsetAmt);
+    float cd = dot(rd, sunDir);
+    float inner = cos(0.0125 * max(O_SUN_SIZE, 0.1));
+    float outer = cos(0.0210 * max(O_SUN_SIZE, 0.1));
+    float above = smoothstep(-0.08, 0.02, sunDir.y);
+    refl += sunCol * (smoothstep(outer, inner, cd) * 2.4 + pow(saturate(cd), 220.0) * 0.35)
+            * above * max(O_SUN_INTENSITY, 0.0);
 
-    // ---- 隔着水看到的“底”：原画面只做模糊参考。模糊半径按视线距离估：
-    //      约半格 ≈ 0.36*Viewport.y/dist 像素。不再用 fwidth——480p 重建深度
-    //      的 fwidth 又跳又不稳，中距离经常掉回 2px 等于没模糊，海床台阶的
-    //      亮暗就会被“深/浅”曲线放大成一条条竖纹 ----
-    float dist = length(rel);
-    float2 buv = clamp(Viewport.y * 0.36 / max(dist, 3.0), 2.0, 30.0) / Viewport.xy;
-    float3 ref = c * 0.24;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv + float2(buv.x, 0.0), 0).rgb * 0.12;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv - float2(buv.x, 0.0), 0).rgb * 0.12;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv + float2(0.0, buv.y), 0).rgb * 0.12;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv - float2(0.0, buv.y), 0).rgb * 0.12;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv + buv, 0).rgb * 0.07;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv - buv, 0).rgb * 0.07;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv + float2(buv.x, -buv.y), 0).rgb * 0.07;
-    ref += SceneColor.SampleLevel(SceneColorSampler, uv + float2(-buv.x, buv.y), 0).rgb * 0.07;
-    float lum = min(dot(ref, float3(0.299, 0.587, 0.114)), 0.60);   // 雾把远处刷亮时别跟着白
+    // ---- 水体：吸收 + 散射（Atmosphere.glsl waterFogTotal 照搬） ----
+    // 原版路径长 = 水面点到固体层距离；框架只有单层深度，取常数近似
+    float thickness = 2.0;
+    float skyLight = saturate(day);
+    float3 upSky = skyGradient(float3(0.0, 1.0, 0.0), sunDir, day, sunsetAmt, zen, hor, haz);
+    float3 skyTint = upSky + sunCol * 2.0 * (1.0 - 0.3);   // SUNLIGHT_BRIGHTNESS / ENVIROMENT_BRIGHTNESS = 1
+    float phMie = hcMiePhase(rayDir.y, 0.4, 0.16);
+    float3 body = c.rgb * exp(-thickness * HC_WATER_BETA);
+    body += HC_WATER_SCAT * skyLight * phMie * skyTint
+          * (1.0 - exp(-thickness * HC_WATER_BETA))
+          * exp(-16.0 * (1.0 - skyLight) * HC_WATER_BETA);
 
-    float3 seaBlue = lerp(float3(0.015, 0.036, 0.062), float3(0.048, 0.135, 0.215), day);
-    float3 shallowCol = lerp(float3(0.020, 0.062, 0.070), float3(0.075, 0.235, 0.260), day);
-    float shallow = saturate((lum - 0.08) * 2.4);   // 0 = 深海，1 = 浅滩
-    float3 body = lerp(seaBlue, shallowCol, shallow * 0.75) * (0.72 + 0.38 * saturate(lum));
+    // ---- 菲涅尔混合 + 太阳高光 ----
+    float F = 0.02 + 0.98 * pow(1.0 - cosV, 5.0);
+    float3 waterCol = lerp(body, refl, F);
 
-    // 水下吸收（红先被吃掉），把“底”混进水体：浅处透出床色的亮度与暖调，
-    // 深处几乎只剩深蓝；这样“清水见沙”是从模糊底线里长出来的，不是方块贴图
-    float3 absorb = lerp(float3(0.30, 0.44, 0.60), float3(0.48, 0.74, 0.94), day);
-    float3 bed = ref * absorb;
-    body = lerp(body, bed * 0.90, 0.08 + 0.30 * shallow);
+    float3 hvec = normalize(viewDir + sunDir);
+    float NoH = saturate(dot(nW, hvec));
+    float VoH = saturate(dot(viewDir, hvec));
+    float NoL = saturate(dot(nW, sunDir));
+    float glintAmt = saturate(O_WATER_GLINT / 0.60);       // 默认 0.60 -> 1.0
+    float glintSpec = min(hcWaterGlint(NoH, VoH, cosV, NoL, 0.06) * NoL * above, 6.0);
+    waterCol += sunCol * glintSpec * glintAmt * 0.12;
 
-    body = lerp(body, SunsetColor.rgb * 0.28, sunsetAmt * 0.30);
+    return lerp(c, waterCol, mask);
+}
 
-    // 自带波纹明暗（替代原版水面贴图留下的那点纹理感，幅度很淡）
-    float h0 = waterWaveHeight(wp, t, lod2, lod3) - 0.5;
-    body *= 1.0 + h0 * 0.22 * saturate(O_WATER_RIPPLES);
+// ---------------------------------------------------------------------------
+// 大气雾 —— 照搬 Helian-MMCO (Sundial Lite edit) 的 solidAtmosphereScattering
+//
+//  源文件对应:
+//    libs/Atmosphere.glsl                solidAtmosphereScattering / rayleighPhase
+//    programs/composite/Composite5.frag  L217-221（固体与水面像素统一施加）
+//    settings/GlobalSettings.glsl        ASF_DENSITY=1.0 / RF_DENSITY=0.3 /
+//                                        RF_GROUND_EXTRA_DENSITY=0.4 / mieG=0.76
+//
+//  已知替代（框架无透射率 LUT / 无 lightmap / 无世界坐标输入）:
+//    1. 日/月穿过大气的透射率 LUT → 散射色直接取 skyGradient() 天穹色
+//       （本身已含日落暖色与太阳辉光，与头顶天空、水面反射同源）；
+//    2. skyLight（原版 lightmap.y）→ lerp(0.22, 1.0, day)，仍按原式平方调制
+//       （夜晚散射≈0，远处只轻微失蓝变暗）;
+//    3. 消光系数按世界尺度重标（蓝端先散射再由散射色补回，等效瑞利/米氏合并）;
+//    4. 米氏相位照搬（g 随距离变平），另加瑞利相位；天气（雨）增浓沿用
+//       RF_DENSITY 结构（weather 来自 Sky.z 晴空亮度）;
+//    5. 天穹像素不施加（原版固定按 1600 深度加在天上；我们的天空模型已含
+//       雾霭与辉光，再加会双重）;
+//    6. 视距归一：短视距不至于看不见、长视距不至于过浓（轻微非物理，观感优先）。
+//
+//  强度旋钮复用 HAZE（地平线雾霭）滑条：strength = saturate(O_HAZE) × 3.0。
+// ---------------------------------------------------------------------------
 
-    // ---- 菲涅尔：视线方向从近平面射线反推。不能拿重构出的“海床点”当视角：
-    //      那是逐方块几何，会让反射/高光一块块贴在方块上；射线方向是平滑的 ----
-    float4 nearH = mul(InvViewProj, float4(ndc, 1.0, 1.0));
-    float3 viewToCam = -normalize(nearH.xyz);
-    float ndv = saturate(dot(nW, viewToCam));
-    float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
-    float3 reflDir = reflect(-viewToCam, nW);
-    float3 zTmp = 0.0;
-    float3 hTmp = 0.0;
-    float3 sTmp = 0.0;
-    float3 skyRef = skyGradient(normalize(reflDir), sunDir, day, sunsetAmt, zTmp, hTmp, sTmp) * 0.85;
-    float3 waterCol = lerp(body, skyRef, fres);
+static const float3 HC_ASF_BETA = float3(7.5e-5, 1.45e-4, 4.25e-4); // 每格等效消光
+static const float  HC_ASF_HAZE_GAIN = 3.0;   // HAZE 滑条 → 强度倍率
+static const float  HC_ASF_MIE_G = 0.76;      // 原 mieG
+static const float  HC_ASF_RAIN = 2.5;        // 雨时消光增浓（RF_DENSITY 结构）
 
-    // ---- 太阳镜面：锐利高光 + 近距离碎金（反射里的太阳辉光已贡献一部分） ----
-    float sunUp = smoothstep(-0.06, 0.20, sunDir.y);
-    float3 hvec = normalize(viewToCam + normalize(sunDir));
-    float ndh = saturate(dot(nW, hvec));
-    float3 sunCol = lerp(float3(1.00, 0.96, 0.86), SunsetColor.rgb * 1.30 + 0.05, sunsetAmt);
-    float glint = saturate(O_WATER_GLINT);
-    float nearFade = 1.0 - smoothstep(0.6, 2.2, fp);   // 远处不做高频碎金
-    float spec = (pow(ndh, 900.0) * 1.8 + pow(ndh, 80.0) * 0.22) * glint * sunUp;
-    // 碎金：放宽门槛、降低幅度，从“满天白点”回到“蜿蜒的碎光”
-    float n4 = vnoise(wp * 1.9 - float2(t * 0.12, t * 0.09));
-    float sparkle = smoothstep(0.55, 1.00, n4) * pow(ndh, 30.0) * glint * sunUp * 0.35 * nearFade;
-    waterCol += sunCol * (spec + sparkle);
+// rayleighPhase（Atmosphere.glsl 原式：1/4π × 8/10 系数）
+float hcRayleighPhase(float cosAngle)
+{
+    const float k = 0.0795774715 * 0.8;
+    return 1.4 * k + 0.5 * k * cosAngle;
+}
 
-    // ---- 混合：水平面铺水膜；陡面不铺膜（竖着铺会把波纹拉成竖条），
-    //      只把“饱和蓝”压暗一点，免得漏出原版的亮青 ----
-    float amt = saturate(O_WATER_TINT * 1.35) * blueness;
-    float steepAmt = smoothstep(0.30, 0.75, c.b - c.r) * 0.55;
-    float3 steep = c * lerp(float3(0.48, 0.66, 0.84), float3(0.60, 0.80, 1.00), day);
-    steep = lerp(c, steep, steepAmt);
-    float3 flatCol = lerp(c, waterCol, mask);
-    return lerp(c, lerp(flatCol, steep, 1.0 - flatness), amt);
+// solidAtmosphereScattering 的框架适配版：几何像素按距离混入天穹散射色。
+// 返回 = scatter × (1 - absorb) + color × absorb（与原版 mix 同构）。
+float3 hcAirFog(float3 color, float2 ndc, float depth,
+                float3 sunDir, float day, float sunsetAmt)
+{
+    float strength = saturate(O_HAZE) * HC_ASF_HAZE_GAIN;
+    if (strength <= 0.003) return color;
+
+    float4 rel4 = mul(InvViewProj, float4(ndc, depth, 1.0));
+    float3 relPos = rel4.xyz / max(abs(rel4.w), 1e-4);
+    float dist = length(relPos);
+    if (dist < 0.5) return color;
+    float3 worldDir = relPos / dist;
+
+    // 视距归一（短视距增强、长视距减弱）
+    strength *= clamp(300.0 / max(Misc.x, 96.0), 0.75, 1.75);
+
+    float weather = saturate(1.0 - Sky.z);        // 0 = 晴, 1 = 大雨
+    float skyLight = lerp(0.22, 1.0, day);        // lightmap.y 的近似
+
+    // 光学厚度：距离 × 天气增浓（RF 结构）
+    float opt = dist * strength * (1.0 + HC_ASF_RAIN * weather * weather);
+    float3 absorb = exp(-opt * HC_ASF_BETA);
+
+    // 散射色 = 天穹色（已含日落暖色/太阳辉光）；雨天偏向灰白；夜晚平方归零
+    float3 zenDummy;
+    float3 horDummy;
+    float3 skyHazeCol;
+    float3 base = skyGradient(worldDir, sunDir, day, sunsetAmt, zenDummy, horDummy, skyHazeCol);
+    float greyLum = dot(base, float3(0.3333, 0.3333, 0.3333)) * 0.9;
+    float3 scatter = lerp(base, float3(greyLum, greyLum, greyLum), sqrt(weather) * 0.79)
+                   * skyLight * skyLight;
+
+    // 太阳方向相位暖光（米氏前向 + 瑞利，日落低角最明显；相位照搬原式）
+    float cosSunDir = dot(worldDir, sunDir);
+    float g = HC_ASF_MIE_G * (1.0 - exp2(-dist * 0.001));   // g 随距离变平
+    float phase = hcMiePhase(cosSunDir, g, g * g) + hcRayleighPhase(cosSunDir);
+    float3 sunTint = lerp(float3(1.0, 0.96, 0.90), SunsetColor.rgb * 1.35, sunsetAmt);
+    float sunUp = smoothstep(-0.10, 0.06, sunDir.y);
+    scatter += sunTint * phase * 0.55 * sunUp * skyLight;
+
+    return scatter * (1.0 - absorb) + color * absorb;
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,14 +1455,19 @@ float4 main(VSOut input) : SV_TARGET
     float day = smoothstep(-0.12, 0.14, sunY);
     float sunsetAmt = pow(saturate(1.0 - abs(sunY) * 3.0), 1.4);
 
-    // reverse-Z：远平面 = 0 = 天空；其余像素在主世界尝试水面处理
+    // reverse-Z：远平面 = 0 = 天空；其余像素在主世界尝试水面处理 + 大气雾
     if (depth > 1e-6)
     {
-        if (skybox == 1 && max(O_WATER_TINT, O_WATER_RIPPLES) > 0.002)
+        float3 result = scene.rgb;
+        if (skybox == 1)
         {
-            return float4(shadeWater(scene, uv, ndc, depth, sunDir, day, sunsetAmt), 1.0);
+            if (max(O_WATER_TINT, O_WATER_RIPPLES) > 0.002)
+            {
+                result = shadeWater(scene, uv, ndc, depth, sunDir, day, sunsetAmt);
+            }
+            result = hcAirFog(result, ndc, depth, sunDir, day, sunsetAmt);
         }
-        return scene;
+        return float4(result, 1.0);
     }
 
     float4 nearH = mul(InvViewProj, float4(ndc, 1.0, 1.0));
