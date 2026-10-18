@@ -2,6 +2,8 @@ package com.xgdt.dx12.mixin;
 
 import com.xgdt.dx12.dx12.Dx12Device;
 import com.xgdt.dx12.dx12.Dx12ShaderPackRenderer;
+import com.xgdt.dx12.dx12.OfflineRender;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -18,9 +20,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * 地形"消失"。
  *
  * <p>此时机也早于手部渲染与 GUI，手和 HUD 不会被光影链二次处理。
+ *
+ * <p>{@code extractCamera} TAIL 处还挂了一个 ITRP 离线渲染的亚像素抖动（只在离线
+ * 累积进行中生效）：必须赶在世界几何取走相机矩阵之前修改投影矩阵。放在提取相机
+ * 状态之后（而不是 renderLevel 开头）是因为投影矩阵每次提取都会被整体重写
+ * （{@code Camera.extractRenderState} 里 {@code projection.getMatrix(...)}），
+ * 抖动不会叠加到上一帧残留的矩阵上。
  */
 @Mixin(GameRenderer.class)
 public class GameRendererShaderPackMixin {
+
+    @Inject(method = "extractCamera", at = @At("TAIL"), remap = false)
+    private void dx12_offlineRenderJitter(DeltaTracker deltaTracker, float worldPartialTicks,
+                                          float cameraEntityPartialTicks, CallbackInfo ci) {
+        OfflineRender.beginFrame();
+    }
 
     @Inject(
         method = "renderLevel",

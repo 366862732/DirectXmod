@@ -3,6 +3,7 @@
 //
 // 输入：t0 = fx:0（天空/体积云合成结果）
 //       t1 = fx:1（光追太阳可见性：1 = 受光，0 = 被遮挡）
+//       t2 = scene_depth（reverse-Z，用于阴影软硬的距离分级）
 // 输出：scene_color（主渲染目标）
 //
 // 目标：写实、柔和。高光压缩但不压暗中间调，暗部有轻微抬升，不做死黑。
@@ -12,6 +13,8 @@ Texture2D<float4> InColor : register(t0);
 SamplerState InSampler : register(s0);
 Texture2D<float4> ShadowTex : register(t1);
 SamplerState ShadowSampler : register(s1);
+Texture2D<float> SceneDepth : register(t2);
+SamplerState SceneDepthSampler : register(s2);
 
 #define O_BRIGHTNESS    (Options[0].x)
 #define O_SATURATION    (Options[0].y)
@@ -34,6 +37,33 @@ struct VSOut
     float4 position : SV_POSITION;
     float2 uv : TEXCOORD0;
 };
+
+// 软阴影：8 抽环形采样，半径随距离增大（近处锐利、远处柔和）；
+// 每个像素按哈希旋转采样图案，避免出现规则网格状条带。
+float sunVisibilityPCF(float2 uv, float radiusPx)
+{
+    static const float2 kOffsets[8] =
+    {
+        float2( 0.00,  1.00), float2( 0.71,  0.71),
+        float2( 1.00,  0.00), float2( 0.71, -0.71),
+        float2( 0.00, -1.00), float2(-0.71, -0.71),
+        float2(-1.00,  0.00), float2(-0.71,  0.71)
+    };
+
+    float ang = frac(sin(dot(uv * Viewport.xy, float2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+    float cs = cos(ang);
+    float sn = sin(ang);
+    float2 px = Viewport.zw * radiusPx;
+
+    float sum = 0.0;
+    for (int i = 0; i < 8; ++i)
+    {
+        float2 o = kOffsets[i];
+        float2 r = float2(o.x * cs - o.y * sn, o.x * sn + o.y * cs) * px;
+        sum += saturate(ShadowTex.SampleLevel(ShadowSampler, uv + r, 0.0).r);
+    }
+    return sum * 0.125;
+}
 
 float4 main(VSOut input) : SV_TARGET
 {
@@ -60,11 +90,25 @@ float4 main(VSOut input) : SV_TARGET
 
     // 光追太阳阴影（P68）：只在白天生效；天空像素的可见性恒为 1，不会被压暗。
     // 阴影不压成死黑——背光最多压到 ~0.6 并偏冷，保留暗部细节。
+    // 软硬分级：采样半径随相机距离增大（近锐远柔），边缘自然过渡。
     float shadowStrength = saturate(PassParams.x);
     float sunUp = saturate(SunDirection.y * 6.0);
     if (shadowStrength > 0.001 && sunUp > 0.001)
     {
-        float vis = saturate(ShadowTex.SampleLevel(ShadowSampler, uv, 0.0).r);
+        float depth = SceneDepth.SampleLevel(SceneDepthSampler, uv, 0.0);
+        float vis;
+        if (depth <= 1e-6)
+        {
+            vis = 1.0; // 天空：不接收地形阴影，也不做模糊（避免剪影向天空渗出）
+        }
+        else
+        {
+            float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            float4 rel4 = mul(InvViewProj, float4(ndc, depth, 1.0));
+            float dist = length(rel4.xyz / max(rel4.w, 1e-4));
+            float radius = lerp(0.7, 4.0, saturate(dist / 260.0));
+            vis = sunVisibilityPCF(uv, radius);
+        }
         float3 shade = lerp(float3(0.58, 0.63, 0.74), float3(1.0, 1.0, 1.0), vis);
         lin *= lerp(float3(1.0, 1.0, 1.0), shade, shadowStrength * sunUp);
     }

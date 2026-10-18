@@ -1,6 +1,13 @@
 package com.xgdt.dx12;
 
+import com.mojang.blaze3d.platform.InputConstants;
+import com.xgdt.dx12.dx12.OfflineRender;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.resources.Identifier;
+import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,11 +27,22 @@ import org.slf4j.LoggerFactory;
 public class Dx12Mod implements ClientModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12");
 
+    /** F10：ITRP 风格离线渲染（冻结时间 + 亚像素抖动 + 时间累积，自动保存截图）。 */
+    private static KeyMapping offlineRenderKey;
+
     @Override
     public void onInitializeClient() {
         LOGGER.info("GL4DX12 initializing");
         LOGGER.info("DX12 backend is registered via PreferredGraphicsApiMixin; "
             + "creation is driven by the vanilla backend-selection loop");
+        offlineRenderKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+            "key.gl4dx12.offline_render", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_F10,
+            KeyMapping.Category.register(Identifier.fromNamespaceAndPath("gl4dx12", "main"))));
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while (offlineRenderKey.consumeClick()) {
+                OfflineRender.toggle(client);
+            }
+        });
         startExitWatchdog();
     }
 

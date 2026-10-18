@@ -17,7 +17,7 @@
     {
       "name": "final",
       "fragment": "shaders/final/final.hlsl",
-      "inputs": ["fx:0", "fx:1"],
+      "inputs": ["fx:0", "fx:1", "scene_depth"],
       "output": "scene_color",
       "params": [0.85, 0.0, 0.0, 0.0]
     }

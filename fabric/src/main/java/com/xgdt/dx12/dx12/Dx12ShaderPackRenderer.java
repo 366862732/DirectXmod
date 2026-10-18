@@ -128,6 +128,28 @@ public final class Dx12ShaderPackRenderer {
         }
         """;
 
+    /**
+     * ITRP 风格离线渲染的累积 pass：把本帧与历史累积按 1/n 混合（乒乓 fx:6/fx:7）。
+     * {@code PassParams.x = 1/n}，{@code PassParams.y = 1} 表示首帧（直接覆盖，
+     * 避免读到未初始化的历史缓冲）。
+     */
+    private static final String ACCUM_PS = """
+        Texture2D<float4> InColor : register(t0);
+        Texture2D<float4> InAccum : register(t1);
+        SamplerState InSampler : register(s0);
+        SamplerState AccumSampler : register(s1);
+
+        float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
+        {
+            float4 scene = InColor.SampleLevel(InSampler, uv, 0.0);
+            float weight = PassParams.x;
+            float reset = PassParams.y;
+            float4 accum = InAccum.SampleLevel(AccumSampler, uv, 0.0);
+            float4 result = reset > 0.5 ? scene : lerp(accum, scene, weight);
+            return float4(result.rgb, 1.0);
+        }
+        """;
+
     private static final Dx12ShaderPackRenderer INSTANCE = new Dx12ShaderPackRenderer();
 
     /** (packId, passName, outputFormat) -> native pipeline handle。 */
@@ -158,6 +180,7 @@ public final class Dx12ShaderPackRenderer {
         ShaderPackManager manager = ShaderPackManager.getInstance();
         ShaderPack pack = manager.activeIfEnabled();
         if (pack == null) {
+            OfflineRender.abort();
             if (Dx12RtScene.enabled) {
                 Dx12RtScene.enabled = false;
                 Dx12RtScene.clear();
@@ -317,6 +340,77 @@ public final class Dx12ShaderPackRenderer {
                 }
             }
         }
+
+        // ITRP 风格离线渲染：把本帧混入累积缓冲并展示累积结果（截图也在这一步抓取）。
+        if (OfflineRender.framePrepared()) {
+            offlineAccumulate(ctx, pack, color, colorView, sceneFormat, width, height,
+                minecraft, uniformHandle, passIndex);
+        }
+    }
+
+    /**
+     * 离线渲染的累积步骤：scene_color 与历史累积按 1/n 乒乓混合（fx:6/fx:7），
+     * 再把累积结果贴回主目标显示——主目标里因此始终是收敛中的最终画面，
+     * {@link OfflineRender#onFrameAccumulated()} 在最后一帧直接对它截图。
+     */
+    private void offlineAccumulate(long ctx, ShaderPack pack, Dx12GpuTexture color,
+                                   Dx12GpuTextureView colorView, int sceneFormat, int width, int height,
+                                   Minecraft minecraft, long uniformHandle, int passIndex) {
+        int n = OfflineRender.sampleIndex();
+        int srcIndex = (n & 1) == 0 ? 6 : 7;
+        int dstIndex = (n & 1) == 0 ? 7 : 6;
+        Dx12TextureRef accumDst = intermediateRef(dstIndex, width, height);
+        Dx12TextureRef accumSrc = intermediateRef(srcIndex, width, height);
+
+        long pipeline = accumPipeline();
+        if (pipeline == 0L) {
+            OfflineRender.cancel("累积管线创建失败");
+            return;
+        }
+        float weight = 1.0f / (n + 1);
+        float reset = n == 0 ? 1.0f : 0.0f;
+        int accumOffset = writeUniforms(pack, width, height, minecraft,
+            new float[]{weight, reset, 0.0f, 0.0f}, passIndex + 1);
+        Dx12Native.dx12BeginRenderPass(ctx, new long[]{accumDst.texture().handle()},
+            new int[]{0}, new byte[]{0}, null, 0L, 0, (byte) 0, 0.0, 0, 0, width, height);
+        try {
+            Dx12Native.dx12SetPipeline(ctx, pipeline, false);
+            pushDescriptors(ctx, List.of(
+                new Dx12TextureRef(color, colorView, sceneFormat),
+                accumSrc), uniformHandle, accumOffset);
+            Dx12Native.dx12Draw(ctx, 3, 1, 0, 0);
+        } finally {
+            Dx12Native.dx12EndRenderPass(ctx);
+        }
+
+        long copy = copyPipeline(sceneFormat);
+        if (copy == 0L) {
+            OfflineRender.cancel("展示管线创建失败");
+            return;
+        }
+        int copyOffset = writeUniforms(pack, width, height, minecraft, null, passIndex + 2);
+        Dx12Native.dx12BeginRenderPass(ctx, new long[]{color.handle()}, new int[]{0},
+            new byte[]{0}, null, 0L, 0, (byte) 0, 0.0, 0, 0, width, height);
+        try {
+            Dx12Native.dx12SetPipeline(ctx, copy, false);
+            pushDescriptors(ctx, List.of(accumDst), uniformHandle, copyOffset);
+            Dx12Native.dx12Draw(ctx, 3, 1, 0, 0);
+        } finally {
+            Dx12Native.dx12EndRenderPass(ctx);
+        }
+        OfflineRender.onFrameAccumulated();
+    }
+
+    /** 离线渲染的累积管线（RGBA16F 输出；输入 t0=scene_color、t1=历史累积）。 */
+    private long accumPipeline() {
+        String key = "__offline_accum__";
+        Long cached = this.pipelineCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        long handle = createPipeline(FULLSCREEN_VS, ACCUM_PS, GpuFormat.RGBA16_FLOAT.ordinal(), 2);
+        this.pipelineCache.put(key, handle);
+        return handle;
     }
 
     /**
@@ -479,7 +573,7 @@ public final class Dx12ShaderPackRenderer {
         buffer.putFloat(base + 12, 1.0f / Math.max(1, height));
 
         long gameTime = minecraft.level == null ? 0L : minecraft.level.getGameTime();
-        buffer.putFloat(base + 16, (float) (System.nanoTime() / 1_000_000_000.0));
+        buffer.putFloat(base + 16, OfflineRender.shaderTime());
         buffer.putFloat(base + 20, (float) this.frameIndex);
         buffer.putFloat(base + 24, this.deltaSeconds);
         buffer.putFloat(base + 28, gameTime / 20.0f);
@@ -694,6 +788,7 @@ public final class Dx12ShaderPackRenderer {
 
     /** 释放全部缓存（切换光影包 / 资源重载时调用）。 */
     public void invalidate() {
+        OfflineRender.abort();
         for (Long handle : this.pipelineCache.values()) {
             if (handle != null && handle != 0L) {
                 Dx12Native.dx12DestroyPipeline(handle);

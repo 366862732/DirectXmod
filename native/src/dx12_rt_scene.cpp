@@ -35,10 +35,12 @@ constexpr int kRtVertexStride = 40;
 // 每帧最多新建多少个 BLAS：初次进入世界时 section 数量很大，分帧构建避免
 // 长时间占用 scene 锁阻塞区块 worker 线程。
 constexpr int kBlasBuildsPerFrame = 24;
-// BLAS 建好后顶点/索引还会被 GPU 读取；延迟这么多帧再释放 UPLOAD 缓冲。
-constexpr int kGeomFreeDelayFrames = 4;
-// TLAS 双缓冲：重建时写另一份，避免与上一帧仍在执行的 DispatchRays 抢同一资源。
-constexpr int kTlasSlotCount = 2;
+// 延迟释放帧数：必须覆盖「TLAS 槽位复用的最短间隔 + 引擎最大在飞帧数」。
+// BLAS/vb/ib 在 TLAS 重建后仍可能被在飞帧的 DispatchRays 遍历到。
+constexpr int kGeomFreeDelayFrames = 8;
+// TLAS 槽位轮换：槽位数必须大于引擎最大在飞帧数（交换链 3 缓冲，约 2-3 帧），
+// 否则重建会覆盖 GPU 仍在读取的 TLAS。原为 2 槽，重建频繁时必踩在飞帧。
+constexpr int kTlasSlotCount = 4;
 
 bool rtAvailable(DeviceContext*& dev)
 {
@@ -116,6 +118,8 @@ struct PendingFree {
     ComPtr<ID3D12Resource> vb;
     ComPtr<ID3D12Resource> ib;
     ComPtr<ID3D12Resource> blas;
+    ComPtr<ID3D12Resource> scratch;
+    ComPtr<ID3D12Resource> instance;   // 实例缓冲扩容时替换下来的旧缓冲
     int framesLeft = 0;
 };
 
@@ -135,8 +139,9 @@ TlasSlot gTlas[kTlasSlotCount];
 int gTlasIndex = 0;
 int gTlasActive = -1;   // 已构建且可采样的槽位；-1 = 尚未构建
 
-ComPtr<ID3D12Resource> gInstanceBuffer;  // UPLOAD
-UINT gInstanceCapacity = 0;
+// 实例描述缓冲按 TLAS 槽位轮换，避免重写 GPU 在飞帧仍在读取的实例数据。
+ComPtr<ID3D12Resource> gInstanceBuffer[kTlasSlotCount];  // UPLOAD
+UINT gInstanceCapacity[kTlasSlotCount] = {};
 
 // ---- 光追管线 ----
 struct RtPipeline {
@@ -304,7 +309,9 @@ bool initPipeline(std::string& err)
     // ---- 描述符堆 ----
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 3;
+    // 每个 TLAS 槽位一组（t0 深度 / t1 TLAS / u0 输出），轮换使用，
+    // 避免覆盖在飞帧 DispatchRays 仍在读取的描述符。
+    hd.NumDescriptors = 3 * kTlasSlotCount;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = dev->device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gPipeline.heap));
     if (FAILED(hr)) {
@@ -418,10 +425,11 @@ bool rtUpdateSection(long long key, int layer, int cx, int cy, int cz,
         std::lock_guard<std::mutex> lock(gSceneMutex);
         auto it = gSections.find(mapKey);
         if (it != gSections.end() && it->second->blasBuilt) {
-            // 旧几何已被 BLAS 读过，延迟释放。
+            // 旧几何/BLAS 已被 TLAS 读过，延迟释放（立即释放会在飞帧引用悬垂）。
             PendingFree pending;
             pending.vb = it->second->vb;
             pending.ib = it->second->ib;
+            pending.blas = it->second->blas;
             pending.framesLeft = kGeomFreeDelayFrames;
             gPendingFree.push_back(std::move(pending));
         }
@@ -444,6 +452,7 @@ bool rtRemoveSection(long long key)
             PendingFree pending;
             pending.vb = it->second->vb;
             pending.ib = it->second->ib;
+            pending.blas = it->second->blas;
             pending.framesLeft = kGeomFreeDelayFrames;
             gPendingFree.push_back(std::move(pending));
         }
@@ -459,8 +468,19 @@ bool rtRemoveSection(long long key)
 void rtResetScene()
 {
     std::lock_guard<std::mutex> lock(gSceneMutex);
+    // 不能立即销毁：在飞帧的 TLAS 构建 / DispatchRays 可能仍引用这些资源，
+    // 全部转入延迟释放队列，由后续帧的构建调用逐步回收。
+    for (auto& entry : gSections) {
+        PendingFree pending;
+        pending.vb = entry.second->vb;
+        pending.ib = entry.second->ib;
+        pending.blas = entry.second->blas;
+        if (pending.vb || pending.blas) {
+            pending.framesLeft = kGeomFreeDelayFrames;
+            gPendingFree.push_back(std::move(pending));
+        }
+    }
     gSections.clear();
-    gPendingFree.clear();
     gTlasDirty = true;
     gTlasActive = -1;
 }
@@ -525,6 +545,9 @@ bool buildOneBlas(ID3D12GraphicsCommandList4* list, RtSection& section, std::str
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, &blas, err, "BLAS")) {
         return false;
     }
+    // 暂存缓冲：构建命令只是被录制，资源必须存活到 GPU 执行完成——局部 ComPtr
+    // 会在录制后立刻销毁，留下悬垂的 ScratchAccelerationStructureData。
+    // 录制完成后转入延迟释放队列（8 帧后回收，避免长期占用显存）。
     ComPtr<ID3D12Resource> scratch;
     if (!createRtBuffer(dev.device.Get(), info.ScratchDataSizeInBytes,
             D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -538,6 +561,13 @@ bool buildOneBlas(ID3D12GraphicsCommandList4* list, RtSection& section, std::str
     desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     desc.SourceAccelerationStructureData = 0;
     list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+
+    {
+        PendingFree pending;
+        pending.scratch = scratch;
+        pending.framesLeft = kGeomFreeDelayFrames;
+        gPendingFree.push_back(std::move(pending));
+    }
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -583,8 +613,12 @@ bool rebuildTlas(ID3D12GraphicsCommandList4* list4, std::string& err)
     const UINT count = (UINT)entries.size();
     const UINT64 instanceBytes = (UINT64)count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
 
-    if (!gInstanceBuffer || gInstanceCapacity < count) {
-        UINT capacity = gInstanceCapacity;
+    // 轮换槽位：槽位数 > 在飞帧数，保证被重写的槽位已经执行完毕。
+    const int slot = (gTlasActive >= 0) ? (gTlasActive + 1) % kTlasSlotCount : 0;
+
+    // 实例描述缓冲同样按槽位轮换：在飞帧可能仍在读旧内容。
+    if (!gInstanceBuffer[slot] || gInstanceCapacity[slot] < count) {
+        UINT capacity = gInstanceCapacity[slot];
         while (capacity < count) {
             capacity = capacity == 0 ? 256 : capacity * 2;
         }
@@ -594,12 +628,19 @@ bool rebuildTlas(ID3D12GraphicsCommandList4* list4, std::string& err)
                 D3D12_RESOURCE_FLAG_NONE, &buffer, err, "TLAS instances")) {
             return false;
         }
-        gInstanceBuffer = buffer;
-        gInstanceCapacity = capacity;
+        if (gInstanceBuffer[slot]) {
+            // 旧缓冲可能仍被在飞帧的 TLAS 构建命令读取，延迟释放。
+            PendingFree pending;
+            pending.instance = gInstanceBuffer[slot];
+            pending.framesLeft = kGeomFreeDelayFrames;
+            gPendingFree.push_back(std::move(pending));
+        }
+        gInstanceBuffer[slot] = buffer;
+        gInstanceCapacity[slot] = capacity;
     }
 
     void* mapped = nullptr;
-    if (FAILED(gInstanceBuffer->Map(0, nullptr, &mapped))) {
+    if (FAILED(gInstanceBuffer[slot]->Map(0, nullptr, &mapped))) {
         err = "TLAS instances Map 失败";
         return false;
     }
@@ -625,13 +666,13 @@ bool rebuildTlas(ID3D12GraphicsCommandList4* list4, std::string& err)
         d.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         d.AccelerationStructure = it->second->blas->GetGPUVirtualAddress();
     }
-    gInstanceBuffer->Unmap(0, nullptr);
+    gInstanceBuffer[slot]->Unmap(0, nullptr);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
     inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.NumDescs = count;
-    inputs.InstanceDescs = gInstanceBuffer->GetGPUVirtualAddress();
+    inputs.InstanceDescs = gInstanceBuffer[slot]->GetGPUVirtualAddress();
     inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
@@ -641,8 +682,7 @@ bool rebuildTlas(ID3D12GraphicsCommandList4* list4, std::string& err)
         return false;
     }
 
-    // 双缓冲：写另一个槽位，避免与上一帧仍在执行的 DispatchRays 冲突。
-    const int slot = (gTlasActive >= 0) ? (1 - gTlasActive) : 0;
+    // 槽位已在上面选好；写目标槽位，避免与在飞帧 DispatchRays 抢同一资源。
     TlasSlot& target = gTlas[slot];
     if (!target.tlas || target.tlasSize < info.ResultDataMaxSizeInBytes) {
         ComPtr<ID3D12Resource> tlas;
@@ -808,9 +848,13 @@ bool rtDispatch(CommandContext* ctx, Dx12Object* depthView,
     }
 
     // ---- 写描述符：t0 深度 / t1 TLAS / u0 输出 ----
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gPipeline.heap->GetCPUDescriptorHandleForHeapStart();
+    // 描述符按 TLAS 槽位分段：同一段要隔 kTlasSlotCount 帧才会被重写，
+    // 避免覆盖在飞帧 DispatchRays 仍在读取的描述符。
     const UINT inc = dev.device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gPipeline.heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)inc * 3 * gTlasActive;
 
     D3D12_CPU_DESCRIPTOR_HANDLE hDepth = cpu;
     D3D12_CPU_DESCRIPTOR_HANDLE hTlas{ cpu.ptr + inc };
@@ -846,6 +890,7 @@ bool rtDispatch(CommandContext* ctx, Dx12Object* depthView,
         uniformBuffer->resource->GetGPUVirtualAddress() + (UINT64)uniformOffset);
 
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = gPipeline.heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += (UINT64)inc * 3 * gTlasActive;
     D3D12_GPU_DESCRIPTOR_HANDLE gpuDepth{ gpu.ptr };
     D3D12_GPU_DESCRIPTOR_HANDLE gpuTlas{ gpu.ptr + inc };
     D3D12_GPU_DESCRIPTOR_HANDLE gpuUav{ gpu.ptr + (SIZE_T)inc * 2 };
@@ -880,8 +925,10 @@ void rtResetAll()
     std::lock_guard<std::mutex> lock(gSceneMutex);
     gSections.clear();
     gPendingFree.clear();
-    gInstanceBuffer.Reset();
-    gInstanceCapacity = 0;
+    for (int i = 0; i < kTlasSlotCount; ++i) {
+        gInstanceBuffer[i].Reset();
+        gInstanceCapacity[i] = 0;
+    }
     for (int i = 0; i < kTlasSlotCount; ++i) {
         gTlas[i].tlas.Reset();
         gTlas[i].scratch.Reset();
