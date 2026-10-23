@@ -5,6 +5,8 @@ import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.math.Axis;
 import com.xgdt.dx12.shaderpack.ShaderPack;
 import com.xgdt.dx12.shaderpack.ShaderPackManager;
 import com.xgdt.dx12.shaderpack.ShaderPackManifest;
@@ -19,9 +21,11 @@ import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.GameRenderState;
+import net.minecraft.client.renderer.state.level.CameraEntityRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
+import net.minecraft.util.Mth;
 import org.joml.Matrix4f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -566,6 +570,11 @@ public final class Dx12ShaderPackRenderer {
             cameraY = (float) camera.pos.y;
             cameraZ = (float) camera.pos.z;
         }
+        // TEMP DEBUG：确认 sky pass（passIndex=0）的 uniform 槽位与相机坐标（诊断完删除）。
+        if (passIndex == 0 && this.frameIndex % 60 == 0) {
+            LOGGER.info("[shaderpack] sky uniform slot={} camera=({}, {}, {})",
+                base, cameraX, cameraY, cameraZ);
+        }
 
         buffer.putFloat(base, width);
         buffer.putFloat(base + 4, height);
@@ -614,7 +623,7 @@ public final class Dx12ShaderPackRenderer {
         float[] matrix = new float[16];
         Matrix4f invViewProj = new Matrix4f();
         if (camera != null) {
-            invViewProj.set(camera.projectionMatrix).mul(camera.viewRotationMatrix).invert();
+            invViewProj.set(levelProjection(camera, renderState)).mul(camera.viewRotationMatrix).invert();
         }
         invViewProj.get(matrix);
         for (int i = 0; i < 16; i++) {
@@ -634,6 +643,59 @@ public final class Dx12ShaderPackRenderer {
             buffer.putFloat(base + 272 + i * 4, options[i]);
         }
         return base;
+    }
+
+    /**
+     * 还原 {@code GameRenderer.renderLevel} 实际用于世界渲染的投影矩阵。
+     *
+     * <p>原版会把相机投影复制一份，再后乘 {@code bobHurt} 与（开启视点摆动时）
+     * {@code bobView} 的 PoseStack 矩阵；行渲染用的就是这个副本，而
+     * {@code CameraRenderState.projectionMatrix} 本身不含摆动。光影的
+     * {@code InvViewProj} 若直接用它，天空/云不会和地形一起晃，走路时就会
+     * 看到地平线相对地形“游”。这里按原版公式复现同一个矩阵。
+     */
+    private static Matrix4f levelProjection(CameraRenderState camera, GameRenderState renderState) {
+        Matrix4f projection = new Matrix4f(camera.projectionMatrix);
+        if (renderState == null) {
+            return projection;
+        }
+        CameraEntityRenderState entity = camera.entityRenderState;
+        PoseStack bobStack = new PoseStack();
+
+        // GameRenderer.bobHurt
+        if (entity.isLiving) {
+            if (entity.isDeadOrDying) {
+                float duration = Math.min(entity.deathTime, 20.0f);
+                bobStack.mulPose(Axis.ZP.rotationDegrees(40.0f - 8000.0f / (duration + 200.0f)));
+            }
+            float hurt = entity.hurtTime;
+            if (hurt >= 0.0f) {
+                hurt /= Math.max(1, entity.hurtDuration);
+                hurt = Mth.sin(hurt * hurt * hurt * hurt * (float) Math.PI);
+                float hurtDir = entity.hurtDir;
+                bobStack.mulPose(Axis.YP.rotationDegrees(-hurtDir));
+                float tilt = (float) ((double) (-hurt) * 14.0
+                    * renderState.optionsRenderState.damageTiltStrength);
+                bobStack.mulPose(Axis.ZP.rotationDegrees(tilt));
+                bobStack.mulPose(Axis.YP.rotationDegrees(hurtDir));
+            }
+        }
+
+        // GameRenderer.bobView
+        if (renderState.optionsRenderState.bobView && entity.isPlayer) {
+            float walk = entity.backwardsInterpolatedWalkDistance;
+            float bob = entity.bob;
+            bobStack.translate(
+                Mth.sin(walk * (float) Math.PI) * bob * 0.5f,
+                -Math.abs(Mth.cos(walk * (float) Math.PI) * bob),
+                0.0f);
+            bobStack.mulPose(Axis.ZP.rotationDegrees(Mth.sin(walk * (float) Math.PI) * bob * 3.0f));
+            bobStack.mulPose(Axis.XP.rotationDegrees(
+                Math.abs(Mth.cos(walk * (float) Math.PI - 0.2f) * bob) * 5.0f));
+        }
+
+        projection.mul(bobStack.last().pose());
+        return projection;
     }
 
     private static void putFloats(ByteBuffer buffer, int offset, float[] values) {

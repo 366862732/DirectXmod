@@ -35,6 +35,7 @@ SamplerState SceneDepthSampler : register(s1);
 #define O_WATER_RIPPLES (Options[4].y)
 #define O_WATER_GLINT   (Options[4].z)
 #define O_END_GALAXY    (Options[4].w)
+#define O_CLOUD_SIZE    (Options[5].x)
 
 struct VSOut
 {
@@ -234,9 +235,18 @@ float endGalaxy(float3 rd, float amount)
 // 体积云：移植 Helian-MMCO v1.2.0 (Sundial Lite edit) 的 CLOUD_TYPE 2
 // realisticCloud —— 千米尺度球壳积云
 //
-// 照搬的结构：地球半径 6371 km 的球壳云层（云底 ~4.7 km / 云顶 ~13.7 km），
-// 6 octave 值噪声密度场、“日月双光路 x 5 样本 x 3 octave”自遮蔽光学深度、
-// 自带 16-bit 透射率 LUT 提供的大气斜射消光与地面吸收项（低太阳时的暖色云顶）。
+// 照搬的结构：地球半径 6371 km 的球壳云层，6 octave 值噪声密度场、
+// “日月双光路 x 5 样本 x 3 octave”自遮蔽光学深度、自带 16-bit 透射率 LUT
+// 提供的大气斜射消光与地面吸收项（低太阳时的暖色云顶）。
+//
+// B 项改造：原版云底 4.2 km 太高，走路几乎看不出视差（天空像贴在头上）。
+// 现在云底固定在世界 y=800（云顶 ~2.5 km），整套云层厚度/层距/采样步长
+// 按 HC_CLOUD_SCALE_DOWN 等比缩小；噪声坐标反向放大同样的倍数，云块在
+// 屏幕上的角尺寸基本不变，但走/飞时的平移视差会明显出现。
+//
+// 云块大小滑条（O_CLOUD_SIZE，默认 0.33）：同时缩放基底 2D 噪声与主导形状的
+// 前两层 3D octave，让云团从 ~4 km 缩到 ~1.3 km；第 3~4 层保持原频率——
+// 最细一层已经接近采样步长，再放大只会变成噪点/闪烁。拉回 1.0 就是原来的大云板。
 //
 // 框架差异处理：
 //   * noisetex 纹理噪声 -> 整数格哈希值噪声（大坐标稳定，按 1:64 格距等价替换）；
@@ -245,9 +255,13 @@ float endGalaxy(float3 rd, float amount)
 // ---------------------------------------------------------------------------
 
 #define HC_EARTH_R            6371000.0
-#define HC_HEIGHT             4200.0
-#define HC_THICKNESS          9000.0
-#define HC_CENTER_THICKNESS   1800.0
+// 云底固定世界高度（格）。想再调高/调低只改这一个数：整套云层厚度、
+// 采样尺度、消光系数和风速补偿都会按 4200/HC_HEIGHT 自动重标。
+#define HC_HEIGHT             800.0
+// 4200 / 800：云底高度与全部纵向尺度共用的缩小倍数。
+#define HC_CLOUD_SCALE_DOWN   (4200.0 / HC_HEIGHT)
+#define HC_THICKNESS          (9000.0 / HC_CLOUD_SCALE_DOWN)
+#define HC_CENTER_THICKNESS   (1800.0 / HC_CLOUD_SCALE_DOWN)
 #define HC_CENTER_Y           (HC_EARTH_R + HC_HEIGHT + 500.0)
 #define HC_BOTTOM             (HC_CENTER_Y)
 #define HC_TOP                (HC_EARTH_R + HC_HEIGHT + HC_THICKNESS + 500.0)
@@ -255,24 +269,27 @@ float endGalaxy(float3 rd, float amount)
 #define HC_OCTAVE_SCALE       3.0
 #define HC_OCTAVE_FADE        0.5
 #define HC_HARDNESS           0.2
-#define HC_SAMPLE_DENSITY     0.02
-#define HC_SHADOW_STEP        540.0
-#define HC_FADE_DISTANCE      70000.0
+// 消光系数与步长同步反向缩放，光学厚度（云的不透明度）保持不变。
+#define HC_SAMPLE_DENSITY     (0.02 * HC_CLOUD_SCALE_DOWN)
+#define HC_SHADOW_STEP        (540.0 / HC_CLOUD_SCALE_DOWN)
+// 70000 是按 4.2 km 云底调的；云底降到 800 后按地平线距离重标，保证远云
+// 仍然是“淡出”而不是在低空突然断掉。
+#define HC_FADE_DISTANCE      30000.0
 #define HC_BASIC_SHADOWLIGHT  0.01
 // 参考管线的环境光来自它自己的 HDR 天空（数值远高于我们 0-1 的天空渐变），
 // 照抄 0.1 会让云底只剩 ~0.05 亮度，看上去就是一坨黑烟；0.18 加上采样处
 // 把环境光放大 4 倍后，云底才回到“灰白阴天”该有的亮度。
 #define HC_BASIC_SKYLIGHT     0.18
 #define HC_LIGHT_SCALE        2.0
-// 形状 octave 用 4（参考为 6）：第 5~6 层特征只有 86/28.6 米，在 500m~2km
-// 步进下采不到，只会往云边撒白噪点；第 4 层（257 米）贡献 6.7%，给云边
-// 添一点起伏，缓解“像加了模糊滤镜”的观感。4 层权重和恰为 0.9375。
+// 形状 octave 用 4（参考为 6）：第 5~6 层特征只有几十米，在当前步进尺度下
+// 采不到，只会往云边撒白噪点；第 4 层贡献 6.7%，给云边添一点起伏，缓解
+// “像加了模糊滤镜”的观感。4 层权重和恰为 0.9375。
 #define HC_DENSITY_WEIGHTS    0.9375
 #define HC_SHADOW_WEIGHTS     0.9375
-// 参考速度在 770m+ 的特征上几乎看不出移动（实测反馈“云是静态的”），
-// 默认档乘 4（约 32 m/s）让漂移可见；嫌快可调低“云速度”滑条。
-#define HC_CLOUD_SPEED        (max(O_CLOUD_SPEED, 0.0) * 4.0)
-#define HC_CLOUD_AMOUNT       (lerp(0.45, 0.95, saturate(O_CLOUD_COVER)) * 2.0)
+// 平面云层不再靠球壳距离制造“远景”，风速直接按世界格/秒给：
+// 默认档约 15 格/秒，云块 470 格时约半分钟换一个形状；嫌快可调低滑条。
+#define HC_CLOUD_SPEED        (max(O_CLOUD_SPEED, 0.0) * 8.0 / HC_CLOUD_SCALE_DOWN)
+#define HC_CLOUD_AMOUNT       (lerp(0.35, 1.55, saturate(O_CLOUD_COVER)))
 
 // 高度/角度索引范围对应 Helian-MMCO AtmosphereTransmittance.bin 的 texel 索引
 #define HC_LUT_NH 33
@@ -869,121 +886,94 @@ float3 hcAtmoAbsorptionLUT(float height, float cosAngle)
     return lerp(lerp(a, b, fh), lerp(c, d, fh), fv);
 }
 
-// 垂直收边因子（云底/云顶各一项，随采样高度变化）
-float2 hcHeightClampPair(float cloudDistance)
+// 云层几何：世界固定的水平层。
+//
+// 之前照搬 Helian 的地球球壳（半径 6371 km）求交：地平线附近的交点距离
+// 会到上百公里，飞 1000 格视角只变 0.6°，看起来就是“云粘在镜头上”。
+// 平面层的距离有限（最远 HC_MAX_DIST），任何仰角下飞行视差都明显；
+// 同时高度剖面直接用采样点的世界 y，不再依赖那个恒为 1 的球壳高度项。
+#define HC_CLOUD_TOP_Y   (HC_HEIGHT + HC_THICKNESS)
+#define HC_MAX_DIST      14000.0
+
+// 云层垂直剖面：云底/云顶柔和收边，中间最厚。
+float hcHeightFactor(float y)
 {
-    float bottom = saturate(1.0 + HC_CENTER_Y / HC_CENTER_THICKNESS - cloudDistance / HC_CENTER_THICKNESS);
-    float top = saturate(cloudDistance / HC_THICKNESS_MC - (HC_CENTER_THICKNESS + HC_CENTER_Y) / HC_THICKNESS_MC);
-    return float2(bottom, top);
+    float h = saturate((y - HC_HEIGHT) / HC_THICKNESS);
+    return smoothstep(0.0, 0.18, h) * (1.0 - smoothstep(0.74, 1.0, h));
 }
 
-// 云密度（对照 realisticCloudDensity；weatherStrength 取 0）
-float hcCloudDensity(float3 cloudPos, float3 wind, float cloudDistance, int octaves, float weights)
+// 水平风：y 方向不吹，云层高度稳定；速度按云底高度反比补偿。
+// 这里直接用 Time.x，不走 hcTime() 的 3600 秒回绕：云图案每 470 格才
+// 重复一次，整点回绕会让满天云瞬移一大截。
+float3 hcCloudWind()
 {
-    cloudPos += hcTime() * HC_CLOUD_SPEED * float3(10.0, -10.0, 5.0);
-    // 噪声 y 坐标去地球中心化：y≈6.4e6 直接进高频 octave 会丢 fp32 精度
-    cloudPos.y -= HC_EARTH_R;
+    return Time.x * HC_CLOUD_SPEED * float3(10.0, 0.0, 5.0);
+}
 
-    float density = ivnoise2(cloudPos.xz * (0.00001 / 20.0 * 64.0));
-    float weight = 1.0;
+// 云密度：世界坐标 3D 值噪声。基底 2D 噪声给大团块，3 层 3D octave
+// 给边缘细节；归一化后按云量阈值切出云体。
+float hcCloudDensity(float3 p, float3 wind, float heightFactor)
+{
+    float sizeScale = rcp(clamp(O_CLOUD_SIZE, 0.2, 1.0));
+    float3 q = p + wind;
+    q.y -= HC_HEIGHT;
+
+    // 默认 O_CLOUD_SIZE=0.33 时：基底 ~470 格，三层细节 ~255/85/28 格。
+    // 拉回 1.0 就是 ~1400/770/255 格的大云板。
+    float d = ivnoise2(q.xz * (0.00070 * sizeScale));
+    float amp = 0.5;
+    float3 q3 = q * (0.00130 * sizeScale);
     for (int i = 0; i < 3; i++)
     {
-        if (i >= octaves) break;
-        cloudPos = cloudPos * HC_OCTAVE_SCALE + wind;
-        weight *= HC_OCTAVE_FADE;
-        density += ivnoise3(cloudPos * (0.000015 / 20.0 * 64.0)) * weight;
+        d += ivnoise3(q3) * amp;
+        q3 = q3 * 3.0 + 11.7;
+        amp *= 0.5;
     }
+    d *= rcp(1.875);   // 1 + 0.5 + 0.25 + 0.125
 
-    float2 hc = hcHeightClampPair(cloudDistance);
-    float heightClamp = hc.x + hc.y;
-    heightClamp *= heightClamp;
-
-    float cloudAmount = HC_CLOUD_AMOUNT;
-    density = saturate(density / weights + cloudAmount - HC_HARDNESS * 10.0 - cloudAmount * heightClamp);
-    return density;
+    // 云量：0.30 时阈值 0.54，约 25~30% 天空有云；0.70 时约 70%。
+    float threshold = lerp(0.66, 0.26, saturate(O_CLOUD_COVER));
+    float density = saturate((d - threshold) * 5.0);
+    return density * heightFactor;
 }
 
-// 地面/大气吸收项（对照 atmosphereAbsorptionGround）
-float hcAtmoAbsorptionGround(float RdotP, float cloudDistance)
+// 单次采样：密度 + 太阳方向自遮蔽 + 天空环境光。
+float4 hcSampleRealisticCloud(float3 p, float3 sunDir, float3 atmosphere,
+                              float noise, float heightFactor)
 {
-    float rayHeight = cloudDistance * sqrt(max(0.0, 1.0 + RdotP)) - HC_EARTH_R - 500.0;
-    float absorption = saturate(rayHeight / (HC_HEIGHT * 4.0));
-    return absorption * absorption;
-}
-
-// 单次采样：密度 + 日月双光路自遮蔽 + 天空光（对照 sampleRealisticCloud）
-float4 hcSampleRealisticCloud(float3 cloudPos, float3 sunDir, float3 atmosphere, float noise)
-{
-    float3 relativeCloudPos = cloudPos - float3(CameraPosition.x, 0.0, CameraPosition.z);
-    float cloudDistance2 = dot(relativeCloudPos, relativeCloudPos);
-    float cloudDistanceInv = rsqrt(max(cloudDistance2, 1.0));
-    float3 wind = HC_OCTAVE_SCALE * hcTime() * HC_CLOUD_SPEED * float3(10.0, -10.0, 5.0);
-
-    float4 result = float4(0.0, 0.0, 0.0, 0.0);
-    result.w = hcCloudDensity(cloudPos, wind, cloudDistance2 * cloudDistanceInv, 4, HC_DENSITY_WEIGHTS);
-    if (result.w > 1e-5)
+    float3 wind = hcCloudWind();
+    float density = hcCloudDensity(p, wind, heightFactor);
+    if (density < 1e-4)
     {
-        // 只算太阳一路：参考实现的月光支路最终权重只有 0.006，可以忽略；
-        // 省下的开销拿去把主步进从 16 步提到 24 步。
-        float RdotP = 2.0 * dot(sunDir, relativeCloudPos);
-        float sunlightOpticalDepth = 0.0;
-        float stepSize = HC_SHADOW_STEP * (0.5 + noise);
-        float stepLength = 0.0;
-        for (int i = 0; i < 5; i++)
-        {
-            stepLength += stepSize;
-            float3 sunlightSamplePos = cloudPos + sunDir * stepLength;
-            sunlightOpticalDepth += hcCloudDensity(sunlightSamplePos, wind,
-                sqrt(max(cloudDistance2 + stepLength * (RdotP + stepLength), 0.0)), 3, HC_SHADOW_WEIGHTS) * stepSize;
-            stepSize += HC_SHADOW_STEP;
-        }
-
-        RdotP *= cloudDistanceInv * 0.5;
-        float cloudDistance = cloudDistance2 * cloudDistanceInv;
-        float3 sunlightStrength = hcAtmoAbsorptionLUT(cloudDistance, RdotP);
-        float cosAbs = RdotP * abs(RdotP);
-        sunlightStrength *= hcAtmoAbsorptionGround(cosAbs, cloudDistance);
-
-        sunlightStrength *= HC_BASIC_SHADOWLIGHT
-            + exp2(-sqrt(sunlightOpticalDepth * HC_SAMPLE_DENSITY * 2.08136898));
-        result.rgb += HC_LIGHT_SCALE * sunlightStrength;
-
-        // 天空光：越靠云顶接受的天光越多（含参考实现的两次平滑与云内吸收项）
-        float2 hc = hcHeightClampPair(cloudDistance);
-        float skyLightStrength = (-hc.x + hc.y) * 0.5 + 0.5;
-        skyLightStrength *= skyLightStrength * (3.0 - 2.0 * skyLightStrength);
-        skyLightStrength *= skyLightStrength * (3.0 - 2.0 * skyLightStrength);
-        skyLightStrength *= skyLightStrength * (3.0 - 2.0 * skyLightStrength);
-        skyLightStrength *= skyLightStrength * (3.0 - 2.0 * skyLightStrength);
-        float cloudAbsorptionBeta = exp2(-HC_THICKNESS * HC_SAMPLE_DENSITY);
-        skyLightStrength += cloudAbsorptionBeta - skyLightStrength * cloudAbsorptionBeta;
-        result.rgb += atmosphere * (skyLightStrength + HC_BASIC_SKYLIGHT);
+        return float4(0.0, 0.0, 0.0, 0.0);
     }
-    return result;
+
+    // 太阳方向自遮蔽：4 步，步长随噪声抖动，避免条带。
+    float opticalDepth = 0.0;
+    float stepSize = 90.0 * (0.5 + noise);
+    for (int i = 0; i < 4; i++)
+    {
+        float t = stepSize * (float)(i + 1);
+        float3 sp = p + sunDir * t;
+        opticalDepth += hcCloudDensity(sp, wind, hcHeightFactor(sp.y)) * stepSize;
+    }
+    float sunTrans = exp2(-opticalDepth * HC_SAMPLE_DENSITY * 1.44269502);
+
+    float sunUp = saturate(sunDir.y * 4.0);
+    float3 sunTint = lerp(float3(1.00, 0.52, 0.26), float3(1.00, 0.96, 0.90),
+                          saturate(sunDir.y * 3.0));
+    float3 sunlight = sunTint * (0.20 + 0.80 * sunTrans) * sunUp;
+
+    // 环境光：云顶更亮，云底偏灰；atmosphere 已经是天空散射色。
+    float3 ambient = atmosphere * (0.42 + 0.58 * heightFactor);
+    float3 color = ambient + sunlight * 1.15;
+
+    // 厚云偏灰蓝，薄云偏白（廉价的多重散射补偿）。
+    color = lerp(color, atmosphere * 1.05, density * 0.18);
+    return float4(color, density);
 }
 
-// 行星相交（对照 planetIntersectionData；天空像素的相机相对坐标原点为 0）
-float4 hcPlanetIntersectionData(float3 worldDir)
-{
-    float3 originPos = float3(0.0, max(300.0 + HC_EARTH_R, CameraPosition.y + 500.0 + HC_EARTH_R), 0.0);
-    float R2 = dot(originPos, originPos);
-    float RdotP = dot(originPos, worldDir);
-    float RdotP2 = RdotP * RdotP - R2;
-    float d = sqrt(RdotP2 + HC_EARTH_R * HC_EARTH_R);
-    float intersection = max(-1.0, -RdotP - d);
-    return float4(RdotP, RdotP2, intersection, 0.0);
-}
-
-// 球面求交（对照 raySphereIntersection）
-float2 hcRaySphereIntersection(float RdotP, float RdotP2, float negR2)
-{
-    float d = sqrt(max(RdotP2 - negR2, 0.0));
-    return max(float2(-1.0, -1.0), float2(-RdotP - d, -RdotP + d));
-}
-
-// 步进抖动（替代 bayer64Temporal 与 NoiseGenerator）：参考实现把抖动交给
-// TAA 收敛，我们没有 TAA，逐像素白噪会固化成满屏雪花点。改用“世界坐标锚
-// 定”的平滑值噪声——相邻像素拿到相近的抖动量，云边只轻微起伏、不起噪点。
+// 步进抖动：世界坐标锚定的平滑值噪声，避免逐像素白噪固化成雪花点。
 float hcStartDither(float3 worldPos)
 {
     return ivnoise3(worldPos * 0.02);
@@ -994,73 +984,75 @@ float hcSampleDither(float3 worldPos, int i)
     return ivnoise3(worldPos * 0.02 + (float)i * 37.0);
 }
 
-// 主步进（对照 realisticCloud；天空像素 backDepth = 0，跳过）
+// 主步进：平面云层求交 + 前向 march。
 float4 hcRealisticCloud(float3 baseColor, float3 atmosphere, float3 skyColorUp,
                         float3 worldDir, float3 sunDir, float2 uv)
 {
-    float4 intersectionData = hcPlanetIntersectionData(worldDir);
-    float planetIntersection = intersectionData.z;
-    float2 cloudBottomIntersection = hcRaySphereIntersection(intersectionData.x, intersectionData.y, -HC_BOTTOM * HC_BOTTOM);
-    float2 cloudTopIntersection = hcRaySphereIntersection(intersectionData.x, intersectionData.y, -HC_TOP * HC_TOP);
+    float3 camPos = CameraPosition.xyz;
+    float bottom = HC_HEIGHT;
+    float top = HC_CLOUD_TOP_Y;
 
-    float3 cloudPos = float3(0.0, max(300.0 + HC_EARTH_R, CameraPosition.y + 500.0 + HC_EARTH_R), 0.0);
-    bool hit;
-    float startIntersection;
-    float endIntersection;
-    if (cloudPos.y < HC_BOTTOM)
+    float tStart = 0.0;
+    float tEnd = 0.0;
+    if (abs(worldDir.y) < 1e-4)
     {
-        hit = planetIntersection < 0.0;
-        startIntersection = cloudBottomIntersection.y;
-        endIntersection = cloudTopIntersection.y;
+        // 水平射线：只有相机在层内才有云，路径截断到 HC_MAX_DIST。
+        if (camPos.y < bottom || camPos.y > top)
+        {
+            return float4(baseColor, 0.0);
+        }
+        tStart = 0.0;
+        tEnd = HC_MAX_DIST;
     }
     else
     {
-        endIntersection = (cloudBottomIntersection.x > 0.0) ? cloudBottomIntersection.x : cloudTopIntersection.y;
-        float overCloud = saturate((cloudPos.y - HC_TOP) * 1e+10);
-        startIntersection = cloudTopIntersection.x * overCloud;
-        hit = cloudPos.y < HC_TOP || cloudTopIntersection.y > 0.0;
+        float t0 = (bottom - camPos.y) / worldDir.y;
+        float t1 = (top - camPos.y) / worldDir.y;
+        tStart = max(min(t0, t1), 0.0);
+        tEnd = min(max(t0, t1), HC_MAX_DIST);
     }
-    endIntersection = min(endIntersection, startIntersection + 50000.0);
-
-    float4 result = float4(baseColor, 0.0);
-    if (hit && endIntersection > startIntersection)
+    if (tEnd <= tStart + 1.0)
     {
-        int hq = (int)clamp(O_CLOUD_STEPS * 1.2, 6.0, 24.0);
-        float cloudTransmittance = 1.0;
-        float stepSize = (endIntersection - startIntersection) / (hq + 1.0);
-        float3 ditherAnchor = cloudPos + worldDir * startIntersection;
-        ditherAnchor.xz += CameraPosition.xz;
-        float startNoise = stepSize * hcStartDither(ditherAnchor);
-        float stepTransmittance = -stepSize * HC_SAMPLE_DENSITY * 1.44269502;
-        cloudPos += worldDir * (startIntersection + startNoise);
-        cloudPos.xz += CameraPosition.xz;
-        float3 stepVector = worldDir * stepSize;
-
-        float3 cloudColor = float3(0.0, 0.0, 0.0);
-        // 参考管线的天空是 HDR 大值，它那套 0.5/PI 直接搬过来会暗得只剩黑烟；
-        // 按我们 0-1 量级的天空放大 4 倍（0.5 -> 2.0）。
-        float3 atmosAmbient = (skyColorUp + atmosphere) * 2.0 / 3.14159265;
-        for (int i = 0; i < 24; i++)
-        {
-            if (i >= hq) break;
-            float4 sampleCloud = hcSampleRealisticCloud(cloudPos, sunDir, atmosAmbient, hcSampleDither(cloudPos, i));
-            float sampleTransmittance = exp2(sampleCloud.w * stepTransmittance) * cloudTransmittance;
-            cloudColor += (cloudTransmittance - sampleTransmittance) * sampleCloud.rgb;
-            cloudTransmittance = sampleTransmittance;
-            if (cloudTransmittance < 0.0001) break;
-            cloudPos += stepVector;
-            cloudTransmittance = clamp(cloudTransmittance * 1.005 - 0.005, 0.0, 1.0);
-        }
-        if (cloudTransmittance < 0.9999)
-        {
-            float cloudDensity = 1.0 - cloudTransmittance;
-            float cloudFalloff = exp(-startIntersection / HC_FADE_DISTANCE);
-            cloudColor = cloudColor * cloudFalloff + (1.0 - cloudDensity * cloudFalloff) * atmosphere;
-            cloudColor = lerp(baseColor, cloudColor, cloudDensity * clamp(cloudFalloff * 2.7, 0.0, 1.0));
-            result = float4(cloudColor, cloudDensity * cloudFalloff);
-        }
+        return float4(baseColor, 0.0);
     }
-    return result;
+
+    int steps = (int)clamp(O_CLOUD_STEPS, 6.0, 32.0);
+    float stepSize = (tEnd - tStart) / (float)steps;
+    float3 ditherAnchor = camPos + worldDir * tStart;
+    float3 p = camPos + worldDir * (tStart + stepSize * hcStartDither(ditherAnchor));
+    float3 stepVec = worldDir * stepSize;
+
+    float transmittance = 1.0;
+    float3 cloudColor = float3(0.0, 0.0, 0.0);
+    for (int i = 0; i < 32; i++)
+    {
+        if (i >= steps) break;
+        float hf = hcHeightFactor(p.y);
+        if (hf > 0.001)
+        {
+            float4 s = hcSampleRealisticCloud(p, sunDir, atmosphere,
+                                              hcSampleDither(p, i), hf);
+            float sampleTrans = exp2(-s.w * stepSize * HC_SAMPLE_DENSITY * 1.44269502)
+                              * transmittance;
+            cloudColor += (transmittance - sampleTrans) * s.rgb;
+            transmittance = sampleTrans;
+            if (transmittance < 0.01) break;
+        }
+        p += stepVec;
+    }
+
+    if (transmittance > 0.999)
+    {
+        return float4(baseColor, 0.0);
+    }
+
+    float alpha = 1.0 - transmittance;
+    float3 avgColor = cloudColor / max(alpha, 1e-4);
+    avgColor = lerp(avgColor, atmosphere, 0.12);
+    float fade = 1.0 - smoothstep(HC_MAX_DIST * 0.72, HC_MAX_DIST, tStart);
+    float a = alpha * fade;
+
+    return float4(lerp(baseColor, avgColor, a), a);
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,8 +1462,12 @@ float4 main(VSOut input) : SV_TARGET
         return float4(result, 1.0);
     }
 
-    float4 nearH = mul(InvViewProj, float4(ndc, 1.0, 1.0));
-    float3 dir = normalize(nearH.xyz);
+    // 天空方向：用远平面反投影（reverse-Z 下 depth=0 即无穷远）。
+    // 这里不能用近平面 (ndc, 1, 1)：bob 投影矩阵里的平移项在近平面会被
+    // 放大成几十度，走路时整个天空会跟着甩；远平面只保留 bob 的旋转，
+    // 和原版天空穹顶的表现一致。
+    float4 farH = mul(InvViewProj, float4(ndc, 0.0, 1.0));
+    float3 dir = normalize(farH.xyz);
     float up = saturate(dir.y);
 
     float3 color;
