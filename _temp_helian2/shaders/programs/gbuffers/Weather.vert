@@ -1,0 +1,49 @@
+//     _________      __        __     ___       __     __________      ________        ______        __           
+//    /  _____  \    |  |      |  |   |   \     |  |   |   _____  \    |__    __|      /  __  \      |  |          
+//   /  /     \__\   |  |      |  |   |    \    |  |   |  |     \  \      |  |        /  /  \  \     |  |          
+//  |  |             |  |      |  |   |  |  \   |  |   |  |      |  |     |  |       /  /    \  \    |  |          
+//   \  \______      |  |      |  |   |  |\  \  |  |   |  |      |  |     |  |      |  |______|  |   |  |          
+//    \______  \     |  |      |  |   |  | \  \ |  |   |  |      |  |     |  |      |   ______   |   |  |          
+//           \  \    |  |      |  |   |  |  \  \|  |   |  |      |  |     |  |      |  |      |  |   |  |          
+//  ___       |  |   |  |      |  |   |  |   \  |  |   |  |      |  |     |  |      |  |      |  |   |  |          
+//  \  \_____/  /     \  \____/  /    |  |    \    |   |  |_____/  /    __|  |__    |  |      |  |   |  |_________ 
+//   \_________/       \________/     |__|     \___|   |__________/    |________|   |__|      |__|   |____________|
+//
+//  General Public License v3.0. Copyright (C) 2026 GeForceLegend.
+//  https://github.com/GeForceLegend/Sundial-Lite
+//  https://www.gnu.org/licenses/gpl-3.0.en.html
+//
+//  Gbuffer for rain and snow
+//
+
+out vec4 color;
+out vec3 worldPos;
+out vec2 texcoord;
+
+#include "/settings/GlobalSettings.glsl"
+#include "/libs/Uniform.glsl"
+
+vec3 viewToWorldPos(vec3 viewPos) {
+    return mat3(gbufferModelViewInverse) * viewPos + gbufferModelViewInverse[3].xyz;
+}
+
+void main() {
+    vec4 vertexPosition = gl_Vertex;
+    vec2 playerSpeed = cameraMovement.xz / frameTime;
+    vertexPosition.xz += gl_Vertex.y * playerSpeed * 0.05;
+
+    vec4 viewPos = gl_ModelViewMatrix * vertexPosition;
+    worldPos = viewToWorldPos(viewPos.xyz);
+
+    gl_Position = gl_ProjectionMatrix * viewPos;
+    color = gl_Color;
+    texcoord = vec2(gl_TextureMatrix[0] * gl_MultiTexCoord0);
+
+    #if SR_ENABLE
+        gl_Position.xy = gl_Position.xy * renderScale + (renderScale - 1.0) * gl_Position.w;
+    #endif
+
+    #ifdef TAA
+        gl_Position.xy += taaOffset * gl_Position.w;
+    #endif
+}

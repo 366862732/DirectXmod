@@ -1,0 +1,458 @@
+#include "/libs/Materials.glsl"
+
+#ifdef LOD
+    mat4 projLod() {
+        #ifdef DISTANT_HORIZONS
+            return dhProjection;
+        #endif
+        #ifdef VOXY
+            return vxProj;
+        #endif
+        return gbufferProjection;
+    }
+
+    mat4 projInvLod() {
+        #ifdef DISTANT_HORIZONS
+            return dhProjectionInverse;
+        #endif
+        #ifdef VOXY
+            return vxProjInv;
+        #endif
+        return gbufferProjectionInverse;
+    }
+
+    mat4 projPrevLod() {
+        #ifdef DISTANT_HORIZONS
+            return dhPreviousProjection;
+        #endif
+        #ifdef VOXY
+            return vxProjPrev;
+        #endif
+        return gbufferPreviousProjection;
+    }
+
+    float lodRenderDistance() {
+        #ifdef DISTANT_HORIZONS
+            return float(dhRenderDistance);
+        #endif
+        #ifdef VOXY
+            return vxRenderDistance * 16.0;
+        #endif
+        return far;
+    }
+
+    float getLodDepthSolid(vec2 coord) {
+        #ifdef DISTANT_HORIZONS
+            return textureLod(dhDepthTex1, coord, 0.0).x;
+        #endif
+        #ifdef VOXY
+            #if SR_ENABLE
+                coord *= upscaleRatio;
+            #endif
+            return textureLod(vxDepthTexOpaque, coord, 0.0).x;
+        #endif
+        return textureLod(depthtex1, coord, 0.0).x;
+    }
+
+    float getLodDepthSolidDeferred(vec2 coord) {
+        #ifdef DISTANT_HORIZONS
+            return textureLod(dhDepthTex0, coord, 0.0).x;
+        #endif
+        #ifdef VOXY
+            #if SR_ENABLE
+                coord *= upscaleRatio;
+            #endif
+            return textureLod(vxDepthTexOpaque, coord, 0.0).x;
+        #endif
+        return textureLod(depthtex0, coord, 0.0).x;
+    }
+
+    float getLodDepthWater(vec2 coord) {
+        #ifdef DISTANT_HORIZONS
+            return textureLod(dhDepthTex0, coord, 0.0).x;
+        #endif
+        #ifdef VOXY
+            #if SR_ENABLE
+                coord *= upscaleRatio;
+            #endif
+            return textureLod(vxDepthTexTrans, coord, 0.0).x;
+        #endif
+        return textureLod(depthtex0, coord, 0.0).x;
+    }
+
+    vec3 screenToViewPosLod(vec2 coord, float depth) {
+        vec3 projPos = vec3(coord.xy, depth) * 2.0 - 1.0;
+        #ifdef TAA
+            projPos.xy -= taaOffset;
+        #endif
+        #if SR_ENABLE
+            projPos.xy = projPos.xy * upscaleRatio + upscaleRatio - 1.0;
+        #endif
+        vec3 viewDirection = vec3(vec2(projInvLod()[0].x, projInvLod()[1].y) * projPos.xy, projInvLod()[3].z);
+        viewDirection.xy += vec2(projInvLod()[3].xy);
+        float viewDepth = projInvLod()[2].w * projPos.z + projInvLod()[3].w;
+        return viewDirection / viewDepth;
+    }
+
+    vec3 projectionToViewPosLod(vec3 projPos) {
+        #if SR_ENABLE
+            projPos.xy = projPos.xy * upscaleRatio + upscaleRatio - 1.0;
+        #endif
+        vec3 viewDirection = vec3(vec2(projInvLod()[0].x, projInvLod()[1].y) * projPos.xy, projInvLod()[3].z);
+        viewDirection.xy += vec2(projInvLod()[3].xy);
+        float viewDepth = projInvLod()[2].w * projPos.z + projInvLod()[3].w;
+        return viewDirection / viewDepth;
+    }
+
+    vec3 viewToProjectionPosLod(vec3 viewPos) {
+        vec3 projPos = -(vec3(projLod()[0].x, projLod()[1].y, projLod()[2].z) * viewPos + projLod()[3].xyz) / viewPos.z;
+        #if SR_ENABLE
+            projPos.xy = projPos.xy * renderScale + renderScale - 1.0;
+        #endif
+        return projPos;
+    }
+
+    vec3 prevProjectionToViewPosLod(vec3 projPos) {
+        #if SR_ENABLE
+            projPos.xy = projPos.xy * upscaleRatio + upscaleRatio - 1.0;
+        #endif
+        projPos.xy += projPrevLod()[2].xy;
+        projPos.x /= projPrevLod()[0].x;
+        projPos.y /= projPrevLod()[1].y;
+        projPos.z = projPrevLod()[3].z / (projPos.z + projPrevLod()[2].z);
+        return vec3(projPos.xy * projPos.z, -projPos.z);
+    }
+
+    vec3 prevViewToProjectionPosLod(vec3 viewPos) {
+        vec3 projPos = vec3(projPrevLod()[0].x, projPrevLod()[1].y, projPrevLod()[2].z) * viewPos;
+        projPos.xy += projPrevLod()[2].xy * viewPos.z;
+        projPos.z += projPrevLod()[3].z;
+        projPos = -projPos / viewPos.z;
+        #if SR_ENABLE
+            projPos.xy = projPos.xy * renderScale + renderScale - 1.0;
+        #endif
+        return projPos;
+    }
+
+    float screenToViewDepthLod(float depth) {
+        depth = depth * 2.0 - 1.0;
+        return 1.0 / (depth * projInvLod()[2].w + projInvLod()[3].w);
+    }
+
+    float viewToScreenDepthLod(float depth) {
+        depth = (1.0 / depth - projInvLod()[3].w) / projInvLod()[2].w;
+        return depth * 0.5 + 0.5;
+    }
+#endif
+
+struct GbufferData {
+    vec4 albedo;
+    vec3 normal;
+    vec3 geoNormal;
+    vec2 lightmap;
+    float smoothness;
+    float metalness;
+    float porosity;
+    float emissive;
+    float materialID;
+    float parallaxOffset;
+    float depth;
+};
+
+mat3 rotation(vec4 quaternion) {
+    float w2 = quaternion.w * quaternion.w;
+    float x2 = quaternion.x * quaternion.x;
+    float y2 = quaternion.y * quaternion.y;
+    float z2 = quaternion.z * quaternion.z;
+    float zw = quaternion.z * quaternion.w;
+    float xy = quaternion.x * quaternion.y;
+    float xz = quaternion.x * quaternion.z;
+    float yw = quaternion.y * quaternion.w;
+    float yz = quaternion.y * quaternion.z;
+    float xw = quaternion.x * quaternion.w;
+    float dzw = 2.0 * zw;
+    float dxy = 2.0 * xy;
+    float dxz = 2.0 * xz;
+    float dyw = 2.0 * yw;
+    float dyz = 2.0 * yz;
+    float dxw = 2.0 * xw;
+    return mat3(
+        w2 + x2 - z2 - y2, dxy + dzw, dxz - dyw,
+        -dzw + dxy, y2 - z2 + w2 - x2, dyz + dxw,
+        dyw + dxz, dyz - dxw, z2 - y2 - x2 + w2
+    );
+}
+
+vec2 encodeNormal(vec3 normal) {
+    normal.xy /= dot(vec3(1.0), abs(normal));
+    float useInv = clamp(normal.z * -1e+10, 0.0, 1.0);
+    vec2 normalInv = uintBitsToFloat(floatBitsToUint(vec2(1.0) - abs(normal.yx)) ^ (floatBitsToUint(normal.xy) & 0x80000000u));
+    normal.xy = mix(normal.xy, normalInv, vec2(useInv));
+    normal.xy = normal.xy * 0.5 + 0.5;
+    return normal.xy;
+}
+
+vec3 decodeNormal(vec2 data) {
+    data = data * 2.0 - 1.0;
+    vec3 normal = vec3(data, 1.0 - abs(data.x) - abs(data.y));
+    float useInv = clamp(normal.z * -1e+10, 0.0, 1.0);
+    vec2 normalInv = uintBitsToFloat(floatBitsToUint(vec2(1.0) - abs(normal.yx)) ^ (floatBitsToUint(normal.xy) & 0x80000000u));
+    normal.xy = mix(normal.xy, normalInv, vec2(useInv));
+    return normalize(normal);
+}
+
+float pack2x8Bit(vec2 x) {
+    x = clamp(x, 0.0, 1.0);
+    x = x * vec2(255.0 / 256.0) + vec2(256.5 / 256.0);
+    uvec2 u = floatBitsToUint(x);
+    uint p = (u.x & 0xFFFF8000u) + ((u.y & 0x007F8000u) >> 8) + 0x00000020u;
+    return clamp(uintBitsToFloat(p) * 65536.0 / 65535.0 - 65536.0 / 65535.0, 0.0, 1.0);
+}
+
+vec2 unpack2x8Bit(float x) {
+    uint u = floatBitsToUint(x * 65535.0 / 65536.0 + 65536.5 / 65536.0);
+    uvec2 p = (uvec2(u, u << 8) & 0x007F8000u) | 0x3F800000u;
+    return uintBitsToFloat(p) * 256.0 / 255.0 - 256.0 / 255.0;
+}
+
+float packM3P13(vec2 x) {
+    x = clamp(x, 0.0, 1.0);
+    x = x * vec2(7.0 / 8.0, 8191.0 / 8192.0) + vec2(8.5 / 8.0, 8192.5 / 8192.0);
+    uvec2 u = floatBitsToUint(x);
+    uint p = (u.x & 0xFFF00000u) + ((u.y & 0x007FFC00u) >> 3) + 0x00000020u;
+    return clamp(uintBitsToFloat(p) * 65536.0 / 65535.0 - 65536.0 / 65535.0, 0.0, 1.0);
+}
+
+vec2 unpackM3P13(float x) {
+    uint u = floatBitsToUint(x * 65535.0 / 65536.0 + 65536.5 / 65536.0);
+    uvec2 p = (uvec2(u, u << 3) & uvec2(0x00700000u, 0x007FFC00u)) | 0x3F800000u;
+    return uintBitsToFloat(p) * vec2(8.0 / 7.0, 8192.0 / 8191.0) - vec2(8.0 / 7.0, 8192.0 / 8191.0);
+}
+
+uint pack2x16Bit(vec2 x) {
+    x = clamp(x, 0.0, 1.0);
+    x = x * vec2(65535.0 / 65536.0) + vec2(65536.5 / 65536.0);
+    uvec2 u = floatBitsToUint(x);
+    uvec2 p = u & 0x007FFF80u;
+    return (p.x >> 7) | (p.y << 9);
+}
+
+vec2 unpack2x16Bit(uint x) {
+    uvec2 p = (uvec2(x << 7, x >> 9) & 0x007FFF80u) | 0x3F800000u;
+    return uintBitsToFloat(p) * 65536.0 / 65535.0 - 65536.0 / 65535.0;
+}
+
+uint packF8D24(float frames, float depth) {
+    frames = clamp(frames / 256.0, 0.0, 1.0);
+    uint uFrames = (floatBitsToUint(frames + 1.0) << 9) & 0xFF000000u;
+    uint uDepth = floatBitsToUint(abs(depth) + 1.0) & 0x007FFFFEu;
+    uDepth += floatBitsToUint(depth) >> 31;
+    return uFrames + uDepth;
+}
+
+vec2 unpackF8D24(uint x) {
+    float frames = uintBitsToFloat(((x & 0xFF000000u) >> 9) | 0x3F800000u) * 256.0 - 256.0;
+    uint signDepth = (x << 31) | 0x3F800000u;
+    float depth = uintBitsToFloat((x & 0x007FFFFEu) | signDepth) - uintBitsToFloat(signDepth);
+    return vec2(frames, depth);
+}
+
+void LabPBR(inout GbufferData dataSet, vec4 specularData) {
+    dataSet.smoothness = specularData.r;
+    dataSet.metalness = specularData.g;
+    dataSet.porosity = specularData.b;
+    dataSet.emissive = specularData.a * step(specularData.a, 0.999);
+}
+
+void ClassicPBR(inout GbufferData dataSet, vec4 specularData) {
+    dataSet.smoothness = specularData.r;
+    dataSet.metalness = specularData.g;
+    dataSet.porosity = 0.0;
+    dataSet.emissive = specularData.b;
+}
+
+void BedrockRTX(inout GbufferData dataSet, vec4 specularData) {
+    dataSet.smoothness = 1.0 - specularData.b;
+    dataSet.metalness = specularData.r;
+    dataSet.porosity = 0.0;
+    dataSet.emissive = specularData.g;
+}
+
+vec3 LabPBR(vec3 rawNormal) {
+    vec3 normal = rawNormal * 2.0 - 1.0;
+    normal.z = sqrt(clamp(1.0 - dot(normal.xy, normal.xy), 0.0, 1.0));
+    normal.xy = uintBitsToFloat(floatBitsToUint(clamp(abs(normal.xy) - 1.0 / 255.0, 0.0, 1.0)) | (floatBitsToUint(normal.xy) & 0x80000000u));
+    return normal;
+}
+
+vec3 ClassicPBR(vec3 rawNormal) {
+    vec3 normal = rawNormal * 2.0 - 1.0;
+    normal.xy = uintBitsToFloat(floatBitsToUint(clamp(abs(normal.xy) - 1.0 / 255.0, 0.0, 1.0)) | (floatBitsToUint(normal.xy) & 0x80000000u));
+    return normal;
+}
+
+vec3 getNormalTexel(ivec2 texel) {
+    vec2 rawData = texelFetch(colortex1, texel, 0).xy;
+    return decodeNormal(rawData);
+}
+
+vec3 getGeoNormalTexel(ivec2 texel) {
+    vec2 rawData = texelFetch(colortex2, texel, 0).xy;
+    return decodeNormal(rawData);
+}
+
+float getSolidDepth(vec2 coord) {
+    return textureLod(depthtex1, coord, 0.0).x;
+}
+
+float getWaterDepth(vec2 coord) {
+    return textureLod(depthtex0, coord, 0.0).x;
+}
+
+void packUpGbufferDataSolid(in GbufferData rawData, out vec4 data0, out vec4 data1, out vec4 data2) {
+    // colortex0 RGBA8
+    data0 = rawData.albedo;
+
+    // colortex1 RGBA16
+    data1 = vec4(
+        encodeNormal(rawData.normal),
+        pack2x8Bit(vec2(rawData.smoothness, rawData.metalness)),
+        pack2x8Bit(vec2(rawData.porosity, rawData.emissive))
+    );
+
+    // colortex2 RGBA16
+    data2 = vec4(
+        encodeNormal(rawData.geoNormal),
+        pack2x8Bit(vec2(rawData.lightmap.x, rawData.lightmap.y)),
+        packM3P13(vec2(rawData.materialID / 7.0, rawData.parallaxOffset))
+    );
+}
+
+GbufferData getGbufferData(ivec2 texel, vec2 coord) {
+    vec4 tex0 = texelFetch(colortex0, texel, 0);
+    vec4 tex1 = texelFetch(colortex1, texel, 0);
+    vec4 tex2 = texelFetch(colortex2, texel, 0);
+
+    vec2 unpacked1z = unpack2x8Bit(tex1.z);
+    vec2 unpacked1w = unpack2x8Bit(tex1.w);
+    vec2 unpacked2w = unpackM3P13(tex2.w);
+
+    GbufferData data;
+
+    data.albedo = tex0;
+    data.albedo.rgb = pow(data.albedo.rgb, vec3(2.2));
+    data.normal = decodeNormal(tex1.rg);
+    data.geoNormal = decodeNormal(tex2.rg);
+    data.lightmap = unpack2x8Bit(tex2.z);
+
+    data.smoothness = unpacked1z.x;
+    data.metalness = unpacked1z.y;
+    data.porosity = unpacked1w.x;
+    data.emissive = unpacked1w.y;
+
+    data.materialID = round(unpacked2w.x * 7.0);
+    data.parallaxOffset = unpacked2w.y;
+
+    data.depth = textureLod(depthtex1, coord, 0.0).x;
+
+    return data;
+}
+
+vec3 screenToViewPos(vec2 coord, float depth) {
+    vec3 projPos = vec3(coord.xy, depth) * 2.0 - 1.0;
+    #ifdef TAA
+        projPos.xy -= taaOffset;
+    #endif
+    #if SR_ENABLE
+        projPos.xy = projPos.xy * upscaleRatio + upscaleRatio - 1.0;
+    #endif
+    vec3 viewDirection = vec3(vec2(gbufferProjectionInverse[0].x, gbufferProjectionInverse[1].y) * projPos.xy, gbufferProjectionInverse[3].z);
+    viewDirection.xy += gbufferProjectionInverse[3].xy;
+    float viewDepth = gbufferProjectionInverse[2].w * projPos.z + gbufferProjectionInverse[3].w;
+    return viewDirection / viewDepth;
+}
+
+vec3 projectionToViewPos(vec3 projPos) {
+    #if SR_ENABLE
+        projPos.xy = projPos.xy * upscaleRatio + upscaleRatio - 1.0;
+    #endif
+    vec3 viewDirection = vec3(vec2(gbufferProjectionInverse[0].x, gbufferProjectionInverse[1].y) * projPos.xy, gbufferProjectionInverse[3].z);
+    viewDirection.xy += gbufferProjectionInverse[3].xy;
+    float viewDepth = gbufferProjectionInverse[2].w * projPos.z + gbufferProjectionInverse[3].w;
+    return viewDirection / viewDepth;
+}
+
+vec3 viewToProjectionPos(vec3 viewPos) {
+    vec3 projPos = vec3(gbufferProjection[0].x, gbufferProjection[1].y, gbufferProjection[2].z) * viewPos;
+    projPos.z += gbufferProjection[3].z;
+    projPos.xy += gbufferProjection[2].xy * viewPos.z;
+    projPos = -projPos / viewPos.z;
+    #if SR_ENABLE
+        projPos.xy = projPos.xy * renderScale + renderScale - 1.0;
+    #endif
+    return projPos;
+}
+
+vec3 viewToWorldPos(vec3 viewPos) {
+    return mat3(gbufferModelViewInverse) * viewPos + gbufferModelViewInverse[3].xyz;
+}
+
+vec3 worldToViewPos(vec3 worldPos) {
+    return mat3(gbufferModelView) * worldPos + gbufferModelView[3].xyz;
+}
+
+vec3 prevProjectionToViewPos(vec3 projPos) {
+    #if SR_ENABLE
+        projPos.xy = projPos.xy * upscaleRatio + upscaleRatio - 1.0;
+    #endif
+    projPos.xy += gbufferPreviousProjection[2].xy;
+    projPos.x /= gbufferPreviousProjection[0].x;
+    projPos.y /= gbufferPreviousProjection[1].y;
+    projPos.z = gbufferPreviousProjection[3].z / (projPos.z + gbufferPreviousProjection[2].z);
+    return vec3(projPos.xy * projPos.z, -projPos.z);
+}
+
+vec3 prevViewToProjectionPos(vec3 viewPos) {
+    vec3 projPos = vec3(gbufferPreviousProjection[0].x, gbufferPreviousProjection[1].y, gbufferPreviousProjection[2].z) * viewPos;
+    projPos.xy += gbufferPreviousProjection[2].xy * viewPos.z;
+    projPos.z += gbufferPreviousProjection[3].z;
+    projPos = -projPos / viewPos.z;
+    #if SR_ENABLE
+        projPos.xy = projPos.xy * renderScale + renderScale - 1.0;
+    #endif
+    return projPos;
+}
+
+vec3 prevViewToWorldPos(vec3 viewPos) {
+    return (viewPos - gbufferPreviousModelView[3].xyz) * mat3(gbufferPreviousModelView);
+}
+
+vec3 prevWorldToViewPos(vec3 worldPos) {
+    return mat3(gbufferPreviousModelView) * worldPos + gbufferPreviousModelView[3].xyz;
+}
+
+float screenToViewDepth(float depth) {
+    depth = depth * 2.0 - 1.0;
+    return 1.0 / (depth * gbufferProjectionInverse[2].w + gbufferProjectionInverse[3].w);
+}
+
+float viewToScreenDepth(float depth) {
+    depth = (1.0 / depth - gbufferProjectionInverse[3].w) / gbufferProjectionInverse[2].w;
+    return depth * 0.5 + 0.5;
+}
+
+uvec2 projIntersection(vec4 origin, vec4 direction, vec2 targetCoord) {
+    return floatBitsToUint((targetCoord * origin.ww - origin.xy) / (direction.xy - targetCoord * direction.ww));
+}
+
+float projIntersectionScreenEdge(vec4 origin, vec4 direction) {
+    uvec2 intersectionAA = projIntersection(origin, direction, vec2(1.0));
+    uvec2 intersectionBB = projIntersection(origin, direction, vec2(-1.0));
+    uint intersection = min(min(intersectionAA.x, intersectionAA.y), min(intersectionBB.x, intersectionBB.y));
+    float depthLimit = far;
+    #ifdef LOD
+        depthLimit = lodRenderDistance() * 1.01;
+    #endif
+    intersection = min(intersection, floatBitsToUint(depthLimit + 32.0));
+    return uintBitsToFloat(intersection);
+}

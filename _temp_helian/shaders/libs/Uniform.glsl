@@ -1,0 +1,117 @@
+uniform int frameCounter;
+uniform int isEyeInWater;
+uniform int heldBlockLightValue;
+uniform float far;
+uniform float blindness;
+uniform float frameTime;
+uniform float nightVision;
+uniform float alphaTestRef;
+uniform float rainStrength;
+uniform float rainyMieBeta;
+uniform float handRotationX;
+uniform float handRotationY;
+uniform float rainyStrength;
+uniform float darknessFactor;
+uniform float weatherStrength;
+uniform float frameTimeCounter;
+uniform float endFlashIntensity;
+uniform ivec2 atlasSize;
+uniform ivec2 eyeBrightnessSmooth;
+uniform vec2 texelSize;
+uniform vec2 screenSize;
+uniform vec3 fogColor;
+uniform vec3 sunDirection;
+uniform vec3 sunlightColor;
+uniform vec3 cameraPosition;
+uniform vec3 cameraMovement;
+uniform vec3 shadowDirection;
+uniform vec3 relativeEyePosition;
+uniform vec3 shadowModelViewProj0;
+uniform vec3 shadowModelViewProj1;
+uniform vec3 shadowModelViewProj2;
+uniform vec3 shadowModelViewProj3;
+uniform vec4 spriteBounds;
+
+uniform sampler2D gtexture;
+uniform sampler2D normals;
+uniform sampler2D specular;
+uniform sampler2D noisetex;
+uniform sampler2D gaux2;
+uniform sampler2D colortex0;
+uniform sampler2D colortex1;
+uniform sampler2D colortex2;
+uniform sampler2D colortex3;
+uniform sampler2D colortex4;
+uniform sampler2D colortex5;
+uniform usampler2D colortex6;
+uniform sampler2D colortex7;
+uniform sampler2D depthtex0;
+uniform sampler2D depthtex1;
+uniform sampler2D depthtex2;
+uniform sampler2D shadowtex1;
+uniform sampler2D shadowcolor0;
+uniform sampler2DShadow shadowtex0;
+#ifdef IS_IRIS
+    uniform sampler2D transmittanceTex;
+#endif
+
+uniform mat4 shadowModelView;
+uniform mat4 shadowProjection;
+uniform mat4 shadowModelViewInverse;
+uniform mat4 shadowProjectionInverse;
+uniform mat4 gbufferModelView;
+uniform mat4 gbufferProjection;
+uniform mat4 gbufferModelViewInverse;
+uniform mat4 gbufferProjectionInverse;
+uniform mat4 gbufferPreviousModelView;
+uniform mat4 gbufferPreviousProjection;
+
+#if SR_ENABLE && SR_ALGO_SUPPORTS_JITTER
+    uniform vec2 SRJitterOffset;
+    vec2 taaOffset = SRJitterOffset * texelSize * 2.0 * vec2(1.0, -1.0);
+#else
+    uniform vec2 taaOffset;
+#endif
+
+#ifdef DISTANT_HORIZONS
+    uniform sampler2D dhDepthTex0;
+    uniform sampler2D dhDepthTex1;
+
+    uniform mat4 dhProjection;
+    uniform mat4 dhProjectionInverse;
+    uniform mat4 dhPreviousProjection;
+
+    uniform int dhRenderDistance;
+#endif
+
+#ifdef VOXY
+    uniform sampler2D vxDepthTexOpaque;
+    uniform sampler2D vxDepthTexTrans;
+
+    uniform mat4 vxProj;
+    uniform mat4 vxProjInv;
+    uniform mat4 vxProjPrev;
+
+    uniform int vxRenderDistance;
+#endif
+
+const float PI = 3.1415926535897;
+#if SR_ENABLE
+    vec2 renderScale = floor(SR_RENDER_SCALE_FACTOR * screenSize) * texelSize;
+    vec2 upscaleRatio = screenSize / floor(SR_RENDER_SCALE_FACTOR * screenSize);
+    vec2 screenEdge = renderScale;
+    const float mipBias = log2(SR_RENDER_SCALE_FACTOR);
+#else
+    const vec2 screenEdge = vec2(1.0);
+    const float mipBias = 0.0;
+#endif
+const mat2 goldenRotate = mat2(cos(2.39996323), sin(2.39996323), -sin(2.39996323), cos(2.39996323));
+
+#ifdef SETTINGS
+    float nightBrightness = mix(NIGHT_BRIGHTNESS, NIGHT_VISION_BRIGHTNESS, nightVision);
+    vec3 sunColor = sunlightColor * clamp(nightBrightness + clamp(sunDirection.y * 1e+5, 0.0, 1.0), 0.0, 1.0);
+#endif
+
+#if defined IS_IRIS && defined THE_END && MC_VERSION >= 12109
+    #define END_FLASH
+#endif

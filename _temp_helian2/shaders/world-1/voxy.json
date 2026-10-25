@@ -1,0 +1,51 @@
+{
+    "version": 1,
+    "uniforms": [
+        "far",
+        "frameCounter",
+        "rainStrength",
+        "rainyStrength",
+        "weatherStrength",
+        "frameTimeCounter",
+        "taaOffsetVX",
+        "texelSize",
+        "screenSize",
+        "cameraPosition",
+        "gbufferModelView",
+        "gbufferProjection",
+        "gbufferModelViewInverse",
+        "gbufferProjectionInverse",
+        "gbufferPreviousModelView",
+        "gbufferPreviousProjection",
+        "vxProj",
+        "vxProjInv",
+        "vxProjPrev",
+        "vxRenderDistance"
+    #if SR_ENABLE
+        ,"SRJitterOffset"
+        ,"SRScaledViewportSize"
+    ],
+    "renderScale":[SR_RENDER_SCALE_FACTOR],
+    "useViewportDims": true,
+    "taaOffset": "{return SRJitterOffset * 2.0 * vec2(1.0, -1.0) / SRScaledViewportSize;}",
+    #else
+    ],
+    "taaOffset": "{return taaOffsetVX;}",
+    #endif
+    "samplers": {
+        "gtexture": "sampler2D",
+        "normals": "sampler2D",
+        "noisetex": "sampler2D",
+        "gaux2": "sampler2D",
+        "depthtex0": "sampler2D",
+        "depthtex1": "sampler2D",
+        "vxDepthTexOpaque": "sampler2D",
+        "vxDepthTexTrans": "sampler2D"
+    },
+    "blending": {
+        "-1": "off"
+    },
+    "excludeLodsFromVanillaDepth": true,
+    "opaqueDrawBuffers": [0, 1, 2],
+    "translucentDrawBuffers": [16, 17, 18]
+}

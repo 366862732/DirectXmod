@@ -1,0 +1,112 @@
+//     _________      __        __     ___       __     __________      ________        ______        __           
+//    /  _____  \    |  |      |  |   |   \     |  |   |   _____  \    |__    __|      /  __  \      |  |          
+//   /  /     \__\   |  |      |  |   |    \    |  |   |  |     \  \      |  |        /  /  \  \     |  |          
+//  |  |             |  |      |  |   |  |  \   |  |   |  |      |  |     |  |       /  /    \  \    |  |          
+//   \  \______      |  |      |  |   |  |\  \  |  |   |  |      |  |     |  |      |  |______|  |   |  |          
+//    \______  \     |  |      |  |   |  | \  \ |  |   |  |      |  |     |  |      |   ______   |   |  |          
+//           \  \    |  |      |  |   |  |  \  \|  |   |  |      |  |     |  |      |  |      |  |   |  |          
+//  ___       |  |   |  |      |  |   |  |   \  |  |   |  |      |  |     |  |      |  |      |  |   |  |          
+//  \  \_____/  /     \  \____/  /    |  |    \    |   |  |_____/  /    __|  |__    |  |      |  |   |  |_________ 
+//   \_________/       \________/     |__|     \___|   |__________/    |________|   |__|      |__|   |____________|
+//
+//  General Public License v3.0. Copyright (C) 2026 GeForceLegend.
+//  https://github.com/GeForceLegend/Sundial-Lite
+//  https://www.gnu.org/licenses/gpl-3.0.en.html
+//
+//  Gbuffer for particles, entities and block entities
+//
+
+#if MC_VERSION >= 11700
+    in vec4 mc_midTexCoord;
+    in vec4 at_tangent;
+#elif MC_VERSION >= 11500
+    layout(location = 12) in vec4 mc_midTexCoord;
+    layout(location = 13) in vec4 at_tangent;
+#else
+    layout(location = 11) in vec4 mc_midTexCoord;
+    layout(location = 12) in vec4 at_tangent;
+#endif
+
+// #define GLOWING_OVERLAY
+
+out vec4 color;
+out vec4 texlmcoord;
+out vec3 viewPos;
+
+noperspective out vec4 coordRange;
+
+#ifdef ENTITIES
+    uniform vec4 entityColor;
+#endif
+
+uniform sampler2D gaux1;
+
+#include "/settings/GlobalSettings.glsl"
+#include "/libs/Uniform.glsl"
+#include "/libs/Common.glsl"
+
+#ifdef ENTITY_VERTEX_TBN
+    out mat3 vertexTbnMatrix;
+#endif
+
+void main() {
+    viewPos = (gl_ModelViewMatrix * gl_Vertex).xyz;
+
+    gl_Position = gl_ProjectionMatrix * vec4(viewPos, 1.0);
+    color = gl_Color;
+    texlmcoord.st = vec2(gl_TextureMatrix[0] * gl_MultiTexCoord0);
+    texlmcoord.pq = gl_MultiTexCoord1.st / 240.0;
+
+    vec2 albedoTexSize = vec2(textureSize(gtexture, 0));
+    bool clampCoord = textureSize(gaux1, 0) == albedoTexSize;
+    #ifdef MC_ANISOTROPIC_FILTERING
+        clampCoord = (spriteBounds.zw - spriteBounds.xy) * textureSize(gaux1, 0) == albedoTexSize;
+    #endif
+    vec2 minCoord = vec2(0.0);
+    vec2 coordSize = vec2(1.0);
+    if (clampCoord) {
+        vec2 vertexCoord = gl_MultiTexCoord0.st;
+        if (min(abs(mc_midTexCoord.s - gl_MultiTexCoord0.s), abs(mc_midTexCoord.t - gl_MultiTexCoord0.t)) < 1e-6) {
+            vertexCoord = gl_MultiTexCoord0.st + (mc_midTexCoord.st - gl_MultiTexCoord0.st).ts;
+        }
+        vec2 albedoTexelSize = 1.0 / albedoTexSize;
+        vec2 midCoord = mc_midTexCoord.st * albedoTexSize;
+        vec2 coordToCenter = abs(vertexCoord - mc_midTexCoord.st) * albedoTexSize;
+        minCoord = floor(midCoord - coordToCenter) * albedoTexelSize;
+        coordSize = ceil(midCoord + coordToCenter) * albedoTexelSize - minCoord;
+    }
+    coordRange = vec4(minCoord, coordSize);
+
+    #ifdef ENTITIES
+        color.rgb *= mix(vec3(1.0), entityColor.rgb, vec3(entityColor.a));
+    #endif
+
+    #ifdef GLOWING
+        #ifdef GLOWING_OVERLAY
+            gl_Position.z = (gl_Position.z * 0.5 + 0.5) * 0.02 - 0.01;
+        #endif
+    #endif
+
+    #ifdef OVERLAY
+        gl_Position.z -= 1e-5;
+    #endif
+
+    #if SR_ENABLE
+        gl_Position.xy = gl_Position.xy * renderScale + (renderScale - 1.0) * gl_Position.w;
+    #endif
+
+    #ifdef TAA
+        gl_Position.xy += taaOffset * gl_Position.w;
+    #endif
+
+    #ifdef ENTITY_VERTEX_TBN
+        vec3 viewNormal = normalize(gl_NormalMatrix * gl_Normal);
+        vec3 tangent = gl_NormalMatrix * at_tangent.xyz;
+        float tangentLength = dot(tangent, tangent);
+        tangent *= inversesqrt(tangentLength + float(tangentLength == 0.0));
+        vec3 bitangent = cross(tangent, viewNormal) * at_tangent.w;
+        float bitangentLength = dot(bitangent, bitangent);
+        bitangent *= inversesqrt(bitangentLength + float(bitangentLength == 0.0));
+        vertexTbnMatrix = mat3(tangent, bitangent, viewNormal);
+    #endif
+}

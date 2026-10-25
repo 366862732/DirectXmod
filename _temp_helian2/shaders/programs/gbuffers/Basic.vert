@@ -1,0 +1,37 @@
+//     _________      __        __     ___       __     __________      ________        ______        __           
+//    /  _____  \    |  |      |  |   |   \     |  |   |   _____  \    |__    __|      /  __  \      |  |          
+//   /  /     \__\   |  |      |  |   |    \    |  |   |  |     \  \      |  |        /  /  \  \     |  |          
+//  |  |             |  |      |  |   |  |  \   |  |   |  |      |  |     |  |       /  /    \  \    |  |          
+//   \  \______      |  |      |  |   |  |\  \  |  |   |  |      |  |     |  |      |  |______|  |   |  |          
+//    \______  \     |  |      |  |   |  | \  \ |  |   |  |      |  |     |  |      |   ______   |   |  |          
+//           \  \    |  |      |  |   |  |  \  \|  |   |  |      |  |     |  |      |  |      |  |   |  |          
+//  ___       |  |   |  |      |  |   |  |   \  |  |   |  |      |  |     |  |      |  |      |  |   |  |          
+//  \  \_____/  /     \  \____/  /    |  |    \    |   |  |_____/  /    __|  |__    |  |      |  |   |  |_________ 
+//   \_________/       \________/     |__|     \___|   |__________/    |________|   |__|      |__|   |____________|
+//
+//  General Public License v3.0. Copyright (C) 2026 GeForceLegend.
+//  https://github.com/GeForceLegend/Sundial-Lite
+//  https://www.gnu.org/licenses/gpl-3.0.en.html
+//
+//  Gbuffer for selection outline and leash (basic)
+//
+
+flat out vec4 color;
+out vec2 lmcoord;
+
+#include "/settings/GlobalSettings.glsl"
+#include "/libs/Uniform.glsl"
+
+void main() {
+    color = gl_Color;
+    lmcoord = gl_MultiTexCoord1.st / 240.0;
+    gl_Position = ftransform();
+
+    #if SR_ENABLE
+        gl_Position.xy = gl_Position.xy * renderScale + (renderScale - 1.0) * gl_Position.w;
+    #endif
+
+    #ifdef TAA
+        gl_Position.xy += taaOffset * gl_Position.w;
+    #endif
+}
