@@ -1,4 +1,9 @@
 {
   "key.category.gl4dx12.main": "GL4DX12 (D3D12)",
-  "key.gl4dx12.offline_render": "Offline Render (ITRP accumulation)"
+  "key.gl4dx12.offline_render": "Offline Render (ITRP accumulation)",
+  "options.gl4dx12.render_scale": "Render Scale",
+  "options.gl4dx12.upscale_mode": "Upscaling Filter",
+  "options.gl4dx12.upscale_sharpness": "Sharpness",
+  "options.gl4dx12.frame_gen": "Frame Generation (Built-in)",
+  "options.gl4dx12.frame_gen_strength": "Interpolation Weight"
 }

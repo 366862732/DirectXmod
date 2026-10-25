@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "dx12_device.h"
+#include "ngx_dlss.h"
 
 using namespace dx12mc;
 
@@ -89,6 +90,53 @@ JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12BlitSurface(
     }
     dbgLogInfo("blitSurface: ok ctx=%p surface=%p texture=%p",
         toCtx(ctx), toSurface(surface), toObject(texture));
+}
+
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetUpscaleParams(
+    JNIEnv*, jclass, jint mode, jfloat sharpness) {
+    setBlitUpscaleParams((int)mode, (float)sharpness);
+    dbgLogInfo("dx12SetUpscaleParams: mode=%d sharpness=%.2f", (int)mode, (float)sharpness);
+}
+
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetFrameGenParams(
+    JNIEnv*, jclass, jint mode, jfloat weight) {
+    setFrameGenParams((int)mode, (float)weight);
+    dbgLogInfo("dx12SetFrameGenParams: mode=%d weight=%.2f", (int)mode, (float)weight);
+}
+
+// NGX（DLSS）配置推送：设备创建后由 Java 侧调用一次。
+// App ID / Project ID 都为空时，原生侧只记一条日志并保持 DLSS 通道关闭。
+JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetNgxConfig(
+    JNIEnv* env, jclass, jstring appId, jstring projectId, jstring appDataPath) {
+    auto read = [&](jstring s) -> std::string {
+        if (!s) {
+            return std::string();
+        }
+        const char* c = env->GetStringUTFChars(s, nullptr);
+        std::string out = c ? c : "";
+        if (c) {
+            env->ReleaseStringUTFChars(s, c);
+        }
+        return out;
+    };
+    ngxSetConfig(read(appId), read(projectId), read(appDataPath));
+}
+
+// 返回一行 NGX 状态供「图形增强」页显示（详细原因仍写 debug.log）。
+JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetNgxStatus(
+    JNIEnv* env, jclass) {
+    NgxState st = ngxGetState();
+    std::string text;
+    if (!st.configured) {
+        text = "NGX: 未配置 App ID，DLSS 关闭";
+    } else if (!st.initialized) {
+        text = "NGX: 初始化失败（详见 debug.log）";
+    } else {
+        text = std::string("NGX: 已就绪 · DLSS 超分")
+            + (st.dlssAvailable ? "可用" : "不可用") + " · 帧生成"
+            + (st.frameGenAvailable ? "可用" : "不可用");
+    }
+    return env->NewStringUTF(text.c_str());
 }
 
 JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PresentSurface(

@@ -20,6 +20,7 @@ import com.mojang.blaze3d.textures.FilterMode;
 import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
+import com.xgdt.dx12.config.Dx12Config;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 import java.util.OptionalDouble;
@@ -92,12 +93,57 @@ public class Dx12Backend implements GpuBackend {
             // 必须在返回给游戏前清除，否则 getOrCompilePipeline 会命中自测缓存条目，
             // 导致真实游戏 shader 从未被编译，屏幕显示的是自测阶段的嵌入 shader 输出（紫色）。
             device.clearPipelineCache();
+            // 设备就绪后把配置里的上采样参数推送到原生 blit 管线。
+            pushUpscaleParams();
+            // 同上，把帧生成参数推送到原生渲染线程。
+            pushFrameGenParams();
+            // NGX（DLSS）：有 App ID 才会真正初始化，否则原生侧只记一条日志。
+            pushNgxConfig();
             return new GpuDevice(device, criticalShaderLoader);
         } catch (Throwable t) {
             LOGGER.error("[dx12] D3D12 self-test failed", t);
             throw new BackendCreationException(
                 "DX12 self-test failed: " + t, BackendCreationException.Reason.OTHER);
         }
+    }
+
+    /**
+     * 把配置中的上采样参数推送到原生 blit 管线。
+     * 设备创建后调用一次；视频设置里改动时也可直接调用。
+     */
+    public static void pushUpscaleParams() {
+        Dx12Config cfg = Dx12Config.getInstance();
+        Dx12Native.dx12SetUpscaleParams(cfg.getUpscaleMode(), cfg.getUpscaleSharpness() / 100.0f);
+    }
+
+    /**
+     * 把配置中的帧生成参数推送到原生渲染线程。
+     * 设备创建后调用一次；视频设置里改动时也可直接调用。
+     */
+    public static void pushFrameGenParams() {
+        Dx12Config cfg = Dx12Config.getInstance();
+        Dx12Native.dx12SetFrameGenParams(cfg.getFrameGen(), cfg.getFrameGenStrength() / 100.0f);
+    }
+
+    /**
+     * 把配置中的 NGX（DLSS）App ID / Project ID 推送到原生侧。
+     * 两者都为空时原生侧只写一条日志，DLSS 通道保持关闭。
+     * 数据目录取 {@code <user.dir>/dx12mod}：与 dx12_mc.dll 同目录，NGX 从这里
+     * 找 nvngx_dlss.dll，并写日志/临时文件。
+     */
+    public static void pushNgxConfig() {
+        Dx12Config cfg = Dx12Config.getInstance();
+        String appDataPath = java.nio.file.Path.of(System.getProperty("user.dir"), "dx12mod")
+            .toAbsolutePath().toString();
+        Dx12Native.dx12SetNgxConfig(cfg.getNgxAppId(), cfg.getNgxProjectId(), appDataPath);
+        // 原生侧的 stderr（dbgLog）不会进启动器日志，这里把 NGX 状态转成 Java 日志，
+        // 否则初始化成功与否、失败码是多少在 latest.log 里完全看不到。
+        LOGGER.info("[dx12] {}", getNgxStatus());
+    }
+
+    /** 读取原生侧 NGX 状态（一行文案），供视频设置界面显示。 */
+    public static String getNgxStatus() {
+        return Dx12Native.dx12GetNgxStatus();
     }
 
     /**

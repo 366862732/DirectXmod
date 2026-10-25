@@ -587,13 +587,26 @@ void destroyPipeline(Dx12Pipeline* pipeline);
 // 光栅器自动做格式转换，无需手动 resolve。
 // ---------------------------------------------------------------------------
 struct BlitPipeline {
-    ComPtr<ID3D12RootSignature> rootSig;       // SRV(t0) + sampler(s0)
-    ComPtr<ID3D12PipelineState> pso;           // noDepth, noBlend, noCull
+    ComPtr<ID3D12RootSignature> rootSig;       // SRV(t0) + sampler(s0) + 根常量 b0
+    ComPtr<ID3D12PipelineState> pso;           // 纯双线性采样（noDepth, noBlend, noCull）
+    ComPtr<ID3D12PipelineState> psoSharpen;    // CAS 锐化上采样
     ComPtr<ID3D12Resource> vertBuf;            // 4 vertices, R32G32 + R32G32
     ComPtr<ID3D12Resource> idxBuf;             // 6 indices, R16_UINT
     D3D12_VERTEX_BUFFER_VIEW vbView{};
     D3D12_INDEX_BUFFER_VIEW ibView{};
 };
+
+// 上采样配置（渲染缩放后的 blit 使用）：
+//   mode      0 = 双线性（默认）, 1 = CAS 锐化
+//   sharpness 0..1 锐化强度（仅 mode=1 生效）
+void setBlitUpscaleParams(int mode, float sharpness);
+void getBlitUpscaleParams(int& mode, float& sharpness);
+
+// 帧生成配置（自研帧间插值：真实帧之后再 present 一张 prev/cur 的混合帧）：
+//   mode   0 = 关闭（默认）, 1 = 开启
+//   weight 0..1 混合权重（越大越靠近当前真实帧）
+void setFrameGenParams(int mode, float weight);
+void getFrameGenParams(int& mode, float& weight);
 
 // 懒初始化 blit 管线（线程安全：第一次调用创建，后续直接返回）。
 void initBlitPipeline(std::string& err);
@@ -725,6 +738,10 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     std::string& err);
 // 获取当前 back buffer index（DXGI FLIP 模型下 Present 内部同步）。
 bool acquireSurface(Dx12Surface* s, std::string& err);
+// 帧生成内部使用：与 acquireSurface 相同，但跳过 waitForPendingPresents——
+// 调用点位于渲染线程的 present 尾部，此时本帧尚未计入 gPresentedFrames，
+// 若等待会自我阻塞到超时。
+bool acquireSurfaceForFrameGen(Dx12Surface* s, std::string& err);
 // 录制 blit（源纹理 -> back buffer）：在 command list 录制状态下调用；
 // 源与目标格式须一致（RGBA8/BGRA8 族可直接拷贝）。返回 false 表示未录制。
 bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
@@ -732,6 +749,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
 // Present(interval, flags)：FIFO=Present(1,0)；IMMEDIATE=Present(0,0)；
 // FIFO_RELAXED=Present(1,ALLOW_TEARING)。
 void presentSurface(Dx12Surface* s);
+// 帧生成专用：插值帧立刻上屏（syncInterval=0，允许 tearing 时带 ALLOW_TEARING），
+// 避免每个真实帧占用两个垂直同步周期导致帧率减半。
+void presentSurfaceInterpolated(Dx12Surface* s);
 void destroySurface(Dx12Surface* s);
 // 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部调用，在 render thread 已停止后使用）
 void destroySurfaceNoWaitIdle(Dx12Surface* s);

@@ -636,6 +636,36 @@ public final class Dx12Native {
      */
     public static native void dx12BlitSurface(long ctx, long surface, long texture);
 
+    /**
+     * 上采样参数推送（渲染缩放后的 blit 使用）。
+     *
+     * @param mode      0 = 双线性，1 = CAS 锐化
+     * @param sharpness 0..1 锐化强度（仅 mode=1 生效）
+     */
+    public static native void dx12SetUpscaleParams(int mode, float sharpness);
+
+    /**
+     * 帧生成参数推送（自研帧间线性插值，非 NVIDIA DLSS-G）。
+     *
+     * @param mode   0 = 关闭，1 = 开启（每个真实帧后额外 present 一帧插值帧）
+     * @param weight 0..1 插值权重（越大越靠近当前真实帧）
+     */
+    public static native void dx12SetFrameGenParams(int mode, float weight);
+
+    /**
+     * NGX（DLSS）配置推送。设备创建后调用一次；两个 ID 都为空时原生侧只记日志，
+     * 不产生任何渲染副作用。
+     *
+     * @param appId       NVIDIA 分配的 Application ID（十进制字符串，可为空）
+     * @param projectId   Project ID（无 App ID 时使用，可为空）
+     * @param appDataPath NGX 日志/临时文件目录（空字符串 = 进程当前目录）
+     */
+    public static native void dx12SetNgxConfig(String appId, String projectId,
+        String appDataPath);
+
+    /** 返回一行 NGX 状态文案（供视频设置「图形增强」页显示）。 */
+    public static native String dx12GetNgxStatus();
+
     /** Present the current back buffer (vsync follows the configured mode). */
     public static native void dx12PresentSurface(long surface);
 

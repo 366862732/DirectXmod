@@ -1,5 +1,6 @@
 #include "dx12_device.h"
 #include "dx12_rt_scene.h"
+#include "ngx_dlss.h"
 
 #include <dxgi.h>
 
@@ -696,6 +697,9 @@ bool ensureDevice(std::string& errorOut) {
     }
     gCtx.device = device;
     gCtx.adapterName = queryAdapterName(device.Get());
+    // NGX（DLSS）接入层：记录设备并在已配置 App ID 时尝试初始化。
+    // 未配置时只写一条日志，不改变任何渲染路径。
+    ngxInitForDevice(device.Get());
     // P66：探测 DX12 Ultimate（FL 12_2）能力。这一步只做查询，不改变任何渲染路径；
     // 目的是确认 DXR / Mesh Shader / VRS / Sampler Feedback 是否可用，为后续
     // 光线追踪实验提供入口（ID3D12Device5）。
@@ -833,6 +837,9 @@ bool ensureDevice(std::string& errorOut) {
     return true;
 }
 
+// 帧生成资源清理（实现在本文件后部的帧生成模块中）。
+void destroyFrameGenResources();
+
 void destroyDevice() {
     dbgLog("destroyDevice: enter");
     if (gCtx.queueFenceEvent) {
@@ -854,6 +861,11 @@ void destroyDevice() {
             }
         }
     }
+    // 帧生成：历史纹理 / SRV 堆 / 独立 CommandContext 必须在设备销毁前释放，
+    // 否则 D3D12 调试层会报 live object。
+    destroyFrameGenResources();
+    // NGX：必须在 ID3D12Device 释放前关闭，否则 NGX 内部仍持有设备引用。
+    ngxShutdown();
     // 进程退出前释放所有延迟删除对象（若此后不再有 submit，pending 不会
     // 被 flush，需在此兜底）。
     flushPendingDeletes(/*force=*/true);
@@ -4183,7 +4195,43 @@ static const char kBlitPS[] =
     "    return srcTex.Sample(blitSampler, IN.tc);\n"
     "}\n";
 
+// PS: 锐化上采样（渲染缩放 < 100% 时使用）。以源像素尺寸做 5 抽头 unsharp mask，
+// 抵消双线性放大带来的模糊。参数由根常量 b0 提供。
+static const char kBlitSharpenPS[] =
+    "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
+    "Texture2D<float4> srcTex : register(t0, space0);\n"
+    "SamplerState blitSampler : register(s0, space0);\n"
+    "cbuffer BlitParams : register(b0, space0) {\n"
+    "    float sharpness;\n"
+    "    float2 texelSize;\n"
+    "    float pad;\n"
+    "};\n"
+    "float4 main(VS_OUT IN) : SV_Target {\n"
+    "    float4 c = srcTex.Sample(blitSampler, IN.tc);\n"
+    "    float3 n = srcTex.Sample(blitSampler, IN.tc + float2(0.0, -texelSize.y)).rgb;\n"
+    "    float3 s = srcTex.Sample(blitSampler, IN.tc + float2(0.0,  texelSize.y)).rgb;\n"
+    "    float3 e = srcTex.Sample(blitSampler, IN.tc + float2( texelSize.x, 0.0)).rgb;\n"
+    "    float3 w = srcTex.Sample(blitSampler, IN.tc + float2(-texelSize.x, 0.0)).rgb;\n"
+    "    float3 blur = (n + s + e + w) * 0.25;\n"
+    "    float3 diff = clamp((c.rgb - blur) * sharpness, -0.15, 0.15);\n"
+    "    return float4(saturate(c.rgb + diff), c.a);\n"
+    "}\n";
+
+// 上采样全局配置（由 Java 侧 dx12SetUpscaleParams 写入，渲染线程读取）。
+static int gBlitUpscaleMode = 0;
+static float gBlitUpscaleSharpness = 0.0f;
+
 }  // namespace
+
+void setBlitUpscaleParams(int mode, float sharpness) {
+    gBlitUpscaleMode = mode == 1 ? 1 : 0;
+    gBlitUpscaleSharpness = sharpness < 0.0f ? 0.0f : (sharpness > 1.0f ? 1.0f : sharpness);
+}
+
+void getBlitUpscaleParams(int& mode, float& sharpness) {
+    mode = gBlitUpscaleMode;
+    sharpness = gBlitUpscaleSharpness;
+}
 
 void initBlitPipeline(std::string& err) {
     if (!ensureDevice(err)) return;
@@ -4207,10 +4255,17 @@ void initBlitPipeline(std::string& err) {
         table.NumDescriptorRanges = 1;
         table.pDescriptorRanges = ranges;
 
-        D3D12_ROOT_PARAMETER param{};
-        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        param.DescriptorTable = table;
-        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable = table;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        // b0：锐化上采样参数（sharpness, texelSize.xy, pad）
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 0;
+        params[1].Constants.RegisterSpace = 0;
+        params[1].Constants.Num32BitValues = 4;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC staticSam{};
         staticSam.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -4228,8 +4283,8 @@ void initBlitPipeline(std::string& err) {
         staticSam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 1;
-        rsDesc.pParameters = &param;
+        rsDesc.NumParameters = 2;
+        rsDesc.pParameters = params;
         rsDesc.NumStaticSamplers = 1;
         rsDesc.pStaticSamplers = &staticSam;
         rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -4249,16 +4304,20 @@ void initBlitPipeline(std::string& err) {
         }
     }
 
-    // 编译 VS / PS
-    ComPtr<ID3DBlob> vsBlob, psBlob, errs;
+    // 编译 VS / PS（双线性 + 锐化两个 PS 变体）
+    ComPtr<ID3DBlob> vsBlob, psBlob, sharpenBlob;
     std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
     std::vector<uint8_t> psBytes(kBlitPS, kBlitPS + sizeof(kBlitPS));
+    std::vector<uint8_t> sharpenBytes(kBlitSharpenPS, kBlitSharpenPS + sizeof(kBlitSharpenPS));
     if (!compileShaderBytecode(vsBytes, "blit_vs", "vs_5_1", vsBlob, err)) return;
     if (!compileShaderBytecode(psBytes, "blit_ps", "ps_5_1", psBlob, err)) return;
+    if (!compileShaderBytecode(sharpenBytes, "blit_sharpen_ps", "ps_5_1", sharpenBlob, err)) return;
 
-    // 创建 PSO
+    // 创建 PSO（同一份状态，仅 PS 不同）
     ComPtr<ID3D12PipelineState> pso;
-    {
+    ComPtr<ID3D12PipelineState> psoSharpen;
+    auto createBlitPso = [&](ID3DBlob* ps, const char* label,
+                             ComPtr<ID3D12PipelineState>& out) -> bool {
         D3D12_INPUT_ELEMENT_DESC ie[2] = {};
         ie[0].SemanticName = "POSITION";
         ie[0].SemanticIndex = 0;
@@ -4312,7 +4371,7 @@ void initBlitPipeline(std::string& err) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
         psoDesc.pRootSignature = rootSig.Get();
         psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
-        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
         psoDesc.InputLayout = { ie, 2 };
         psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         psoDesc.NumRenderTargets = 1;
@@ -4327,12 +4386,16 @@ void initBlitPipeline(std::string& err) {
         psoDesc.Flags = D3D12_PIPELINE_STATE_FLAGS(0);
 
         HRESULT hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc,
-            IID_PPV_ARGS(&pso));
+            IID_PPV_ARGS(&out));
         if (FAILED(hr)) {
-            err = "initBlitPipeline: CreateGraphicsPipelineState hr=0x" + hrText(hr);
-            return;
+            err = std::string("initBlitPipeline: CreateGraphicsPipelineState(") + label
+                + ") hr=0x" + hrText(hr);
+            return false;
         }
-    }
+        return true;
+    };
+    if (!createBlitPso(psBlob.Get(), "linear", pso)) return;
+    if (!createBlitPso(sharpenBlob.Get(), "sharpen", psoSharpen)) return;
 
     // 顶点缓冲：4 顶点，R32G32(position) + R32G32(texcoord)，upload heap
     {
@@ -4399,9 +4462,10 @@ void initBlitPipeline(std::string& err) {
 
     bp->rootSig = rootSig;
     bp->pso = pso;
+    bp->psoSharpen = psoSharpen;
     gCtx.blitPipeline = std::move(bp);
-    dbgLog("initBlitPipeline: done rootSig=%p pso=%p",
-        (void*)rootSig.Get(), (void*)pso.Get());
+    dbgLog("initBlitPipeline: done rootSig=%p pso=%p psoSharpen=%p",
+        (void*)rootSig.Get(), (void*)pso.Get(), (void*)psoSharpen.Get());
 }
 
 const BlitPipeline* getBlitPipeline() {
@@ -4465,6 +4529,420 @@ bool blitBindRawTextureSRV(CommandContext* ctx, ID3D12Resource* res,
     dbgLogDebug("blitBindRawTextureSRV: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
         ctx->drawHeapSlotBase, ctx->nextDrawSlot, (unsigned long long)srvGpu.ptr);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 图形增强：帧生成（自研帧间线性插值，非 NVIDIA DLSS-G）
+// ---------------------------------------------------------------------------
+//
+// 原理：显卡每渲染一帧真实画面并 present 之后，再额外 present 一张由
+// 「上一真实帧」与「当前真实帧」按权重混合出的插值帧，使显示器收到的帧数翻倍。
+// DLSS-G 需要引擎提供运动矢量 + jitter 并由光流网络做像素级重投影；本模组没有
+// 这些输入，因此这里是纯屏幕空间的线性插值：快速运动时会出现轻微重影，
+// 插值权重可在视频设置中调节。
+//
+// 全部历史帧状态都只在渲染线程内维护（避免跨线程索引竞争）：
+//   1. CopyResource: 真实 backbuffer → hist[write]
+//   2. 全屏 quad 绘制 lerp(hist[read], hist[write], weight) → 新 backbuffer
+//   3. present 新 backbuffer
+namespace {
+
+// 插值 PS：t0 = 上一真实帧，t1 = 当前真实帧；b0.x = 向当前帧靠拢的比例。
+static const char kFrameGenPS[] =
+    "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
+    "Texture2D<float4> prevTex : register(t0, space0);\n"
+    "Texture2D<float4> curTex : register(t1, space0);\n"
+    "SamplerState fgSampler : register(s0, space0);\n"
+    "cbuffer FrameGenParams : register(b0, space0) {\n"
+    "    float weight;\n"
+    "    float3 pad;\n"
+    "};\n"
+    "float4 main(VS_OUT IN) : SV_Target {\n"
+    "    float4 a = prevTex.Sample(fgSampler, IN.tc);\n"
+    "    float4 b = curTex.Sample(fgSampler, IN.tc);\n"
+    "    return float4(lerp(a.rgb, b.rgb, weight), 1.0f);\n"
+    "}\n";
+
+struct FrameGenResources {
+    bool ready = false;
+    UINT width = 0;
+    UINT height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ComPtr<ID3D12Resource> histTex[2];                 // 历史真实帧（backbuffer 尺寸）
+    ComPtr<ID3D12DescriptorHeap> srvHeap;              // 2 个 SRV 槽位（shader visible）
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu[2]{};
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu[2]{};
+    int writeIndex = 0;                                // 下一帧写入的 hist 下标
+    int filledIndex = 0;                               // 本帧已捕获的 hist 下标（= 当前真实帧）
+    bool haveHistory = false;                          // 是否已有一帧可供插值
+    UINT64 realFrameCounter = 0;                       // 真实帧序号（每帧递增）
+    UINT64 histFrameCounter = 0;                       // 最后一次成功捕获时的帧序号
+    ComPtr<ID3D12RootSignature> rootSig;
+    ComPtr<ID3D12PipelineState> pso;
+    CommandContext* ctx = nullptr;                     // 帧生成专用命令上下文
+};
+
+static FrameGenResources gFrameGen;
+static int gFrameGenMode = 0;
+static float gFrameGenWeight = 0.5f;
+
+// 释放历史纹理与 SRV 堆（先等 GPU 完成上一笔帧生成提交，避免 use-after-free）。
+void fgReleaseHistory() {
+    if (gFrameGen.ctx && gFrameGen.ctx->fenceValue > 0) {
+        std::string e;
+        if (!waitForFenceValue(gFrameGen.ctx, gFrameGen.ctx->fenceValue,
+                5'000'000'000ULL, e)) {
+            dbgLog("frameGen: wait before release FAILED: %s", e.c_str());
+        }
+    }
+    gFrameGen.histTex[0].Reset();
+    gFrameGen.histTex[1].Reset();
+    gFrameGen.srvHeap.Reset();
+    gFrameGen.width = 0;
+    gFrameGen.height = 0;
+    gFrameGen.ready = false;
+    gFrameGen.haveHistory = false;
+    gFrameGen.writeIndex = 0;
+    gFrameGen.filledIndex = 0;
+}
+
+// 根签名：table(SRV t0,t1) + b0(4 x 32bit) + static sampler s0。
+bool fgCreatePipeline(DXGI_FORMAT rtFormat, std::string& err) {
+    D3D12_DESCRIPTOR_RANGE srvRange{};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 2;                       // t0 = prev, t1 = cur
+    srvRange.BaseShaderRegister = 0;
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_DESCRIPTOR_TABLE table{};
+    table.NumDescriptorRanges = 1;
+    table.pDescriptorRanges = &srvRange;
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = table;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.ShaderRegister = 0;
+    params[1].Constants.RegisterSpace = 0;
+    params[1].Constants.Num32BitValues = 4;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC staticSam{};
+    staticSam.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSam.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSam.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSam.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSam.MipLODBias = 0.0f;
+    staticSam.MaxAnisotropy = 1;
+    staticSam.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    staticSam.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    staticSam.MinLOD = 0.0f;
+    staticSam.MaxLOD = D3D12_FLOAT32_MAX;
+    staticSam.ShaderRegister = 0;
+    staticSam.RegisterSpace = 0;
+    staticSam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 2;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = 1;
+    rsDesc.pStaticSamplers = &staticSam;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+        &rsBlob, &rsErr);
+    if (FAILED(hr)) {
+        err = "frameGen: SerializeRootSignature hr=0x" + hrText(hr);
+        return false;
+    }
+    hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+        rsBlob->GetBufferSize(), IID_PPV_ARGS(&gFrameGen.rootSig));
+    if (FAILED(hr)) {
+        err = "frameGen: CreateRootSignature hr=0x" + hrText(hr);
+        return false;
+    }
+
+    // VS 复用 blit 的顶点输入布局（POSITION + TEXCOORD，即 kBlitVS）。
+    std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
+    std::vector<uint8_t> psBytes(kFrameGenPS, kFrameGenPS + sizeof(kFrameGenPS));
+    ComPtr<ID3DBlob> vsBlob, psBlob;
+    if (!compileShaderBytecode(vsBytes, "framegen_vs", "vs_5_1", vsBlob, err)) return false;
+    if (!compileShaderBytecode(psBytes, "framegen_ps", "ps_5_1", psBlob, err)) return false;
+
+    D3D12_INPUT_ELEMENT_DESC ie[2] = {};
+    ie[0].SemanticName = "POSITION";
+    ie[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+    ie[0].InputSlot = 0;
+    ie[0].AlignedByteOffset = 0;
+    ie[0].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    ie[1].SemanticName = "TEXCOORD";
+    ie[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+    ie[1].InputSlot = 0;
+    ie[1].AlignedByteOffset = 8;
+    ie[1].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+
+    D3D12_RENDER_TARGET_BLEND_DESC rtBlend{};
+    rtBlend.BlendEnable = FALSE;
+    rtBlend.LogicOpEnable = FALSE;
+    rtBlend.SrcBlend = D3D12_BLEND_ONE;
+    rtBlend.DestBlend = D3D12_BLEND_ZERO;
+    rtBlend.BlendOp = D3D12_BLEND_OP_ADD;
+    rtBlend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    rtBlend.DestBlendAlpha = D3D12_BLEND_ZERO;
+    rtBlend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    rtBlend.LogicOp = D3D12_LOGIC_OP_NOOP;
+    rtBlend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    D3D12_BLEND_DESC blendDesc{};
+    blendDesc.AlphaToCoverageEnable = FALSE;
+    blendDesc.IndependentBlendEnable = FALSE;
+    blendDesc.RenderTarget[0] = rtBlend;
+
+    D3D12_RASTERIZER_DESC rasterDesc{};
+    rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
+    rasterDesc.CullMode = D3D12_CULL_MODE_NONE;
+    rasterDesc.FrontCounterClockwise = FALSE;
+    rasterDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    rasterDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    rasterDesc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    rasterDesc.DepthClipEnable = TRUE;
+    rasterDesc.MultisampleEnable = FALSE;
+    rasterDesc.AntialiasedLineEnable = FALSE;
+
+    D3D12_DEPTH_STENCIL_DESC dsDesc{};
+    dsDesc.DepthEnable = FALSE;
+    dsDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    dsDesc.StencilEnable = FALSE;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = gFrameGen.rootSig.Get();
+    psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+    psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+    psoDesc.InputLayout = { ie, 2 };
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = rtFormat;
+    psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    psoDesc.SampleDesc.Count = 1;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.BlendState = blendDesc;
+    psoDesc.RasterizerState = rasterDesc;
+    psoDesc.DepthStencilState = dsDesc;
+    hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&gFrameGen.pso));
+    if (FAILED(hr)) {
+        err = "frameGen: CreateGraphicsPipelineState hr=0x" + hrText(hr);
+        return false;
+    }
+    return true;
+}
+
+// 确保历史纹理 / SRV / 管线与当前 surface 尺寸一致（尺寸变化时重建）。
+bool fgEnsure(Dx12Surface* s, std::string& err) {
+    if (!gCtx.device) { err = "frameGen: device not initialized"; return false; }
+    if (gFrameGen.ready && gFrameGen.width == s->width &&
+        gFrameGen.height == s->height && gFrameGen.format == s->format) {
+        return true;
+    }
+    fgReleaseHistory();
+
+    for (int i = 0; i < 2; ++i) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = s->width;
+        rd.Height = s->height;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = s->format;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        HRESULT hr = gCtx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&gFrameGen.histTex[i]));
+        if (FAILED(hr)) {
+            err = "frameGen: create hist texture hr=0x" + hrText(hr);
+            fgReleaseHistory();
+            return false;
+        }
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    HRESULT hr = gCtx.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gFrameGen.srvHeap));
+    if (FAILED(hr)) {
+        err = "frameGen: create srv heap hr=0x" + hrText(hr);
+        fgReleaseHistory();
+        return false;
+    }
+    const UINT inc = gCtx.device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    gFrameGen.srvCpu[0] = gFrameGen.srvHeap->GetCPUDescriptorHandleForHeapStart();
+    gFrameGen.srvCpu[1] = gFrameGen.srvCpu[0];
+    gFrameGen.srvCpu[1].ptr += inc;
+    gFrameGen.srvGpu[0] = gFrameGen.srvHeap->GetGPUDescriptorHandleForHeapStart();
+    gFrameGen.srvGpu[1] = gFrameGen.srvGpu[0];
+    gFrameGen.srvGpu[1].ptr += inc;
+
+    // SRV 固定绑定 hist0→t0 / hist1→t1；插值方向由 weight 取 1-w 翻转，
+    // 避免每帧改写描述符（描述符可能仍被 GPU 在飞）。
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = s->format;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    gCtx.device->CreateShaderResourceView(gFrameGen.histTex[0].Get(), &sd, gFrameGen.srvCpu[0]);
+    gCtx.device->CreateShaderResourceView(gFrameGen.histTex[1].Get(), &sd, gFrameGen.srvCpu[1]);
+
+    if (!gFrameGen.pso) {
+        if (!fgCreatePipeline(s->format, err)) { fgReleaseHistory(); return false; }
+    }
+    if (!gFrameGen.ctx) {
+        gFrameGen.ctx = createCommandEncoder(err);
+        if (!gFrameGen.ctx) { fgReleaseHistory(); return false; }
+    }
+
+    gFrameGen.width = s->width;
+    gFrameGen.height = s->height;
+    gFrameGen.format = s->format;
+    gFrameGen.ready = true;
+    gFrameGen.haveHistory = false;
+    gFrameGen.writeIndex = 0;
+    gFrameGen.filledIndex = 0;
+    dbgLogInfo("frameGen: history ready %ux%u fmt=%d", s->width, s->height, (int)s->format);
+    return true;
+}
+
+// 捕获本真实帧到 hist[write]。**必须在 present 之前调用**：Present 之后
+// backbuffer 归 DXGI 所有，再读属于未定义行为。
+// canInterp 输出「上一帧的历史是否仍然有效」——若帧生成刚被关闭过若干帧，
+// 历史帧会过期，此时不插值（否则会出现跨越大段时间的诡异混合）。
+bool fgCapture(Dx12Surface* s, bool& canInterp, std::string& err) {
+    canInterp = false;
+    CommandContext* ctx = gFrameGen.ctx;
+    if (!ctx || !gFrameGen.ready) { err = "frameGen: not ready"; return false; }
+    if (!s || s->currentImageIndex < 0 ||
+        s->currentImageIndex >= (int)s->backBuffers.size()) {
+        err = "frameGen: no acquired back buffer";
+        return false;
+    }
+    ID3D12Resource* bb = s->backBuffers[(size_t)s->currentImageIndex].Get();
+    ID3D12Resource* dst = gFrameGen.histTex[gFrameGen.writeIndex].Get();
+    if (!bb || !dst) { err = "frameGen: null resource"; return false; }
+
+    canInterp = gFrameGen.haveHistory &&
+        (gFrameGen.realFrameCounter - gFrameGen.histFrameCounter == 1);
+
+    if (!beginCommandList(ctx, err)) return false;
+    ID3D12GraphicsCommandList* cmd = ctx->commandList;
+    // PRESENT 与 COMMON 同为 0，backbuffer 的锚点统一用 COMMON。
+    transitionTo(ctx, bb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->CopyResource(dst, bb);
+    transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    transitionTo(ctx, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (submitCommandList(ctx, err) == 0) return false;
+
+    gFrameGen.haveHistory = true;
+    gFrameGen.histFrameCounter = gFrameGen.realFrameCounter;
+    // 记录本帧落在哪个槽位，并翻转下一帧的写入槽位（无论插值帧是否绘制成功，
+    // 历史槽位必须轮转，否则下一帧会把刚捕获的帧覆盖掉）。
+    gFrameGen.filledIndex = gFrameGen.writeIndex;
+    gFrameGen.writeIndex ^= 1;
+    return true;
+}
+
+// 用新 acquire 的 backbuffer 绘制 prev/cur 的线性混合帧。
+// 调用方负责在返回成功后调 presentSurface 并自行处理 present fence。
+bool fgDraw(Dx12Surface* s, int& presentedIdx, std::string& err) {
+    presentedIdx = -1;
+    CommandContext* ctx = gFrameGen.ctx;
+    if (!ctx || !gFrameGen.ready) { err = "frameGen: not ready"; return false; }
+
+    // 复用 blit 管线的顶点/索引缓冲（全屏四边形）。
+    initBlitPipeline(err);
+    const BlitPipeline* bp = getBlitPipeline();
+    if (!bp) { err = "frameGen: blit pipeline not ready"; return false; }
+
+    if (!acquireSurfaceForFrameGen(s, err)) return false;
+    const int idx = s->currentImageIndex;
+    if (idx < 0 || idx >= (int)s->rtvHandles.size()) {
+        err = "frameGen: bad back buffer index";
+        return false;
+    }
+    ID3D12Resource* dst = s->backBuffers[(size_t)idx].Get();
+    ID3D12Resource* prev = gFrameGen.histTex[gFrameGen.filledIndex ^ 1].Get();
+    ID3D12Resource* cur = gFrameGen.histTex[gFrameGen.filledIndex].Get();
+    const UINT w = s->width;
+    const UINT h = s->height;
+
+    if (!beginCommandList(ctx, err)) return false;
+    ID3D12GraphicsCommandList* cmd = ctx->commandList;
+
+    transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    transitionTo(ctx, prev, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transitionTo(ctx, cur, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // 帧生成使用独立描述符堆（2 个 SRV 槽位），块结束前不切回 drawHeap：
+    // 本 list 只用这张堆，主渲染 list 下次 beginCommandList 会自行重置。
+    ID3D12DescriptorHeap* heaps[] = { gFrameGen.srvHeap.Get() };
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetGraphicsRootSignature(gFrameGen.rootSig.Get());
+    cmd->SetPipelineState(gFrameGen.pso.Get());
+    cmd->SetGraphicsRootDescriptorTable(0, gFrameGen.srvGpu[0]);
+    // t0 固定 = hist0、t1 固定 = hist1；写入 hist0 时插值方向相反，
+    // 用 1-weight 表达「从 hist1 走向 hist0」，避免每帧改写描述符。
+    const float weight = (gFrameGen.filledIndex == 1)
+        ? gFrameGenWeight : (1.0f - gFrameGenWeight);
+    const float params[4] = { weight, 0.0f, 0.0f, 0.0f };
+    cmd->SetGraphicsRoot32BitConstants(1, 4, params, 0);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)idx];
+    cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp{ 0.0f, 0.0f, (FLOAT)w, (FLOAT)h, 0.0f, 1.0f };
+    D3D12_RECT rect{ 0, 0, (LONG)w, (LONG)h };
+    cmd->RSSetViewports(1, &vp);
+    cmd->RSSetScissorRects(1, &rect);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->IASetVertexBuffers(0, 1, &bp->vbView);
+    cmd->IASetIndexBuffer(&bp->ibView);
+    cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+
+    if (submitCommandList(ctx, err) == 0) return false;
+    presentedIdx = idx;
+    return true;
+}
+
+}  // namespace
+
+void setFrameGenParams(int mode, float weight) {
+    gFrameGenMode = mode == 1 ? 1 : 0;
+    gFrameGenWeight = weight < 0.0f ? 0.0f : (weight > 1.0f ? 1.0f : weight);
+}
+
+void getFrameGenParams(int& mode, float& weight) {
+    mode = gFrameGenMode;
+    weight = gFrameGenWeight;
+}
+
+void destroyFrameGenResources() {
+    fgReleaseHistory();
+    if (gFrameGen.ctx) {
+        destroyCommandEncoder(gFrameGen.ctx);
+        gFrameGen.ctx = nullptr;
+    }
+    gFrameGen.rootSig.Reset();
+    gFrameGen.pso.Reset();
+    gFrameGen.realFrameCounter = 0;
+    gFrameGen.histFrameCounter = 0;
+    gFrameGenMode = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -4612,6 +5090,31 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         }
         SetEvent(gEvtSubmitDone);
 
+        // ---- 图形增强：帧生成（自研帧间线性插值，非 NVIDIA DLSS-G）----
+        // 捕获必须在本帧 present **之前**：Present 之后 backbuffer 归 DXGI 所有，
+        // 再 CopyResource 读取属于未定义行为。
+        bool fgWillDraw = false;
+        {
+            int fgMode = 0;
+            float fgWeight = 0.5f;
+            getFrameGenParams(fgMode, fgWeight);
+            ++gFrameGen.realFrameCounter;
+            if (fgMode == 1 && s) {
+                std::string fgErr;
+                if (!fgEnsure(s, fgErr)) {
+                    static bool fgLogged = false;
+                    if (!fgLogged) { fgLogged = true; dbgLog("frameGen: ensure FAILED: %s", fgErr.c_str()); }
+                } else {
+                    bool canInterp = false;
+                    if (fgCapture(s, canInterp, fgErr)) fgWillDraw = canInterp;
+                    else {
+                        static bool fgLoggedCap = false;
+                        if (!fgLoggedCap) { fgLoggedCap = true; dbgLog("frameGen: capture FAILED: %s", fgErr.c_str()); }
+                    }
+                }
+            }
+        }
+
         // present（presentSurface 返回 void）
         dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
             (unsigned long long)gCtx.queueFenceValue, bbIdx);
@@ -4629,6 +5132,27 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
                 sProfWaitCmdMs = sProfSubmitMs = sProfPresentMs = 0.0;
             }
         }
+        // ---- 图形增强：帧生成（绘制并 present 插值帧）----
+        // 必须在 ++gPresentedFrames 之前完成：该计数器一旦递增就会放行主线程的
+        // acquireSurface，与本处并发的 acquireSurfaceForFrameGen 抢同一个 back buffer。
+        if (fgWillDraw) {
+            int fgIdx = -1;
+            std::string fgErr;
+            if (fgDraw(getActiveSurface(), fgIdx, fgErr)) {
+                presentSurfaceInterpolated(getActiveSurface());
+                if (s && fgIdx >= 0) {
+                    UINT64 pv2 = ++gCtx.queueFenceValue;
+                    gCtx.queue->Signal(gCtx.queueFence.Get(), pv2);
+                    if (s->surfacePresentFences.size() < (size_t)kSurfaceBufferCount)
+                        s->surfacePresentFences.resize(kSurfaceBufferCount, 0);
+                    s->surfacePresentFences[(size_t)fgIdx] = pv2;
+                }
+            } else {
+                static bool fgLoggedDraw = false;
+                if (!fgLoggedDraw) { fgLoggedDraw = true; dbgLog("frameGen: draw FAILED: %s", fgErr.c_str()); }
+            }
+        }
+
         // P48：Present 完成，放行主线程的 back buffer acquire。
         {
             std::lock_guard<std::mutex> lk(gPresentMtx);

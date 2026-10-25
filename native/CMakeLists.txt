@@ -17,9 +17,17 @@ include_directories("${JAVA_HOME}/include" "${JAVA_HOME}/include/win32")
 # ---- DirectX / Windows SDK ----
 # d3d12.lib、dxgi.lib 由 MSVC 的 Windows SDK 环境自动提供。
 
+# ---- NVIDIA NGX（DLSS）SDK ----
+# 头文件 + 动态 CRT 版加载器库（nvsdk_ngx_d.lib）：本工程用 /MD，静态 CRT 版
+# （nvsdk_ngx_s.lib）会触发 LNK2038 运行库不匹配。加载器把 NGX 链进 dx12_mc.dll，
+# 未配置 App ID 时不会产生额外 DLL 依赖，只在显式初始化时返回失败。
+set(NGX_ROOT "${CMAKE_SOURCE_DIR}/../DLSS")
+include_directories("${NGX_ROOT}/include")
+
 add_library(dx12_mc SHARED
     src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
+    src/ngx_dlss.cpp
     src/dx12_raytracing.cpp
     src/dx12_rt_scene.cpp
     src/dx12_async_executor.cpp
@@ -37,7 +45,8 @@ add_library(dx12_mc SHARED
 )
 
 # d3dcompiler：D3DCompile 把 HLSL 编译为 DXBC（vs_5_1/ps_5_1）
-target_link_libraries(dx12_mc PRIVATE d3d12 dxgi d3dcompiler)
+target_link_libraries(dx12_mc PRIVATE d3d12 dxgi d3dcompiler
+    "${NGX_ROOT}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
 
 # 警告级别 + 强制源文件按 UTF-8 解析（源码含中文注释，避免 GBK 代码页误读）
 if(MSVC)

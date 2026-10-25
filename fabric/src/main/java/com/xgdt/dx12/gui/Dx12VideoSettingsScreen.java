@@ -4,6 +4,9 @@ import com.mojang.blaze3d.platform.Monitor;
 import com.mojang.blaze3d.platform.VideoMode;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.serialization.Codec;
+import com.xgdt.dx12.config.Dx12Config;
+import com.xgdt.dx12.dx12.Dx12Backend;
 import com.xgdt.dx12.dx12.Dx12Native;
 import com.xgdt.dx12.shaderpack.ShaderPack;
 import com.xgdt.dx12.shaderpack.ShaderPackManager;
@@ -66,6 +69,16 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
     private Category category = Category.DISPLAY;
     private OptionInstance<Integer> fullscreenResolution;
 
+    // 「图形增强」页的自有选项：直接读写 Dx12Config，不进入原版 Options。
+    private OptionInstance<Integer> renderScaleOption;
+    private OptionInstance<Integer> upscaleModeOption;
+    private OptionInstance<Integer> upscaleSharpnessOption;
+    private OptionInstance<Integer> frameGenOption;
+    private OptionInstance<Integer> frameGenStrengthOption;
+
+    /** 原生侧 NGX 状态一行文案；null = 尚未读取。 */
+    private String ngxStatus;
+
     private int scroll;
     private int maxScroll;
 
@@ -123,7 +136,9 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         this.scroll = 0;
         this.searchFocused = false;
         this.draggingRow = null;
+        this.ngxStatus = null;
         this.buildFullscreenResolutionOption();
+        this.buildUpscalingOptions();
         this.buildRows();
     }
 
@@ -163,6 +178,98 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             });
     }
 
+    /**
+     * 「图形增强」页的选项：内部渲染缩放 + 上采样滤镜。
+     *
+     * <p>这三项保存在 mod 自己的配置文件里（{@link Dx12Config}），不参与原版
+     * Options 的序列化；渲染缩放由 {@code GameRendererRenderScaleMixin} 生效，
+     * 上采样由原生 blit 管线在放大到窗口时执行。
+     */
+    private void buildUpscalingOptions() {
+        Dx12Config cfg = Dx12Config.getInstance();
+        this.renderScaleOption = new OptionInstance<>(
+            "options.gl4dx12.render_scale", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(value + "%")),
+            new OptionInstance.IntRange(50, 100), cfg.getRenderScale(),
+            cfg::setRenderScale);
+        this.upscaleModeOption = new OptionInstance<>(
+            "options.gl4dx12.upscale_mode", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.upscaleModeLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1), Codec.INT), cfg.getUpscaleMode(),
+            value -> {
+                cfg.setUpscaleMode(value);
+                Dx12Backend.pushUpscaleParams();
+            });
+        this.upscaleSharpnessOption = new OptionInstance<>(
+            "options.gl4dx12.upscale_sharpness", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(value + "%")),
+            new OptionInstance.IntRange(0, 100), cfg.getUpscaleSharpness(),
+            value -> {
+                cfg.setUpscaleSharpness(value);
+                Dx12Backend.pushUpscaleParams();
+            });
+        this.frameGenOption = new OptionInstance<>(
+            "options.gl4dx12.frame_gen", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.frameGenLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1), Codec.INT), cfg.getFrameGen(),
+            value -> {
+                cfg.setFrameGen(value);
+                Dx12Backend.pushFrameGenParams();
+            });
+        this.frameGenStrengthOption = new OptionInstance<>(
+            "options.gl4dx12.frame_gen_strength", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(value + "%")),
+            new OptionInstance.IntRange(0, 100), cfg.getFrameGenStrength(),
+            value -> {
+                cfg.setFrameGenStrength(value);
+                Dx12Backend.pushFrameGenParams();
+            });
+    }
+
+    private String upscaleModeLabel(int mode) {
+        boolean chinese = this.isChinese();
+        if (mode == 1) {
+            return chinese ? "CAS 锐化" : "CAS Sharpening";
+        }
+        return chinese ? "双线性" : "Bilinear";
+    }
+
+    /** 帧生成开关文案：0 = 关闭，1 = 开启（自研帧间插值，非 DLSS-G）。 */
+    private String frameGenLabel(int value) {
+        boolean chinese = this.isChinese();
+        if (value == 1) {
+            return chinese ? "开启（自研插帧）" : "On (Built-in)";
+        }
+        return chinese ? "关闭" : "Off";
+    }
+
+    /** 原生侧 NGX 状态文案（只在首次进入页面时问一次 native，随后缓存）。 */
+    private String ngxStatusLine() {
+        if (this.ngxStatus == null) {
+            String text = "";
+            if (Dx12Native.isLoaded()) {
+                try {
+                    text = Dx12Backend.getNgxStatus();
+                } catch (Throwable t) {
+                    text = "";
+                }
+            }
+            this.ngxStatus = text == null ? "" : text;
+        }
+        return this.ngxStatus;
+    }
+
+    /** 「图形增强」页是否显示 NGX 状态行（搜索态与其它页不显示）。 */
+    private boolean showsNgxStatusLine() {
+        return this.search.isEmpty() && this.category == Category.UPSCALING
+            && !this.ngxStatusLine().isEmpty();
+    }
+
     private void buildRows() {
         this.allRows.clear();
         for (OptionInstance<?> option : this.displayOptions()) {
@@ -171,9 +278,17 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         for (OptionInstance<?> option : this.qualityOptions()) {
             this.allRows.add(new Row(option, Category.QUALITY));
         }
+        for (OptionInstance<?> option : this.upscalingOptions()) {
+            this.allRows.add(new Row(option, Category.UPSCALING));
+        }
         for (OptionInstance<?> option : this.preferenceOptions()) {
             this.allRows.add(new Row(option, Category.PREFERENCES));
         }
+    }
+
+    private List<OptionInstance<?>> upscalingOptions() {
+        return List.of(this.renderScaleOption, this.upscaleModeOption,
+            this.upscaleSharpnessOption, this.frameGenOption, this.frameGenStrengthOption);
     }
 
     private List<OptionInstance<?>> displayOptions() {
@@ -277,7 +392,8 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             this.maxScroll = 0;
         } else {
             int visibleHeight = Math.max(0, this.contentH - 26
-                - (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0));
+                - (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0)
+                - (this.showsNgxStatusLine() ? 12 : 0));
             this.maxScroll = Math.max(0, shown.size() * ROW_HEIGHT - visibleHeight);
         }
         this.scroll = Mth.clamp(this.scroll, 0, this.maxScroll);
@@ -367,6 +483,12 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         }
 
         int rowTop = this.contentY + 26 + (restart ? 12 : 0);
+        if (this.showsNgxStatusLine()) {
+            graphics.centeredText(this.font, Component.literal(this.ngxStatusLine()),
+                this.contentX + this.contentW / 2, this.contentY + 16 + (restart ? 12 : 0),
+                TEXT_DIM);
+            rowTop += 12;
+        }
         int rowX = this.contentX;
         int rowW = this.contentW - 8;
         int rowRight = rowX + rowW;
@@ -962,6 +1084,14 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 return Dx12VideoSettingsScreen.this.options.textureFiltering().get()
                     == TextureFilteringMethod.ANISOTROPIC;
             }
+            // 锐化强度仅在上采样模式为 CAS 时生效。
+            if (this.option == Dx12VideoSettingsScreen.this.upscaleSharpnessOption) {
+                return Dx12VideoSettingsScreen.this.upscaleModeOption.get() == 1;
+            }
+            // 插值权重仅在帧生成开启时生效。
+            if (this.option == Dx12VideoSettingsScreen.this.frameGenStrengthOption) {
+                return Dx12VideoSettingsScreen.this.frameGenOption.get() == 1;
+            }
             return true;
         }
 
@@ -1042,6 +1172,7 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
     private enum Category {
         DISPLAY("options.video.display.header", "显示", "Display"),
         QUALITY("options.video.quality.header", "质量", "Quality"),
+        UPSCALING(null, "图形增强", "Graphics Enhancements"),
         PREFERENCES("options.video.preferences.header", "偏好", "Preferences"),
         SHADERS(null, "光影", "Shaders"),
         DX_SUPPORT(null, "DX 支持", "DX Support");

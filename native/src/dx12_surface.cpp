@@ -602,7 +602,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode,
     return true;
 }
 
-bool acquireSurface(Dx12Surface* s, std::string& err) {
+static bool acquireSurfaceImpl(Dx12Surface* s, bool waitPresents, std::string& err) {
     if (!s || !s->swapChain) {
         err = "surface not created";
         return false;
@@ -612,7 +612,7 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     // 已推迟到 blit 之前（Java Dx12GpuSurface.ensureAcquired），此时本帧录制已完成，
     // 上一帧 Present 通常早已结束 → 通常 0ms。同步/SYNC 路径（渲染线程未运行）下
     // waitForPendingPresents 内部直接返回，无额外开销。
-    waitForPendingPresents();
+    if (waitPresents) waitForPendingPresents();
     // 以下两条为逐帧诊断（原为 dbgLog，每帧 2 次 stderr+文件 flush，实测 ~0.1-0.2ms/条，
     // 属帧关键路径纯开销）→ 降为 DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
     dbgLogDebug("acquireSurface: enter surface=%p", (void*)s);
@@ -666,6 +666,14 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     // 旧数据（表现为黑屏/错误内容）。
     s->lastBlitIndex = s->currentImageIndex;
     return true;
+}
+
+bool acquireSurface(Dx12Surface* s, std::string& err) {
+    return acquireSurfaceImpl(s, true, err);
+}
+
+bool acquireSurfaceForFrameGen(Dx12Surface* s, std::string& err) {
+    return acquireSurfaceImpl(s, false, err);
 }
 
 // 返回当前 acquire 的 back buffer 原始 ID3D12Resource 指针。
@@ -839,8 +847,23 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
             err = "blitSurface: " + blitErr; return false;
         }
         const BlitPipeline* bp = getBlitPipeline();
+        // 上采样：渲染缩放 < 100% 时按配置选择双线性 / CAS 锐化 PSO。
+        int upscaleMode = 0;
+        float upscaleSharpness = 0.0f;
+        getBlitUpscaleParams(upscaleMode, upscaleSharpness);
+        bool sharpen = upscaleMode == 1 && upscaleSharpness > 0.0f;
         cmd->SetGraphicsRootSignature(bp->rootSig.Get());
-        cmd->SetPipelineState(bp->pso.Get());
+        cmd->SetPipelineState(sharpen ? bp->psoSharpen.Get() : bp->pso.Get());
+        if (sharpen) {
+            const D3D12_RESOURCE_DESC srcDesc = srcTex->resource->GetDesc();
+            float params[4] = {
+                upscaleSharpness,
+                srcDesc.Width > 0 ? 1.0f / (float)srcDesc.Width : 0.0f,
+                srcDesc.Height > 0 ? 1.0f / (float)srcDesc.Height : 0.0f,
+                0.0f
+            };
+            cmd->SetGraphicsRoot32BitConstants(1, 4, params, 0);
+        }
         dbgLogDebug("blitSurface: set blit rootSig=%p pso=%p",
             (void*)bp->rootSig.Get(), (void*)bp->pso.Get());
 
@@ -916,7 +939,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     return true;
 }
 
-void presentSurface(Dx12Surface* s) {
+// immediate=true：帧生成插入的合成帧使用——必须尽快上屏，不能等垂直同步，
+// 否则每个真实帧要占两个 vblank，实际帧率反而减半。
+static void presentSurfaceInternal(Dx12Surface* s, bool immediate) {
     if (!s || !s->swapChain) {
         return;
     }
@@ -929,8 +954,9 @@ void presentSurface(Dx12Surface* s) {
     // Present 立即返回（~0.15ms）故无此问题。传入 ALLOW_TEARING 后全屏不再同步到
     // vblank（等价官方 Vulkan 的 IMMEDIATE present，实测官方全屏 1022FPS）。
     // 前提：swapchain 创建时带 ALLOW_TEARING（s->allowTearing），且 syncInterval==0。
-    UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
-    UINT flags = (s->presentMode == 0 && s->allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    UINT syncInterval = (immediate || s->presentMode == 0) ? 0 : 1;
+    UINT flags = ((immediate || s->presentMode == 0) && s->allowTearing)
+        ? DXGI_PRESENT_ALLOW_TEARING : 0;
     // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
     // P3.2 诊断：每帧检查 Backbuffer 格式和尺寸是否与窗口匹配
     if (!s->backBuffers.empty()) {
@@ -968,6 +994,14 @@ void presentSurface(Dx12Surface* s) {
         dbgLogDebug("presentSurface: ok (syncInterval=%u)", syncInterval);
         s->suboptimal = false;  // 正常 present 清除 suboptimal 标记
     }
+}
+
+void presentSurface(Dx12Surface* s) {
+    presentSurfaceInternal(s, false);
+}
+
+void presentSurfaceInterpolated(Dx12Surface* s) {
+    presentSurfaceInternal(s, true);
 }
 
 void destroySurface(Dx12Surface* s) {

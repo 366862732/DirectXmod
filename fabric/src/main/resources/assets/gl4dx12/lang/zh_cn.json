@@ -1,4 +1,9 @@
 {
   "key.category.gl4dx12.main": "GL4DX12（D3D12）",
-  "key.gl4dx12.offline_render": "离线渲染（ITRP 时间累积）"
+  "key.gl4dx12.offline_render": "离线渲染（ITRP 时间累积）",
+  "options.gl4dx12.render_scale": "渲染缩放",
+  "options.gl4dx12.upscale_mode": "上采样滤镜",
+  "options.gl4dx12.upscale_sharpness": "锐化强度",
+  "options.gl4dx12.frame_gen": "帧生成（自研插帧）",
+  "options.gl4dx12.frame_gen_strength": "插值权重"
 }

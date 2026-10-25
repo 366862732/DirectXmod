@@ -5,6 +5,7 @@
     "client": [
         "PreferredGraphicsApiMixin",
         "GameRendererRenderDebugMixin",
+        "GameRendererRenderScaleMixin",
         "GameRendererShaderPackMixin",
         "CloudRendererShaderPackMixin",
         "MinecraftRunDebugMixin",
