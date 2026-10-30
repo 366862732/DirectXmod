@@ -75,6 +75,11 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
     private OptionInstance<Integer> upscaleSharpnessOption;
     private OptionInstance<Integer> frameGenOption;
     private OptionInstance<Integer> frameGenStrengthOption;
+    private OptionInstance<Integer> dlssSrOption;
+    private OptionInstance<Integer> dlssQualityOption;
+    private OptionInstance<Integer> dlssPresetOption;
+    private OptionInstance<Integer> dlssFgOption;
+    private OptionInstance<Integer> dlssFgFramesOption;
 
     /** 原生侧 NGX 状态一行文案；null = 尚未读取。 */
     private String ngxStatus;
@@ -229,6 +234,102 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 cfg.setFrameGenStrength(value);
                 Dx12Backend.pushFrameGenParams();
             });
+        this.dlssSrOption = new OptionInstance<>(
+            "options.gl4dx12.dlss_sr", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.dlssSrLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1), Codec.INT), cfg.getDlssSr(),
+            value -> {
+                cfg.setDlssSr(value);
+                Dx12Backend.pushDlssConfig();
+            });
+        this.dlssQualityOption = new OptionInstance<>(
+            "options.gl4dx12.dlss_quality", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.dlssQualityLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4, 5), Codec.INT),
+            cfg.getDlssQuality(),
+            value -> {
+                cfg.setDlssQuality(value);
+                Dx12Backend.pushDlssConfig();
+            });
+        this.dlssPresetOption = new OptionInstance<>(
+            "options.gl4dx12.dlss_preset", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.dlssPresetLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 10, 11, 12, 13), Codec.INT),
+            cfg.getDlssPreset(),
+            value -> {
+                cfg.setDlssPreset(value);
+                Dx12Backend.pushDlssConfig();
+            });
+        this.dlssFgOption = new OptionInstance<>(
+            "options.gl4dx12.dlss_fg", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.dlssFgLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1), Codec.INT), cfg.getDlssFg(),
+            value -> {
+                cfg.setDlssFg(value);
+                Dx12Backend.pushDlssConfig();
+            });
+        this.dlssFgFramesOption = new OptionInstance<>(
+            "options.gl4dx12.dlss_fg_frames", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.dlssFgFramesLabel(value))),
+            new OptionInstance.Enum<>(List.of(1, 2, 3), Codec.INT),
+            cfg.getDlssFgFrames(),
+            value -> {
+                cfg.setDlssFgFrames(value);
+                Dx12Backend.pushDlssConfig();
+            });
+    }
+
+    private String dlssSrLabel(int value) {
+        boolean chinese = this.isChinese();
+        if (value == 1) {
+            return chinese ? "开启（DLSS 超分）" : "On (DLSS SR)";
+        }
+        return chinese ? "关闭" : "Off";
+    }
+
+    private String dlssQualityLabel(int value) {
+        boolean chinese = this.isChinese();
+        return switch (value) {
+            case 0 -> "DLAA";
+            case 2 -> chinese ? "均衡" : "Balanced";
+            case 3 -> chinese ? "性能" : "Performance";
+            case 4 -> chinese ? "极致性能" : "Ultra Performance";
+            case 5 -> chinese ? "自定义（渲染缩放）" : "Custom (Render Scale)";
+            default -> chinese ? "质量" : "Quality";
+        };
+    }
+
+    private String dlssPresetLabel(int value) {
+        boolean chinese = this.isChinese();
+        return switch (value) {
+            case 10 -> "J";
+            case 11 -> "K";
+            case 12 -> "L";
+            case 13 -> "M";
+            default -> chinese ? "默认" : "Default";
+        };
+    }
+
+    private String dlssFgLabel(int value) {
+        boolean chinese = this.isChinese();
+        if (value == 1) {
+            return chinese ? "开启（DLSS 帧生成）" : "On (DLSS Frame Gen)";
+        }
+        return chinese ? "关闭" : "Off";
+    }
+
+    private String dlssFgFramesLabel(int value) {
+        boolean chinese = this.isChinese();
+        return switch (value) {
+            case 2 -> chinese ? "3x（2 张生成帧）" : "3x (2 generated)";
+            case 3 -> chinese ? "4x（3 张生成帧）" : "4x (3 generated)";
+            default -> chinese ? "2x（1 张生成帧）" : "2x (1 generated)";
+        };
     }
 
     private String upscaleModeLabel(int mode) {
@@ -288,7 +389,9 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
 
     private List<OptionInstance<?>> upscalingOptions() {
         return List.of(this.renderScaleOption, this.upscaleModeOption,
-            this.upscaleSharpnessOption, this.frameGenOption, this.frameGenStrengthOption);
+            this.upscaleSharpnessOption, this.dlssSrOption, this.dlssQualityOption,
+            this.dlssPresetOption, this.dlssFgOption, this.dlssFgFramesOption,
+            this.frameGenOption, this.frameGenStrengthOption);
     }
 
     private List<OptionInstance<?>> displayOptions() {
@@ -1084,13 +1187,37 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 return Dx12VideoSettingsScreen.this.options.textureFiltering().get()
                     == TextureFilteringMethod.ANISOTROPIC;
             }
+            // 渲染缩放：DLSS 超分开启时由质量档位决定；仅 Custom 档可手动调。
+            if (this.option == Dx12VideoSettingsScreen.this.renderScaleOption) {
+                return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1
+                    || Dx12VideoSettingsScreen.this.dlssQualityOption.get() == 5;
+            }
+            // DLSS 超分开启时 blit 直接使用 NGX 输出，双线性/CAS 不再参与。
+            if (this.option == Dx12VideoSettingsScreen.this.upscaleModeOption) {
+                return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1;
+            }
             // 锐化强度仅在上采样模式为 CAS 时生效。
             if (this.option == Dx12VideoSettingsScreen.this.upscaleSharpnessOption) {
-                return Dx12VideoSettingsScreen.this.upscaleModeOption.get() == 1;
+                return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1
+                    && Dx12VideoSettingsScreen.this.upscaleModeOption.get() == 1;
             }
-            // 插值权重仅在帧生成开启时生效。
+            // 质量档 / 渲染预设只在 DLSS 超分开启时可调。
+            if (this.option == Dx12VideoSettingsScreen.this.dlssQualityOption
+                || this.option == Dx12VideoSettingsScreen.this.dlssPresetOption) {
+                return Dx12VideoSettingsScreen.this.dlssSrOption.get() == 1;
+            }
+            // 生成帧数量只在 DLSS-G 开启时可调。
+            if (this.option == Dx12VideoSettingsScreen.this.dlssFgFramesOption) {
+                return Dx12VideoSettingsScreen.this.dlssFgOption.get() == 1;
+            }
+            // 自研插帧与 DLSS-G 互斥。
+            if (this.option == Dx12VideoSettingsScreen.this.frameGenOption) {
+                return Dx12VideoSettingsScreen.this.dlssFgOption.get() != 1;
+            }
+            // 插值权重仅在自研插帧开启（且 DLSS-G 关闭）时生效。
             if (this.option == Dx12VideoSettingsScreen.this.frameGenStrengthOption) {
-                return Dx12VideoSettingsScreen.this.frameGenOption.get() == 1;
+                return Dx12VideoSettingsScreen.this.frameGenOption.get() == 1
+                    && Dx12VideoSettingsScreen.this.dlssFgOption.get() != 1;
             }
             return true;
         }

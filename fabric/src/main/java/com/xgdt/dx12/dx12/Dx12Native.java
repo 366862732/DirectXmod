@@ -666,6 +666,46 @@ public final class Dx12Native {
     /** 返回一行 NGX 状态文案（供视频设置「图形增强」页显示）。 */
     public static native String dx12GetNgxStatus();
 
+    /**
+     * DLSS 超分 / 帧生成配置推送。返回 DLSS 超分是否可用。
+     *
+     * @param sr     是否启用 DLSS 超分
+     * @param quality 0=DLAA, 1=Quality, 2=Balanced, 3=Performance,
+     *                4=UltraPerformance, 5=Custom（使用 render_scale）
+     * @param preset  0=Default, 10=J, 11=K, 12=L, 13=M
+     * @param fg      是否启用 DLSS 帧生成
+     * @param frames  每个真实帧额外生成的帧数（1..3）
+     */
+    public static native boolean dx12SetDlssConfig(boolean sr, int quality,
+        int preset, boolean fg, int frames);
+
+    /** 每帧开始：清空捕获状态并推进原生帧号。 */
+    public static native void dx12DlssBeginFrame(boolean active,
+        boolean notRenderingGameFrames);
+
+    /**
+     * 世界渲染完成后捕获深度与相机矩阵，由原生 compute shader 生成运动矢量。
+     *
+     * @param ctx      当前命令上下文（sharedEncoder 的 nativeHandle）
+     * @param surface  当前游戏 surface
+     * @param depthTex 主渲染目标深度纹理（Dx12GpuTexture.handle()）
+     * @param data     98 个 float 的捕获数据（布局见 ngx_dlss_render.h）
+     * @return true 表示捕获成功
+     */
+    public static native boolean dx12DlssCaptureFrame(long ctx, long surface,
+        long depthTex, float[] data);
+
+    /** 场景切换 / 尺寸变化 / 配置变化：清空 DLSS 时间历史。 */
+    public static native void dx12DlssReset();
+
+    public static native boolean dx12DlssIsSrActive();
+
+    public static native boolean dx12DlssIsFgActive();
+
+    public static native boolean dx12DlssIsSrAvailable();
+
+    public static native boolean dx12DlssIsFgAvailable();
+
     /** Present the current back buffer (vsync follows the configured mode). */
     public static native void dx12PresentSurface(long surface);
 

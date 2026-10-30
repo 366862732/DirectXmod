@@ -25,6 +25,9 @@ void ngxSetConfig(const std::string& appId, const std::string& projectId,
 // 之后 ngxSetConfig 被调用时会用同一个 device 重试。
 void ngxInitForDevice(void* d3d12Device);
 
+// NGX 是否已经初始化成功（渲染模块据此决定能否创建 feature）。
+bool ngxIsInitialized();
+
 // 设备销毁前调用。
 void ngxShutdown();
 

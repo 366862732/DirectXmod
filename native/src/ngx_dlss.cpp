@@ -19,6 +19,7 @@
 #include "nvsdk_ngx_defs_dlssg.h"
 
 #include "dx12_device.h"
+#include "ngx_dlss_render.h"
 
 using namespace dx12mc;
 
@@ -180,8 +181,7 @@ void tryInit() {
 
     char buf[192];
     std::snprintf(buf, sizeof(buf),
-        "NGX 初始化成功（%s）。DLSS 超分可用=%s，DLSS 帧生成可用=%s；"
-        "运动矢量/jitter 输入尚未接入，暂不启用 DLSS 渲染路径",
+        "NGX 初始化成功（%s）。DLSS 超分可用=%s，DLSS 帧生成可用=%s",
         mode.c_str(), gState.dlssAvailable ? "是" : "否",
         gState.frameGenAvailable ? "是" : "否");
     setMessage(buf);
@@ -205,11 +205,17 @@ void ngxInitForDevice(void* d3d12Device) {
 
 void ngxShutdown() {
     if (gState.initialized) {
+        // 先释放 SR/FG feature 并等待 GPU 空闲，再关闭 NGX。
+        ngxRenderShutdown();
         NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Shutdown1(gDevice);
         dbgLog("ngx: shutdown result=0x%08x", (unsigned)r);
     }
     gState = NgxState{};
     gDevice = nullptr;
+}
+
+bool ngxIsInitialized() {
+    return gState.initialized;
 }
 
 NgxState ngxGetState() {

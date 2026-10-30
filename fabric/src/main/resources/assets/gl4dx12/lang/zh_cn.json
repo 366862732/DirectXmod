@@ -5,5 +5,10 @@
   "options.gl4dx12.upscale_mode": "上采样滤镜",
   "options.gl4dx12.upscale_sharpness": "锐化强度",
   "options.gl4dx12.frame_gen": "帧生成（自研插帧）",
-  "options.gl4dx12.frame_gen_strength": "插值权重"
+  "options.gl4dx12.frame_gen_strength": "插值权重",
+  "options.gl4dx12.dlss_sr": "DLSS 超分辨率",
+  "options.gl4dx12.dlss_quality": "DLSS 质量档位",
+  "options.gl4dx12.dlss_preset": "DLSS 渲染预设",
+  "options.gl4dx12.dlss_fg": "DLSS 帧生成",
+  "options.gl4dx12.dlss_fg_frames": "DLSS 生成帧数"
 }

@@ -1,13 +1,18 @@
 package com.xgdt.dx12.mixin;
 
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.xgdt.dx12.dx12.DlssFrameCapture;
 import com.xgdt.dx12.dx12.Dx12Device;
 import com.xgdt.dx12.dx12.Dx12ShaderPackRenderer;
 import com.xgdt.dx12.dx12.OfflineRender;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
+import net.minecraft.client.renderer.ProjectionMatrixBuffer;
+import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
@@ -36,6 +41,34 @@ public class GameRendererShaderPackMixin {
         OfflineRender.beginFrame();
     }
 
+    /**
+     * 每帧开始：重置 DLSS 捕获状态并选择本帧抖动。
+     * 放在 render HEAD，早于 resize / 清屏 / 世界渲染。
+     */
+    @Inject(method = "render", at = @At("HEAD"), remap = false)
+    private void dx12_dlssBeginFrame(DeltaTracker deltaTracker, boolean advanceGameTime,
+                                     CallbackInfo ci) {
+        DlssFrameCapture.beginFrame();
+    }
+
+    /**
+     * 最终关卡投影矩阵上传前叠加 DLSS 亚像素抖动。
+     * 该调用在 {@code renderLevel} 中唯一一次以 Matrix4f 为参数的 getBuffer。
+     */
+    @Redirect(
+        method = "renderLevel",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/client/renderer/ProjectionMatrixBuffer;getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
+        ),
+        remap = false
+    )
+    private GpuBufferSlice dx12_dlssProjection(ProjectionMatrixBuffer buffer,
+                                               Matrix4f projection) {
+        DlssFrameCapture.applyProjectionJitter(projection);
+        return buffer.getBuffer(projection);
+    }
+
     @Inject(
         method = "renderLevel",
         at = @At(
@@ -49,6 +82,9 @@ public class GameRendererShaderPackMixin {
         if (!Dx12Device.isInitialized()) {
             return;
         }
+        // 深度尚未被原版清除：先让 DLSS 捕获世界深度并生成相机运动矢量，
+        // 再执行光影 pass 链（光影只读 scene_depth，不会破坏捕获结果）。
+        DlssFrameCapture.captureWorldDepth();
         Dx12ShaderPackRenderer.getInstance().renderFrame();
     }
 }

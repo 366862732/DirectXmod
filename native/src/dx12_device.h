@@ -387,6 +387,9 @@ void waitForRenderThreadSubmit();
 // 提前 acquire 会拿到同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。
 // 正常情况（主线程录制耗时 ≫ 渲染线程 Present 耗时）返回 0ms。
 void waitForPendingPresents();
+// 在队列上信号一个新的全局 fence 并返回其值。DLSS-G 一次 Present 多帧后，
+// 用同一个 fence 标记所有被使用的 back buffer（surfacePresentFences）。
+UINT64 signalQueueFence();
 // 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
 bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
 // 阻塞：等到本帧提交完成（或超时 ms）。
@@ -670,7 +673,9 @@ bool drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
 // PresentMode 序数 = 官方枚举 ordinal：IMMEDIATE=0, MAILBOX=1, FIFO=2,
 // FIFO_RELAXED=3。DXGI FLIP 模型支持 {0, 2, 3}（MAILBOX 无直接对应）。
 // ---------------------------------------------------------------------------
-constexpr UINT kSurfaceBufferCount = 3;  // 镜像官方 minImageCount max(3, min)
+// DLSS-G 多帧生成：每个真实帧最多额外生成 3 帧，加上真实帧共 4 次 Present，
+// 因此 swapchain 至少需要 4 个 back buffer，避免 Present 时等待空闲 buffer。
+constexpr UINT kSurfaceBufferCount = 4;  // 镜像官方 minImageCount max(3, min)
 
 struct Dx12Surface {
     ComPtr<IDXGISwapChain3> swapChain;

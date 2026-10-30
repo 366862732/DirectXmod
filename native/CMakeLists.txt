@@ -28,6 +28,7 @@ add_library(dx12_mc SHARED
     src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
     src/ngx_dlss.cpp
+    src/ngx_dlss_render.cpp
     src/dx12_raytracing.cpp
     src/dx12_rt_scene.cpp
     src/dx12_async_executor.cpp

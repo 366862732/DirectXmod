@@ -99,6 +99,8 @@ public class Dx12Backend implements GpuBackend {
             pushFrameGenParams();
             // NGX（DLSS）：有 App ID 才会真正初始化，否则原生侧只记一条日志。
             pushNgxConfig();
+            // DLSS 超分/帧生成配置（必须在 NGX 初始化之后推送）。
+            pushDlssConfig();
             return new GpuDevice(device, criticalShaderLoader);
         } catch (Throwable t) {
             LOGGER.error("[dx12] D3D12 self-test failed", t);
@@ -122,7 +124,42 @@ public class Dx12Backend implements GpuBackend {
      */
     public static void pushFrameGenParams() {
         Dx12Config cfg = Dx12Config.getInstance();
-        Dx12Native.dx12SetFrameGenParams(cfg.getFrameGen(), cfg.getFrameGenStrength() / 100.0f);
+        // DLSS-G 开启时关闭自研插帧：两套帧生成同时 Present 会互相抢 back buffer。
+        int mode = cfg.isCustomFrameGenActive() ? 1 : 0;
+        Dx12Native.dx12SetFrameGenParams(mode, cfg.getFrameGenStrength() / 100.0f);
+    }
+
+    /**
+     * 把 DLSS 超分/帧生成配置推送到原生侧。
+     *
+     * @return DLSS 超分是否可用（无 NVIDIA 显卡/驱动不支持时为 false）
+     */
+    public static boolean pushDlssConfig() {
+        Dx12Config cfg = Dx12Config.getInstance();
+        boolean srAvailable;
+        boolean fgAvailable = false;
+        try {
+            srAvailable = Dx12Native.dx12SetDlssConfig(
+                cfg.getDlssSr() == 1, cfg.getDlssQuality(), cfg.getDlssPreset(),
+                cfg.getDlssFg() == 1, cfg.getDlssFgFrames());
+            fgAvailable = Dx12Native.dx12DlssIsFgAvailable();
+        } catch (Throwable t) {
+            LOGGER.warn("[dx12] DLSS config push failed: {}", t.toString());
+            srAvailable = false;
+        }
+        DlssFrameCapture.setSrAvailable(srAvailable);
+        DlssFrameCapture.setFgAvailable(fgAvailable);
+        // DLSS-G 开关会改变自研插帧是否生效，同步一次。
+        pushFrameGenParams();
+        // 配置变化会让时间历史失效（质量档/预设/尺寸都可能变化）。
+        try {
+            Dx12Native.dx12DlssReset();
+        } catch (Throwable ignored) {
+        }
+        LOGGER.info("[dx12] DLSS config: sr={} quality={} preset={} fg={} frames={} srAvailable={} fgAvailable={}",
+            cfg.getDlssSr(), cfg.getDlssQuality(), cfg.getDlssPreset(),
+            cfg.getDlssFg(), cfg.getDlssFgFrames(), srAvailable, fgAvailable);
+        return srAvailable;
     }
 
     /**

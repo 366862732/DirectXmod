@@ -23,6 +23,11 @@ public class Dx12Config {
     private static final String KEY_FRAME_GEN_STRENGTH = "frame_gen_strength";
     private static final String KEY_NGX_APP_ID = "ngx_app_id";
     private static final String KEY_NGX_PROJECT_ID = "ngx_project_id";
+    private static final String KEY_DLSS_SR = "dlss_sr";
+    private static final String KEY_DLSS_QUALITY = "dlss_quality";
+    private static final String KEY_DLSS_PRESET = "dlss_preset";
+    private static final String KEY_DLSS_FG = "dlss_fg";
+    private static final String KEY_DLSS_FG_FRAMES = "dlss_fg_frames";
 
     private static Dx12Config instance;
     private final Properties props = new Properties();
@@ -43,6 +48,16 @@ public class Dx12Config {
     private String ngxAppId = "";
     /** NGX Project ID：没有 App ID 时的替代标识（同样留空则关闭）。 */
     private String ngxProjectId = "";
+    /** DLSS 超分开光：0 = 关闭，1 = 开启。 */
+    private int dlssSr = 0;
+    /** DLSS 质量档位：0=DLAA, 1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance, 5=Custom。 */
+    private int dlssQuality = 1;
+    /** DLSS 渲染预设：0=Default, 10=J, 11=K, 12=L, 13=M。 */
+    private int dlssPreset = 11;
+    /** DLSS 帧生成开关：0 = 关闭，1 = 开启。 */
+    private int dlssFg = 0;
+    /** 每个真实帧额外生成的帧数：1=2x, 2=3x, 3=4x。 */
+    private int dlssFgFrames = 1;
 
     private Dx12Config() {
         configPath = Path.of(System.getProperty("user.dir"), FILE_NAME);
@@ -112,6 +127,73 @@ public class Dx12Config {
         save();
     }
 
+    public int getDlssSr() { return dlssSr; }
+
+    public void setDlssSr(int enabled) {
+        this.dlssSr = enabled == 1 ? 1 : 0;
+        props.setProperty(KEY_DLSS_SR, String.valueOf(this.dlssSr));
+        save();
+    }
+
+    public int getDlssQuality() { return dlssQuality; }
+
+    public void setDlssQuality(int quality) {
+        this.dlssQuality = Math.max(0, Math.min(5, quality));
+        props.setProperty(KEY_DLSS_QUALITY, String.valueOf(this.dlssQuality));
+        save();
+    }
+
+    public int getDlssPreset() { return dlssPreset; }
+
+    public void setDlssPreset(int preset) {
+        // 只接受 NGX 当前支持的预设值；其他值回落到 K。
+        if (preset != 0 && preset != 10 && preset != 11 && preset != 12 && preset != 13) {
+            preset = 11;
+        }
+        this.dlssPreset = preset;
+        props.setProperty(KEY_DLSS_PRESET, String.valueOf(this.dlssPreset));
+        save();
+    }
+
+    public int getDlssFg() { return dlssFg; }
+
+    public void setDlssFg(int enabled) {
+        this.dlssFg = enabled == 1 ? 1 : 0;
+        props.setProperty(KEY_DLSS_FG, String.valueOf(this.dlssFg));
+        save();
+    }
+
+    public int getDlssFgFrames() { return dlssFgFrames; }
+
+    public void setDlssFgFrames(int frames) {
+        this.dlssFgFrames = Math.max(1, Math.min(3, frames));
+        props.setProperty(KEY_DLSS_FG_FRAMES, String.valueOf(this.dlssFgFrames));
+        save();
+    }
+
+    /**
+     * 实际内部渲染比例。DLSS 超分开启时由质量档位决定（Quality 67% 等）；
+     * Custom 档复用 {@code render_scale}。DLSS 关闭时与旧行为完全一致。
+     */
+    public int getEffectiveRenderScale() {
+        if (this.dlssSr != 1) {
+            return this.renderScale;
+        }
+        switch (this.dlssQuality) {
+            case 0: return 100; // DLAA
+            case 1: return 67;  // Quality
+            case 2: return 58;  // Balanced
+            case 3: return 50;  // Performance
+            case 4: return 33;  // Ultra Performance
+            default: return this.renderScale; // Custom
+        }
+    }
+
+    /** DLSS-G 开启时自研插帧必须让位，避免两套帧生成同时 Present。 */
+    public boolean isCustomFrameGenActive() {
+        return this.frameGen == 1 && this.dlssFg != 1;
+    }
+
     public String getNgxProjectId() { return ngxProjectId; }
 
     public void setNgxProjectId(String projectId) {
@@ -134,9 +216,21 @@ public class Dx12Config {
                 frameGenStrength = parseInt(props.getProperty(KEY_FRAME_GEN_STRENGTH, "50"), 50);
                 ngxAppId = props.getProperty(KEY_NGX_APP_ID, "").trim();
                 ngxProjectId = props.getProperty(KEY_NGX_PROJECT_ID, "").trim();
-                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={}",
+                dlssSr = parseInt(props.getProperty(KEY_DLSS_SR, "0"), 0) == 1 ? 1 : 0;
+                dlssQuality = Math.max(0, Math.min(5,
+                    parseInt(props.getProperty(KEY_DLSS_QUALITY, "1"), 1)));
+                dlssPreset = parseInt(props.getProperty(KEY_DLSS_PRESET, "11"), 11);
+                if (dlssPreset != 0 && dlssPreset != 10 && dlssPreset != 11
+                    && dlssPreset != 12 && dlssPreset != 13) {
+                    dlssPreset = 11;
+                }
+                dlssFg = parseInt(props.getProperty(KEY_DLSS_FG, "0"), 0) == 1 ? 1 : 0;
+                dlssFgFrames = Math.max(1, Math.min(3,
+                    parseInt(props.getProperty(KEY_DLSS_FG_FRAMES, "1"), 1)));
+                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={}",
                     aaMode, renderScale, upscaleMode, frameGen,
-                    ngxAppId.isEmpty() && ngxProjectId.isEmpty() ? "off" : "configured");
+                    ngxAppId.isEmpty() && ngxProjectId.isEmpty() ? "off" : "configured",
+                    dlssSr, dlssQuality, dlssFg);
             } else {
                 LOGGER.info("[dx12-wm] No config file found, using defaults");
                 props.setProperty(KEY_AA_MODE, String.valueOf(aaMode));
@@ -148,6 +242,11 @@ public class Dx12Config {
                 // 空值也写进文件，方便用户按名字找到并填写 App ID。
                 props.setProperty(KEY_NGX_APP_ID, "");
                 props.setProperty(KEY_NGX_PROJECT_ID, "");
+                props.setProperty(KEY_DLSS_SR, String.valueOf(dlssSr));
+                props.setProperty(KEY_DLSS_QUALITY, String.valueOf(dlssQuality));
+                props.setProperty(KEY_DLSS_PRESET, String.valueOf(dlssPreset));
+                props.setProperty(KEY_DLSS_FG, String.valueOf(dlssFg));
+                props.setProperty(KEY_DLSS_FG_FRAMES, String.valueOf(dlssFgFrames));
                 save(); // save defaults
             }
         } catch (Exception e) {

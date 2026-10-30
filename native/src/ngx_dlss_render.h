@@ -21,6 +21,8 @@
 
 #include "dx12_device.h"
 
+namespace dx12mc {
+
 // Java 侧推送的 DLSS 配置。
 struct NgxDlssConfig {
     bool srEnabled = false;
@@ -67,7 +69,7 @@ void ngxDlssBeginFrame(bool active, bool notRenderingGameFrames);
 //   [95]     cameraAspectRatio（渲染宽/高）
 //   [96]     jitterPx（渲染像素空间）
 //   [97]     jitterPy
-bool ngxDlssCaptureFrame(CommandContext* ctx, Dx12Object* depthTex,
+bool ngxDlssCaptureFrame(CommandContext* ctx, Dx12Surface* s, Dx12Object* depthTex,
     const float* data, int count, std::string& err);
 
 // 场景切换 / 尺寸变化 / 配置变化时调用：只清时间状态，不立即释放 feature。
@@ -76,7 +78,7 @@ void ngxDlssReset();
 // blit 绘制前调用。SR 成功求值时 outSrTex 指向全分辨率输出纹理，
 // 调用方应把它作为 blit 源；返回 false 表示继续使用原始 srcTex。
 bool ngxDlssEvaluateSr(CommandContext* ctx, Dx12Surface* s, Dx12Object* colorTex,
-    Dx12Object* outSrTex, std::string& err);
+    ID3D12Resource** outSrTex, std::string& err);
 
 // blit 绘制完成后、backbuffer 切换到 PRESENT 之前调用。
 // 复制真实帧并按配置求值 DLSS-G；成功时把待呈现条目压入队列。
@@ -91,3 +93,5 @@ bool ngxDlssPresentGeneratedFrames(Dx12Surface* s, CommandContext* mainCtx,
 
 // NGX Shutdown 之前调用：等待 GPU 空闲并释放全部 DLSS 资源/feature。
 void ngxRenderShutdown();
+
+}  // namespace dx12mc

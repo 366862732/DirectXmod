@@ -1,6 +1,7 @@
 #include "dx12_device.h"
 #include "dx12_rt_scene.h"
 #include "ngx_dlss.h"
+#include "ngx_dlss_render.h"
 
 #include <dxgi.h>
 
@@ -1653,6 +1654,10 @@ bool deviceWaitIdle(std::string& err) {
         }
     }
     CloseHandle(evt);
+    // 关键：把全局计数器推进到刚等待过的值。否则后续 ++gCtx.queueFenceValue
+    // 会复用已被 GPU 完成的 fence 值（计数器回退），导致依赖该值的同步判断
+    // 立即通过，资源可能在 GPU 仍使用时被释放。
+    if (fv > gCtx.queueFenceValue) gCtx.queueFenceValue = fv;
     dbgLogDebug("deviceWaitIdle: done (waited for fv=%llu)", (unsigned long long)fv);
     return true;
 }
@@ -5090,6 +5095,24 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         }
         SetEvent(gEvtSubmitDone);
 
+        // ---- DLSS-G：依次 Present 生成帧 + 保留的真实帧 ----
+        // 必须在自定义帧生成的捕获/绘制之前执行：DLSS-G 会自己完成 Present，
+        // 此时 backbuffer 已交给 DXGI，不能再被自研插值路径读取或覆盖。
+        std::vector<int> dlssPresented;
+        bool dlssHandledPresent = false;
+        if (s) {
+            std::string dlssErr;
+            if (ngxDlssPresentGeneratedFrames(s, ctx, dlssPresented, dlssErr)) {
+                dlssHandledPresent = true;
+            } else if (!dlssErr.empty()) {
+                static std::string lastDlssPresentErr;
+                if (dlssErr != lastDlssPresentErr) {
+                    lastDlssPresentErr = dlssErr;
+                    dbgLog("renderThread: DLSS-G present: %s", dlssErr.c_str());
+                }
+            }
+        }
+
         // ---- 图形增强：帧生成（自研帧间线性插值，非 NVIDIA DLSS-G）----
         // 捕获必须在本帧 present **之前**：Present 之后 backbuffer 归 DXGI 所有，
         // 再 CopyResource 读取属于未定义行为。
@@ -5099,7 +5122,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             float fgWeight = 0.5f;
             getFrameGenParams(fgMode, fgWeight);
             ++gFrameGen.realFrameCounter;
-            if (fgMode == 1 && s) {
+            if (fgMode == 1 && s && !dlssHandledPresent && !ngxDlssIsFgActive()) {
                 std::string fgErr;
                 if (!fgEnsure(s, fgErr)) {
                     static bool fgLogged = false;
@@ -5116,9 +5139,12 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         }
 
         // present（presentSurface 返回 void）
-        dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
-            (unsigned long long)gCtx.queueFenceValue, bbIdx);
-        presentSurface(getActiveSurface());
+        // DLSS-G 已经完成生成帧 + 真实帧的 Present 时跳过普通 present。
+        dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d dlss=%d",
+            (unsigned long long)gCtx.queueFenceValue, bbIdx, (int)dlssHandledPresent);
+        if (!dlssHandledPresent) {
+            presentSurface(getActiveSurface());
+        }
         // P3-native 插桩：累加三段耗时，每 300 帧打印一次均值。
         if (sProf) {
             const double tProfPresent1 = nowMs();
@@ -5135,7 +5161,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         // ---- 图形增强：帧生成（绘制并 present 插值帧）----
         // 必须在 ++gPresentedFrames 之前完成：该计数器一旦递增就会放行主线程的
         // acquireSurface，与本处并发的 acquireSurfaceForFrameGen 抢同一个 back buffer。
-        if (fgWillDraw) {
+        if (fgWillDraw && !dlssHandledPresent) {
             int fgIdx = -1;
             std::string fgErr;
             if (fgDraw(getActiveSurface(), fgIdx, fgErr)) {
@@ -5162,9 +5188,21 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // P33 fix：signal per-surface present fence，确保 Display Controller 完成
         // flip 后再销毁 surface。deviceWaitIdle 仅等命令队列，不等待 display controller。
-        if (s && bbIdx >= 0) {
-            UINT64 pv = ++gCtx.queueFenceValue;
-            gCtx.queue->Signal(gCtx.queueFence.Get(), pv);
+        // DLSS-G 一次 Present 多张 backbuffer：全部完成后 signal 一个 fence，
+        // 并把它写到每一个实际使用过的 backbuffer 下标上。
+        if (!dlssPresented.empty()) {
+            UINT64 pv = signalQueueFence();
+            if (s) {
+                if (s->surfacePresentFences.size() < (size_t)kSurfaceBufferCount)
+                    s->surfacePresentFences.resize(kSurfaceBufferCount, 0);
+                for (int idx : dlssPresented) {
+                    if (idx >= 0 && idx < (int)kSurfaceBufferCount) {
+                        s->surfacePresentFences[(size_t)idx] = pv;
+                    }
+                }
+            }
+        } else if (s && bbIdx >= 0) {
+            UINT64 pv = signalQueueFence();
             if (s->surfacePresentFences.size() < (size_t)kSurfaceBufferCount)
                 s->surfacePresentFences.resize(kSurfaceBufferCount, 0);
             s->surfacePresentFences[(size_t)bbIdx] = pv;
@@ -5210,6 +5248,20 @@ void waitForPendingPresents() {
         dbgLog("waitForPendingPresents: TIMEOUT submitted=%llu presented=%llu (render thread stalled)",
             (unsigned long long)gSubmittedFrames, (unsigned long long)gPresentedFrames);
     }
+}
+
+// 在队列上信号一个新的全局 fence 并返回其值。
+// DLSS-G 一次提交后要连续 Present 多张生成帧 + 真实帧；全部 Present 完成后
+// 用同一个 fence 标记所有使用过的 back buffer，destroySurface 等待该值即可
+// 确保 display controller 不再持有任何一张。
+UINT64 signalQueueFence() {
+    if (!gCtx.queue || !gCtx.queueFence) return gCtx.queueFenceValue;
+    UINT64 value = ++gCtx.queueFenceValue;
+    if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), value))) {
+        dbgLog("signalQueueFence: Signal failed value=%llu",
+            (unsigned long long)value);
+    }
+    return value;
 }
 
 // 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。

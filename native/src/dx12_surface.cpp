@@ -7,6 +7,7 @@
 // DXGI FLIP 模型支持 {IMMEDIATE, FIFO, FIFO_RELAXED}（MAILBOX 无直接对应）。
 
 #include "dx12_device.h"
+#include "ngx_dlss_render.h"
 
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -714,6 +715,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
 
     ID3D12GraphicsCommandList* cmd = ctx->commandList;
     ID3D12Resource* dst = s->backBuffers[(size_t)s->currentImageIndex].Get();
+    // DLSS 超分输出（全分辨率）。非空时用它替代 srcTex 作为 blit 源。
+    ID3D12Resource* dlssSrTex = nullptr;
     UINT w = s->width;
     UINT h = s->height;
     dbgLogDebug("blitSurface: cmd=%p dst=%p idx=%d w=%u h=%u srcTex=%p",
@@ -785,6 +788,21 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         return true;
     }
 
+    // DLSS 超分：低分辨率世界颜色 + 深度/相机运动矢量 → 全分辨率输出。
+    // 成功后 dlssSrTex 非空，blit 改用它作为源，并跳过 CAS 锐化。
+    {
+        std::string srErr;
+        if (ngxDlssEvaluateSr(ctx, s, srcTex, &dlssSrTex, srErr)) {
+            dbgLogDebug("blitSurface: DLSS SR output bound as blit source");
+        } else if (!srErr.empty()) {
+            static std::string lastSrErr;
+            if (srErr != lastSrErr) {
+                lastSrErr = srErr;
+                dbgLog("blitSurface: DLSS SR skipped: %s", srErr.c_str());
+            }
+        }
+    }
+
     // P22: Draw-based blit（全屏四边形）— 绕过 CopyTextureRegion 格式不兼容问题。
     // srcTex 格式（如 R32G32B32A32_FLOAT）与 backbuffer（R8G8B8A8_UNORM）不同，
     // CopyTextureRegion 静默失败；改用 GPU 光栅器采样+格式转换。
@@ -851,7 +869,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         int upscaleMode = 0;
         float upscaleSharpness = 0.0f;
         getBlitUpscaleParams(upscaleMode, upscaleSharpness);
-        bool sharpen = upscaleMode == 1 && upscaleSharpness > 0.0f;
+        // DLSS 输出已是全分辨率，不能再叠加 CAS（会二次锐化并破坏时间稳定性）。
+        bool sharpen = dlssSrTex == nullptr && upscaleMode == 1 && upscaleSharpness > 0.0f;
         cmd->SetGraphicsRootSignature(bp->rootSig.Get());
         cmd->SetPipelineState(sharpen ? bp->psoSharpen.Get() : bp->pso.Get());
         if (sharpen) {
@@ -868,7 +887,13 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
             (void*)bp->rootSig.Get(), (void*)bp->pso.Get());
 
         // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
-        if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) {
+        // DLSS SR 输出是裸 ID3D12Resource（不在 Dx12Object 包装中），走 raw 绑定。
+        if (dlssSrTex) {
+            if (!blitBindRawTextureSRV(ctx, dlssSrTex, cmd, err)) {
+                dbgLog("blitSurface: DLSS SR blitBindRawTextureSRV FAILED: %s", err.c_str());
+                return false;
+            }
+        } else if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) {
             dbgLog("blitSurface: blitBindSourceTexture FAILED: %s", err.c_str());
             return false;
         }
@@ -911,11 +936,20 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
             }
         }
 
+        // DLSS-G：真实 backbuffer 已绘制完成（此时仍是 RENDER_TARGET）。
+        // 复制到保留纹理后求值生成帧，并把待呈现条目交给渲染线程。
+        {
+            std::string fgErr;
+            ngxDlssAfterBlit(ctx, s, fgErr);
+        }
+
         // 6. RENDER_TARGET → PRESENT
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 
         // 7. 源纹理 → COMMON（为下一帧 beginRenderPass 准备）
         if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
+        if (dlssSrTex) transitionTo(ctx, dlssSrTex,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
 #endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小

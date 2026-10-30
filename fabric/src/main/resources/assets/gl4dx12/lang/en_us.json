@@ -5,5 +5,10 @@
   "options.gl4dx12.upscale_mode": "Upscaling Filter",
   "options.gl4dx12.upscale_sharpness": "Sharpness",
   "options.gl4dx12.frame_gen": "Frame Generation (Built-in)",
-  "options.gl4dx12.frame_gen_strength": "Interpolation Weight"
+  "options.gl4dx12.frame_gen_strength": "Interpolation Weight",
+  "options.gl4dx12.dlss_sr": "DLSS Super Resolution",
+  "options.gl4dx12.dlss_quality": "DLSS Quality",
+  "options.gl4dx12.dlss_preset": "DLSS Render Preset",
+  "options.gl4dx12.dlss_fg": "DLSS Frame Generation",
+  "options.gl4dx12.dlss_fg_frames": "DLSS Generated Frames"
 }
