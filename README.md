@@ -131,7 +131,7 @@ dx12-lib-template-26.1.2/
 
 ### 渲染管线：完全接管 Minecraft 官方渲染流程
 
-本项目不创建自定义渲染循环，而是实现 Minecraft 26.1+ 引入的 `GpuBackend` 接口族，让游戏引擎自己驱动整个渲染：
+本项目不创建自定义渲染循环，而是实现 Minecraft 26.2+ 引入的 `GpuBackend` 接口族，让游戏引擎自己驱动整个渲染：
 
 ```
 Minecraft RenderSystem
