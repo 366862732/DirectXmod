@@ -316,6 +316,43 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 cfg.setXessQuality(value);
                 Dx12Backend.pushXessConfig();
             });
+        this.lodEnabledOption = new OptionInstance<>(
+            "options.gl4dx12.lod_enabled", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.lodEnabledLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1), Codec.INT), cfg.getLodEnabled(),
+            value -> cfg.setLodEnabled(value));
+        this.lodDistanceOption = new OptionInstance<>(
+            "options.gl4dx12.lod_distance", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(value + (this.isChinese() ? " 区块" : " chunks"))),
+            new OptionInstance.Enum<>(List.of(64, 128, 192, 256, 384, 512, 768, 1024),
+                Codec.INT),
+            cfg.getLodDistance(),
+            value -> cfg.setLodDistance(value));
+        this.lodQualityOption = new OptionInstance<>(
+            "options.gl4dx12.lod_quality", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.lodQualityLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1, 2), Codec.INT), cfg.getLodQuality(),
+            value -> cfg.setLodQuality(value));
+    }
+
+    private String lodEnabledLabel(int value) {
+        boolean chinese = this.isChinese();
+        if (value == 1) {
+            return chinese ? "开启（远视距 LOD）" : "On (Distant LOD)";
+        }
+        return chinese ? "关闭" : "Off";
+    }
+
+    private String lodQualityLabel(int value) {
+        boolean chinese = this.isChinese();
+        return switch (value) {
+            case 0 -> chinese ? "低（4 区块合并）" : "Low (4-chunk merge)";
+            case 2 -> chinese ? "高（每区块）" : "High (per-chunk)";
+            default -> chinese ? "中（2 区块合并）" : "Medium (2-chunk merge)";
+        };
     }
 
     private String dlssSrLabel(int value) {
@@ -467,7 +504,8 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             this.upscaleSharpnessOption, this.dlssSrOption, this.dlssQualityOption,
             this.dlssPresetOption, this.dlssFgOption, this.dlssFgFramesOption,
             this.xessSrOption, this.xessQualityOption,
-            this.frameGenOption, this.frameGenStrengthOption);
+            this.frameGenOption, this.frameGenStrengthOption,
+            this.lodEnabledOption, this.lodDistanceOption, this.lodQualityOption);
     }
 
     private List<OptionInstance<?>> displayOptions() {
@@ -1325,6 +1363,11 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             if (this.option == Dx12VideoSettingsScreen.this.frameGenStrengthOption) {
                 return Dx12VideoSettingsScreen.this.frameGenOption.get() == 1
                     && Dx12VideoSettingsScreen.this.dlssFgOption.get() != 1;
+            }
+            // LOD 距离与精度只在远视距 LOD 开启时可调。
+            if (this.option == Dx12VideoSettingsScreen.this.lodDistanceOption
+                || this.option == Dx12VideoSettingsScreen.this.lodQualityOption) {
+                return Dx12VideoSettingsScreen.this.lodEnabledOption.get() == 1;
             }
             return true;
         }

@@ -12,5 +12,8 @@
   "options.gl4dx12.dlss_fg": "DLSS Frame Generation",
   "options.gl4dx12.dlss_fg_frames": "DLSS Generated Frames",
   "options.gl4dx12.xess_sr": "XeSS Super Resolution",
-  "options.gl4dx12.xess_quality": "XeSS Quality"
+  "options.gl4dx12.xess_quality": "XeSS Quality",
+  "options.gl4dx12.lod_enabled": "Distant LOD",
+  "options.gl4dx12.lod_distance": "LOD Render Distance",
+  "options.gl4dx12.lod_quality": "LOD Mesh Quality"
 }
