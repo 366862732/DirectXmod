@@ -28,6 +28,8 @@ public class Dx12Config {
     private static final String KEY_DLSS_PRESET = "dlss_preset";
     private static final String KEY_DLSS_FG = "dlss_fg";
     private static final String KEY_DLSS_FG_FRAMES = "dlss_fg_frames";
+    private static final String KEY_XESS_SR = "xess_sr";
+    private static final String KEY_XESS_QUALITY = "xess_quality";
 
     private static Dx12Config instance;
     private final Properties props = new Properties();
@@ -58,6 +60,10 @@ public class Dx12Config {
     private int dlssFg = 0;
     /** 每个真实帧额外生成的帧数：1=2x, 2=3x, 3=4x。 */
     private int dlssFgFrames = 1;
+    /** Intel XeSS 超分开关：0 = 关闭，1 = 开启（与 DLSS 超分互斥）。 */
+    private int xessSr = 0;
+    /** XeSS 质量档位：0=AA, 1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance。 */
+    private int xessQuality = 1;
 
     private Dx12Config() {
         configPath = Path.of(System.getProperty("user.dir"), FILE_NAME);
@@ -171,22 +177,52 @@ public class Dx12Config {
         save();
     }
 
+    public int getXessSr() { return xessSr; }
+
+    public void setXessSr(int enabled) {
+        this.xessSr = enabled == 1 ? 1 : 0;
+        props.setProperty(KEY_XESS_SR, String.valueOf(this.xessSr));
+        save();
+    }
+
+    public int getXessQuality() { return xessQuality; }
+
+    public void setXessQuality(int quality) {
+        this.xessQuality = Math.max(0, Math.min(4, quality));
+        props.setProperty(KEY_XESS_QUALITY, String.valueOf(this.xessQuality));
+        save();
+    }
+
     /**
-     * 实际内部渲染比例。DLSS 超分开启时由质量档位决定（Quality 67% 等）；
-     * Custom 档复用 {@code render_scale}。DLSS 关闭时与旧行为完全一致。
+     * 实际内部渲染比例。DLSS / XeSS 超分开启时由质量档位决定；DLSS Custom 档
+     * 复用 {@code render_scale}。两者都关闭时与旧行为完全一致。
+     *
+     * <p>XeSS 的档位比例必须落在其动态输入分辨率范围内（Quality 1.7x、
+     * Balanced 2.0x、Performance 2.3x、Ultra Performance 3.0x），因此这里取
+     * 59% / 50% / 44% / 34%，而不是 DLSS 的 67% / 58% / 50% / 33%。
      */
     public int getEffectiveRenderScale() {
-        if (this.dlssSr != 1) {
-            return this.renderScale;
+        if (this.dlssSr == 1) {
+            switch (this.dlssQuality) {
+                case 0: return 100; // DLAA
+                case 1: return 67;  // Quality
+                case 2: return 58;  // Balanced
+                case 3: return 50;  // Performance
+                case 4: return 33;  // Ultra Performance
+                default: return this.renderScale; // Custom
+            }
         }
-        switch (this.dlssQuality) {
-            case 0: return 100; // DLAA
-            case 1: return 67;  // Quality
-            case 2: return 58;  // Balanced
-            case 3: return 50;  // Performance
-            case 4: return 33;  // Ultra Performance
-            default: return this.renderScale; // Custom
+        if (this.xessSr == 1) {
+            switch (this.xessQuality) {
+                case 0: return 100; // AA
+                case 1: return 59;  // Quality (1.7x)
+                case 2: return 50;  // Balanced (2.0x)
+                case 3: return 44;  // Performance (2.3x)
+                case 4: return 34;  // Ultra Performance (3.0x)
+                default: return 59;
+            }
         }
+        return this.renderScale;
     }
 
     /** DLSS-G 开启时自研插帧必须让位，避免两套帧生成同时 Present。 */
@@ -227,10 +263,13 @@ public class Dx12Config {
                 dlssFg = parseInt(props.getProperty(KEY_DLSS_FG, "0"), 0) == 1 ? 1 : 0;
                 dlssFgFrames = Math.max(1, Math.min(3,
                     parseInt(props.getProperty(KEY_DLSS_FG_FRAMES, "1"), 1)));
-                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={}",
+                xessSr = parseInt(props.getProperty(KEY_XESS_SR, "0"), 0) == 1 ? 1 : 0;
+                xessQuality = Math.max(0, Math.min(4,
+                    parseInt(props.getProperty(KEY_XESS_QUALITY, "1"), 1)));
+                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={} xess_sr={} xess_quality={}",
                     aaMode, renderScale, upscaleMode, frameGen,
                     ngxAppId.isEmpty() && ngxProjectId.isEmpty() ? "off" : "configured",
-                    dlssSr, dlssQuality, dlssFg);
+                    dlssSr, dlssQuality, dlssFg, xessSr, xessQuality);
             } else {
                 LOGGER.info("[dx12-wm] No config file found, using defaults");
                 props.setProperty(KEY_AA_MODE, String.valueOf(aaMode));
@@ -247,6 +286,8 @@ public class Dx12Config {
                 props.setProperty(KEY_DLSS_PRESET, String.valueOf(dlssPreset));
                 props.setProperty(KEY_DLSS_FG, String.valueOf(dlssFg));
                 props.setProperty(KEY_DLSS_FG_FRAMES, String.valueOf(dlssFgFrames));
+                props.setProperty(KEY_XESS_SR, String.valueOf(xessSr));
+                props.setProperty(KEY_XESS_QUALITY, String.valueOf(xessQuality));
                 save(); // save defaults
             }
         } catch (Exception e) {

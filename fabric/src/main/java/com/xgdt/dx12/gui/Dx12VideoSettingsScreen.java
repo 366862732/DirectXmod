@@ -80,9 +80,13 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
     private OptionInstance<Integer> dlssPresetOption;
     private OptionInstance<Integer> dlssFgOption;
     private OptionInstance<Integer> dlssFgFramesOption;
+    private OptionInstance<Integer> xessSrOption;
+    private OptionInstance<Integer> xessQualityOption;
 
     /** 原生侧 NGX 状态一行文案；null = 尚未读取。 */
     private String ngxStatus;
+    /** 原生侧 XeSS 状态一行文案；null = 尚未读取。 */
+    private String xessStatus;
 
     private int scroll;
     private int maxScroll;
@@ -142,6 +146,7 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         this.searchFocused = false;
         this.draggingRow = null;
         this.ngxStatus = null;
+        this.xessStatus = null;
         this.buildFullscreenResolutionOption();
         this.buildUpscalingOptions();
         this.buildRows();
@@ -282,6 +287,32 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 cfg.setDlssFgFrames(value);
                 Dx12Backend.pushDlssConfig();
             });
+        this.xessSrOption = new OptionInstance<>(
+            "options.gl4dx12.xess_sr", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.xessSrLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1), Codec.INT), cfg.getXessSr(),
+            value -> {
+                cfg.setXessSr(value);
+                if (value == 1) {
+                    // DLSS 超分与 XeSS 超分互斥；DLSS-G 依赖 DLSS 超分，一并关闭。
+                    cfg.setDlssSr(0);
+                    this.dlssSrOption.set(0);
+                    cfg.setDlssFg(0);
+                    this.dlssFgOption.set(0);
+                }
+                Dx12Backend.pushXessConfig();
+            });
+        this.xessQualityOption = new OptionInstance<>(
+            "options.gl4dx12.xess_quality", OptionInstance.noTooltip(),
+            (caption, value) -> Options.genericValueLabel(caption,
+                Component.literal(this.xessQualityLabel(value))),
+            new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4), Codec.INT),
+            cfg.getXessQuality(),
+            value -> {
+                cfg.setXessQuality(value);
+                Dx12Backend.pushXessConfig();
+            });
     }
 
     private String dlssSrLabel(int value) {
@@ -332,6 +363,25 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         };
     }
 
+    private String xessSrLabel(int value) {
+        boolean chinese = this.isChinese();
+        if (value == 1) {
+            return chinese ? "开启（XeSS 超分）" : "On (XeSS SR)";
+        }
+        return chinese ? "关闭" : "Off";
+    }
+
+    private String xessQualityLabel(int value) {
+        boolean chinese = this.isChinese();
+        return switch (value) {
+            case 0 -> "AA";
+            case 2 -> chinese ? "均衡" : "Balanced";
+            case 3 -> chinese ? "性能" : "Performance";
+            case 4 -> chinese ? "极致性能" : "Ultra Performance";
+            default -> chinese ? "质量" : "Quality";
+        };
+    }
+
     private String upscaleModeLabel(int mode) {
         boolean chinese = this.isChinese();
         if (mode == 1) {
@@ -371,6 +421,28 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             && !this.ngxStatusLine().isEmpty();
     }
 
+    /** 原生侧 XeSS 状态文案（只在首次进入页面时问一次 native，随后缓存）。 */
+    private String xessStatusLine() {
+        if (this.xessStatus == null) {
+            String text = "";
+            if (Dx12Native.isLoaded()) {
+                try {
+                    text = Dx12Backend.getXessStatus();
+                } catch (Throwable t) {
+                    text = "";
+                }
+            }
+            this.xessStatus = text == null ? "" : text;
+        }
+        return this.xessStatus;
+    }
+
+    /** 「图形增强」页是否显示 XeSS 状态行（搜索态与其它页不显示）。 */
+    private boolean showsXessStatusLine() {
+        return this.search.isEmpty() && this.category == Category.UPSCALING
+            && !this.xessStatusLine().isEmpty();
+    }
+
     private void buildRows() {
         this.allRows.clear();
         for (OptionInstance<?> option : this.displayOptions()) {
@@ -391,6 +463,7 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         return List.of(this.renderScaleOption, this.upscaleModeOption,
             this.upscaleSharpnessOption, this.dlssSrOption, this.dlssQualityOption,
             this.dlssPresetOption, this.dlssFgOption, this.dlssFgFramesOption,
+            this.xessSrOption, this.xessQualityOption,
             this.frameGenOption, this.frameGenStrengthOption);
     }
 
@@ -496,7 +569,8 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         } else {
             int visibleHeight = Math.max(0, this.contentH - 26
                 - (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0)
-                - (this.showsNgxStatusLine() ? 12 : 0));
+                - (this.showsNgxStatusLine() ? 12 : 0)
+                - (this.showsXessStatusLine() ? 12 : 0));
             this.maxScroll = Math.max(0, shown.size() * ROW_HEIGHT - visibleHeight);
         }
         this.scroll = Mth.clamp(this.scroll, 0, this.maxScroll);
@@ -586,10 +660,16 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         }
 
         int rowTop = this.contentY + 26 + (restart ? 12 : 0);
+        int statusY = this.contentY + 16 + (restart ? 12 : 0);
         if (this.showsNgxStatusLine()) {
             graphics.centeredText(this.font, Component.literal(this.ngxStatusLine()),
-                this.contentX + this.contentW / 2, this.contentY + 16 + (restart ? 12 : 0),
-                TEXT_DIM);
+                this.contentX + this.contentW / 2, statusY, TEXT_DIM);
+            statusY += 12;
+            rowTop += 12;
+        }
+        if (this.showsXessStatusLine()) {
+            graphics.centeredText(this.font, Component.literal(this.xessStatusLine()),
+                this.contentX + this.contentW / 2, statusY, TEXT_DIM);
             rowTop += 12;
         }
         int rowX = this.contentX;
@@ -1188,17 +1268,23 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                     == TextureFilteringMethod.ANISOTROPIC;
             }
             // 渲染缩放：DLSS 超分开启时由质量档位决定；仅 Custom 档可手动调。
+            // XeSS 没有自定义档，开启时渲染缩放始终由质量档位决定。
             if (this.option == Dx12VideoSettingsScreen.this.renderScaleOption) {
+                if (Dx12VideoSettingsScreen.this.xessSrOption.get() == 1) {
+                    return false;
+                }
                 return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1
                     || Dx12VideoSettingsScreen.this.dlssQualityOption.get() == 5;
             }
-            // DLSS 超分开启时 blit 直接使用 NGX 输出，双线性/CAS 不再参与。
+            // DLSS / XeSS 超分开启时 blit 直接使用超分输出，双线性/CAS 不再参与。
             if (this.option == Dx12VideoSettingsScreen.this.upscaleModeOption) {
-                return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1;
+                return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1
+                    && Dx12VideoSettingsScreen.this.xessSrOption.get() != 1;
             }
             // 锐化强度仅在上采样模式为 CAS 时生效。
             if (this.option == Dx12VideoSettingsScreen.this.upscaleSharpnessOption) {
                 return Dx12VideoSettingsScreen.this.dlssSrOption.get() != 1
+                    && Dx12VideoSettingsScreen.this.xessSrOption.get() != 1
                     && Dx12VideoSettingsScreen.this.upscaleModeOption.get() == 1;
             }
             // 质量档 / 渲染预设只在 DLSS 超分开启时可调。
@@ -1206,9 +1292,17 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 || this.option == Dx12VideoSettingsScreen.this.dlssPresetOption) {
                 return Dx12VideoSettingsScreen.this.dlssSrOption.get() == 1;
             }
+            // XeSS 质量档只在 XeSS 超分开启时可调。
+            if (this.option == Dx12VideoSettingsScreen.this.xessQualityOption) {
+                return Dx12VideoSettingsScreen.this.xessSrOption.get() == 1;
+            }
             // 生成帧数量只在 DLSS-G 开启时可调。
             if (this.option == Dx12VideoSettingsScreen.this.dlssFgFramesOption) {
                 return Dx12VideoSettingsScreen.this.dlssFgOption.get() == 1;
+            }
+            // DLSS-G 需要 DLSS 超分，且与 XeSS 超分不能同时启用。
+            if (this.option == Dx12VideoSettingsScreen.this.dlssFgOption) {
+                return Dx12VideoSettingsScreen.this.xessSrOption.get() != 1;
             }
             // 自研插帧与 DLSS-G 互斥。
             if (this.option == Dx12VideoSettingsScreen.this.frameGenOption) {

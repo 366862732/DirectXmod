@@ -24,11 +24,16 @@ include_directories("${JAVA_HOME}/include" "${JAVA_HOME}/include/win32")
 set(NGX_ROOT "${CMAKE_SOURCE_DIR}/../DLSS")
 include_directories("${NGX_ROOT}/include")
 
+# ---- Intel XeSS SDK（超分） ----
+# 只使用头文件；libxess.dll 运行时动态加载（LoadLibraryW），不产生链接依赖。
+include_directories("${CMAKE_SOURCE_DIR}/third_party/xess/include")
+
 add_library(dx12_mc SHARED
     src/dx12_descriptor_allocator.cpp
     src/dx12_device.cpp
     src/ngx_dlss.cpp
     src/ngx_dlss_render.cpp
+    src/xess_render.cpp
     src/dx12_raytracing.cpp
     src/dx12_rt_scene.cpp
     src/dx12_async_executor.cpp

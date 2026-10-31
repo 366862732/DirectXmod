@@ -33,6 +33,7 @@ public final class DlssFrameCapture {
 
     private static volatile boolean srAvailable;
     private static volatile boolean fgAvailable;
+    private static volatile boolean xessAvailable;
 
     private static boolean frameActive;
     private static boolean jitterActive;
@@ -85,6 +86,11 @@ public final class DlssFrameCapture {
         fgAvailable = available;
     }
 
+    /** 由 {@code Dx12Backend.pushXessConfig()} 在设备创建/配置变化时写入。 */
+    public static void setXessAvailable(boolean available) {
+        xessAvailable = available;
+    }
+
     public static boolean isSrAvailable() {
         return srAvailable;
     }
@@ -93,15 +99,21 @@ public final class DlssFrameCapture {
         return fgAvailable;
     }
 
+    public static boolean isXessAvailable() {
+        return xessAvailable;
+    }
+
     /**
-     * 每帧开始：判断 DLSS 是否启用、更新抖动，并通知原生侧。
-     * 即使 DLSS 关闭也会调用原生 beginFrame，以清空上一帧的捕获有效位。
+     * 每帧开始：判断 DLSS / XeSS 是否启用、更新抖动，并通知原生侧。
+     * 即使两者都关闭也会调用原生 beginFrame，以清空上一帧的捕获有效位。
      */
     public static void beginFrame() {
         Minecraft minecraft = Minecraft.getInstance();
         Dx12Config cfg = Dx12Config.getInstance();
 
-        boolean srRequested = cfg.getDlssSr() == 1 && srAvailable;
+        boolean dlssSrRequested = cfg.getDlssSr() == 1 && srAvailable;
+        boolean xessSrRequested = cfg.getXessSr() == 1 && xessAvailable;
+        boolean srRequested = dlssSrRequested || xessSrRequested;
         boolean fgRequested = cfg.getDlssFg() == 1 && fgAvailable;
         boolean active = Dx12Device.isInitialized() && Dx12Native.isLoaded()
             && !OfflineRender.active() && (srRequested || fgRequested);

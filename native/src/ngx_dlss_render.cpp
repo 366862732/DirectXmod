@@ -37,6 +37,7 @@
 
 #include "dx12_device.h"
 #include "ngx_dlss.h"
+#include "xess_render.h"
 
 namespace dx12mc {
 namespace {
@@ -126,6 +127,9 @@ ID3D12Resource* createTex2D(DXGI_FORMAT fmt, UINT w, UINT h,
 
 NgxDlssConfig gCfg;
 
+// 外部超分后端（XeSS）请求捕获：即使 DLSS 关闭也要生成深度/运动矢量。
+std::atomic<bool> gExternalCapture{false};
+
 bool gFrameActive = false;
 bool gNotRenderingGameFrames = false;
 UINT64 gFrameCounter = 0;
@@ -157,8 +161,14 @@ struct SlotResources {
     UINT renderW = 0, renderH = 0;
     UINT outW = 0, outH = 0;
 
+    // 捕获只需要深度/运动矢量；DLSS 输出纹理按需分配，避免 XeSS-only 时
+    // 白白占用 5 张全分辨率纹理 × 3 个槽位。
     bool valid() const {
-        return depth && mv && srOut && real && gen[0] && gen[1] && gen[2];
+        return depth && mv;
+    }
+
+    bool dlssValid() const {
+        return srOut && real && gen[0] && gen[1] && gen[2];
     }
 };
 
@@ -435,6 +445,8 @@ void releaseSlotResources() {
 bool createSlotResources(UINT renderW, UINT renderH, UINT outW, UINT outH,
     std::string& err) {
     releaseSlotResources();
+    // DLSS SR / DLSS-G 关闭时只分配捕获用的深度与运动矢量纹理。
+    const bool needDlss = gCfg.srEnabled || gCfg.fgEnabled;
     for (int i = 0; i < 3; ++i) {
         SlotResources& s = gSlots[i];
         s.depth.Attach(createTex2D(DXGI_FORMAT_R32_FLOAT, renderW, renderH,
@@ -443,24 +455,26 @@ bool createSlotResources(UINT renderW, UINT renderH, UINT outW, UINT outH,
         s.mv.Attach(createTex2D(DXGI_FORMAT_R16G16_FLOAT, renderW, renderH,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err));
         if (!s.mv) return false;
-        s.srOut.Attach(createTex2D(DXGI_FORMAT_R8G8B8A8_UNORM, outW, outH,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err));
-        if (!s.srOut) return false;
-        s.real.Attach(createTex2D(DXGI_FORMAT_R8G8B8A8_UNORM, outW, outH,
-            D3D12_RESOURCE_FLAG_NONE, err));
-        if (!s.real) return false;
-        for (int k = 0; k < 3; ++k) {
-            s.gen[k].Attach(createTex2D(DXGI_FORMAT_R8G8B8A8_UNORM, outW, outH,
+        if (needDlss) {
+            s.srOut.Attach(createTex2D(DXGI_FORMAT_R8G8B8A8_UNORM, outW, outH,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err));
-            if (!s.gen[k]) return false;
+            if (!s.srOut) return false;
+            s.real.Attach(createTex2D(DXGI_FORMAT_R8G8B8A8_UNORM, outW, outH,
+                D3D12_RESOURCE_FLAG_NONE, err));
+            if (!s.real) return false;
+            for (int k = 0; k < 3; ++k) {
+                s.gen[k].Attach(createTex2D(DXGI_FORMAT_R8G8B8A8_UNORM, outW, outH,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err));
+                if (!s.gen[k]) return false;
+            }
         }
         s.renderW = renderW;
         s.renderH = renderH;
         s.outW = outW;
         s.outH = outH;
     }
-    dbgLog("DLSS: resources created render=%ux%u out=%ux%u", renderW, renderH,
-        outW, outH);
+    dbgLog("DLSS: resources created render=%ux%u out=%ux%u dlss=%d", renderW, renderH,
+        outW, outH, (int)needDlss);
     return true;
 }
 
@@ -659,10 +673,12 @@ bool captureFrame(CommandContext* ctx, Dx12Surface* s, Dx12Object* depthTex,
         err = "DLSS capture: data buffer too small";
         return false;
     }
-    if (!gCfg.srEnabled && !gCfg.fgEnabled) {
+    const bool dlssWanted = gCfg.srEnabled || gCfg.fgEnabled;
+    if (!dlssWanted && !gExternalCapture.load()) {
         return false;
     }
-    if (!ngxIsInitialized()) {
+    // 外部后端（XeSS）不依赖 NGX；只有 DLSS 本身需要 NGX 初始化成功。
+    if (dlssWanted && !ngxIsInitialized()) {
         err = "DLSS capture: NGX not initialized";
         return false;
     }
@@ -829,6 +845,11 @@ bool evaluateSr(CommandContext* ctx, Dx12Surface* s, Dx12Object* colorTex,
     }
 
     SlotResources& sr = gSlots[ctx->currentListSlot];
+    if (!sr.dlssValid()) {
+        gSrNeedsReset = true;
+        err = "DLSS SR: output resources not allocated";
+        return false;
+    }
     if (!ensureSrFeature(ctx, gCapture.renderW, gCapture.renderH,
             s->width, s->height, err)) {
         gSrNeedsReset = true;
@@ -1102,7 +1123,7 @@ bool presentGeneratedFrames(Dx12Surface* s, CommandContext* mainCtx,
     if (pending.count <= 0 || pending.slot < 0 || pending.slot >= 3) return false;
 
     SlotResources& sr = gSlots[pending.slot];
-    if (!sr.valid()) return false;
+    if (!sr.dlssValid()) return false;
 
     // 第一张生成帧写入「本帧已经 acquire 的真实 backbuffer」。真实内容此前已在
     // blitSurface 中复制到 sr.real，因此直接覆盖是安全的。后续每一张都需要
@@ -1147,8 +1168,12 @@ void ngxDlssSetConfig(const NgxDlssConfig& cfg) {
     const bool changed = next.srEnabled != gCfg.srEnabled
         || next.quality != gCfg.quality || next.preset != gCfg.preset
         || next.fgEnabled != gCfg.fgEnabled || next.fgFrames != gCfg.fgFrames;
+    // SR/FG 开关会改变槽位纹理的分配（XeSS-only 时不分配 DLSS 输出纹理）。
+    const bool dlssTexturesChanged = next.srEnabled != gCfg.srEnabled
+        || next.fgEnabled != gCfg.fgEnabled;
     gCfg = next;
     if (changed) {
+        if (dlssTexturesChanged) gResourcesDirty = true;
         gSrNeedsReset = true;
         gFgNeedsReset = true;
         gMvReset = true;
@@ -1213,6 +1238,38 @@ void ngxDlssReset() {
     gCapture.valid = false;
 }
 
+void ngxDlssSetExternalCapture(bool enabled) {
+    const bool prev = gExternalCapture.exchange(enabled);
+    if (prev == enabled) return;
+    // 外部后端开关会改变槽位纹理分配（XeSS-only 不需要 DLSS 输出纹理）。
+    gResourcesDirty = true;
+    gMvReset = true;
+    gCapture.valid = false;
+    dbgLog("DLSS capture: external backend %s", enabled ? "on" : "off");
+}
+
+bool ngxDlssGetCapturedInputs(CommandContext* ctx, NgxDlssCapturedInputs& out) {
+    out = NgxDlssCapturedInputs{};
+    if (!ctx || !gCapture.valid) return false;
+    if (gCapture.slot != (int)ctx->currentListSlot) return false;
+    if (gCapture.frameId != gFrameCounter) return false;
+    SlotResources& sr = gSlots[gCapture.slot];
+    if (!sr.depth || !sr.mv) return false;
+    out.depth = sr.depth.Get();
+    out.mv = sr.mv.Get();
+    out.renderW = gCapture.renderW;
+    out.renderH = gCapture.renderH;
+    out.outW = gCapture.outW;
+    out.outH = gCapture.outH;
+    out.jitterPx = gCapture.jitterPx;
+    out.jitterPy = gCapture.jitterPy;
+    return true;
+}
+
+bool ngxDlssEnsureCaptureResources(CommandContext* ctx, std::string& err) {
+    return ensureResources(ctx, nullptr, err);
+}
+
 bool ngxDlssEvaluateSr(CommandContext* ctx, Dx12Surface* s, Dx12Object* colorTex,
     ID3D12Resource** outSrTex, std::string& err) {
     return evaluateSr(ctx, s, colorTex, outSrTex, err);
@@ -1236,6 +1293,8 @@ bool ngxDlssPresentGeneratedFrames(Dx12Surface* s, CommandContext* mainCtx,
 }
 
 void ngxRenderShutdown() {
+    // XeSS 与 DLSS 共用捕获资源；先释放 XeSS context 再拆捕获管线。
+    xessShutdown();
     waitForPendingPresents();
     std::string err;
     deviceWaitIdle(err);

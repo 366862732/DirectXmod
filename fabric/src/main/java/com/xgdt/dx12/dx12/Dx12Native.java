@@ -706,6 +706,23 @@ public final class Dx12Native {
 
     public static native boolean dx12DlssIsFgAvailable();
 
+    /**
+     * XeSS 超分配置推送。返回 XeSS 是否可用（libxess.dll 存在且设备支持）。
+     *
+     * @param enabled 是否启用 XeSS 超分（与 DLSS 超分互斥）
+     * @param quality 0=AA, 1=Quality, 2=Balanced, 3=Performance,
+     *                4=UltraPerformance
+     */
+    public static native boolean dx12SetXessConfig(boolean enabled, int quality);
+
+    public static native boolean dx12XessIsAvailable();
+
+    /** XeSS context 是否已初始化完成（Java 侧据此决定是否施加 jitter）。 */
+    public static native boolean dx12XessIsActive();
+
+    /** 返回一行 XeSS 状态文案（供视频设置「图形增强」页显示）。 */
+    public static native String dx12GetXessStatus();
+
     /** Present the current back buffer (vsync follows the configured mode). */
     public static native void dx12PresentSurface(long surface);
 

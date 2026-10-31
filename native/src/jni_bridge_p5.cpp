@@ -12,6 +12,7 @@
 #include "dx12_device.h"
 #include "ngx_dlss.h"
 #include "ngx_dlss_render.h"
+#include "xess_render.h"
 
 using namespace dx12mc;
 
@@ -206,6 +207,32 @@ JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DlssIsSrAvaila
 JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12DlssIsFgAvailable(
     JNIEnv*, jclass) {
     return ngxDlssIsFgAvailable() ? JNI_TRUE : JNI_FALSE;
+}
+
+// XeSS 超分配置：Java 侧每次修改选项后推送。返回 XeSS 是否可用。
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12SetXessConfig(
+    JNIEnv*, jclass, jboolean enabled, jint quality) {
+    XessConfig cfg;
+    cfg.enabled = enabled == JNI_TRUE;
+    cfg.quality = (int)quality;
+    xessSetConfig(cfg);
+    return xessIsAvailable() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12XessIsAvailable(
+    JNIEnv*, jclass) {
+    return xessIsAvailable() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12XessIsActive(
+    JNIEnv*, jclass) {
+    return xessIsActive() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12GetXessStatus(
+    JNIEnv* env, jclass) {
+    std::string text = xessStatusText();
+    return env->NewStringUTF(text.c_str());
 }
 
 JNIEXPORT void JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12PresentSurface(

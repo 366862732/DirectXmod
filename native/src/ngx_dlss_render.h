@@ -75,6 +75,28 @@ bool ngxDlssCaptureFrame(CommandContext* ctx, Dx12Surface* s, Dx12Object* depthT
 // 场景切换 / 尺寸变化 / 配置变化时调用：只清时间状态，不立即释放 feature。
 void ngxDlssReset();
 
+// 外部超分后端（XeSS）是否需要每帧的深度/运动矢量捕获。
+// 捕获管线本身与 NGX 无关，开启后即使 DLSS 关闭也会执行。
+void ngxDlssSetExternalCapture(bool enabled);
+
+// 本帧捕获结果（深度 + 相机运动矢量）。供 XeSS 等外部超分后端复用。
+struct NgxDlssCapturedInputs {
+    ID3D12Resource* depth = nullptr;  // R32_FLOAT，渲染分辨率
+    ID3D12Resource* mv = nullptr;     // R16G16_FLOAT，渲染分辨率
+    UINT renderW = 0;
+    UINT renderH = 0;
+    UINT outW = 0;
+    UINT outH = 0;
+    float jitterPx = 0.0f;
+    float jitterPy = 0.0f;
+};
+
+// 取当前命令列表槽位本帧的捕获结果；无效（未捕获/槽位不符）返回 false。
+bool ngxDlssGetCapturedInputs(CommandContext* ctx, NgxDlssCapturedInputs& out);
+
+// 确保捕获所需的深度/MV 纹理已创建（首次或尺寸变化时会 deviceWaitIdle）。
+bool ngxDlssEnsureCaptureResources(CommandContext* ctx, std::string& err);
+
 // blit 绘制前调用。SR 成功求值时 outSrTex 指向全分辨率输出纹理，
 // 调用方应把它作为 blit 源；返回 false 表示继续使用原始 srcTex。
 bool ngxDlssEvaluateSr(CommandContext* ctx, Dx12Surface* s, Dx12Object* colorTex,

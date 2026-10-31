@@ -8,6 +8,7 @@
 
 #include "dx12_device.h"
 #include "ngx_dlss_render.h"
+#include "xess_render.h"
 
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -717,6 +718,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
     ID3D12Resource* dst = s->backBuffers[(size_t)s->currentImageIndex].Get();
     // DLSS 超分输出（全分辨率）。非空时用它替代 srcTex 作为 blit 源。
     ID3D12Resource* dlssSrTex = nullptr;
+    // XeSS 超分输出（全分辨率）。DLSS 不可用时作为替代源。
+    ID3D12Resource* xessSrTex = nullptr;
     UINT w = s->width;
     UINT h = s->height;
     dbgLogDebug("blitSurface: cmd=%p dst=%p idx=%d w=%u h=%u srcTex=%p",
@@ -790,15 +793,28 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
 
     // DLSS 超分：低分辨率世界颜色 + 深度/相机运动矢量 → 全分辨率输出。
     // 成功后 dlssSrTex 非空，blit 改用它作为源，并跳过 CAS 锐化。
+    // DLSS 未启用/不可用时尝试 XeSS（两者共用同一份深度与运动矢量捕获）。
     {
         std::string srErr;
         if (ngxDlssEvaluateSr(ctx, s, srcTex, &dlssSrTex, srErr)) {
             dbgLogDebug("blitSurface: DLSS SR output bound as blit source");
-        } else if (!srErr.empty()) {
-            static std::string lastSrErr;
-            if (srErr != lastSrErr) {
-                lastSrErr = srErr;
-                dbgLog("blitSurface: DLSS SR skipped: %s", srErr.c_str());
+        } else {
+            if (!srErr.empty()) {
+                static std::string lastSrErr;
+                if (srErr != lastSrErr) {
+                    lastSrErr = srErr;
+                    dbgLog("blitSurface: DLSS SR skipped: %s", srErr.c_str());
+                }
+            }
+            std::string xessErr;
+            if (xessEvaluateSr(ctx, s, srcTex, &xessSrTex, xessErr)) {
+                dbgLogDebug("blitSurface: XeSS SR output bound as blit source");
+            } else if (!xessErr.empty()) {
+                static std::string lastXessErr;
+                if (xessErr != lastXessErr) {
+                    lastXessErr = xessErr;
+                    dbgLog("blitSurface: XeSS SR skipped: %s", xessErr.c_str());
+                }
             }
         }
     }
@@ -869,8 +885,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         int upscaleMode = 0;
         float upscaleSharpness = 0.0f;
         getBlitUpscaleParams(upscaleMode, upscaleSharpness);
-        // DLSS 输出已是全分辨率，不能再叠加 CAS（会二次锐化并破坏时间稳定性）。
-        bool sharpen = dlssSrTex == nullptr && upscaleMode == 1 && upscaleSharpness > 0.0f;
+        // DLSS / XeSS 输出已是全分辨率，不能再叠加 CAS（会二次锐化并破坏时间稳定性）。
+        bool sharpen = dlssSrTex == nullptr && xessSrTex == nullptr
+            && upscaleMode == 1 && upscaleSharpness > 0.0f;
         cmd->SetGraphicsRootSignature(bp->rootSig.Get());
         cmd->SetPipelineState(sharpen ? bp->psoSharpen.Get() : bp->pso.Get());
         if (sharpen) {
@@ -887,10 +904,15 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
             (void*)bp->rootSig.Get(), (void*)bp->pso.Get());
 
         // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
-        // DLSS SR 输出是裸 ID3D12Resource（不在 Dx12Object 包装中），走 raw 绑定。
+        // DLSS / XeSS SR 输出是裸 ID3D12Resource（不在 Dx12Object 包装中），走 raw 绑定。
         if (dlssSrTex) {
             if (!blitBindRawTextureSRV(ctx, dlssSrTex, cmd, err)) {
                 dbgLog("blitSurface: DLSS SR blitBindRawTextureSRV FAILED: %s", err.c_str());
+                return false;
+            }
+        } else if (xessSrTex) {
+            if (!blitBindRawTextureSRV(ctx, xessSrTex, cmd, err)) {
+                dbgLog("blitSurface: XeSS SR blitBindRawTextureSRV FAILED: %s", err.c_str());
                 return false;
             }
         } else if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) {
@@ -949,6 +971,8 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex,
         // 7. 源纹理 → COMMON（为下一帧 beginRenderPass 准备）
         if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
         if (dlssSrTex) transitionTo(ctx, dlssSrTex,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (xessSrTex) transitionTo(ctx, xessSrTex,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
 #endif

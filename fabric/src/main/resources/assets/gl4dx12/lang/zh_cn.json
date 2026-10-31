@@ -10,5 +10,7 @@
   "options.gl4dx12.dlss_quality": "DLSS 质量档位",
   "options.gl4dx12.dlss_preset": "DLSS 渲染预设",
   "options.gl4dx12.dlss_fg": "DLSS 帧生成",
-  "options.gl4dx12.dlss_fg_frames": "DLSS 生成帧数"
+  "options.gl4dx12.dlss_fg_frames": "DLSS 生成帧数",
+  "options.gl4dx12.xess_sr": "XeSS 超分辨率",
+  "options.gl4dx12.xess_quality": "XeSS 质量档位"
 }

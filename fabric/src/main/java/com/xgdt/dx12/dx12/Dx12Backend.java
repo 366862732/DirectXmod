@@ -101,6 +101,8 @@ public class Dx12Backend implements GpuBackend {
             pushNgxConfig();
             // DLSS 超分/帧生成配置（必须在 NGX 初始化之后推送）。
             pushDlssConfig();
+            // XeSS 超分配置（与 DLSS 超分互斥，原生侧优先 DLSS）。
+            pushXessConfig();
             return new GpuDevice(device, criticalShaderLoader);
         } catch (Throwable t) {
             LOGGER.error("[dx12] D3D12 self-test failed", t);
@@ -160,6 +162,37 @@ public class Dx12Backend implements GpuBackend {
             cfg.getDlssSr(), cfg.getDlssQuality(), cfg.getDlssPreset(),
             cfg.getDlssFg(), cfg.getDlssFgFrames(), srAvailable, fgAvailable);
         return srAvailable;
+    }
+
+    /**
+     * 把 XeSS 超分配置推送到原生侧。
+     *
+     * @return XeSS 是否可用（libxess.dll 缺失或设备不支持 SM 6.4 时为 false）
+     */
+    public static boolean pushXessConfig() {
+        Dx12Config cfg = Dx12Config.getInstance();
+        boolean available;
+        try {
+            available = Dx12Native.dx12SetXessConfig(
+                cfg.getXessSr() == 1, cfg.getXessQuality());
+        } catch (Throwable t) {
+            LOGGER.warn("[dx12] XeSS config push failed: {}", t.toString());
+            available = false;
+        }
+        DlssFrameCapture.setXessAvailable(available);
+        // 超分后端切换会改变 jitter 与历史状态，统一重置一次。
+        try {
+            Dx12Native.dx12DlssReset();
+        } catch (Throwable ignored) {
+        }
+        LOGGER.info("[dx12] XeSS config: sr={} quality={} available={}",
+            cfg.getXessSr(), cfg.getXessQuality(), available);
+        return available;
+    }
+
+    /** 读取原生侧 XeSS 状态（一行文案），供视频设置界面显示。 */
+    public static String getXessStatus() {
+        return Dx12Native.dx12GetXessStatus();
     }
 
     /**

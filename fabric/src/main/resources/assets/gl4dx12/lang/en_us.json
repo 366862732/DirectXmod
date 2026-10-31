@@ -10,5 +10,7 @@
   "options.gl4dx12.dlss_quality": "DLSS Quality",
   "options.gl4dx12.dlss_preset": "DLSS Render Preset",
   "options.gl4dx12.dlss_fg": "DLSS Frame Generation",
-  "options.gl4dx12.dlss_fg_frames": "DLSS Generated Frames"
+  "options.gl4dx12.dlss_fg_frames": "DLSS Generated Frames",
+  "options.gl4dx12.xess_sr": "XeSS Super Resolution",
+  "options.gl4dx12.xess_quality": "XeSS Quality"
 }
