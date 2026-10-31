@@ -82,6 +82,9 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
     private OptionInstance<Integer> dlssFgFramesOption;
     private OptionInstance<Integer> xessSrOption;
     private OptionInstance<Integer> xessQualityOption;
+    private OptionInstance<Integer> lodEnabledOption;
+    private OptionInstance<Integer> lodDistanceOption;
+    private OptionInstance<Integer> lodQualityOption;
 
     /** 原生侧 NGX 状态一行文案；null = 尚未读取。 */
     private String ngxStatus;
@@ -567,10 +570,7 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         } else if (this.isShaderPage()) {
             this.maxScroll = 0;
         } else {
-            int visibleHeight = Math.max(0, this.contentH - 26
-                - (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0)
-                - (this.showsNgxStatusLine() ? 12 : 0)
-                - (this.showsXessStatusLine() ? 12 : 0));
+            int visibleHeight = Math.max(0, this.contentY + this.contentH - this.rowsTop());
             this.maxScroll = Math.max(0, shown.size() * ROW_HEIGHT - visibleHeight);
         }
         this.scroll = Mth.clamp(this.scroll, 0, this.maxScroll);
@@ -637,6 +637,22 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         }
     }
 
+    /**
+     * 选项列表的绘制起点。绘制与鼠标命中必须共用这一个值，
+     * 否则状态行占位会让点击区域整体偏移。
+     */
+    private int rowsTop() {
+        int top = this.contentY + 26
+            + (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0);
+        if (this.showsNgxStatusLine()) {
+            top += 12;
+        }
+        if (this.showsXessStatusLine()) {
+            top += 12;
+        }
+        return top;
+    }
+
     private void drawContent(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {
         if (this.isSupportPage()) {
             this.drawSupportPage(graphics);
@@ -659,18 +675,16 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
                 this.contentX + this.contentW / 2, this.contentY + 16, 0xFFFFD37A);
         }
 
-        int rowTop = this.contentY + 26 + (restart ? 12 : 0);
+        int rowTop = this.rowsTop();
         int statusY = this.contentY + 16 + (restart ? 12 : 0);
         if (this.showsNgxStatusLine()) {
             graphics.centeredText(this.font, Component.literal(this.ngxStatusLine()),
                 this.contentX + this.contentW / 2, statusY, TEXT_DIM);
             statusY += 12;
-            rowTop += 12;
         }
         if (this.showsXessStatusLine()) {
             graphics.centeredText(this.font, Component.literal(this.xessStatusLine()),
                 this.contentX + this.contentW / 2, statusY, TEXT_DIM);
-            rowTop += 12;
         }
         int rowX = this.contentX;
         int rowW = this.contentW - 8;
@@ -1197,13 +1211,12 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
     }
 
     private Row rowAt(double mouseX, double mouseY) {
+        int rowTop = this.rowsTop();
         if (mouseX < this.contentX || mouseX >= this.contentX + this.contentW
-            || mouseY < this.contentY + 26 || mouseY >= this.contentY + this.contentH) {
+            || mouseY < rowTop || mouseY >= this.contentY + this.contentH) {
             return null;
         }
         List<Row> shown = this.shownRows();
-        int rowTop = this.contentY + 26
-            + (this.options.isRestartRequiredToApplyVideoSettings() ? 12 : 0);
         for (int i = 0; i < shown.size(); i++) {
             int y = rowTop + i * ROW_HEIGHT - this.scroll;
             if (mouseY >= y && mouseY < y + ROW_HEIGHT) {

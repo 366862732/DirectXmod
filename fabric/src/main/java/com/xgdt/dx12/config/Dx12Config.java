@@ -30,6 +30,9 @@ public class Dx12Config {
     private static final String KEY_DLSS_FG_FRAMES = "dlss_fg_frames";
     private static final String KEY_XESS_SR = "xess_sr";
     private static final String KEY_XESS_QUALITY = "xess_quality";
+    private static final String KEY_LOD_ENABLED = "lod_enabled";
+    private static final String KEY_LOD_DISTANCE = "lod_distance";
+    private static final String KEY_LOD_QUALITY = "lod_quality";
 
     private static Dx12Config instance;
     private final Properties props = new Properties();
@@ -64,6 +67,12 @@ public class Dx12Config {
     private int xessSr = 0;
     /** XeSS 质量档位：0=AA, 1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance。 */
     private int xessQuality = 1;
+    /** LOD 远视距开关：0 = 关闭，1 = 开启。 */
+    private int lodEnabled = 0;
+    /** LOD 渲染距离（区块数，32..1024）：超出原版视距的部分用简化网格绘制。 */
+    private int lodDistance = 256;
+    /** LOD 网格精度档位：0 = 低（每 4 区块合并），1 = 中（每 2 区块），2 = 高（每区块）。 */
+    private int lodQuality = 1;
 
     private Dx12Config() {
         configPath = Path.of(System.getProperty("user.dir"), FILE_NAME);
@@ -193,6 +202,35 @@ public class Dx12Config {
         save();
     }
 
+    public int getLodEnabled() { return lodEnabled; }
+
+    public void setLodEnabled(int enabled) {
+        this.lodEnabled = enabled == 1 ? 1 : 0;
+        props.setProperty(KEY_LOD_ENABLED, String.valueOf(this.lodEnabled));
+        save();
+    }
+
+    public int getLodDistance() { return lodDistance; }
+
+    public void setLodDistance(int distance) {
+        this.lodDistance = Math.max(32, Math.min(1024, distance));
+        props.setProperty(KEY_LOD_DISTANCE, String.valueOf(this.lodDistance));
+        save();
+    }
+
+    public int getLodQuality() { return lodQuality; }
+
+    public void setLodQuality(int quality) {
+        this.lodQuality = Math.max(0, Math.min(2, quality));
+        props.setProperty(KEY_LOD_QUALITY, String.valueOf(this.lodQuality));
+        save();
+    }
+
+    /** LOD 是否应当生效（开关打开即生效，实际可见性由视距差决定）。 */
+    public boolean isLodActive() {
+        return this.lodEnabled == 1;
+    }
+
     /**
      * 实际内部渲染比例。DLSS / XeSS 超分开启时由质量档位决定；DLSS Custom 档
      * 复用 {@code render_scale}。两者都关闭时与旧行为完全一致。
@@ -266,10 +304,16 @@ public class Dx12Config {
                 xessSr = parseInt(props.getProperty(KEY_XESS_SR, "0"), 0) == 1 ? 1 : 0;
                 xessQuality = Math.max(0, Math.min(4,
                     parseInt(props.getProperty(KEY_XESS_QUALITY, "1"), 1)));
-                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={} xess_sr={} xess_quality={}",
+                lodEnabled = parseInt(props.getProperty(KEY_LOD_ENABLED, "0"), 0) == 1 ? 1 : 0;
+                lodDistance = Math.max(32, Math.min(1024,
+                    parseInt(props.getProperty(KEY_LOD_DISTANCE, "256"), 256)));
+                lodQuality = Math.max(0, Math.min(2,
+                    parseInt(props.getProperty(KEY_LOD_QUALITY, "1"), 1)));
+                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={} xess_sr={} xess_quality={} lod={} lod_distance={} lod_quality={}",
                     aaMode, renderScale, upscaleMode, frameGen,
-                    ngxAppId.isEmpty() && ngxProjectId.isEmpty() ? "off" : "configured",
-                    dlssSr, dlssQuality, dlssFg, xessSr, xessQuality);
+                    ngxAppId.isEmpty() && ngxProjectId.isEmpty() ? "builtin" : "configured",
+                    dlssSr, dlssQuality, dlssFg, xessSr, xessQuality,
+                    lodEnabled, lodDistance, lodQuality);
             } else {
                 LOGGER.info("[dx12-wm] No config file found, using defaults");
                 props.setProperty(KEY_AA_MODE, String.valueOf(aaMode));
@@ -288,6 +332,9 @@ public class Dx12Config {
                 props.setProperty(KEY_DLSS_FG_FRAMES, String.valueOf(dlssFgFrames));
                 props.setProperty(KEY_XESS_SR, String.valueOf(xessSr));
                 props.setProperty(KEY_XESS_QUALITY, String.valueOf(xessQuality));
+                props.setProperty(KEY_LOD_ENABLED, String.valueOf(lodEnabled));
+                props.setProperty(KEY_LOD_DISTANCE, String.valueOf(lodDistance));
+                props.setProperty(KEY_LOD_QUALITY, String.valueOf(lodQuality));
                 save(); // save defaults
             }
         } catch (Exception e) {

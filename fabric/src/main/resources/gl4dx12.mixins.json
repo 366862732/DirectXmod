@@ -6,6 +6,7 @@
         "PreferredGraphicsApiMixin",
         "GameRendererRenderDebugMixin",
         "GameRendererRenderScaleMixin",
+        "GuiRendererScissorClampMixin",
         "GameRendererShaderPackMixin",
         "CloudRendererShaderPackMixin",
         "MinecraftRunDebugMixin",

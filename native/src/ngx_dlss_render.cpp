@@ -208,6 +208,9 @@ int gSrFeatureQuality = -1;
 int gSrFeaturePreset = -1;
 UINT gSrFeatureRenderW = 0, gSrFeatureRenderH = 0;
 UINT gSrFeatureOutW = 0, gSrFeatureOutH = 0;
+// CreateFeature 实测失败后置位，避免每帧都重试（每次重试都要 deviceWaitIdle）。
+// 配置变化时清除，让用户改档位后有重新尝试的机会。
+bool gSrProbeFailed = false;
 
 NVSDK_NGX_Handle* gFgFeature = nullptr;
 NVSDK_NGX_Parameter* gFgParams = nullptr;
@@ -573,6 +576,7 @@ bool ensureSrFeature(CommandContext* ctx, UINT renderW, UINT renderH,
     restoreDrawHeap(ctx);
     if (NVSDK_NGX_FAILED(r) || !handle) {
         err = std::string("DLSS SR: CreateFeature failed ") + ngxResultText(r);
+        gSrProbeFailed = true;
         NVSDK_NGX_D3D12_DestroyParameters(params);
         return false;
     }
@@ -586,6 +590,10 @@ bool ensureSrFeature(CommandContext* ctx, UINT renderW, UINT renderH,
     gSrFeatureOutW = outW;
     gSrFeatureOutH = outH;
     gSrNeedsReset = true;
+    gSrProbeFailed = false;
+    // 初始化阶段 SuperSampling_Available 在 ProjectID + CUSTOM 组合下会误报不可用，
+    // 因此以「能否真正创建 feature」作为最终判据回写状态。
+    ngxSetSrAvailable(true);
     dbgLog("DLSS SR: feature created render=%ux%u out=%ux%u quality=%d preset=%d",
         renderW, renderH, outW, outH, gCfg.quality, gCfg.preset);
     return true;
@@ -826,6 +834,8 @@ bool evaluateSr(CommandContext* ctx, Dx12Surface* s, Dx12Object* colorTex,
     ID3D12Resource** outSrTex, std::string& err) {
     *outSrTex = nullptr;
     if (!gCfg.srEnabled || !gFrameActive) return false;
+    // 能力位在 ProjectID + CUSTOM 组合下可能误报，这里只要求 NGX 已初始化，
+    // 真正能否超分交给 CreateFeature 实测；实测失败会置 gSrProbeFailed 停止重试。
     if (!ngxIsInitialized() || !ngxDlssIsSrAvailable()) return false;
     if (!ctx || !ctx->listOpen || !ctx->commandList || !s || !colorTex) {
         return false;
@@ -1174,6 +1184,8 @@ void ngxDlssSetConfig(const NgxDlssConfig& cfg) {
     gCfg = next;
     if (changed) {
         if (dlssTexturesChanged) gResourcesDirty = true;
+        // 档位/开关变化后允许重新尝试创建 SR feature。
+        gSrProbeFailed = false;
         gSrNeedsReset = true;
         gFgNeedsReset = true;
         gMvReset = true;
@@ -1192,7 +1204,10 @@ void ngxDlssSetConfig(const NgxDlssConfig& cfg) {
 
 bool ngxDlssIsSrAvailable() {
     NgxState st = ngxGetState();
-    return st.initialized && st.dlssAvailable;
+    // dlssAvailable 是初始化时的能力位（ProjectID + CUSTOM 下会误报 false），
+    // 因此只要求 NGX 已初始化且 CreateFeature 没有实测失败过。
+    // 实测失败后即使 dlssAvailable=true 也不再重试，避免每帧 deviceWaitIdle 卡顿。
+    return st.initialized && !gSrProbeFailed;
 }
 
 bool ngxDlssIsFgAvailable() {

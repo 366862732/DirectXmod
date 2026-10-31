@@ -101,24 +101,20 @@ bool isGuidLike(const std::string& text) {
 // 自定义引擎（NVSDK_NGX_ENGINE_TYPE_CUSTOM）的版本号，随项目随意填写。
 constexpr const char* kEngineVersion = "1.0";
 
+// 内置 Project ID：没有 NVIDIA 分配的 App ID 时用它走 ProjectID + CUSTOM 引擎，
+// 用户无需在 config/gl4dx12.properties 里手写 ngx_project_id。
+// 配置里显式填了 ngx_project_id 时仍以配置值为准。
+constexpr const char* kDefaultProjectId = "123e4567-e89b-12d3-a456-426614174000";
+
 void tryInit() {
     if (gState.initialized || !gDevice) {
-        return;
-    }
-    if (gCfg.appId.empty() && gCfg.projectId.empty()) {
-        gState.configured = false;
-        // 设备创建与配置推送各触发一次初始化，避免把同一条提示写两遍。
-        if (gState.message.empty()) {
-            setMessage("未配置 NGX App ID / Project ID，DLSS 通道保持关闭"
-                       "（在 config/gl4dx12.properties 填写 ngx_app_id 后重启生效）");
-        }
         return;
     }
 
     gState.configured = true;
     const std::wstring dataPath = resolveAppDataPath();
     NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_InvalidParameter;
-    std::string mode = "AppID";
+    std::string mode = "ProjectID";
 
     // NGX 默认只在进程目录里找 nvngx_dlss.dll；把数据目录（模组的 dx12mod/）
     // 一并加入搜索路径，这样 DLSS 运行库可以跟 dx12_mc.dll 放在一起。
@@ -127,37 +123,33 @@ void tryInit() {
     featureInfo.PathListInfo.Path = searchPaths;
     featureInfo.PathListInfo.Length = 1;
 
-    if (!gCfg.appId.empty()) {
-        unsigned long long appId = 0;
-        if (!parseAppId(gCfg.appId, appId)) {
-            // nvapi- 开头的是 NVIDIA build/API 密钥，NGX 不接受。
-            const bool nvapiKey = gCfg.appId.rfind("nvapi-", 0) == 0;
-            setMessage("NGX App ID 解析失败：应为 NVIDIA 分配的十进制数字（开发期可填 0）"
-                       + std::string(nvapiKey
-                             ? "；当前填的是 nvapi- 开头的 NVIDIA API 密钥，不是 NGX App ID"
-                             : "；当前值：" + gCfg.appId));
-            return;
-        }
+    unsigned long long appId = 0;
+    const bool appIdParsed = parseAppId(gCfg.appId, appId);
+    // 0 只是文档允许的开发期占位值，实测拿不到 DLSS 超分能力；没有 NVIDIA
+    // 分配的真实 App ID 时改走 ProjectID + CUSTOM 引擎（无需审核）。
+    if (appIdParsed && appId != 0) {
+        mode = "AppID";
         result = NVSDK_NGX_D3D12_Init(appId, dataPath.c_str(), gDevice, &featureInfo);
     } else {
-        mode = "ProjectID";
-        // 没有 NVIDIA 分配的 App ID 时走这条路：自己生成一个 GUID 当项目标识，
-        // 引擎类型固定 CUSTOM（NGX 会校验 GUID 格式）。
-        if (!isGuidLike(gCfg.projectId)) {
+        // 没有 NVIDIA 分配的 App ID 时走 ProjectID + CUSTOM 引擎（无需审核）。
+        // 未配置时使用内置 GUID，用户不必手写 ngx_project_id。
+        const std::string projectId =
+            gCfg.projectId.empty() ? kDefaultProjectId : gCfg.projectId;
+        if (!isGuidLike(projectId)) {
             setMessage("NGX Project ID 格式无效：应为 GUID 形式"
                        "（如 a0f57b54-1daf-4934-90ae-c4035c19df04），当前值："
-                       + gCfg.projectId);
+                       + projectId);
             return;
         }
-        result = NVSDK_NGX_D3D12_Init_with_ProjectID(gCfg.projectId.c_str(),
+        result = NVSDK_NGX_D3D12_Init_with_ProjectID(projectId.c_str(),
             NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion,
             dataPath.c_str(), gDevice, &featureInfo);
     }
 
     if (NVSDK_NGX_FAILED(result)) {
-        char buf[160];
+        char buf[192];
         std::snprintf(buf, sizeof(buf),
-            "NGX 初始化失败（%s，result=0x%08x）。常见原因：App ID 未生效、"
+            "NGX 初始化失败（%s，result=0x%08x）。常见原因：Project ID 未被驱动接受、"
             "驱动不支持 NVNGX，或 nvngx_dlss.dll 不在工作目录",
             mode.c_str(), (unsigned)result);
         setMessage(buf);
@@ -216,6 +208,17 @@ void ngxShutdown() {
 
 bool ngxIsInitialized() {
     return gState.initialized;
+}
+
+void ngxSetSrAvailable(bool available) {
+    if (gState.dlssAvailable == available) {
+        return;
+    }
+    gState.dlssAvailable = available;
+    if (available) {
+        setMessage("DLSS 超分实测可用（CreateFeature 成功；"
+                   "初始化阶段的能力位曾报不可用，已按实测结果覆盖）");
+    }
 }
 
 NgxState ngxGetState() {

@@ -92,7 +92,25 @@ public final class DlssFrameCapture {
     }
 
     public static boolean isSrAvailable() {
-        return srAvailable;
+        return queryDlssSrAvailable();
+    }
+
+    /**
+     * 每帧向原生侧查询 DLSS 超分可用性并刷新快照。
+     * 原生侧在首次成功创建 feature 后会把能力位改写为可用，因此不能只依赖
+     * 推送配置时的返回值。
+     */
+    private static boolean queryDlssSrAvailable() {
+        if (!Dx12Device.isInitialized() || !Dx12Native.isLoaded()) {
+            return false;
+        }
+        try {
+            boolean live = Dx12Native.dx12DlssIsSrAvailable();
+            srAvailable = live;
+            return live;
+        } catch (Throwable ignored) {
+            return srAvailable;
+        }
     }
 
     public static boolean isFgAvailable() {
@@ -111,7 +129,9 @@ public final class DlssFrameCapture {
         Minecraft minecraft = Minecraft.getInstance();
         Dx12Config cfg = Dx12Config.getInstance();
 
-        boolean dlssSrRequested = cfg.getDlssSr() == 1 && srAvailable;
+        // srAvailable 是推送配置时的快照，而 NGX 的实测可用性要等首次创建 feature
+        // 之后才确定；这里每帧向原生重新查询，避免快照过期把超分永久判死。
+        boolean dlssSrRequested = cfg.getDlssSr() == 1 && queryDlssSrAvailable();
         boolean xessSrRequested = cfg.getXessSr() == 1 && xessAvailable;
         boolean srRequested = dlssSrRequested || xessSrRequested;
         boolean fgRequested = cfg.getDlssFg() == 1 && fgAvailable;
