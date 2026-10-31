@@ -122,9 +122,22 @@ public final class DlssFrameCapture {
             return;
         }
 
-        RenderTarget target = minecraft.gameRenderer.mainRenderTarget();
-        int width = Math.max(1, target.width);
-        int height = Math.max(1, target.height);
+        // 主目标尺寸由 GameRendererRenderScaleMixin 在 render HEAD 强制 resize。该
+        // mixin 与本方法的注入顺序不保证，直接读 mainRenderTarget 可能拿到上一帧的
+        // 尺寸。这里按窗口尺寸与有效渲染比例计算期望值，保证抖动/矩阵与真实渲染
+        // 分辨率始终一致。
+        int width;
+        int height;
+        var window = minecraft.getWindow();
+        if (window != null && window.getWidth() > 0 && window.getHeight() > 0) {
+            int scale = cfg.getEffectiveRenderScale();
+            width = Math.max(1, (int) ((long) window.getWidth() * scale / 100L));
+            height = Math.max(1, (int) ((long) window.getHeight() * scale / 100L));
+        } else {
+            RenderTarget target = minecraft.gameRenderer.mainRenderTarget();
+            width = Math.max(1, target.width);
+            height = Math.max(1, target.height);
+        }
         boolean reset = false;
 
         if (minecraft.level != lastLevel || width != renderWidth || height != renderHeight) {
@@ -260,6 +273,9 @@ public final class DlssFrameCapture {
         invProjCol.get(captureData, 64);
 
         CameraRenderState camera = cameraState(minecraft);
+        if (camera == null || !camera.initialized) {
+            return;
+        }
         captureData[80] = (float) camera.pos.x;
         captureData[81] = (float) camera.pos.y;
         captureData[82] = (float) camera.pos.z;

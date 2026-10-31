@@ -959,6 +959,11 @@ bool afterBlit(CommandContext* ctx, Dx12Surface* s, std::string& err) {
     const int requested = std::max(1, std::min(gCfg.fgFrames, 3));
     const int count = std::max(1, std::min<int>(requested, (int)gFgMaxFrames));
 
+    // 重置时 DLSS-G 输出的“生成帧”只是输入帧的拷贝，生成多张会得到重复画面。
+    // 指南允许在重置帧把 MultiFrameCount 改成 1（帧对之间可改变），因此只求值
+    // 一张生成帧，下一帧恢复正常数量。
+    const int evalCount = gFgNeedsReset ? 1 : count;
+
     // 真实 backbuffer -> 保留纹理。backbuffer 当前是 RENDER_TARGET。
     ID3D12Resource* bb = s->backBuffers[(size_t)s->currentImageIndex].Get();
     transitionTo(ctx, bb, D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -983,13 +988,13 @@ bool afterBlit(CommandContext* ctx, Dx12Surface* s, std::string& err) {
     eval.pOutputRealFrame = nullptr;
     eval.pOutputDisableInterpolation = nullptr;
 
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < evalCount; ++i) {
         transitionTo(ctx, sr.gen[i].Get(), D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         eval.pOutputInterpFrame = sr.gen[i].Get();
 
         NVSDK_NGX_DLSSG_Opt_Eval_Params opt{};
-        fillFgOptParams(gCapture, count, i + 1, i == 0 && gFgNeedsReset, opt);
+        fillFgOptParams(gCapture, evalCount, i + 1, i == 0 && gFgNeedsReset, opt);
         NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSSG(ctx->commandList,
             gFgFeature, gFgParams, &eval, &opt);
         restoreDrawHeap(ctx);
@@ -998,7 +1003,7 @@ bool afterBlit(CommandContext* ctx, Dx12Surface* s, std::string& err) {
             if (!logged) {
                 logged = true;
                 dbgLog("DLSS-G: EvaluateFeature failed %s (index %d/%d)",
-                    ngxResultText(r), i + 1, count);
+                    ngxResultText(r), i + 1, evalCount);
             }
             gFgNeedsReset = true;
             err = std::string("DLSS-G: EvaluateFeature failed ") + ngxResultText(r);
@@ -1012,7 +1017,7 @@ bool afterBlit(CommandContext* ctx, Dx12Surface* s, std::string& err) {
     pending.key = ctx->fenceValue + 1;
     pending.surface = s;
     pending.slot = (int)ctx->currentListSlot;
-    pending.count = count;
+    pending.count = evalCount;
     pending.frameId = gFrameCounter;
     {
         std::lock_guard<std::mutex> lk(gPendingMtx);
@@ -1022,7 +1027,7 @@ bool afterBlit(CommandContext* ctx, Dx12Surface* s, std::string& err) {
     static bool logged = false;
     if (!logged) {
         logged = true;
-        dbgLog("DLSS-G: evaluated %d generated frame(s)", count);
+        dbgLog("DLSS-G: evaluated %d generated frame(s)", evalCount);
     }
     return true;
 }
