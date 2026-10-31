@@ -302,8 +302,13 @@ public final class Dx12ShaderPackRenderer {
 
             long pipeline = pipelineFor(pack, pass, output.formatOrdinal(), inputs.size());
             if (pipeline == 0L) {
+                LOGGER.error("[shaderpack][DIAG] pipeline==0 for composite pass '{}': "
+                    + "D3DCompile failed or resource mismatch. pass inputs={}, output={}",
+                    pass.name(), pass.inputs(), pass.output());
                 return;
             }
+            LOGGER.debug("[shaderpack][DIAG] pass '{}' pipeline OK (handle={}), inputs={}",
+                pass.name(), pipeline, pass.inputs());
 
             // 每个 pass 独占一个槽位：CBV 地址被烘焙进命令列表，若同帧所有 pass
             // 共用一个槽位，CPU 在录制期就会把前一个 pass 的 params 覆写掉。
@@ -324,10 +329,12 @@ public final class Dx12ShaderPackRenderer {
             }
             lastOutput = pass.output();
             passIndex++;
+            LOGGER.debug("[shaderpack][DIAG] pass '{}' draw OK, lastOutput={}", pass.name(), lastOutput);
         }
 
         if (!"scene_color".equals(lastOutput)) {
             // 链尾把最后一个中间结果贴回主目标。
+            LOGGER.debug("[shaderpack][DIAG] lastOutput={} is not scene_color, running copy pass", lastOutput);
             Dx12TextureRef source = resolveInput(lastOutput, color, colorView, depth, depthView);
             long pipeline = copyPipeline(sceneFormat);
             if (pipeline != 0L) {
