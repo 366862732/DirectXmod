@@ -2,7 +2,6 @@
 
 > **Minecraft 26.2 Fabric 模组的原生 D3D12 渲染后端。**
 > 通过实现 Minecraft 官方的 `GpuBackend` / `GpuDeviceBackend` 接口，用 C++ 原生 DLL（`dx12_mc.dll`）替代 OpenGL/Vulkan 渲染路径，使 Minecraft 使用 D3D12 直接渲染游戏画面，同时保留 Mod 扩展点（AA 设置、ModMenu 集成）。
-
 > 鸣谢：爱睡觉的白洲梓 / xiaozi Graphics Development Team
 
 ## 概述
@@ -11,50 +10,39 @@
 
 ### 核心特点
 
-- **Mixin 注入**：27 个 Mixin 覆盖图形 API 选择 + 初始化/渲染/资源加载/世界加载/区块/摄像机/雾效全链路诊断 + 渲染性能 Prof 插桩 + 自定义视频设置界面替换（见 [Mixin 注入点](#mixin-注入点)）
-- **官方 GpuBackend 接口**：完整实现 `GpuBackend` / `GpuDeviceBackend` / `CommandEncoderBackend` / `RenderPassBackend` / `GpuSurfaceBackend` 等官方接口
-- **零自定义渲染循环**：不复写 `RenderSystem`，完全接管 Minecraft 官方的渲染流程
-- **Shaderc + Spvc 编译链**：GLSL → SPIR-V（shaderc）→ HLSL SM5.1（spvc）→ DXBC（D3DCompile）
-- **资源安全**：所有 D3D12 资源通过 Java 包装类（`Dx12Gpu*`）管理，随 Minecraft 生命周期自动释放
-- **DirectX 12.2 / RT 管线**：设备能力检测（FL 12_2，Raytracing Tier / Mesh Shader / VRS / Sampler Feedback）+ DXR 光追链路（BLAS → TLAS → RTPSO → `DispatchRays` + Shader Binding Table → UAV 读回），光追演示输出（512×288，棋盘地面 + 3 彩盒）作为像素资源叠加进光栅管线
-- **自定义视频设置界面**：`Dx12VideoSettingsScreen` 替换原版视频设置界面，Reese's Sodium Options 风格深色主题（整屏面板 / 顶部搜索 / 左侧分组导航 / 右侧选项行 / 底部 Apply-Done），直接读写原版 `Options` 的 `OptionInstance`，行为/存档/快捷键/重启提示不变，"图形 API" 行灰化并固定显示当前实际后端（DirectX 12）
-- **配置界面**：Fx12Config 持久化配置，Dx12SettingsScreen 设置界面，ModMenu 集成
-- **DLL 自动加载**：从 JAR 提取到 `{user.dir}/dx12mod/dx12_mc.dll`，支持版本隔离
-- **MC 26.2**：支持 Mojang 官方映射（不依赖 Yarn 映射），fabric-api 0.156.0+26.2 / loader 0.19.3 / ModMenu 20.0.1
-
 ### 当前阶段：P0-P33 + Async Phase 1（C++ 已完成，Java 层未纳入），LIGHTMAP-VFLIP 已修复，世界渲染正常（2026-09-26）
 
-| 阶段 | 状态 | 说明 |
-|------|------|------|
-| **P0: 原生层基础** | ✅ 已完成 | dx12_mc.dll：D3D12 初始化 + 资源创建 (texture/buffer/sampler/view) |
-| **P1: 设备自检** | ✅ 已完成 | Dx12Native.dx12CreateDevice() + 资源 self-test |
-| **P2: 资源层** | ✅ 已完成 | Dx12GpuTexture / Dx12GpuBuffer / Dx12GpuSampler / Dx12GpuTextureView |
-| **P3: 命令编码层** | ✅ 已完成 | Dx12CommandEncoderBackend：submit/fence/copy/clear/timestamp |
-| **P4: 管线编译层** | ✅ 已完成 | shaderc SPIR-V → spvc 反射/rebind → HLSL → D3DCompile DXBC |
-| **P5: 交换链层** | ✅ 已完成 | Dx12GpuSurface：DXGI flip-model swapchain (configure/acquire/blit/present) |
-| **P6: Draw 全链路** | ✅ 已完成 | Dx12RenderPassBackend：setPipeline + pushDescriptors + draw/drawIndexed |
-| **P15: 日志分级系统** | ✅ 已完成 | GameRenderer 调试插桩 + 分级日志 (dbgLog/dbgLogInfo/dbgLogDebug) |
-| **P16: renderLevel 诊断** | ✅ 已完成 | 帧计数/advanceGameTime/pause/native submit+present 日志 |
-| **P17: 绘制目标跟踪** | ✅ 已完成 | activeColorTargetsTouched + dbgReadbackSurfacePixels() 3×3 采样 |
-| **P18: Surface fence** | ✅ 已完成 | per-backbuffer fence 追踪，acquireSurface 前检查 GPU 占用 |
-| **P20: 描述符表偏移修复** | ✅ 已完成 | pushDescriptors 根描述符表 GPU 地址偏移修正，避免读前帧残留 |
-| **P21: 深度测试修复** | ✅ 已完成 | removeDepthClearAutoFix + reverse-Z 比较函数 + depth PSO 双轨创建 |
-| **P22: 描述符堆扩容** | ✅ 已完成 | drawHeap x4 半区，支持三帧并行飞行（fenceValue%4 交替写入） |
-| **P24: 帧级瞬态 RTV/DSV** | ✅ 已完成 | 新增 frameRtvHeap/dsvHeap（每帧从 0 复用），P24 fix：SRV 必须写入命令列表当前设置的堆（黑屏根因之一） |
-| **P25: SampleMask + 纹理格式** | ✅ 已完成 | PSO 补设 SampleMask=UINT_MAX；RGB32_FLOAT 不再加宽成 RGBA32_FLOAT |
-| **P26: upload readback 修复** | ✅ 已完成 | Map 读回必须带 offset 的 D3D12_RANGE，否则读到旧数据 |
-| **P27: 高频日志降级** | ✅ 已完成 | beginRenderPass/setPipeline/drawIndexed 逐条诊断日志降级为 DBG_LOG_DEBUG（数千次/帧不拖死主线程） |
-| **P28: 图集渲染与坐标系适配** | ✅ 已完成 | animate_sprite 顶点着色器注入 Y-flip（GL bottom-up → D3D12 top-down）；静态采样器改 POINT（与官方图集上传 NEAREST 语义一致）；图集 dump 验证内容正确、GUI 按钮渲染正常 |
-| **BUG-01: semanticNames 修复** | ✅ 已完成 | `semanticNames` 基于 `vertex.inputs().size()` 补齐，与 spvc 基准对齐 |
-| **LIGHTMAP-VFLIP（已修复）** | ✅ 已完成 | 光贴图更新 pass（pipeline/lightmap）被 P31 flipY 判定排除（usage=13 且需带深度附件）→ GL bottom-up 写入方向与 terrain 采样相反，白天方块采到暗行（lightmapviz≈26-46、whitelight 探针恢复明亮、readback BMP 证实内容渐变正确但 Y 镜像）。修复：Dx12ShaderCompiler 对 location 含 "lightmap" 且 !flipY 的管线在 frag_main 入口注入 `texCoord.y = 1.0f - texCoord.y;`；诊断：whitelight/uv2viz/lightmapviz 探针 + dbgReadbackTexturePixels 读回 16×16 光贴图 |
-| **P29: NDC 翻转修复** | ✅ 已完成 | 修复 GuiItemAtlas / 人物渲染倒置：NDC Y 轴方向适配 D3D12 top-down 坐标 |
-| **P30: 世界渲染黑屏修复** | ✅ 已完成 | level=null 根因定位并修复，世界地形/区块/实体正常渲染；新增区块/摄像机/雾效/切片诊断 mixin |
-| **P31: flipY 判定逻辑优化** | ✅ 已完成 | 仅对需要垂直翻转的 shader 路径注入 Y-flip，避免光贴图误处理 |
-| **P32: Async Phase 1（C++）** | ✅ 已完成 | 异步 Fence/Bundle/Descriptor/Executor C++ 基础设施完成（487 行头文件 + 1253 行 cpp）；per-worker 镜像堆 + SetEventOnCompletion + COM 主线程释放；Java 侧异步包未纳入本次提交 |
-| **P33: JNI 异步描述符绑定** | ✅ 已完成 | jni_bridge_p33.cpp（605 行）新增异步描述符管理的 native 接口 |
-| **CS_OWNDC 窗口修复** | ✅ 已完成 | 修复 Windows CS_OWNDC 类窗口在 DX12 下 swapchain 创建失败的兼容性问题 |
-| **P66: DX12.2 设备能力检测** | ✅ 已完成 | 优先请求 FL 12_2（DX12 Ultimate），通过 `ID3D12Device5` 检测 Raytracing Tier（1.0/1.1）、Mesh Shader / VRS / Sampler Feedback，日志输出设备能力摘要 |
-| **P67: DXR 光追管线（冒烟测试 + 演示）** | ✅ 已完成 | BLAS → TLAS → RTPSO（RayGen/ClosestHit/AnyHit/Miss + Hit Group）→ `DispatchRays` + SBT → UAV 写回 → `CopyTextureRegion` 读回；单三角形冒烟测试独立 queue/fence 跑完即释放；可见演示 512×288（棋盘地面 + 3 彩盒，MaxTraceRecursionDepth=2），输出纹理作为 PIXEL_SHADER_RESOURCE 叠加进光栅管线；`dxrSmokeTestStandalone` / `dxrDemoStandalone` 诊断入口（dllexport） |
+| 阶段                           | 状态    | 说明                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **P0: 原生层基础**                | ✅ 已完成 | dx12\_mc.dll：D3D12 初始化 + 资源创建 (texture/buffer/sampler/view)                                                                                                                                                                                                                                                                                                          |
+| **P1: 设备自检**                 | ✅ 已完成 | Dx12Native.dx12CreateDevice() + 资源 self-test                                                                                                                                                                                                                                                                                                                         |
+| **P2: 资源层**                  | ✅ 已完成 | Dx12GpuTexture / Dx12GpuBuffer / Dx12GpuSampler / Dx12GpuTextureView                                                                                                                                                                                                                                                                                                 |
+| **P3: 命令编码层**                | ✅ 已完成 | Dx12CommandEncoderBackend：submit/fence/copy/clear/timestamp                                                                                                                                                                                                                                                                                                          |
+| **P4: 管线编译层**                | ✅ 已完成 | shaderc SPIR-V → spvc 反射/rebind → HLSL → D3DCompile DXBC                                                                                                                                                                                                                                                                                                             |
+| **P5: 交换链层**                 | ✅ 已完成 | Dx12GpuSurface：DXGI flip-model swapchain (configure/acquire/blit/present)                                                                                                                                                                                                                                                                                            |
+| **P6: Draw 全链路**             | ✅ 已完成 | Dx12RenderPassBackend：setPipeline + pushDescriptors + draw/drawIndexed                                                                                                                                                                                                                                                                                               |
+| **P15: 日志分级系统**              | ✅ 已完成 | GameRenderer 调试插桩 + 分级日志 (dbgLog/dbgLogInfo/dbgLogDebug)                                                                                                                                                                                                                                                                                                             |
+| **P16: renderLevel 诊断**      | ✅ 已完成 | 帧计数/advanceGameTime/pause/native submit+present 日志                                                                                                                                                                                                                                                                                                                   |
+| **P17: 绘制目标跟踪**              | ✅ 已完成 | activeColorTargetsTouched + dbgReadbackSurfacePixels() 3×3 采样                                                                                                                                                                                                                                                                                                        |
+| **P18: Surface fence**       | ✅ 已完成 | per-backbuffer fence 追踪，acquireSurface 前检查 GPU 占用                                                                                                                                                                                                                                                                                                                    |
+| **P20: 描述符表偏移修复**            | ✅ 已完成 | pushDescriptors 根描述符表 GPU 地址偏移修正，避免读前帧残留                                                                                                                                                                                                                                                                                                                             |
+| **P21: 深度测试修复**              | ✅ 已完成 | removeDepthClearAutoFix + reverse-Z 比较函数 + depth PSO 双轨创建                                                                                                                                                                                                                                                                                                            |
+| **P22: 描述符堆扩容**              | ✅ 已完成 | drawHeap x4 半区，支持三帧并行飞行（fenceValue%4 交替写入）                                                                                                                                                                                                                                                                                                                           |
+| **P24: 帧级瞬态 RTV/DSV**        | ✅ 已完成 | 新增 frameRtvHeap/dsvHeap（每帧从 0 复用），P24 fix：SRV 必须写入命令列表当前设置的堆（黑屏根因之一）                                                                                                                                                                                                                                                                                                 |
+| **P25: SampleMask + 纹理格式**   | ✅ 已完成 | PSO 补设 SampleMask=UINT\_MAX；RGB32\_FLOAT 不再加宽成 RGBA32\_FLOAT                                                                                                                                                                                                                                                                                                         |
+| **P26: upload readback 修复**  | ✅ 已完成 | Map 读回必须带 offset 的 D3D12\_RANGE，否则读到旧数据                                                                                                                                                                                                                                                                                                                              |
+| **P27: 高频日志降级**              | ✅ 已完成 | beginRenderPass/setPipeline/drawIndexed 逐条诊断日志降级为 DBG\_LOG\_DEBUG（数千次/帧不拖死主线程）                                                                                                                                                                                                                                                                                       |
+| **P28: 图集渲染与坐标系适配**          | ✅ 已完成 | animate\_sprite 顶点着色器注入 Y-flip（GL bottom-up → D3D12 top-down）；静态采样器改 POINT（与官方图集上传 NEAREST 语义一致）；图集 dump 验证内容正确、GUI 按钮渲染正常                                                                                                                                                                                                                                           |
+| **BUG-01: semanticNames 修复** | ✅ 已完成 | `semanticNames` 基于 `vertex.inputs().size()` 补齐，与 spvc 基准对齐                                                                                                                                                                                                                                                                                                           |
+| **LIGHTMAP-VFLIP（已修复）**      | ✅ 已完成 | 光贴图更新 pass（pipeline/lightmap）被 P31 flipY 判定排除（usage=13 且需带深度附件）→ GL bottom-up 写入方向与 terrain 采样相反，白天方块采到暗行（lightmapviz≈26-46、whitelight 探针恢复明亮、readback BMP 证实内容渐变正确但 Y 镜像）。修复：Dx12ShaderCompiler 对 location 含 "lightmap" 且 !flipY 的管线在 frag\_main 入口注入 `texCoord.y = 1.0f - texCoord.y;`；诊断：whitelight/uv2viz/lightmapviz 探针 + dbgReadbackTexturePixels 读回 16×16 光贴图 |
+| **P29: NDC 翻转修复**            | ✅ 已完成 | 修复 GuiItemAtlas / 人物渲染倒置：NDC Y 轴方向适配 D3D12 top-down 坐标                                                                                                                                                                                                                                                                                                               |
+| **P30: 世界渲染黑屏修复**            | ✅ 已完成 | level=null 根因定位并修复，世界地形/区块/实体正常渲染；新增区块/摄像机/雾效/切片诊断 mixin                                                                                                                                                                                                                                                                                                             |
+| **P31: flipY 判定逻辑优化**        | ✅ 已完成 | 仅对需要垂直翻转的 shader 路径注入 Y-flip，避免光贴图误处理                                                                                                                                                                                                                                                                                                                                |
+| **P32: Async Phase 1（C++）**  | ✅ 已完成 | 异步 Fence/Bundle/Descriptor/Executor C++ 基础设施完成（487 行头文件 + 1253 行 cpp）；per-worker 镜像堆 + SetEventOnCompletion + COM 主线程释放；Java 侧异步包未纳入本次提交                                                                                                                                                                                                                             |
+| **P33: JNI 异步描述符绑定**         | ✅ 已完成 | jni\_bridge\_p33.cpp（605 行）新增异步描述符管理的 native 接口                                                                                                                                                                                                                                                                                                                      |
+| **CS\_OWNDC 窗口修复**           | ✅ 已完成 | 修复 Windows CS\_OWNDC 类窗口在 DX12 下 swapchain 创建失败的兼容性问题                                                                                                                                                                                                                                                                                                                |
+| **P66: DX12.2 设备能力检测**       | ✅ 已完成 | 优先请求 FL 12\_2（DX12 Ultimate），通过 `ID3D12Device5` 检测 Raytracing Tier（1.0/1.1）、Mesh Shader / VRS / Sampler Feedback，日志输出设备能力摘要                                                                                                                                                                                                                                          |
+| **P67: DXR 光追管线（冒烟测试 + 演示）** | ✅ 已完成 | BLAS → TLAS → RTPSO（RayGen/ClosestHit/AnyHit/Miss + Hit Group）→ `DispatchRays` + SBT → UAV 写回 → `CopyTextureRegion` 读回；单三角形冒烟测试独立 queue/fence 跑完即释放；可见演示 512×288（棋盘地面 + 3 彩盒，MaxTraceRecursionDepth=2），输出纹理作为 PIXEL\_SHADER\_RESOURCE 叠加进光栅管线；`dxrSmokeTestStandalone` / `dxrDemoStandalone` 诊断入口（dllexport）                                                         |
 
 ## 项目结构
 
@@ -269,15 +257,11 @@ Minecraft 选择后端时优先使用 `D3D12`，进而实例化我们的 `Dx12Ba
 
 ## DirectX 12.2 / RT（光追）管线（P66 + P67）
 
-在 D3D12 光栅化后端之外，本项目额外打通了完整的 **DX12 Ultimate（FL 12_2 / DXR）** 光追链路，作为能力验证 + 渲染特性演示。
+在 D3D12 光栅化后端之外，本项目额外打通了完整的 **DX12 Ultimate（FL 12\_2 / DXR）** 光追链路，作为能力验证 + 渲染特性演示。
 
 ### P66：设备能力检测
 
-设备创建时优先请求 FL 12_2（DX12 Ultimate），通过 `ID3D12Device5` 一次性探测并记录：
-
-- **Raytracing Tier**（1.0 / 1.1）
-- **Mesh Shader / VRS / Sampler Feedback** 能力
-- 结果写入 `DeviceContext`（`device5` / `raytracingTier` 等字段），并输出设备能力摘要日志
+设备创建时优先请求 FL 12\_2（DX12 Ultimate），通过 `ID3D12Device5` 一次性探测并记录：
 
 `raytracingTier >= 1.0` 时 `device5` 非空，作为后续所有 RT 调用的入口。
 
@@ -308,60 +292,44 @@ UAV 写回 → CopyTextureRegion → Map readback（CPU 验证）
 
 两种形态：
 
-| 形态 | 说明 |
-|------|------|
-| **冒烟测试** `runDxrSmokeTest()` | 单三角形 BLAS → 1 实例 TLAS → RTPSO → `DispatchRays(64×64)` → 读回验证；独立 queue/allocator/fence，跑完即释放 |
-| **可见演示** `initDxrDemo()` / `dxrDemoDispatch()` | 512×288 输出纹理 + 场景（棋盘地面 + 3 个彩盒，最多 48 三角形）；BLAS/TLAS 在首次 dispatch 时惰性构建，输出纹理作为 PIXEL_SHADER_RESOURCE 叠加进光栅管线 |
+| 形态                                             | 说明                                                                                                            |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **冒烟测试** `runDxrSmokeTest()`                   | 单三角形 BLAS → 1 实例 TLAS → RTPSO → `DispatchRays(64×64)` → 读回验证；独立 queue/allocator/fence，跑完即释放                   |
+| **可见演示** `initDxrDemo()` / `dxrDemoDispatch()` | 512×288 输出纹理 + 场景（棋盘地面 + 3 个彩盒，最多 48 三角形）；BLAS/TLAS 在首次 dispatch 时惰性构建，输出纹理作为 PIXEL\_SHADER\_RESOURCE 叠加进光栅管线 |
 
 诊断入口：`dxrSmokeTestStandalone()` / `dxrDemoStandalone()`（`dllexport`），可独立驱动验证。
 
 ## 已完成功能
 
-| 模块 | 说明 |
-|------|------|
-| **P0 原生层** | dx12_mc.dll: D3D12 设备创建、texture/buffer/sampler/view 资源管理、命令列表、fence、swapchain |
-| **P1 设备自检** | Dx12Native.dx12CreateDevice() 返回适配器名称 + 特性级别 + 自测结果 |
-| **P2 资源层** | Dx12GpuTexture/Dx12GpuBuffer/Dx12GpuSampler/Dx12GpuTextureView — 全部通过 JNI 创建真实 D3D12 资源 |
-| **P3 命令层** | Dx12CommandEncoderBackend: submit/fence/copyBuffer/copyTexture/writeToTexture/clear/startEndRenderPass/timestamp |
-| **P4 管线层** | GLSL→SPIR-V→HLSL→DXBC 编译，Pipeline cache (IdentityHashMap)，Shader source cache (HashMap) |
-| **P5 交换链** | Dx12GpuSurface: DXGI flip-model swapchain, 支持 IMMEDIATE/MERCHANTABILITY/RALAXED present mode |
-| **P6 Draw 全链路** | Dx12RenderPassBackend: setPipeline + pushDescriptors(UBO/SRV/TexelBuffer) + draw/drawIndexed/drawIndirect |
-| **P15 日志分级** | dbgLog(ERROR/WARN)/dbgLogInfo/INFO)/dbgLogDebug(DEBUG) 三级输出，DX12_LOG_VERBOSE=1 开启详细日志 |
-| **P16 renderLevel 诊断** | 帧计数器（每 30 帧）+ advanceGameTime/pause/native submit+present 日志 |
-| **P17 绘制目标跟踪** | activeColorTargetsTouched 向量 + dbgReadbackSurfacePixels() 每 30 帧采样，dx12ReadbackTexturePixels 读指定纹理 |
-| **P18 Surface Fence** | per-backbuffer fence 追踪，acquireSurface 前检查 back buffer 是否仍被 GPU 使用 |
-| **P20 描述符偏移修复** | pushDescriptors 根描述符表 GPU 地址加偏移，避免读取前帧残留描述符导致黑屏 |
-| **P21 深度测试修复** | 移除 depthClearFlag=0 的无条件 clear=1.0 回退（pre-clear 已由 MC 完成）；修复 reverse-Z 比较函数 |
-| **P22 描述符堆扩容** | drawHeap 从 2 半区扩展到 4 半区，支持三帧并行飞行（fenceValue%4 交替写入） |
-| **BUG-01 semanticNames 修复** | `semanticNames` 补齐改用 `vertex.inputs().size()` 与 spvc remap 基准对齐 |
-| **LIGHTMAP-VFLIP 修复** | 光贴图更新 pass（pipeline/lightmap）被 P31 flipY 判定排除 → GL bottom-up 内容写入方向与 terrain 采样相反，白天采到暗行（lightmapviz≈26-46、whitelight 探针恢复明亮、readback BMP 证实内容渐变正确但镜像）。修复：frag_main 注入 `texCoord.y = 1.0f - texCoord.y;`（location 含 lightmap 且 !flipY 时自动生效） |
-| **Shader 编译自检** | 内嵌 core/gui + core/position_tex_color 的 GLSL 源码，createDevice 时资源包未加载也可编译 |
-| **4 轮自测** | Java 资源(self-test)→命令层→管线→Surface 逐轮验证，任何失败立即终止并回退 OpenGL |
-| **D3D12 资源管理** | AutoCloseable 模式 + TextureView 引用计数 + gPendingDeletes 延迟销毁 |
-| **ModMenu 集成** | Dx12Config + Dx12SettingsScreen + ModMenuApi entrypoint |
-| **AA 模式持久化** | Properties 格式存储到 `config/gl4dx12.properties`，4 种模式 (None/FXAA/SMAA/TAA) |
-| **异步渲染 Bug 修复** | ✅ 已完成 | ASYNC-01（per-worker CPU-only 镜像堆）+ ASYNC-03（非阻塞 tryBeginFrame）+ ASYNC-04（SetEventOnCompletion 事件驱动）+ ASYNC-05（COM 资源主线程释放）+ ASYNC-09（CommandSignature 参数修复）+ ASYNC-10（PSO 边界切分 Bundle） |
-| **CS_OWNDC 兼容性** | ✅ 已完成 | Windows CS_OWNDC 类窗口的 DX12 swapchain 创建失败修复 |
-| **shader 诊断探针** | ✅ 已完成 | whitelight/uv2viz/lightmapviz 探针 + DIAG_GRAY/UV2_VIZ/LIGHTMAP_VIZ/DUMP_SHADER 等环境变量驱动 |
-| **P66 设备能力检测** | ✅ 已完成 | 优先请求 FL 12_2（DX12 Ultimate），经 `ID3D12Device5` 检测 Raytracing Tier / Mesh Shader / VRS / Sampler Feedback，输出能力摘要日志 |
-| **P67 DXR 光追管线** | ✅ 已完成 | BLAS → TLAS → RTPSO → `DispatchRays` + SBT → UAV 写回读回；单三角形冒烟测试 + 512×288 可见演示（棋盘地面 + 3 彩盒），输出叠加进光栅管线；`dxrSmokeTestStandalone` / `dxrDemoStandalone` 诊断入口 |
-| **自定义视频设置界面** | ✅ 已完成 | `Dx12VideoSettingsScreen`（775 行）替换原版 VideoSettingsScreen，RSO 深色主题（整屏面板/搜索栏/分组导航/选项行/底部按钮），直接读写原版 `OptionInstance`，"图形 API" 行灰化固定显示当前后端（DirectX 12） |
-
-## 关键设计原则
-
-- **Mixin 仅修改 API 选择**：不复写任何渲染逻辑，完全依赖 Minecraft 官方 `RenderSystem` 调用我们的后端
-- **镜像官方 Vulkan 后端**：每个 Java 类都对应官方 `com.mojang.blaze3d.vulkan.Vulkan*` 的等价实现
-- **资源安全释放**：所有 `AutoCloseable`，close() 时销毁所有 D3D12 句柄；TextureView 引用计数 + 延迟销毁队列防 use-after-free
-- **自测驱动开发**：4 轮自测（资源/命令/管线/Surface）在 `createDevice()` 中逐轮验证，失败即终止
-- **Lazy shared encoder**：`createCommandEncoder()` 返回同一实例（镜像官方语义），避免每帧新建 CommandContext 导致的命令丢失
-- **Shader cache**：Pipeline cache (IdentityHashMap) + Shader source cache (HashMap)，同一 shader 只编译一次
-- **DLL 版本隔离**：每次启动从 JAR 重新提取，确保 DLL 与 JAR 版本一致
-- **三帧并行命令**：3 allocator + value-2 完成等待；drawHeap x4 半区防三帧并行冲突
-- **SRV 写当前堆**（P24）：pushDescriptors 将 SRV 写入命令列表当前激活的 drawHeap，避免跨帧描述符错乱（黑屏根因之一）
-- **Async Phase 1 设计**（P32）：Bundle 录制按 PSO 边界切分（ASYNC-10）；Per-worker CPU-only 镜像描述符堆（ASYNC-01）；非阻塞 `tryBeginFrame()`（ASYNC-03）；`SetEventOnCompletion` 事件驱动 fence 等待（ASYNC-04）；COM 资源在主线程释放（ASYNC-05）
-- **诊断开关**：`DX12_LOG_VERBOSE=1` 开启详细日志；`DX12_DIAG_GREEN=1` 开启绿色着色器诊断；`DX12_DBG_DISABLE_DEPTH=1` 强制关闭深度测试（排查深度配置问题）
-
-## 调试与验证
+| 模块                          | 说明                                                                                                                                                                                                                                            | <br />                                                                                                                                                                                 |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **P0 原生层**                  | dx12\_mc.dll: D3D12 设备创建、texture/buffer/sampler/view 资源管理、命令列表、fence、swapchain                                                                                                                                                                | <br />                                                                                                                                                                                 |
+| **P1 设备自检**                 | Dx12Native.dx12CreateDevice() 返回适配器名称 + 特性级别 + 自测结果                                                                                                                                                                                           | <br />                                                                                                                                                                                 |
+| **P2 资源层**                  | Dx12GpuTexture/Dx12GpuBuffer/Dx12GpuSampler/Dx12GpuTextureView — 全部通过 JNI 创建真实 D3D12 资源                                                                                                                                                       | <br />                                                                                                                                                                                 |
+| **P3 命令层**                  | Dx12CommandEncoderBackend: submit/fence/copyBuffer/copyTexture/writeToTexture/clear/startEndRenderPass/timestamp                                                                                                                              | <br />                                                                                                                                                                                 |
+| **P4 管线层**                  | GLSL→SPIR-V→HLSL→DXBC 编译，Pipeline cache (IdentityHashMap)，Shader source cache (HashMap)                                                                                                                                                       | <br />                                                                                                                                                                                 |
+| **P5 交换链**                  | Dx12GpuSurface: DXGI flip-model swapchain, 支持 IMMEDIATE/MERCHANTABILITY/RALAXED present mode                                                                                                                                                  | <br />                                                                                                                                                                                 |
+| **P6 Draw 全链路**             | Dx12RenderPassBackend: setPipeline + pushDescriptors(UBO/SRV/TexelBuffer) + draw/drawIndexed/drawIndirect                                                                                                                                     | <br />                                                                                                                                                                                 |
+| **P15 日志分级**                | dbgLog(ERROR/WARN)/dbgLogInfo/INFO)/dbgLogDebug(DEBUG) 三级输出，DX12\_LOG\_VERBOSE=1 开启详细日志                                                                                                                                                       | <br />                                                                                                                                                                                 |
+| **P16 renderLevel 诊断**      | 帧计数器（每 30 帧）+ advanceGameTime/pause/native submit+present 日志                                                                                                                                                                                  | <br />                                                                                                                                                                                 |
+| **P17 绘制目标跟踪**              | activeColorTargetsTouched 向量 + dbgReadbackSurfacePixels() 每 30 帧采样，dx12ReadbackTexturePixels 读指定纹理                                                                                                                                            | <br />                                                                                                                                                                                 |
+| **P18 Surface Fence**       | per-backbuffer fence 追踪，acquireSurface 前检查 back buffer 是否仍被 GPU 使用                                                                                                                                                                            | <br />                                                                                                                                                                                 |
+| **P20 描述符偏移修复**             | pushDescriptors 根描述符表 GPU 地址加偏移，避免读取前帧残留描述符导致黑屏                                                                                                                                                                                               | <br />                                                                                                                                                                                 |
+| **P21 深度测试修复**              | 移除 depthClearFlag=0 的无条件 clear=1.0 回退（pre-clear 已由 MC 完成）；修复 reverse-Z 比较函数                                                                                                                                                                   | <br />                                                                                                                                                                                 |
+| **P22 描述符堆扩容**              | drawHeap 从 2 半区扩展到 4 半区，支持三帧并行飞行（fenceValue%4 交替写入）                                                                                                                                                                                           | <br />                                                                                                                                                                                 |
+| **BUG-01 semanticNames 修复** | `semanticNames` 补齐改用 `vertex.inputs().size()` 与 spvc remap 基准对齐                                                                                                                                                                               | <br />                                                                                                                                                                                 |
+| **LIGHTMAP-VFLIP 修复**       | 光贴图更新 pass（pipeline/lightmap）被 P31 flipY 判定排除 → GL bottom-up 内容写入方向与 terrain 采样相反，白天采到暗行（lightmapviz≈26-46、whitelight 探针恢复明亮、readback BMP 证实内容渐变正确但镜像）。修复：frag\_main 注入 `texCoord.y = 1.0f - texCoord.y;`（location 含 lightmap 且 !flipY 时自动生效） | <br />                                                                                                                                                                                 |
+| **Shader 编译自检**             | 内嵌 core/gui + core/position\_tex\_color 的 GLSL 源码，createDevice 时资源包未加载也可编译                                                                                                                                                                    | <br />                                                                                                                                                                                 |
+| **4 轮自测**                   | Java 资源(self-test)→命令层→管线→Surface 逐轮验证，任何失败立即终止并回退 OpenGL                                                                                                                                                                                     | <br />                                                                                                                                                                                 |
+| **D3D12 资源管理**              | AutoCloseable 模式 + TextureView 引用计数 + gPendingDeletes 延迟销毁                                                                                                                                                                                    | <br />                                                                                                                                                                                 |
+| **ModMenu 集成**              | Dx12Config + Dx12SettingsScreen + ModMenuApi entrypoint                                                                                                                                                                                       | <br />                                                                                                                                                                                 |
+| **AA 模式持久化**                | Properties 格式存储到 `config/gl4dx12.properties`，4 种模式 (None/FXAA/SMAA/TAA)                                                                                                                                                                       | <br />                                                                                                                                                                                 |
+| **异步渲染 Bug 修复**             | ✅ 已完成                                                                                                                                                                                                                                         | ASYNC-01（per-worker CPU-only 镜像堆）+ ASYNC-03（非阻塞 tryBeginFrame）+ ASYNC-04（SetEventOnCompletion 事件驱动）+ ASYNC-05（COM 资源主线程释放）+ ASYNC-09（CommandSignature 参数修复）+ ASYNC-10（PSO 边界切分 Bundle） |
+| **CS\_OWNDC 兼容性**           | ✅ 已完成                                                                                                                                                                                                                                         | Windows CS\_OWNDC 类窗口的 DX12 swapchain 创建失败修复                                                                                                                                           |
+| **shader 诊断探针**             | ✅ 已完成                                                                                                                                                                                                                                         | whitelight/uv2viz/lightmapviz 探针 + DIAG\_GRAY/UV2\_VIZ/LIGHTMAP\_VIZ/DUMP\_SHADER 等环境变量驱动                                                                                              |
+| **P66 设备能力检测**              | ✅ 已完成                                                                                                                                                                                                                                         | 优先请求 FL 12\_2（DX12 Ultimate），经 `ID3D12Device5` 检测 Raytracing Tier / Mesh Shader / VRS / Sampler Feedback，输出能力摘要日志                                                                      |
+| **P67 DXR 光追管线**            | ✅ 已完成                                                                                                                                                                                                                                         | BLAS → TLAS → RTPSO → `DispatchRays` + SBT → UAV 写回读回；单三角形冒烟测试 + 512×288 可见演示（棋盘地面 + 3 彩盒），输出叠加进光栅管线；`dxrSmokeTestStandalone` / `dxrDemoStandalone` 诊断入口                               |
+| **自定义视频设置界面**               | ✅ 已完成                                                                                                                                                                                                                                         | `Dx12VideoSettingsScreen`（775 行）替换原版 VideoSettingsScreen，RSO 深色主题（整屏面板/搜索栏/分组导航/选项行/底部按钮），直接读写原版 `OptionInstance`，"图形 API" 行灰化固定显示当前后端（DirectX 12）                                     |
 
 ### 启动日志关键输出
 
@@ -389,119 +357,88 @@ UAV 写回 → CopyTextureRegion → Map readback（CPU 验证）
 ### 自测失败时的行为
 
 任何一轮自测失败都会：
-1. 关闭已创建的 D3D12 设备
-2. 抛出 `BackendCreationException`
-3. Minecraft 自动回退到 OpenGL 渲染
-4. 日志中打印完整错误堆栈
 
 ### 额外诊断日志
 
 除上述标准输出外，还支持以下诊断手段：
-- **额外诊断日志**
-  - **分级日志**：`DX12_LOG_VERBOSE=1` 开启详细日志，同时写入 `%TEMP%\dx12-native.log`
-  - **3×3 采样读回**：`dbgReadbackSurfacePixels()` 每 30 帧采样中心 3×3 像素的 RGBA，用于验证 backbuffer 内容
-  - **纹理读回**：`dbgReadbackTexturePixels(tag)` 读取任意纹理并输出 3×3 采样 + 保存 BMP 文件（`dx12_dump_<tag>.bmp`）
-  - **帧计数器**：每 30 帧打印 submit/present 状态，方便判断渲染循环是否正常工作
-  - **pushDescriptors 诊断**：每帧首次 pushDescriptors 打印 binding 数量和 UBO/SRV 指针
-  - **深/读回诊断**：`dx12ReadbackBufferBytes()` 读回 UBO/CBV 原始字节用于调试；`DX12_DBG_DISABLE_DEPTH=1` 强制关闭深度测试
 
 ### 4 轮自测详解
 
-| 轮次 | 测试内容 | 失败原因示例 |
-|------|----------|-------------|
-| **1. Java 资源** | texture/buffer/sampler/view 创建 + map/unmap 读写 | DLL 加载失败、D3D12 初始化失败 |
-| **2. 命令层** | submit + fence wait + buffer copy readback + texture write/readback | 命令列表提交失败、copy 数据不匹配 |
-| **3. 管线** | core/gui + core/position_tex_color 全链路编译（GLSL→SPIR-V→HLSL→DXBC→PSO） | shaderc/spvc/D3DCompile 编译失败 |
-| **4. Surface** | swapchain 创建 → configure → acquire → blit → submit → present | HWND 无效、DXGI 创建 swapchain 失败 |
-
-## 已知问题
-
-| 问题 | 严重度 | 说明 | 状态 |
-|------|--------|------|------|
-| **`minecraft.level` 始终为 null** | ✅ 已修复 | level=null 根因已定位并修复，世界地形/区块/实体正常渲染（P30） |
-| **`beginRenderPass` activeColorTargets 重复 push_back** | 🟠 中 | L1701 和 L1767 两处均 push_back，导致 endRenderPass 回切多执行一次 barrier（幂等，当前无害） | 🔧 待修 |
-| **`toPrimitiveTopology` case 4 (TRIANGLES) 缺失** | 🟡 低 | switch 无 case 4，落入 default 返回 TRIANGLELIST（结果正确），但防御性不足 | 🔧 待修 |
-| **CBV offset 256 对齐未验证** | 🟡 低 | `pushDescriptors` 要求 offset 256 对齐，但未在 native 层断言；若 Java 侧传入未对齐值可能导致 shader 读到错误数据 | 🔧 待修 |
-| **`createFence` 使用全局队列 fence** | 🟠 中 | 多 encoder 场景下 fence 可能由其他 encoder 的 submit 提前完成 | 🔧 待修 |
-| **临时 encoder 与全局 fence 竞争** | 🟠 中 | `createBuffer(data)` 的临时 submit 会递增全局 `queueFenceValue`，可能与 `StagedVertexBuffer` fence 竞态 | 🔧 待修 |
-| **transientMemory queuedFrames 泄漏** | 🟡 低 | `transientMemory.close: queuedFrames=1` 每帧出现，表明 1 路 ubo ring buffer 未被回收 | � 待修 |
-| **`d3d12` 实验包（已迁移）** | 🔵 低 | `com.xgdt.dx12.d3d12.*` 是 JNA 探索的半成品，仍通过 JNI 调用，`close()` 是空操作 | ⚠️ 待清理 |
-| **大量调试日志残留** | 🔵 低 | `getStackTrace()`/高频打印散落在渲染路径，影响性能 | ⚠️ 待清理 |
-| **`ensureDevice` 无幂等保护** | 🟡 低 | 中途创建失败后重试会泄漏首次创建的所有 D3D12 资源 | ⚠️ 已知 |
-| **`dx12_mc_new.dll` 残留** | 🔵 低 | 旧版重命名 DLL 仍存在，需清理 | ⚠️ 待清理 |
+| 轮次             | 测试内容                                                                  | 失败原因示例                       |
+| -------------- | --------------------------------------------------------------------- | ---------------------------- |
+| **1. Java 资源** | texture/buffer/sampler/view 创建 + map/unmap 读写                         | DLL 加载失败、D3D12 初始化失败         |
+| **2. 命令层**     | submit + fence wait + buffer copy readback + texture write/readback   | 命令列表提交失败、copy 数据不匹配          |
+| **3. 管线**      | core/gui + core/position\_tex\_color 全链路编译（GLSL→SPIR-V→HLSL→DXBC→PSO） | shaderc/spvc/D3DCompile 编译失败 |
+| **4. Surface** | swapchain 创建 → configure → acquire → blit → submit → present          | HWND 无效、DXGI 创建 swapchain 失败 |
 
 ## 技术栈
 
-| 层级 | 技术 | 版本 |
-|------|------|------|
-| 游戏 | Minecraft | 26.2 |
-| 加载器 | Fabric Loader | 0.19.3 |
-| API | Fabric API | 0.156.0+26.2 |
-| Mixin | SpongePowered Mixin | 0.8.7 (via Fabric 0.17.3) |
-| 模组浏览器 | ModMenu | 20.0.1 |
-| 语言 | Java | 26 |
-| 原生层 | C++ D3D12 (JNI) | dx12_mc.dll（预编译） |
-| Shader 编译 | shaderc (GLSL→SPIR-V) | LWJGL shaderc |
-| Shader 反射 | spvc (SPIR-V→HLSL) | LWJGL spvc |
-| 依赖 | JNA | 5.17.0（预留，暂未用于生产） |
+| 层级        | 技术                    | 版本                        |
+| --------- | --------------------- | ------------------------- |
+| 游戏        | Minecraft             | 26.2                      |
+| 加载器       | Fabric Loader         | 0.20.1                   |
+| API       | Fabric API            | 0.156.0+26.2              |
+| Mixin     | SpongePowered Mixin   | 0.8.7 (via Fabric 0.17.3) |
+| 模组浏览器     | ModMenu               | 20.0.1                    |
+| 语言        | Java                  | 26                        |
+| 原生层       | C++ D3D12 (JNI)       | dx12\_mc.dll（预编译）         |
+| Shader 编译 | shaderc (GLSL→SPIR-V) | LWJGL shaderc             |
+| Shader 反射 | spvc (SPIR-V→HLSL)    | LWJGL spvc                |
+| 依赖        | JNA                   | 5.17.0（预留，暂未用于生产）         |
 
 ## 路线图
 
 ### P0-P33 + Async Phase 1（C++）: D3D12 后端核心层 ✅ 全部完成
 
-| 阶段 | 状态 | 说明 |
-|------|------|------|
-| **P0-P6: 原生层到 Draw 全链路** | ✅ | 完整 D3D12 设备/资源/命令/管线/表面/draw |
-| **P15-P28: 诊断增强** | ✅ | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级/图集渲染与坐标系适配 |
-| **P29-P33: NDC修复/世界渲染/Async C++** | ✅ | NDC Y-flip/level=null 根因修复/world terrain 正常渲染/Async Phase 1 C++ 基础设施 |
-| **BUG-01: semanticNames** | ✅ | 补齐逻辑与 spvc 基准对齐 |
-| **LIGHTMAP-VFLIP** | ✅ | 光贴图 Y-flip 注入修复，白天地形亮度正常 |
-| **自测通过** | ✅ | GUI + GUI_TEXTURED 管线 + surface blit + buffer copy + texture readback |
-| **Async 7 Bug 修复** | ✅ | ASYNC-01/03/04/05/09/10 全部修复 |
-
-### 🔜 后续优化
-
-| 任务 | 优先级 | 说明 |
-|------|--------|------|
-| **Async Phase 2: 2 线程并行** | 🔴 P0 | Worker 只录命令，主线程写描述符；需实现 Java 侧 async/* 包（BundleRecorder、AsyncDispatcher 等） |
-| **Async Phase 3: N 线程全量异步** | 🔜 待评估 | Per-worker 镜像堆 + 批量 CopyDescriptorsSimple + 完整 fence 管理 |
-| **BUG-01 重复 push_back 修复** | P2 | 删除 beginRenderPass 诊断循环中的重复 activeColorTargets.push_back |
-| **BUG-02 case 4 补齐** | P3 | toPrimitiveTopology 补全 TRIANGLES case |
-| **BUG-06 CBV 对齐验证** | P2 | native 层添加 offset%256 断言 |
-| **诊断日志降级** | P1 | 将高频 `getStackTrace()`/readback 改为条件日志（环境变量控制） |
-| **性能基准测试** | P1 | 对比 GL/Vulkan/D3D12 的 FPS、内存占用、GPU 利用率 |
+| 阶段                                | 状态 | 说明                                                                     |
+| --------------------------------- | -- | ---------------------------------------------------------------------- |
+| **P0-P6: 原生层到 Draw 全链路**          | ✅  | 完整 D3D12 设备/资源/命令/管线/表面/draw                                           |
+| **P15-P28: 诊断增强**                 | ✅  | 日志分级/帧计数/绘制跟踪/Surface fence/描述符偏移/深度测试/堆扩容/帧级瞬态RTV/高频日志降级/图集渲染与坐标系适配   |
+| **P29-P33: NDC修复/世界渲染/Async C++** | ✅  | NDC Y-flip/level=null 根因修复/world terrain 正常渲染/Async Phase 1 C++ 基础设施   |
+| **BUG-01: semanticNames**         | ✅  | 补齐逻辑与 spvc 基准对齐                                                        |
+| **LIGHTMAP-VFLIP**                | ✅  | 光贴图 Y-flip 注入修复，白天地形亮度正常                                               |
+| **自测通过**                          | ✅  | GUI + GUI\_TEXTURED 管线 + surface blit + buffer copy + texture readback |
+| **Async 7 Bug 修复**                | ✅  | ASYNC-01/03/04/05/09/10 全部修复                                           |
 
 ### 🎯 最终目标
 
-| 阶段 | 目标 | 状态 |
-|------|------|------|
-| **过渡方案** | 通过 GpuBackend 接口完全接管 Minecraft 渲染（当前阶段） | ✅ 已完成 |
-| **功能完整** | terrain/entity/particle 全量 shader 渲染正常 + Async Phase 1 Java 接入 | 🔜 进行中 |
-| **正式发行** | 通过官方渠道发布为 Minecraft 26.2+ 的 D3D12 后端模组 | 🔜 待实现 |
+| 阶段       | 目标                                                             | 状态     |
+| -------- | -------------------------------------------------------------- | ------ |
+| **过渡方案** | 通过 GpuBackend 接口完全接管 Minecraft 渲染（当前阶段）                        | ✅ 已完成  |
+| **功能完整** | terrain/entity/particle 全量 shader 渲染正常 + Async Phase 1 Java 接入 | ✅ 已完成 |
+| **正式发行** | 通过官方渠道发布为 Minecraft 26.2+ 的 D3D12 后端模组                         | ✅ 已完成 |
 
----
+***
+
 ### 如何编译
 
 #### 在编译之前你需要确保你的电脑上安装了MSVC编译器和cmake和Gradle编译器
 
 先安装cmake，然后执行以下命令编译项目：
+
 ```bash
 //在此之前先删除native目录下的 build 目录,确保编译的dll是最新的
 cd native
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
+
 编译的产物在这个路径下：
+
 ```bash
 \native\build\bin\Release\dx12_mc.dll
-``` 
+```
+
 把它复制到\fabric\src\main\resources下如有直接覆盖即可
 安装Gradle，然后执行以下命令编译：
+
 ```bash
 cd fabric
 gradlew clean build
 ```
+
 在这里找到你编译的模组文件
+
 ```bash
 \fabric\build\libs\gl4dx12-0.1.0.jar
 ```
@@ -513,8 +450,3 @@ gradlew clean build
 ## 许可证
 
 本项目采用 **Apache License 2.0** 协议。
-
-- 你可以自由使用、修改、分发本项目，包括商业用途。
-- 分发时必须保留本项目的版权声明、许可证文本和 NOTICE 文件中的归属信息。
-- 不得使用本项目的名称或作者名义为衍生品做背书或推广。
-- 详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

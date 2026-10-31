@@ -5,7 +5,7 @@
 // 输出：fx:0（RGBA16F）
 //
 // 天空像素（reverse-Z 下 depth == 0）程序化生成：
-//   1. 暗灰色暴风雨云层（移植体积云引擎，参数调暗）
+//   1. 暗灰色暴风雨云层（体积云引擎）
 //   2. 不规则光缝（大尺度 FBM 在云层中撕开对角裂口）
 //   3. 丁达尔光束（光缝沿太阳方向投射的锥形体积光）
 //   4. 光缝处的暖金色阳光（穿透云层的耀眼高光）
@@ -160,10 +160,9 @@ float3 hcAirFog(float3 color, float2 ndc, float depth,
 }
 
 // ---------------------------------------------------------------------------
-// 体积云引擎（移植自 Sunlit，参数调为暴风雨模式）
+// 体积云引擎
 // ---------------------------------------------------------------------------
 
-#define HC_EARTH_R            6371000.0
 #define HC_HEIGHT             (O_CLOUD_HEIGHT * 100.0)
 #define HC_CLOUD_SCALE_DOWN   (4200.0 / HC_HEIGHT)
 #define HC_THICKNESS          (O_CLOUD_THICK * 100.0)
@@ -193,7 +192,6 @@ float hcCloudDensity(float3 p, float3 wind, float heightFactor)
     float d3 = ivnoise3(q * (0.00025 * sizeScale));
     d = d * 0.82 + d3 * 0.18;
 
-    // 暴风雨云：阈值更低（更厚）、密度增益更大
     float threshold = lerp(0.55, 0.22, saturate(O_CLOUD_COVER));
     float density = saturate((d - threshold) * 3.8);
     return density * heightFactor;
@@ -254,10 +252,15 @@ float4 hcRealisticCloud(float3 baseColor, float3 atmosphere, float3 skyColorUp,
     {
         if (camPos.y < bottom || camPos.y > top)
         {
-            return float4(baseColor, 0.0);
+            // 相机在云层外且视线水平：仍尝试采样云层上方
+            tStart = 0.0;
+            tEnd = HC_MAX_DIST;
         }
-        tStart = 0.0;
-        tEnd = HC_MAX_DIST;
+        else
+        {
+            tStart = 0.0;
+            tEnd = HC_MAX_DIST;
+        }
     }
     else
     {
@@ -353,7 +356,6 @@ float3 godRayBeam(float3 viewDir, float3 sunDir, float3 camPos)
     float beamAmt = saturate(O_LIGHT_BEAM);
     if (beamAmt <= 0.001) return float3(0.0);
 
-    // 沿视线在云层中 march 5 步，采样光缝
     float totalGap = 0.0;
     float stepDist = 2000.0;
     for (int i = 0; i < 5; i++)
@@ -361,15 +363,13 @@ float3 godRayBeam(float3 viewDir, float3 sunDir, float3 camPos)
         float3 probe = camPos + viewDir * (stepDist * (float)(i + 1));
         totalGap += godRayGap(probe, sunDir, camPos);
     }
-    totalGap *= 0.2;  // 平均
+    totalGap *= 0.2;
 
     if (totalGap < 0.02) return float3(0.0);
 
-    // 锥形衰减：视线与太阳方向夹角越小，光束越亮
     float cosBeam = saturate(dot(viewDir, sunDir));
     float beamProfile = pow(cosBeam, lerp(8.0, 2.0, saturate(O_BEAM_SPREAD * 0.4)));
 
-    // 距离衰减（越远离光源越弱）
     float distFade = exp(-stepDist * 0.00012);
 
     float3 beamColor = float3(1.15, 0.92, 0.55);
@@ -445,17 +445,77 @@ float4 main(VSOutput input) : SV_TARGET
         return scene;
     }
 
-    // ====================================================================
-    // DEBUG: 纯色测试 — 红色=天空，蓝色=地面
-    // 如果画面变色（天空变红/地面变蓝），管线 OK
-    // 如果画面没变（原版），管线有问题
-    // ====================================================================
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float3 sunDir = SunDirection.xyz;
+    float day = saturate(SunDirection.w + 0.5);
+    float sunsetAmt = 1.0 - abs(day - 0.5) * 2.0;
+    sunsetAmt = saturate(sunsetAmt);
+
+    // =================================================================
+    // 天空像素
+    // =================================================================
     if (depth <= 1e-6)
     {
-        return float4(0.9, 0.1, 0.1, 1.0);  // 天空 → 红色
+        float3 rel4 = mul(InvViewProj, float4(ndc, 0.0, 1.0));
+        float3 worldDir = rel4.xyz / max(abs(rel4.w), 1e-4);
+        worldDir = normalize(worldDir);
+
+        // 1. 天空渐变（暴风雨暗灰）
+        float3 zenith, horizonCol;
+        float3 baseSky = stormSkyGradient(worldDir, sunDir, day, sunsetAmt,
+                                          zenith, horizonCol);
+
+        // 2. 环境大气光（冷灰蓝）
+        float3 atmosphere = lerp(zenith, horizonCol, 0.6) * 0.4;
+
+        // 3. 体积云
+        float4 cloud = hcRealisticCloud(baseSky, atmosphere, zenith,
+                                        worldDir, sunDir, uv);
+        float3 color = cloud.rgb;
+        float cloudAlpha = cloud.a;
+
+        // 4. 光缝处的阳光（HDR 高动态值）
+        float gap = godRayGap(CameraPosition.xyz + worldDir * 5000.0, sunDir,
+                              CameraPosition.xyz);
+        float sunUp = smoothstep(-0.05, 0.15, sunDir.y);
+        float sunIntensity = saturate(O_SUN_INTENSITY) * sunUp;
+
+        float3 sunCore = float3(1.4, 1.1, 0.65) * sunIntensity;
+        color += sunCore * (gap * gap * 0.7 + pow(gap, 3.0) * 1.5) * cloudAlpha;
+
+        // 5. 丁达尔光束
+        color += godRayBeam(worldDir, sunDir, CameraPosition.xyz);
+
+        // 6. 大气雾（空气透视）
+        color = hcAirFog(color, ndc, 0.0, sunDir, day, sunsetAmt);
+
+        return float4(color, 1.0);
     }
-    else
-    {
-        return float4(0.1, 0.1, 0.9, 1.0);  // 地面 → 蓝色
-    }
+
+    // =================================================================
+    // 地面 / 建筑像素
+    // =================================================================
+    float3 color = scene.rgb;
+
+    // 反投影到世界坐标
+    float4 rel4 = mul(InvViewProj, float4(ndc, depth, 1.0));
+    float3 worldPos = rel4.xyz / max(abs(rel4.w), 1e-4) + CameraPosition.xyz;
+
+    // 大气雾（空气透视）
+    color = hcAirFog(color, ndc, depth, sunDir, day, sunsetAmt);
+
+    // 云影斑驳光斑
+    float dapple = cloudDapple(worldPos, sunDir);
+    float shadowStrength = saturate(O_SHADOW_STORM) * 0.45;
+    float3 shadowTint = lerp(float3(0.42, 0.50, 0.68), float3(0.25, 0.30, 0.42),
+                             saturate(O_CLOUD_RAIN));
+    color *= lerp(1.0, shadowTint, dapple * shadowStrength);
+
+    // 光缝阳光投射到地面（暖金色）
+    float groundGap = godRayGap(worldPos, sunDir, CameraPosition.xyz);
+    float sunUp = smoothstep(-0.05, 0.15, sunDir.y);
+    float3 groundSun = float3(1.2, 0.95, 0.55) * saturate(O_SUN_INTENSITY) * sunUp;
+    color += groundSun * groundGap * groundGap * (1.0 - dapple) * 0.3;
+
+    return float4(color, 1.0);
 }
