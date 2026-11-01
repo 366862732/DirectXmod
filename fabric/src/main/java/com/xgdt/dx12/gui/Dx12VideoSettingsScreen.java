@@ -325,9 +325,8 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
         this.lodDistanceOption = new OptionInstance<>(
             "options.gl4dx12.lod_distance", OptionInstance.noTooltip(),
             (caption, value) -> Options.genericValueLabel(caption,
-                Component.literal(value + (this.isChinese() ? " 区块" : " chunks"))),
-            new OptionInstance.Enum<>(List.of(64, 128, 192, 256, 384, 512, 768, 1024),
-                Codec.INT),
+                Component.literal(this.lodDistanceLabel(value))),
+            new OptionInstance.IntRange(Dx12Config.LOD_DISTANCE_MIN, Dx12Config.LOD_DISTANCE_MAX),
             cfg.getLodDistance(),
             value -> cfg.setLodDistance(value));
         this.lodQualityOption = new OptionInstance<>(
@@ -344,6 +343,15 @@ public class Dx12VideoSettingsScreen extends VideoSettingsScreen {
             return chinese ? "开启（远视距 LOD）" : "On (Distant LOD)";
         }
         return chinese ? "关闭" : "Off";
+    }
+
+    private String lodDistanceLabel(int value) {
+        boolean chinese = this.isChinese();
+        if (value >= Dx12Config.LOD_DISTANCE_MAX) {
+            // 滑块拉到最大 = 不限制：渲染到几何预算允许的最远处
+            return chinese ? "不限制" : "Unlimited";
+        }
+        return value + (chinese ? " 区块" : " chunks");
     }
 
     private String lodQualityLabel(int value) {

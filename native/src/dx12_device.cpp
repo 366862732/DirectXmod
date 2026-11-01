@@ -129,13 +129,23 @@ UINT64 bufferCapacity(const Dx12Object* o) {
 // 全部 miss、走 CreateCommittedResource（D3D12 最小分配粒度 64KB + DEFAULT 堆
 // 零初始化，是主线程最大热点）。改为「不小于请求值即可复用」，底层资源更大无害
 // （消费方用的是 obj->size 逻辑长度）。
-Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
+Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity,
+    D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
     std::lock_guard<std::mutex> lk(gFreeBufferMutex);
     size_t best = SIZE_MAX;
     UINT64 bestCap = 0;
+    // P69：要求 UAV 的 buffer 绝不能复用没带 ALLOW_UNORDERED_ACCESS 的资源，
+    // 否则 CreateUnorderedAccessView / 状态过渡会失败。
+    const bool needUav =
+        (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
     for (size_t i = 0; i < gFreeBuffers.size(); ++i) {
         PooledBuffer& pb = gFreeBuffers[i];
         if (pb.obj->heapType != heapType) continue;
+        if (needUav && pb.obj->resource &&
+            (pb.obj->resource->GetDesc().Flags &
+             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+            continue;
+        }
         UINT64 cap = bufferCapacity(pb.obj);
         if (cap < capacity) continue;
         if (best == SIZE_MAX || cap < bestCap) {
@@ -1119,12 +1129,16 @@ Dx12Object* createBuffer(int usage, long long size, std::string& err) {
     if (size <= 0) { err = "buffer size must be positive"; return nullptr; }
 
     D3D12_HEAP_TYPE heapType = pickBufferHeapType(usage);
+    // P69：UAV buffer（compute 写入的顶点/计数缓冲）。DEFAULT 堆才允许 UAV。
+    D3D12_RESOURCE_FLAGS bufferFlags =
+        (usage & kBufferUsageUav) ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                  : D3D12_RESOURCE_FLAG_NONE;
 
     // P60：优先复用池中 (heapType, 容量) 完全匹配的空闲 buffer，跳过
     // CreateCommittedResource（D3D12 最小分配粒度 64KB + DEFAULT 堆零初始化）。
     // 池内对象均为 fence 已覆盖（GPU 不再引用）者，复用安全。
     const UINT64 alignedSize = ((UINT64)size + 255ULL) & ~255ULL;
-    if (Dx12Object* reused = takePooledBuffer(heapType, alignedSize)) {
+    if (Dx12Object* reused = takePooledBuffer(heapType, alignedSize, bufferFlags)) {
         reused->usage = usage;
         reused->size = size;
         reused->mappedPtr = nullptr;
@@ -1146,6 +1160,7 @@ Dx12Object* createBuffer(int usage, long long size, std::string& err) {
     desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = bufferFlags;
 
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Buffer;
@@ -2764,6 +2779,7 @@ bool compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageNam
         }
         err = std::string("D3DCompile(") + target + ") hr=0x" + hrText(hr)
             + (msg.empty() ? "" : "\n" + msg);
+        std::fprintf(stderr, "[dx12] COMPILE FAIL %s\n%s\n", target, msg.c_str());
         return false;
     }
     return true;
@@ -3304,6 +3320,243 @@ void destroyPipeline(Dx12Pipeline* pipeline) {
     DBG_LOG_DEBUG("destroyPipeline: pso=%p", (void*)pipeline);
     delete pipeline;
     DBG_LOG_DEBUG("destroyPipeline: done");
+}
+
+// ---------------------------------------------------------------------------
+// P69: compute 管线（LOD 网格 GPU 生成）
+//
+// 根签名：b0 = 32bit root constants（可选）+ 单个描述符表（SRV t0.. 然后 UAV u0..）。
+// 描述符堆按命令列表在飞槽位（3 段 ring）划分，dispatch 只覆写自己那段。
+// ---------------------------------------------------------------------------
+namespace {
+constexpr UINT kComputeRing = 3;
+}
+
+Dx12ComputePipeline* createComputePipeline(const void* csSource, int csLen,
+    int srvCount, int uavCount, int constCount, std::string& err) {
+    if (!ensureDevice(err)) return nullptr;
+    if (!csSource || csLen <= 0) { err = "createComputePipeline: empty source"; return nullptr; }
+    if (srvCount < 0 || uavCount < 0 || srvCount + uavCount > 60) {
+        err = "createComputePipeline: bad binding counts"; return nullptr;
+    }
+    if (constCount < 0) constCount = 0;
+    if (constCount > 64) { err = "createComputePipeline: constCount > 64"; return nullptr; }
+
+    std::vector<uint8_t> src((const uint8_t*)csSource,
+        (const uint8_t*)csSource + (size_t)csLen);
+    ComPtr<ID3DBlob> csBlob;
+    if (!compileShaderBytecode(src, "compute", "cs_5_1", csBlob, err)) return nullptr;
+
+    std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
+    ranges.reserve(2);
+    if (srvCount > 0) {
+        D3D12_DESCRIPTOR_RANGE r{};
+        r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        r.NumDescriptors = (UINT)srvCount;
+        r.BaseShaderRegister = 0;
+        r.RegisterSpace = 0;
+        r.OffsetInDescriptorsFromTableStart = 0;
+        ranges.push_back(r);
+    }
+    if (uavCount > 0) {
+        D3D12_DESCRIPTOR_RANGE r{};
+        r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        r.NumDescriptors = (UINT)uavCount;
+        r.BaseShaderRegister = 0;
+        r.RegisterSpace = 0;
+        r.OffsetInDescriptorsFromTableStart = (UINT)srvCount;
+        ranges.push_back(r);
+    }
+
+    std::vector<D3D12_ROOT_PARAMETER> params;
+    params.reserve(2);
+    if (constCount > 0) {
+        // 必须最先填 b0，索引固定为 0（dispatchCompute 依赖该顺序）。
+        D3D12_ROOT_PARAMETER p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p.Constants.ShaderRegister = 0;
+        p.Constants.RegisterSpace = 0;
+        p.Constants.Num32BitValues = (UINT)constCount;
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(p);
+    }
+    if (!ranges.empty()) {
+        D3D12_ROOT_PARAMETER p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable.NumDescriptorRanges = (UINT)ranges.size();
+        p.DescriptorTable.pDescriptorRanges = ranges.data();
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(p);
+    }
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = (UINT)params.size();
+    rsDesc.pParameters = params.empty() ? nullptr : params.data();
+    rsDesc.NumStaticSamplers = 0;
+    rsDesc.pStaticSamplers = nullptr;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+        &rsBlob, &rsErr);
+    if (FAILED(hr)) {
+        err = "createComputePipeline: D3D12SerializeRootSignature hr=0x" + hrText(hr);
+        return nullptr;
+    }
+    ComPtr<ID3D12RootSignature> rootSig;
+    hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+        rsBlob->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+    if (FAILED(hr)) {
+        err = "createComputePipeline: CreateRootSignature hr=0x" + hrText(hr);
+        return nullptr;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = rootSig.Get();
+    psoDesc.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
+    psoDesc.NodeMask = 0;
+    psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    ComPtr<ID3D12PipelineState> pso;
+    hr = gCtx.device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) {
+        err = "createComputePipeline: CreateComputePipelineState hr=0x" + hrText(hr);
+        return nullptr;
+    }
+
+    auto pipeline = std::make_unique<Dx12ComputePipeline>();
+    pipeline->rootSig = rootSig;
+    pipeline->pso = pso;
+    pipeline->srvCount = srvCount;
+    pipeline->uavCount = uavCount;
+    pipeline->constCount = constCount;
+    pipeline->inc = gCtx.device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    const UINT perSlot = (UINT)(srvCount + uavCount);
+    if (perSlot > 0) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = perSlot * kComputeRing;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = gCtx.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&pipeline->heap));
+        if (FAILED(hr)) {
+            err = "createComputePipeline: CreateDescriptorHeap hr=0x" + hrText(hr);
+            return nullptr;
+        }
+    }
+    dbgLogInfo("createComputePipeline: srv=%d uav=%d consts=%d pso=%p",
+        srvCount, uavCount, constCount, (void*)pipeline->pso.Get());
+    return pipeline.release();
+}
+
+void destroyComputePipeline(Dx12ComputePipeline* pipeline) {
+    DBG_LOG_DEBUG("destroyComputePipeline: pso=%p", (void*)pipeline);
+    delete pipeline;
+}
+
+bool dispatchCompute(CommandContext* ctx, Dx12ComputePipeline* pipeline,
+    const int* constants, int constCount, const ComputeBinding* srvs, int srvCount,
+    const ComputeBinding* uavs, int uavCount, int groupX, int groupY, int groupZ,
+    std::string& err) {
+    if (!ctx || !ctx->listOpen) { err = "dispatchCompute: no open command list"; return false; }
+    if (!pipeline || !pipeline->pso || !pipeline->rootSig) {
+        err = "dispatchCompute: invalid pipeline"; return false;
+    }
+    if (srvCount != pipeline->srvCount || uavCount != pipeline->uavCount) {
+        err = "dispatchCompute: binding count mismatch"; return false;
+    }
+    if (constCount < 0) constCount = 0;
+    if (constCount > pipeline->constCount) constCount = pipeline->constCount;
+    if (constCount > 0 && !constants) {
+        err = "dispatchCompute: null constants"; return false;
+    }
+    const UINT perSlot = (UINT)(pipeline->srvCount + pipeline->uavCount);
+    if (perSlot == 0 || !pipeline->heap) {
+        err = "dispatchCompute: pipeline has no bindings"; return false;
+    }
+
+    const UINT slot = ctx->currentListSlot % kComputeRing;
+    const UINT baseIndex = slot * perSlot;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+        pipeline->heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)baseIndex * pipeline->inc;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+        pipeline->heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += (UINT64)baseIndex * pipeline->inc;
+
+    // 写本槽位描述符：先 SRV（t0..），再 UAV（u0..）。
+    for (int i = 0; i < srvCount; ++i) {
+        const ComputeBinding& b = srvs[i];
+        if (!b.buffer || !b.buffer->resource || b.count <= 0 || b.stride <= 0) {
+            err = "dispatchCompute: invalid srv binding"; return false;
+        }
+        // UPLOAD/READBACK 堆的资源必须常驻初始态（GENERIC_READ / COPY_DEST），
+        // D3D12 不允许对它们发 state transition；只有 DEFAULT 堆才需要切到 SRV。
+        if (b.buffer->heapType == D3D12_HEAP_TYPE_DEFAULT) {
+            transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Buffer.FirstElement = (UINT64)b.offset;
+        sd.Buffer.NumElements = (UINT)b.count;
+        sd.Buffer.StructureByteStride = (UINT)b.stride;
+        sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = cpu;
+        dst.ptr += (SIZE_T)i * pipeline->inc;
+        gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(), &sd, dst);
+    }
+    for (int i = 0; i < uavCount; ++i) {
+        const ComputeBinding& b = uavs[i];
+        if (!b.buffer || !b.buffer->resource || b.count <= 0 || b.stride <= 0) {
+            err = "dispatchCompute: invalid uav binding"; return false;
+        }
+        transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = (UINT64)b.offset;
+        ud.Buffer.NumElements = (UINT)b.count;
+        ud.Buffer.StructureByteStride = (UINT)b.stride;
+        ud.Buffer.CounterOffsetInBytes = 0;
+        ud.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = cpu;
+        dst.ptr += (SIZE_T)(srvCount + i) * pipeline->inc;
+        gCtx.device->CreateUnorderedAccessView(b.buffer->resource.Get(), nullptr, &ud, dst);
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { pipeline->heap.Get() };
+    ctx->commandList->SetDescriptorHeaps(1, heaps);
+    ctx->commandList->SetComputeRootSignature(pipeline->rootSig.Get());
+    ctx->commandList->SetPipelineState(pipeline->pso.Get());
+    if (pipeline->constCount > 0) {
+        ctx->commandList->SetComputeRoot32BitConstants(0, (UINT)constCount,
+            constants, 0);
+    }
+    ctx->commandList->SetComputeRootDescriptorTable(
+        pipeline->constCount > 0 ? 1 : 0, gpu);
+    ctx->commandList->Dispatch(
+        (UINT)std::max(0, groupX), (UINT)std::max(0, groupY), (UINT)std::max(0, groupZ));
+
+    // UAV 写完之后立刻可能被当作顶点/索引缓冲读取（同一个命令列表内），
+    // 显式插 UAV barrier 保证写入对后续读取可见。
+    for (int i = 0; i < uavCount; ++i) {
+        if (!uavs[i].buffer || !uavs[i].buffer->resource) continue;
+        D3D12_RESOURCE_BARRIER ub{};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = uavs[i].buffer->resource.Get();
+        ctx->commandList->ResourceBarrier(1, &ub);
+    }
+
+    // 恢复图形描述符堆并作废 setPipeline 快速路径缓存（根签名已换成 compute 的）。
+    if (gCtx.drawHeap) {
+        ID3D12DescriptorHeap* drawHeaps[] = { gCtx.drawHeap.Get() };
+        ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
+    }
+    ctx->cachedPso = nullptr;
+    ctx->currentPipeline = nullptr;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

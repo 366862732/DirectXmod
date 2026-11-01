@@ -600,6 +600,37 @@ public final class Dx12Native {
     public static native void dx12DestroyPipeline(long pipeline);
 
     // -----------------------------------------------------------------------
+    // P69: compute pipeline（GPU 侧几何生成）
+    // -----------------------------------------------------------------------
+
+    /**
+     * 用 HLSL（入口 main，profile cs_5_1）创建 compute 管线。
+     *
+     * <p>根签名固定布局：{@code b0} = constCount 个 32bit 常量（constCount==0 时省略），
+     * 随后一张描述符表 = {@code t0..t(srvCount-1)} 再 {@code u0..u(uavCount-1)}。
+     *
+     * @return native Dx12ComputePipeline* handle；0 表示失败（错误已打到 stderr）
+     */
+    public static native long dx12CreateComputePipeline(byte[] cs, int srvCount,
+        int uavCount, int constCount);
+
+    /** 销毁 compute 管线。 */
+    public static native void dx12DestroyComputePipeline(long pipeline);
+
+    /**
+     * 录制一次 compute dispatch。
+     *
+     * <p>{@code srv} 与 {@code uav} 各四组数组按索引对齐（buffer handle / 元素偏移 / 元素个数 / 元素字节数），
+     * 均为结构化缓冲视图。dispatch 结束后 native 会自动恢复图形描述符堆。
+     *
+     * @return null 表示成功，否则为错误描述
+     */
+    public static native String dx12DispatchCompute(long ctx, long pipeline,
+        int[] constants, long[] srvBuffers, int[] srvOffsets, int[] srvCounts,
+        int[] srvStrides, long[] uavBuffers, int[] uavOffsets, int[] uavCounts,
+        int[] uavStrides, int groupX, int groupY, int groupZ);
+
+    // -----------------------------------------------------------------------
     // P5: surface (DXGI swapchain)
     // -----------------------------------------------------------------------
 

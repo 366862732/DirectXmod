@@ -585,6 +585,49 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 void destroyPipeline(Dx12Pipeline* pipeline);
 
 // ---------------------------------------------------------------------------
+// P69: compute 管线（供 LOD 网格在 GPU 侧生成）
+//
+// 根签名固定为两个参数：
+//   b0  = 32bit root constants（constCount 个 DWORD，constCount == 0 时省略）
+//   t0..t{srvCount-1} / u0..u{uavCount-1} 合并在同一张描述符表里
+// 描述符堆按命令列表在飞槽位（3 路 ring）划分，每次 dispatch 覆写自己那段，
+// 不会与另外两帧在飞行中的描述符冲突。
+// ---------------------------------------------------------------------------
+// Java 侧未占用的 GpuBuffer.USAGE_* 位：buffer 需带
+// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS 才能作 UAV。
+constexpr int kBufferUsageUav = 1024;
+
+struct Dx12ComputePipeline {
+    ComPtr<ID3D12RootSignature> rootSig;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap;  // SHADER_VISIBLE，kRing 段
+    UINT inc = 0;
+    int srvCount = 0;
+    int uavCount = 0;
+    int constCount = 0;
+};
+
+// csSource：完整 HLSL 源码（entry = main，target = cs_5_1）。
+Dx12ComputePipeline* createComputePipeline(const void* csSource, int csLen,
+    int srvCount, int uavCount, int constCount, std::string& err);
+void destroyComputePipeline(Dx12ComputePipeline* pipeline);
+
+// buffer 视图（结构化缓冲）。offset/count 以元素为单位，stride = 元素字节数。
+struct ComputeBinding {
+    Dx12Object* buffer = nullptr;
+    long long offset = 0;
+    long long count = 0;
+    int stride = 0;
+};
+
+// 一次 compute dispatch：写本帧 ring 段的描述符 → 状态过渡 → 设置根签名/PSO/
+// 常量/描述符表 → Dispatch → 恢复图形描述符堆（避免污染后续 draw）。
+bool dispatchCompute(CommandContext* ctx, Dx12ComputePipeline* pipeline,
+    const int* constants, int constCount, const ComputeBinding* srvs, int srvCount,
+    const ComputeBinding* uavs, int uavCount, int groupX, int groupY, int groupZ,
+    std::string& err);
+
+// ---------------------------------------------------------------------------
 // P22: Blit 管线（全屏四边形绘制，绕过 CopyTextureRegion 格式不兼容问题）
 // 源纹理（R32G32B32A32_FLOAT 等）→ backbuffer（R8G8B8A8_UNORM），由 GPU
 // 光栅器自动做格式转换，无需手动 resolve。

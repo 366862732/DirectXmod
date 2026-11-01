@@ -3,6 +3,7 @@ package com.xgdt.dx12.mixin;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.xgdt.dx12.dx12.DlssFrameCapture;
 import com.xgdt.dx12.dx12.Dx12Device;
+import com.xgdt.dx12.dx12.Dx12LodRenderer;
 import com.xgdt.dx12.dx12.Dx12ShaderPackRenderer;
 import com.xgdt.dx12.dx12.OfflineRender;
 import net.minecraft.client.DeltaTracker;
@@ -83,8 +84,9 @@ public class GameRendererShaderPackMixin {
             return;
         }
         // 深度尚未被原版清除：先让 DLSS 捕获世界深度并生成相机运动矢量，
-        // 再执行光影 pass 链（光影只读 scene_depth，不会破坏捕获结果）。
+        // 再补远视距 LOD（只读深度做遮挡、自身写深度），最后执行光影 pass 链。
         DlssFrameCapture.captureWorldDepth();
+        Dx12LodRenderer.getInstance().renderFrame();
         Dx12ShaderPackRenderer.getInstance().renderFrame();
     }
 }

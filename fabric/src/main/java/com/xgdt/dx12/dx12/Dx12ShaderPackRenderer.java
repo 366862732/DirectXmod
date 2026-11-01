@@ -661,8 +661,16 @@ public final class Dx12ShaderPackRenderer {
      * {@code InvViewProj} 若直接用它，天空/云不会和地形一起晃，走路时就会
      * 看到地平线相对地形“游”。这里按原版公式复现同一个矩阵。
      */
-    private static Matrix4f levelProjection(CameraRenderState camera, GameRenderState renderState) {
-        Matrix4f projection = new Matrix4f(camera.projectionMatrix);
+    static Matrix4f levelProjection(CameraRenderState camera, GameRenderState renderState) {
+        return applyCameraBob(new Matrix4f(camera.projectionMatrix), camera, renderState);
+    }
+
+    /**
+     * 把 {@code bobHurt} / {@code bobView} 叠加到给定投影矩阵上（投影本身由调用方决定，
+     * LOD 用同一个摆动、但更远的远平面重建）。
+     */
+    static Matrix4f applyCameraBob(Matrix4f projection, CameraRenderState camera,
+                                   GameRenderState renderState) {
         if (renderState == null) {
             return projection;
         }

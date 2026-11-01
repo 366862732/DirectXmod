@@ -1,17 +1,17 @@
 // ===========================================================================
-// StormBreak — 天空 pass（暴风雨前夕）
+// StormBreak - sky pass (pre-storm atmosphere)
 //
-// 输入：t0 = scene_color, t1 = scene_depth
-// 输出：fx:0（RGBA16F）
+// Inputs: t0 = scene_color, t1 = scene_depth
+// Output: fx:0 (RGBA16F)
 //
-// 天空像素（reverse-Z 下 depth == 0）程序化生成：
-//   1. 暗灰色暴风雨云层（体积云引擎）
-//   2. 不规则光缝（大尺度 FBM 在云层中撕开对角裂口）
-//   3. 丁达尔光束（光缝沿太阳方向投射的锥形体积光）
-//   4. 光缝处的暖金色阳光（穿透云层的耀眼高光）
-// 地面/建筑像素：云影斑驳光斑 + 大气雾
+// Sky pixels (depth == 0 under reverse-Z):
+//   1. Dark grey storm clouds (volumetric cloud engine)
+//   2. Irregular god-ray gap (large-scale FBM tears diagonal rift)
+//   3. Tyndall light beam (conical volumetric light through the gap)
+//   4. Warm golden sunlight at gap (punches through cloud layer, HDR)
+// Ground / building pixels: cloud dapple + aerial fog
 //
-// 设置项顺序必须与 shaders.properties 中 option.* 的书写顺序一致。
+// Option order must match option.* order in shaders.properties.
 // ===========================================================================
 
 Texture2D<float4> SceneColor : register(t0);
@@ -53,7 +53,7 @@ struct VSOutput
 };
 
 // ---------------------------------------------------------------------------
-// 噪声（整数格点哈希，大坐标稳定）
+// Noise (integer lattice hash, stable at large coordinates)
 // ---------------------------------------------------------------------------
 
 float ihash12(int2 p)
@@ -120,7 +120,7 @@ float fbm4(float2 p)
 }
 
 // ---------------------------------------------------------------------------
-// 大气雾（空气透视）
+// Aerial fog (atmospheric perspective)
 // ---------------------------------------------------------------------------
 
 static const float3 HC_ASF_BETA = float3(7.5e-5, 1.45e-4, 4.25e-4);
@@ -145,13 +145,13 @@ float3 hcAirFog(float3 color, float2 ndc, float depth,
     float opt = dist * strength * (1.0 + 2.5 * weather * weather);
     float3 absorb = exp(-opt * HC_ASF_BETA);
 
-    // 散射色：暴风雨前的冷灰蓝
+    // Scatter color: cold grey-blue before storm
     float3 scatter = lerp(float3(0.28, 0.32, 0.40), float3(0.45, 0.50, 0.58), skyLight);
     scatter *= skyLight;
 
-    // 太阳方向暖光（米氏前向散射近似）
+    // Sun-direction warm light (Mie forward-scattering approximation)
     float cosSunDir = dot(worldDir, sunDir);
-    float sunTint = lerp(float3(1.0, 0.96, 0.90), SunsetColor.rgb * 1.35, sunsetAmt);
+    float3 sunTint = lerp(float3(1.0, 0.96, 0.90), SunsetColor.rgb * 1.35, sunsetAmt);
     float phase = pow(saturate(cosSunDir), 8.0) * 0.55;
     float sunUp = smoothstep(-0.10, 0.06, sunDir.y);
     scatter += sunTint * phase * sunUp * skyLight;
@@ -160,7 +160,7 @@ float3 hcAirFog(float3 color, float2 ndc, float depth,
 }
 
 // ---------------------------------------------------------------------------
-// 体积云引擎
+// Volumetric cloud engine
 // ---------------------------------------------------------------------------
 
 #define HC_HEIGHT             (O_CLOUD_HEIGHT * 100.0)
@@ -188,12 +188,13 @@ float hcCloudDensity(float3 p, float3 wind, float heightFactor)
     float3 q = p + wind;
     q.y -= HC_HEIGHT;
 
-    float d = ivnoise2(q.xz * (0.00030 * sizeScale));
-    float d3 = ivnoise3(q * (0.00025 * sizeScale));
-    d = d * 0.82 + d3 * 0.18;
+    float d = ivnoise2(q.xz * (0.0032 * sizeScale));
+    float d3 = ivnoise3(q * (0.0028 * sizeScale));
+    float dDetail = ivnoise2(q.xz * (0.011 * sizeScale) + 41.7);
+    d = d * 0.55 + d3 * 0.25 + dDetail * 0.20;
 
-    float threshold = lerp(0.55, 0.22, saturate(O_CLOUD_COVER));
-    float density = saturate((d - threshold) * 3.8);
+    float threshold = lerp(0.62, 0.30, saturate(O_CLOUD_COVER));
+    float density = saturate((d - threshold) * 4.6);
     return density * heightFactor;
 }
 
@@ -217,26 +218,34 @@ float4 hcSampleRealisticCloud(float3 p, float3 sunDir, float3 atmosphere,
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
+    // March a few steps along -sunDir (light path) and sum density for
+    // transmittance. Without this the cloud is a flat color with no depth.
     float opticalDepth = 0.0;
-    float stepSize = 90.0 * (0.5 + noise);
-    for (int i = 0; i < 4; i++)
+    float stepSize = 60.0;
+    for (int i = 0; i < 3; i++)
     {
-        float t = stepSize * (float)(i + 1);
-        float3 sp = p + sunDir * t;
+        float3 sp = p - sunDir * (stepSize * (float)(i + 1));
         opticalDepth += hcCloudDensity(sp, wind, hcHeightFactor(sp.y)) * stepSize;
     }
     float sunTrans = exp2(-opticalDepth * HC_SAMPLE_DENSITY * 1.44269502);
 
-    float sunUp = saturate(sunDir.y * 4.0);
-    float3 sunTint = lerp(float3(0.85, 0.72, 0.50), float3(1.00, 0.88, 0.65),
-                          saturate(sunDir.y * 3.0));
-    float3 sunlight = sunTint * (0.08 + 0.12 * sunTrans) * sunUp;
+    // Two-tone light: top lit by sun (warm), bottom / shadow side darker.
+    // The relY split is what reads as "3D slab" to the eye.
+    float relY = p.y - (HC_HEIGHT + 0.5 * HC_THICKNESS);
+    float height = clamp(relY / HC_THICKNESS * 2.0, -1.0, 1.0);
+    float3 sunTint = lerp(float3(1.05, 0.92, 0.70), float3(1.40, 1.18, 0.82),
+                          saturate(sunDir.y * 1.6));
+    // Top surface (height > 0) catches the sun; bottom stays in shadow.
+    float3 litTint = sunTint * (0.50 + 0.85 * sunTrans)
+                       * (0.35 + 0.75 * saturate(height * 1.8 + 0.25));
+    // Shadow side: cold ambient, brighter where sun light bleeds through.
+    float3 shadeTint = atmosphere * (0.55 + 0.45 * (1.0 - saturate(height)))
+                         * (0.50 + 0.60 * sunTrans);
+    float3 col = lerp(shadeTint, litTint, saturate(height * 0.9 + 0.5));
 
-    float3 ambient = atmosphere * (0.30 + 0.35 * heightFactor);
-    float3 color = ambient + sunlight * 0.85;
-
-    color = lerp(color, atmosphere * 0.85, density * 0.25);
-    return float4(color, density);
+    // Denser cloud absorbs ambient light, fade to darker storm grey.
+    col = lerp(col, atmosphere * 0.50, density * 0.30);
+    return float4(col, density);
 }
 
 float4 hcRealisticCloud(float3 baseColor, float3 atmosphere, float3 skyColorUp,
@@ -250,17 +259,8 @@ float4 hcRealisticCloud(float3 baseColor, float3 atmosphere, float3 skyColorUp,
     float tEnd = 0.0;
     if (abs(worldDir.y) < 1e-4)
     {
-        if (camPos.y < bottom || camPos.y > top)
-        {
-            // 相机在云层外且视线水平：仍尝试采样云层上方
-            tStart = 0.0;
-            tEnd = HC_MAX_DIST;
-        }
-        else
-        {
-            tStart = 0.0;
-            tEnd = HC_MAX_DIST;
-        }
+        tStart = 0.0;
+        tEnd = HC_MAX_DIST;
     }
     else
     {
@@ -314,22 +314,22 @@ float4 hcRealisticCloud(float3 baseColor, float3 atmosphere, float3 skyColorUp,
 }
 
 // ---------------------------------------------------------------------------
-// 不规则光缝（God Ray Gap）
-//
-// 大尺度 FBM 在世界 XZ 平面撕开对角裂口，裂口处云层通透。
-// 采样点用 相机位置 + 视线方向 × 固定距离（世界锚定，不随视角晃动）。
+// God-ray gap: large-scale FBM tears a diagonal rift through clouds.
+// Sample point = camera + viewDir * fixed distance (world-anchored).
 // ---------------------------------------------------------------------------
 
 float godRayGap(float3 samplePoint, float3 sunDir, float3 camPos)
 {
-    float2 gapCoord = samplePoint.xz * 0.0004 + samplePoint.y * 0.00008;
+    // World-anchored: coordinates span the full world (thousands of blocks),
+    // so the gap pattern stays fixed to the terrain regardless of camera yaw.
+    float2 gapCoord = samplePoint.xz * 0.00012 + samplePoint.y * 0.00003;
 
     float mainGap = fbm4(gapCoord);
-    float ragged = ivnoise2(samplePoint.xz * 0.003) * 0.3;
+    float ragged = ivnoise2(samplePoint.xz * 0.0009) * 0.3;
     float gap = mainGap + ragged;
 
     float gapWidth = lerp(0.15, 0.60, saturate(O_BEAM_SPREAD));
-    float center = 0.5 + sin(gapCoord.x * 1.8) * 0.12;
+    float center = 0.5 + sin(gapCoord.x * 0.9) * 0.12;
     float dist = abs(gap - center);
     float openness = 1.0 - smoothstep(gapWidth * 0.3, gapWidth, dist);
 
@@ -342,86 +342,92 @@ float godRayGap(float3 samplePoint, float3 sunDir, float3 camPos)
 }
 
 // ---------------------------------------------------------------------------
-// 丁达尔光束（Volumetric God Rays）
-//
-// 相机在云层中沿视线方向 march，采样光缝通透度 × 锥形衰减。
-// 采样点 = camPos + viewDir × stepDist（世界锚定）。
+// Tyndall beam: march along view direction, sample gap openness * cone falloff.
+// Sample point = camPos + viewDir * stepDist (world-anchored).
 // ---------------------------------------------------------------------------
 
 float3 godRayBeam(float3 viewDir, float3 sunDir, float3 camPos)
 {
     float sunUp = smoothstep(-0.05, 0.15, sunDir.y);
-    if (sunUp < 0.01) return float3(0.0);
+    if (sunUp < 0.01) return float3(0.0, 0.0, 0.0);
 
     float beamAmt = saturate(O_LIGHT_BEAM);
-    if (beamAmt <= 0.001) return float3(0.0);
+    if (beamAmt <= 0.001) return float3(0.0, 0.0, 0.0);
 
+    // March the view ray through the world; at each probe read the gap
+    // openness at the actual world point. This ties the beam to terrain
+    // (camera rotates -> different probes -> the beam shifts in the world).
     float totalGap = 0.0;
-    float stepDist = 2000.0;
-    for (int i = 0; i < 5; i++)
+    float stepDist = 1500.0;
+    for (int i = 0; i < 6; i++)
     {
         float3 probe = camPos + viewDir * (stepDist * (float)(i + 1));
         totalGap += godRayGap(probe, sunDir, camPos);
     }
-    totalGap *= 0.2;
+    totalGap *= 0.16;
 
-    if (totalGap < 0.02) return float3(0.0);
+    if (totalGap < 0.02) return float3(0.0, 0.0, 0.0);
 
-    float cosBeam = saturate(dot(viewDir, sunDir));
-    float beamProfile = pow(cosBeam, lerp(8.0, 2.0, saturate(O_BEAM_SPREAD * 0.4)));
-
-    float distFade = exp(-stepDist * 0.00012);
-
-    float3 beamColor = float3(1.15, 0.92, 0.55);
-    float intensity = totalGap * beamProfile * distFade * beamAmt * 2.5 * sunUp;
+    // Brightness peaks where the ray actually passes through an open gap.
+    float3 beamColor = float3(1.25, 1.00, 0.60);
+    float distFade = exp(-stepDist * 0.00018);
+    float intensity = totalGap * distFade * beamAmt * 3.2 * sunUp;
 
     return beamColor * intensity;
 }
 
 // ---------------------------------------------------------------------------
-// 天空渐变（暴风雨模式）
+// Sky gradient (storm mode)
 // ---------------------------------------------------------------------------
 
-float3 stormSkyGradient(float3 rd, float3 sunDir, float day, float sunsetAmt,
-                       out float3 zenith, out float3 horizonCol)
+// Sky gradient result: separate zenith / horizon colors.
+struct SkyGradient
 {
-    float up = saturate(rd.y);
+    float3 zenith;
+    float3 horizon;
+};
 
+SkyGradient stormSkyGradient(float3 rd, float3 sunDir, float day, float sunsetAmt)
+{
     float3 skyTint = max(SkyColor.rgb, float3(0.02, 0.03, 0.06));
     float3 dayZenith = lerp(float3(0.025, 0.035, 0.070), skyTint * 0.35, 0.40);
     float3 dayHorizon = lerp(float3(0.18, 0.22, 0.30), skyTint * 0.70, 0.30);
 
-    zenith = lerp(float3(0.008, 0.010, 0.022), dayZenith, day);
-    horizonCol = lerp(float3(0.020, 0.025, 0.045), dayHorizon, day);
-
-    float h = pow(saturate(1.0 - up), 3.0);
-    float3 color = lerp(zenith, horizonCol, h);
+    float3 zenith = lerp(float3(0.008, 0.010, 0.022), dayZenith, day);
+    float3 horizonCol = lerp(float3(0.020, 0.025, 0.045), dayHorizon, day);
 
     float cosSun = saturate(dot(rd, sunDir));
     float glow = pow(cosSun, 12.0) * 0.06 + pow(cosSun, 64.0) * 0.12;
     float3 sunGlow = lerp(float3(0.80, 0.65, 0.40), SunsetColor.rgb * 0.9, sunsetAmt);
-    color += sunGlow * glow * day;
 
-    return color;
+    // Fold the sun glow back into the horizon band so callers keep the HDR tint.
+    SkyGradient result;
+    result.zenith = zenith;
+    result.horizon = horizonCol + sunGlow * glow * day;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
-// 云影斑驳光斑（Screen-Space Dapple）
+// Cloud dapple (ground/building shading): low-frequency world-space noise so
+// the cloud-shadow pattern stays anchored to the terrain (not the camera).
 // ---------------------------------------------------------------------------
 
-float cloudDapple(float3 worldPos, float3 sunDir)
+float cloudDapple(float2 uv, float3 worldPos, float3 sunDir)
 {
-    float shadowShift = sunDir.x * 800.0 - sunDir.z * 600.0;
-    float2 dappleCoord = worldPos.xz * 0.0008 + shadowShift;
+    // World-space low-frequency layer. Coordinate spans thousands of blocks,
+    // so the patch pattern is stable across camera yaw / bob (no flicker).
+    float2 wp = worldPos.xz * 0.0004 + worldPos.y * 0.0001;
+    float big  = ivnoise2(wp * 1.4 + 7.1);
+    float mid  = ivnoise2(wp * 3.7 + 19.7);
 
-    float big   = fbm4(dappleCoord);
-    float mid   = ivnoise2(dappleCoord * 3.1 + 5.2);
-    float fine  = ivnoise2(dappleCoord * 8.7 + 13.1);
+    float dapple = big * 0.7 + mid * 0.3;
+    float threshold = 0.44;
+    float mask = 1.0 - smoothstep(threshold - 0.05, threshold + 0.05, dapple);
 
-    float dapple = big * 0.55 + mid * 0.30 + fine * 0.15;
-
-    float threshold = 0.42;
-    float mask = 1.0 - smoothstep(threshold - 0.06, threshold + 0.04, dapple);
+    // Fade with distance to camera so the shadow reads as "cloud overhead"
+    // nearby and dissolves into the fog at the horizon.
+    float dist = length(worldPos - CameraPosition.xyz);
+    mask *= 1.0 - smoothstep(800.0, 2400.0, dist);
 
     float gap = godRayGap(worldPos, sunDir, CameraPosition.xyz);
     mask *= 1.0 - gap * 0.7;
@@ -430,7 +436,7 @@ float cloudDapple(float3 worldPos, float3 sunDir)
 }
 
 // ---------------------------------------------------------------------------
-// 主函数
+// Main
 // ---------------------------------------------------------------------------
 
 float4 main(VSOutput input) : SV_TARGET
@@ -448,74 +454,79 @@ float4 main(VSOutput input) : SV_TARGET
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     float3 sunDir = SunDirection.xyz;
     float day = saturate(SunDirection.w + 0.5);
-    float sunsetAmt = 1.0 - abs(day - 0.5) * 2.0;
-    sunsetAmt = saturate(sunsetAmt);
+    float sunsetAmt = saturate(1.0 - abs(day - 0.5) * 2.0);
 
-    // =================================================================
-    // 天空像素
-    // =================================================================
+    // =============== Sky pixels ===============
     if (depth <= 1e-6)
     {
-        float3 rel4 = mul(InvViewProj, float4(ndc, 0.0, 1.0));
+        float4 rel4 = mul(InvViewProj, float4(ndc, 0.0, 1.0));
         float3 worldDir = rel4.xyz / max(abs(rel4.w), 1e-4);
         worldDir = normalize(worldDir);
 
-        // 1. 天空渐变（暴风雨暗灰）
-        float3 zenith, horizonCol;
-        float3 baseSky = stormSkyGradient(worldDir, sunDir, day, sunsetAmt,
-                                          zenith, horizonCol);
+        // 1. Sky gradient (storm grey)
+        SkyGradient skyGrad = stormSkyGradient(worldDir, sunDir, day, sunsetAmt);
+        float3 zenith = skyGrad.zenith;
+        float3 horizonCol = skyGrad.horizon;
+        float3 baseSky = lerp(zenith, horizonCol, pow(saturate(1.0 - worldDir.y), 3.0));
 
-        // 2. 环境大气光（冷灰蓝）
+        // 2. Ambient atmosphere (cold grey-blue)
         float3 atmosphere = lerp(zenith, horizonCol, 0.6) * 0.4;
 
-        // 3. 体积云
+        // 3. Volumetric clouds
         float4 cloud = hcRealisticCloud(baseSky, atmosphere, zenith,
                                         worldDir, sunDir, uv);
         float3 color = cloud.rgb;
         float cloudAlpha = cloud.a;
 
-        // 4. 光缝处的阳光（HDR 高动态值）
-        float gap = godRayGap(CameraPosition.xyz + worldDir * 5000.0, sunDir,
-                              CameraPosition.xyz);
+        // 4. Sunlight through gap (HDR). Anchored to the world point where the
+        // ray crosses the cloud band, so the bright shaft is fixed to terrain.
+        float3 camPos = CameraPosition.xyz;
+        float slabMid = HC_HEIGHT + 0.5 * HC_THICKNESS;
+        float tGap = (slabMid - camPos.y) / max(abs(worldDir.y), 0.08);
+        tGap = clamp(tGap, 0.0, HC_MAX_DIST);
+        float gapPoint = camPos + worldDir * max(tGap, 400.0);
+        float gap = godRayGap(gapPoint, sunDir, camPos);
         float sunUp = smoothstep(-0.05, 0.15, sunDir.y);
-        float sunIntensity = saturate(O_SUN_INTENSITY) * sunUp;
+        // Keep the full 0..5 slider as HDR intensity (no saturate clamp),
+        // so the gap can punch far above the terrain's own brightness.
+        float sunIntensity = O_SUN_INTENSITY * sunUp;
 
-        float3 sunCore = float3(1.4, 1.1, 0.65) * sunIntensity;
-        color += sunCore * (gap * gap * 0.7 + pow(gap, 3.0) * 1.5) * cloudAlpha;
+        float3 sunCore = float3(2.4, 1.85, 1.05) * sunIntensity;
+        // Bright core at the gap, soft halo around it.
+        float core = gap * gap;
+        float halo = pow(gap, 4.0);
+        color += sunCore * (core * 1.6 + halo * 2.8) * (0.35 + 0.65 * cloudAlpha);
 
-        // 5. 丁达尔光束
-        color += godRayBeam(worldDir, sunDir, CameraPosition.xyz);
+        // 5. Tyndall beam
+        color += godRayBeam(worldDir, sunDir, camPos);
 
-        // 6. 大气雾（空气透视）
+        // 6. Aerial fog
         color = hcAirFog(color, ndc, 0.0, sunDir, day, sunsetAmt);
 
         return float4(color, 1.0);
     }
 
-    // =================================================================
-    // 地面 / 建筑像素
-    // =================================================================
+    // =============== Ground / building pixels ===============
     float3 color = scene.rgb;
 
-    // 反投影到世界坐标
     float4 rel4 = mul(InvViewProj, float4(ndc, depth, 1.0));
     float3 worldPos = rel4.xyz / max(abs(rel4.w), 1e-4) + CameraPosition.xyz;
 
-    // 大气雾（空气透视）
+    // Aerial fog
     color = hcAirFog(color, ndc, depth, sunDir, day, sunsetAmt);
 
-    // 云影斑驳光斑
-    float dapple = cloudDapple(worldPos, sunDir);
-    float shadowStrength = saturate(O_SHADOW_STORM) * 0.45;
+    // Cloud dapple
+    float dapple = cloudDapple(uv, worldPos, sunDir);
+    float shadowStrength = saturate(O_SHADOW_STORM);
     float3 shadowTint = lerp(float3(0.42, 0.50, 0.68), float3(0.25, 0.30, 0.42),
                              saturate(O_CLOUD_RAIN));
     color *= lerp(1.0, shadowTint, dapple * shadowStrength);
 
-    // 光缝阳光投射到地面（暖金色）
+    // Sunlight through gap projected onto ground (warm gold, HDR).
     float groundGap = godRayGap(worldPos, sunDir, CameraPosition.xyz);
     float sunUp = smoothstep(-0.05, 0.15, sunDir.y);
-    float3 groundSun = float3(1.2, 0.95, 0.55) * saturate(O_SUN_INTENSITY) * sunUp;
-    color += groundSun * groundGap * groundGap * (1.0 - dapple) * 0.3;
+    float3 groundSun = float3(1.7, 1.35, 0.80) * O_SUN_INTENSITY * sunUp;
+    color += groundSun * groundGap * groundGap * (1.0 - dapple) * 0.5;
 
     return float4(color, 1.0);
 }

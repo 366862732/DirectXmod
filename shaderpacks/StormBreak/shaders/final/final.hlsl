@@ -1,16 +1,16 @@
 // ===========================================================================
-// StormBreak — 最终调色 pass
+// StormBreak - final tone mapping pass
 //
-// 输入：t0 = fx:0 (sky), t1 = fx:1 (raytrace shadow), t2 = scene_depth
-// 输出：scene_color
+// Inputs: t0 = fx:0 (sky), t1 = fx:1 (raytrace shadow), t2 = scene_depth
+// Output: scene_color
 //
-// 处理流程：
-//   1. sRGB → 线性空间
-//   2. 光追阴影 PCF 软边缘
-//   3. 冷暖色彩分离（阴影冷蓝 vs 高光暖金）
-//   4. Filmic 色调映射
-//   5. 对比度 / 饱和度 / 暗角 / 锐化
-//   6. 线性 → sRGB
+// Pipeline:
+//   1. sRGB -> linear
+//   2. Raytrace shadow PCF soft edges
+//   3. Cold/warm color split (cold shadows vs warm highlights)
+//   4. Filmic tone mapping (ACES approx)
+//   5. Contrast / saturation / vignette / sharpen
+//   6. linear -> sRGB
 // ===========================================================================
 
 Texture2D<float4> InColor : register(t0);
@@ -20,7 +20,7 @@ SamplerState ShadowSampler : register(s1);
 Texture2D<float> SceneDepth : register(t2);
 SamplerState SceneDepthSampler : register(s2);
 
-// [Options[0..5]] — 与 shaders.properties 声明顺序一致
+// [Options[0..5]] - must match shaders.properties declaration order
 #define O_BRIGHTNESS    (Options[0].x)
 #define O_SATURATION    (Options[0].y)
 #define O_CONTRAST      (Options[0].z)
@@ -36,7 +36,7 @@ struct VSOutput
 };
 
 // ---------------------------------------------------------------------------
-// 辅助函数
+// Helpers
 // ---------------------------------------------------------------------------
 
 float3 srgbToLinear(float3 c)
@@ -49,22 +49,25 @@ float3 linearToSrgb(float3 c)
     return pow(saturate(c), float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
 }
 
-// ACES 近似 Filmic 色调映射
+// ACES tone mapping fit (Narkowicz 2015). Better HDR headroom than the
+// filmic curve: values up to ~5x white still show separation.
 float3 filmicToneMap(float3 x)
 {
-    const float3 A = float3(2.51, 2.43, 2.45);
-    const float3 B = float3(0.03, 0.027, 0.025);
-    const float3 C = float3(2.43, 2.40, 2.39);
-    const float3 D = float3(0.59, 0.55, 0.50);
-    const float3 E = float3(0.14, 0.125, 0.108);
+    const float A = 2.51;
+    const float B = 0.03;
+    const float C = 2.43;
+    const float D = 0.59;
+    const float E = 0.14;
+    // Apply per-channel: ACES fit has enough headroom to keep HDR highlights
+    // distinct (clouds can reach 4~8 in linear space before this pass).
     return saturate((x * (A * x + B)) / (x * (C * x + D) + E));
 }
 
-// PCF 阴影采样（3×3 软边缘）
+// PCF shadow sampling (3x3 soft edges)
 float sampleShadowPCF(float2 uv, float depth)
 {
     float2 texel = 1.0 / float2(300.0, 300.0);
-    // 近处阴影边缘锐利，远处柔和
+    // Near = sharp, far = soft
     float blur = lerp(0.7, 4.5, saturate(depth * 5.0));
     float2 off = texel * blur;
 
@@ -80,38 +83,37 @@ float sampleShadowPCF(float2 uv, float depth)
 }
 
 // ---------------------------------------------------------------------------
-// 冷暖色彩分离
+// Cold/warm color split
 // ---------------------------------------------------------------------------
 
 float3 colorSplit(float3 color, float shadowMask, float warmthAmt)
 {
-    float3 coldTint = float3(0.88, 0.94, 1.10);
-    float3 warmTint = float3(1.08, 1.02, 0.88);
+    float3 coldTint = float3(0.88, 0.94, 1.10);  // shadows cool blue
+    float3 warmTint = float3(1.08, 1.02, 0.88);  // highlights warm gold
 
-    float3 result = color;
-    result = lerp(result, result * coldTint, shadowMask * warmthAmt);
-    result = lerp(result, result * warmTint, (1.0 - shadowMask) * warmthAmt * 0.3);
+    color = lerp(color, color * coldTint, shadowMask * warmthAmt);
+    color = lerp(color, color * warmTint, (1.0 - shadowMask) * warmthAmt * 0.3);
 
-    return result;
+    return color;
 }
 
 // ---------------------------------------------------------------------------
-// 主函数
+// Main
 // ---------------------------------------------------------------------------
 
 float4 main(VSOutput input) : SV_TARGET
 {
     float2 uv = input.uv;
 
-    // 1. 采样输入
+    // 1. Sample inputs
     float4 skyOut = InColor.SampleLevel(InSampler, uv, 0);
     float depth = SceneDepth.SampleLevel(SceneDepthSampler, uv, 0);
     float shadow = sampleShadowPCF(uv, depth);
 
-    // 2. sRGB → 线性
+    // 2. sRGB -> linear
     float3 color = srgbToLinear(skyOut.rgb);
 
-    // 3. 光追阴影（仅对深度 > 0 的像素生效）
+    // 3. Raytrace shadow (only for depth > 0)
     float shadowMask = 0.0;
     if (depth > 1e-6)
     {
@@ -120,35 +122,35 @@ float4 main(VSOutput input) : SV_TARGET
         color = lerp(color, color * shadowColor, shadowMask * 0.7);
     }
 
-    // 4. 曝光
-    color *= saturate(O_EXPOSURE);
+    // 4. Exposure (slider 0.5–2.0, not clamped)
+    color *= O_EXPOSURE;
 
-    // 5. 冷暖色彩分离
+    // 5. Cold/warm split
     color = colorSplit(color, shadowMask, saturate(O_WARMTH));
 
-    // 6. Filmic 色调映射
+    // 6. Contrast S-curve in linear space, before tone mapping
+    float contrast = saturate(O_CONTRAST);
+    color = lerp(color, (color - 0.5) * (1.0 + contrast * 0.8) + 0.5, contrast);
+
+    // 7. ACES tone mapping (preserves HDR highlights up to ~5x white)
     color = filmicToneMap(color);
 
-    // 7. 对比度（柔和 S 曲线）
-    float contrast = saturate(O_CONTRAST);
-    color = lerp(color, (color - 0.5) * (1.0 + contrast * 0.5) + 0.5, contrast);
-
-    // 8. 饱和度
+    // 8. Saturation
     float sat = saturate(O_SATURATION);
     float lum = dot(color, float3(0.299, 0.587, 0.114));
-    color = lerp(float3(lum), color, sat);
+    color = lerp(float3(lum, lum, lum), color, sat);
 
-    // 9. 暗角
+    // 9. Vignette
     float vig = saturate(O_VIGNETTE);
     float2 vigUV = (uv - 0.5) * 2.0;
     float vigMask = 1.0 - dot(vigUV, vigUV) * vig * 0.5;
     color *= clamp(vigMask, 0.0, 1.0);
 
-    // 10. 暗部抬升
+    // 10. Shadow lift
     float lift = saturate(O_SHADOW_LIFT);
     color = max(color, lift * color + lift * 0.01);
 
-    // 11. 线性 → sRGB
+    // 11. linear -> sRGB
     color = linearToSrgb(color);
 
     return float4(color, 1.0);

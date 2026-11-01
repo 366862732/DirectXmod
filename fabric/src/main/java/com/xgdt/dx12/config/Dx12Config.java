@@ -34,6 +34,11 @@ public class Dx12Config {
     private static final String KEY_LOD_DISTANCE = "lod_distance";
     private static final String KEY_LOD_QUALITY = "lod_quality";
 
+    /** LOD 距离滑块的下限（区块）。 */
+    public static final int LOD_DISTANCE_MIN = 32;
+    /** LOD 距离滑块的上限（区块）；取该值表示「不限制」，即渲染到几何预算允许的最远处。 */
+    public static final int LOD_DISTANCE_MAX = 1024;
+
     private static Dx12Config instance;
     private final Properties props = new Properties();
     private final Path configPath;
@@ -69,7 +74,7 @@ public class Dx12Config {
     private int xessQuality = 1;
     /** LOD 远视距开关：0 = 关闭，1 = 开启。 */
     private int lodEnabled = 0;
-    /** LOD 渲染距离（区块数，32..1024）：超出原版视距的部分用简化网格绘制。 */
+    /** LOD 渲染距离（区块，{@link #LOD_DISTANCE_MIN}..{@link #LOD_DISTANCE_MAX}）；上限表示不限制。 */
     private int lodDistance = 256;
     /** LOD 网格精度档位：0 = 低（每 4 区块合并），1 = 中（每 2 区块），2 = 高（每区块）。 */
     private int lodQuality = 1;
@@ -213,7 +218,7 @@ public class Dx12Config {
     public int getLodDistance() { return lodDistance; }
 
     public void setLodDistance(int distance) {
-        this.lodDistance = Math.max(32, Math.min(1024, distance));
+        this.lodDistance = Math.max(LOD_DISTANCE_MIN, Math.min(LOD_DISTANCE_MAX, distance));
         props.setProperty(KEY_LOD_DISTANCE, String.valueOf(this.lodDistance));
         save();
     }
@@ -305,7 +310,7 @@ public class Dx12Config {
                 xessQuality = Math.max(0, Math.min(4,
                     parseInt(props.getProperty(KEY_XESS_QUALITY, "1"), 1)));
                 lodEnabled = parseInt(props.getProperty(KEY_LOD_ENABLED, "0"), 0) == 1 ? 1 : 0;
-                lodDistance = Math.max(32, Math.min(1024,
+                lodDistance = Math.max(LOD_DISTANCE_MIN, Math.min(LOD_DISTANCE_MAX,
                     parseInt(props.getProperty(KEY_LOD_DISTANCE, "256"), 256)));
                 lodQuality = Math.max(0, Math.min(2,
                     parseInt(props.getProperty(KEY_LOD_QUALITY, "1"), 1)));
