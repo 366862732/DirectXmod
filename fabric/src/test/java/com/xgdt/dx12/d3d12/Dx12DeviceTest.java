@@ -140,6 +140,25 @@ public class Dx12DeviceTest {
     }
 
     @Test
+    @Order(10)
+    void testVoxelGraphicsShadersCompile() throws Exception {
+        java.lang.reflect.Method create = Class.forName("com.xgdt.dx12.dx12.Dx12LodRenderer")
+            .getDeclaredMethod("createVoxelPipeline", int.class);
+        create.setAccessible(true);
+        String failure = null;
+        long handle = 0L;
+        try {
+            handle = (Long) create.invoke(null, 6);
+        } catch (Throwable t) {
+            failure = (t.getCause() != null ? t.getCause() : t).toString();
+        }
+        System.out.println("[lod-voxel] handle=" + handle + " failure=" + failure);
+        assertNull(failure, "LOD voxel pipeline compile/create failed: " + failure);
+        assertNotEquals(0L, handle, "LOD voxel pipeline handle must be non-zero");
+        Dx12Native.dx12DestroyPipeline(handle);
+    }
+
+    @Test
     @Order(8)
     void testRenderLoop() {
         final int W = 640;

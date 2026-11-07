@@ -25,32 +25,55 @@ class LodVoxelMesherTest {
     /** 一个小方块集合 → VoxelChunk 的简易构造器。 */
     private static final class Builder {
         private final Map<Integer, Integer> cells = new HashMap<>();
+        private final Map<Integer, String> cellNames = new HashMap<>();
         private int topY = MIN_Y;
 
         Builder put(int x, int y, int z, int rgb) {
-            // blocks 的下标是「区块内 y」，不是绝对 y
-            this.cells.put(((y - MIN_Y) * 16 + z) * 16 + x, rgb);
+            return put(x, y, z, rgb, "minecraft:stone");
+        }
+
+        Builder put(int x, int y, int z, int rgb, String blockName) {
+            int key = ((y - MIN_Y) * 16 + z) * 16 + x;
+            this.cells.put(key, rgb);
+            this.cellNames.put(key, blockName);
             this.topY = Math.max(this.topY, y);
             return this;
         }
 
         LodRegionCache.VoxelChunk build() {
             short[] blocks = new short[16 * 16 * HEIGHT];
-            int[] palette = new int[this.cells.size() + 1];
-            palette[0] = -1;
+            // 先收集所有不重复的 (rgb, name) 对
+            Map<String, Integer> unique = new HashMap<>();
             int next = 1;
-            Map<Integer, Integer> colorToIndex = new HashMap<>();
-            for (Map.Entry<Integer, Integer> entry : this.cells.entrySet()) {
-                Integer index = colorToIndex.get(entry.getValue());
-                if (index == null) {
-                    index = next;
-                    palette[next++] = entry.getValue();
-                    colorToIndex.put(entry.getValue(), index);
+            for (int key : this.cells.keySet()) {
+                int rgb = this.cells.get(key);
+                String name = this.cellNames.get(key);
+                String compoundKey = rgb + "\0" + name;
+                if (!unique.containsKey(compoundKey)) {
+                    unique.put(compoundKey, next++);
                 }
-                blocks[entry.getKey()] = (short) (int) index;
+            }
+            int paletteSize = next;
+            int[] palette = new int[paletteSize];
+            String[] paletteNames = new String[paletteSize];
+            palette[0] = -1;
+            paletteNames[0] = null;
+            int idx = 1;
+            for (Map.Entry<String, Integer> entry : unique.entrySet()) {
+                int rgb = Integer.parseInt(entry.getKey().split("\0")[0]);
+                String name = entry.getKey().split("\0")[1];
+                palette[idx] = rgb;
+                paletteNames[idx] = name;
+                idx++;
+            }
+            for (int key : this.cells.keySet()) {
+                int rgb = this.cells.get(key);
+                String name = this.cellNames.get(key);
+                int paletteIdx = unique.get(rgb + "\0" + name);
+                blocks[key] = (short) paletteIdx;
             }
             return new LodRegionCache.VoxelChunk(MIN_Y, HEIGHT, this.topY,
-                java.util.Arrays.copyOf(palette, next), blocks);
+                palette, paletteNames, blocks);
         }
     }
 

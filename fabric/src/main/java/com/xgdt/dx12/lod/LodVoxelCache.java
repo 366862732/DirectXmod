@@ -168,7 +168,15 @@ public final class LodVoxelCache {
             int gen = this.generation.get();
             int ax = this.anchorX;
             int az = this.anchorZ;
-            LodRegionCache.VoxelChunk chunk = LodRegionCache.getInstance().readVoxel(key.x(), key.z());
+            LodRegionCache regionCache = LodRegionCache.getInstance();
+            // 图集 UV 映射未就绪时不建网：UV 会烘进顶点并被缓存复用，启动早期
+            // spriteUvMap 还是空的，此时建网整块会落到未命中回退位置，之后映射补齐
+            // 相机往里走就「外圈先闪一片再跳变」。等就绪再建一次即可。
+            if (!regionCache.isSpriteUvReady()) {
+                this.completed.incrementAndGet();
+                return;
+            }
+            LodRegionCache.VoxelChunk chunk = regionCache.readVoxel(key.x(), key.z());
             LodVoxelMesher.Mesh mesh;
             if (chunk == null) {
                 // 区块不存在或读盘失败：先记成空，避免反复重读同一个未生成的区块
@@ -178,8 +186,8 @@ public final class LodVoxelCache {
                 }
             } else {
                 // 顶点写成「世界坐标 − 锚点」：着色器里再用 CameraPos 做相机相对变换。
-                // 锚点在 16384 方块网格上，float32 在这个量级仍有毫米级精度。
-                mesh = LodVoxelMesher.mesh(chunk, key.x(), key.z(), ax, az, key.shift());
+                // 传入 regionCache 让 mesher 查图集 UV 矩形。
+                mesh = LodVoxelMesher.mesh(chunk, key.x(), key.z(), ax, az, key.shift(), regionCache);
                 if (gen == this.generation.get() && ax == this.anchorX && az == this.anchorZ) {
                     this.ready.put(key, mesh);
                 }

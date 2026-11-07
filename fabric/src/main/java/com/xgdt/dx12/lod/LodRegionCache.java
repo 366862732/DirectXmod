@@ -10,10 +10,12 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -26,6 +28,8 @@ import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.resources.model.sprite.SpriteId;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -117,10 +121,12 @@ public final class LodRegionCache {
      * 一个区块的完整方块数据（3D 体素 LOD 用）。
      *
      * <p>{@code blocks} 是按 {@code ((y - minY) * 16 + z) * 16 + x} 排列的调色板下标，
-     * {@code palette[index]} 是该方块的 RGB（{@code -1} 表示空气/透明）。整块数据约
-     * 16×16×384 项，只在建网时临时存在，不进入长期缓存。
+     * {@code palette[index]} 是该方块的 RGB（{@code -1} 表示空气/透明），
+     * {@code paletteNames[index]} 是该方块的注册名（{@code null} 表示未知/空气）。
+     * 整块数据约 16×16×384 项，只在建网时临时存在，不进入长期缓存。
      */
-    public record VoxelChunk(int minY, int height, int topY, int[] palette, short[] blocks) {
+    public record VoxelChunk(int minY, int height, int topY,
+                             int[] palette, String[] paletteNames, short[] blocks) {
         /** 区块内坐标（x/z 为 0..15，y 为绝对世界坐标）是否有实心方块。 */
         public boolean solid(int x, int y, int z) {
             int ly = y - this.minY;
@@ -138,10 +144,46 @@ public final class LodRegionCache {
             }
             return this.palette[this.blocks[(ly * 16 + z) * 16 + x] & 0xFFFF];
         }
+
+        /** 取某格方块的注册名（{@code null} = 空气/未解析），供纹理系统查 sprite。 */
+        public String blockName(int x, int y, int z) {
+            int ly = y - this.minY;
+            if (ly < 0 || ly >= this.height || x < 0 || x > 15 || z < 0 || z > 15) {
+                return null;
+            }
+            int idx = this.blocks[(ly * 16 + z) * 16 + x] & 0xFFFF;
+            if (idx >= this.paletteNames.length) {
+                return null;
+            }
+            return this.paletteNames[idx];
+        }
     }
 
     /** 方块注册名 → RGB（{@code -1} = 空气或无法解析），避免每列都做一次注册表查询。 */
     private static final Map<String, Integer> BLOCK_COLORS = new ConcurrentHashMap<>();
+
+    /**
+     * 方块注册名 → 图集 UV 矩形 {@code [u0, v0, u1, v1]}（{@code 0..1}，图集空间）。
+     * 每次 {@link #prepare(ClientLevel)} 时从 {@link net.minecraft.client.resources.model.sprite.AtlasManager}
+     * 刷新；mesher 据此把方块面 0..1 UV 映射到图集坐标。
+     *
+     * <p>值是 6 个 UV 矩形（{@code [u0, v0, u1, v1]}），下标为
+     * {@link net.minecraft.core.Direction#ordinal()}：0=DOWN 1=UP 2=NORTH 3=SOUTH
+     * 4=WEST 5=EAST。照搬 voxy 的「每面独立贴图」——草地侧面是草皮+泥土、原木侧面是
+     * 树皮、顶面才是年轮，若六面共用一个矩形会全部用成顶面贴图。
+     *
+     * <p>渲染线程写、后台建网线程读，用 {@link ConcurrentHashMap} 保证可见性。
+     */
+    private final Map<String, float[][]> spriteUvMap = new ConcurrentHashMap<>();
+    /**
+     * 方块注册名 → 6 个面的染色值（{@code 0xRRGGBB}，{@code 0xFFFFFF} 表示不染色）。
+     *
+     * <p>草方块顶面、草、树叶、甘蔗等贴图本身是灰白色，颜色来自生物群系染色
+     * （{@code BlockColors}）。voxy 在着色器里用 {@code tintingFunction} 给灰白像素补色；
+     * 我们改成在烘焙时逐面查 {@code materialInfo().tintIndex()}，只给真的声明了
+     * tintindex 的面写染色值，其余面写白——原木侧面因此不会被染绿。
+     */
+    private final Map<String, int[]> spriteTintMap = new ConcurrentHashMap<>();
     /**
      * 方块注册名 → 是否按「实心方块」参与体素 LOD。
      *
@@ -227,6 +269,12 @@ public final class LodRegionCache {
             return;
         }
         if (dir.equals(this.regionDir) && level.dimension().equals(this.dimension)) {
+            // 图集可能晚于首次 prepare 才加载好（加载阶段 getAtlasManager 抛异常被吞掉），
+            // 此时 spriteUvReady 仍为 false、后台建网被闸门挡住。每帧补刷一次直到就绪，
+            // 避免永远停在「没有 UV」状态。
+            if (!this.spriteUvReady) {
+                refreshSpriteUv();
+            }
             return;
         }
         this.regionDir = dir;
@@ -242,6 +290,183 @@ public final class LodRegionCache {
         openStore(dir);
         // 体素网格是按方块数据建的，换世界/维度后全部失效
         LodVoxelCache.getInstance().clear();
+        // 刷新方块→图集 UV 映射（atlas 在渲染线程才可用）
+        refreshSpriteUv();
+    }
+
+    /**
+     * 从 {@link net.minecraft.client.resources.model.sprite.AtlasManager} 批量查询
+     * {@code LOCATION_BLOCKS} 图集里所有方块的 sprite UV 矩形，写入 {@link #spriteUvMap}。
+     *
+     * <p>必须在渲染线程调用（{@code prepare()} 已经在渲染线程里）。
+     * 失败时保留旧值，不影响渲染。
+     */
+    /**
+     * 把方块名映射成六个方向各自的图集 sprite UV 矩形。
+     *
+     * <p>26.2 里方块 sprite 名是<b>贴图路径</b>（如 {@code block/grass_block_top}），
+     * 不是方块注册名（{@code minecraft:grass_block}）。照搬 voxy 的 {@code bakeBlockModel}
+     * 思路：走 {@code BlockStateModelSet.get(state).collectParts()} → 逐方向遍历 quad →
+     * {@code materialInfo().sprite()} 拿到该面的真实 sprite，取其图集 UV 矩形。
+     *
+     * <p>按 {@link net.minecraft.core.Direction#ordinal()} 下标存入 6 个矩形，
+     * 使草地侧面/顶面、原木树皮/年轮各不相同（voxy 的每面独立贴图）。
+     * 某方向没有 quad 时回填顶面（UP）或任意已有面，避免该面退化成 0..1 乱采样。
+     */
+    private void refreshSpriteUv() {
+        Minecraft minecraft = Minecraft.getInstance();
+        try {
+            var modelManager = minecraft.getModelManager();
+            if (modelManager == null) {
+                return;
+            }
+            var modelSet = modelManager.getBlockStateModelSet();
+            var blockColors = minecraft.getBlockColors();
+            for (Block block : BuiltInRegistries.BLOCK) {
+                var key = BuiltInRegistries.BLOCK.getKey(block);
+                if (key == null) {
+                    continue;
+                }
+                String blockName = key.toString();
+                var state = block.defaultBlockState();
+                if (state.getRenderShape() == net.minecraft.world.level.block.RenderShape.INVISIBLE) {
+                    continue;
+                }
+                var model = modelSet.get(state);
+                if (model == null) {
+                    continue;
+                }
+                List<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> parts = new ArrayList<>();
+                model.collectParts(net.minecraft.util.RandomSource.create(42L), parts);
+
+                float[][] rects = new float[6][];
+                int[] tints = new int[6];
+                Arrays.fill(tints, 0xFFFFFF);
+                for (var part : parts) {
+                    for (var dir : net.minecraft.core.Direction.values()) {
+                        int idx = dir.ordinal();
+                        if (rects[idx] != null) {
+                            continue; // 该方向已取到贴图
+                        }
+                        var quads = part.getQuads(dir);
+                        if (quads == null) {
+                            continue;
+                        }
+                        for (var quad : quads) {
+                            var materialInfo = quad.materialInfo();
+                            if (materialInfo == null) {
+                                continue;
+                            }
+                            var sprite = materialInfo.sprite();
+                            if (sprite == null) {
+                                continue;
+                            }
+                            rects[idx] = new float[]{
+                                sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()
+                            };
+                            tints[idx] = tintColor(blockColors, state, materialInfo.tintIndex());
+                            break;
+                        }
+                    }
+                }
+                // 回填：没有 quad 的方向借用顶面（UP=1）或任意非空面
+                float[] fallback = rects[1];
+                if (fallback == null) {
+                    for (float[] r : rects) {
+                        if (r != null) {
+                            fallback = r;
+                            break;
+                        }
+                    }
+                }
+                if (fallback == null) {
+                    continue; // 完全没有贴图（如屏障），跳过
+                }
+                for (int i = 0; i < 6; i++) {
+                    if (rects[i] == null) {
+                        rects[i] = fallback;
+                    }
+                }
+                this.spriteUvMap.put(blockName, rects);
+                this.spriteTintMap.put(blockName, tints);
+            }
+            if (!this.activeLogged && LOGGER.isInfoEnabled()) {
+                LOGGER.info("[lod] 方块 sprite UV 映射已刷新：{} 项（每面独立，BlockStateModelSet）",
+                    this.spriteUvMap.size());
+                this.activeLogged = true;
+            }
+            this.spriteUvReady = !this.spriteUvMap.isEmpty();
+        } catch (Throwable t) {
+            LOGGER.warn("[lod] 刷新方块 sprite UV 映射失败（图集可能未加载）", t);
+        }
+    }
+
+    /** 首次刷新时打一条日志，避免每帧都打。 */
+    private boolean activeLogged;
+
+    /** 方块→图集 UV 映射是否已就绪。渲染线程写、后台建网线程读，volatile 保证可见性。 */
+    private volatile boolean spriteUvReady;
+
+    /**
+     * 取方块名对应的 6 面图集 UV 矩形数组（下标 = {@code Direction.ordinal()}，
+     * 每项 {@code [u0, v0, u1, v1]}）。不存在返回 {@code null}（调用方退回顶点内 0..1 UV）。
+     */
+    public float[][] getSpriteUv(String blockName) {
+        if (blockName == null) {
+            return null;
+        }
+        return this.spriteUvMap.get(blockName);
+    }
+
+    /**
+     * 取方块名对应的 6 面生物群系染色值（{@code 0xRRGGBB}，下标同 {@link #getSpriteUv}）。
+     *
+     * <p>不染色的面是 {@code 0xFFFFFF}（着色器里乘 1，等价于关闭）。
+     * 不存在返回 {@code null}。
+     */
+    public int[] getSpriteTint(String blockName) {
+        if (blockName == null) {
+            return null;
+        }
+        return this.spriteTintMap.get(blockName);
+    }
+
+    /**
+     * 查某个面（模型里声明的 {@code tintindex}）的染色值。
+     *
+     * <p>{@code tintIndex < 0} 表示这个面本来就不该染色（原木、石头），返回白。
+     * 群系相关的染色这里用 {@link net.minecraft.client.color.block.BlockTintSource#color}
+     * 的「非世界默认色」——它不依赖 {@code BlockAndTintGetter}，后台线程也能安全调用；
+     * 结果就是原版草色/叶色的标准值（不是按群系插值的，但绝不会是灰白）。
+     */
+    private static int tintColor(net.minecraft.client.color.block.BlockColors blockColors,
+                                 net.minecraft.world.level.block.state.BlockState state,
+                                 int tintIndex) {
+        if (blockColors == null || tintIndex < 0) {
+            return 0xFFFFFF;
+        }
+        var source = blockColors.getTintSource(state, tintIndex);
+        if (source == null) {
+            return 0xFFFFFF;
+        }
+        int argb = source.color(state);
+        int rgb = argb & 0xFFFFFF;
+        if (rgb == 0xFFFFFF || rgb == 0) {
+            return 0xFFFFFF; // -1 / 0：不染色
+        }
+        return rgb;
+    }
+
+    /**
+     * 方块→图集 UV 映射是否已就绪。
+     *
+     * <p>后台建网线程据此做闸门：{@code refreshSpriteUv()} 只在渲染线程 {@code prepare()}
+     * 时跑一次，启动早期尚未刷新。若此时就建网，整块 UV 会落到未命中的回退位置
+     * （[0,0,0,0]），之后映射补齐再往里走就会「外圈先闪一片、再跳变」。闸门保证
+     * 只在映射就绪后才把区块烘成带 UV 的网格。
+     */
+    public boolean isSpriteUvReady() {
+        return this.spriteUvReady;
     }
 
     /**
@@ -292,6 +517,9 @@ public final class LodRegionCache {
         this.pending.clear();
         this.queue.clear();
         this.regionStats.clear();
+        this.spriteUvMap.clear();
+        this.spriteTintMap.clear();
+        this.spriteUvReady = false;
         closeStore();
         this.storeDir = null;
         LodVoxelCache.getInstance().clear();
@@ -360,6 +588,18 @@ public final class LodRegionCache {
     /** 已缓存且可读的区块数（调试用）。 */
     public int cachedCount() {
         return this.columns.size();
+    }
+
+    /**
+     * 仍在排队或正在读盘的区块数。
+     *
+     * <p>渲染端用它判断「远景数据还在补」：刚开启 LOD 时整张网格的第一次采样几乎
+     * 全是 miss，此时 {@link #cachedCount()} 可能已经有一批旧数据、看起来不再变化，
+     * 只按它判断就会把几何永久冻结在「几乎没有地形」的状态。pending 归零才说明
+     * 能读到的数据都读完了，不必再重建。
+     */
+    public int pendingCount() {
+        return this.pending.size();
     }
 
     private void request(long key) {
@@ -597,8 +837,12 @@ public final class LodRegionCache {
         int sections = height / 16;
         short[] blocks = new short[16 * 16 * height];
         int[] palette = new int[256];
+        String[] paletteNames = new String[256];
         palette[0] = -1;
+        paletteNames[0] = null;
         int paletteSize = 1;
+        // 方块名 → 区块级调色板下标：同名方块合并，避免调色板爆炸
+        Map<String, Integer> nameToIndex = new HashMap<>();
 
         ListTag list = tag.getListOrEmpty("sections");
         int topY = minY;
@@ -616,26 +860,34 @@ public final class LodRegionCache {
             int[] remap = new int[data.paletteColors.length];
             for (int p = 0; p < remap.length; p++) {
                 int color = data.paletteColors[p];
+                String name = p < data.paletteNames.length ? data.paletteNames[p] : null;
                 // 非实心方块（草、花、火把、地毯、台阶……）在体素 LOD 里一律当空气：
                 // 它们在远处根本看不见，算进去只会让一个平原区块凭空多出上千个面。
                 if (color == -1 || !data.paletteSolid[p]) {
                     remap[p] = 0;
                     continue;
                 }
-                // 同一颜色合并（不同方块同名同色即可共用），避免调色板无限增长
+                // 同名方块合并（同一注册名共享同一调色板槽），避免调色板无限增长
                 int found = -1;
-                for (int q = 1; q < paletteSize; q++) {
-                    if (palette[q] == color) {
-                        found = q;
-                        break;
+                if (name != null) {
+                    Integer cached = nameToIndex.get(name);
+                    if (cached != null) {
+                        found = cached;
                     }
                 }
                 if (found < 0) {
                     if (paletteSize == palette.length) {
-                        palette = Arrays.copyOf(palette, paletteSize * 2);
+                        int newCap = paletteSize * 2;
+                        palette = Arrays.copyOf(palette, newCap);
+                        paletteNames = Arrays.copyOf(paletteNames, newCap);
                     }
                     found = paletteSize;
-                    palette[paletteSize++] = color;
+                    palette[paletteSize] = color;
+                    paletteNames[paletteSize] = name;
+                    if (name != null) {
+                        nameToIndex.put(name, paletteSize);
+                    }
+                    paletteSize++;
                 }
                 remap[p] = found;
             }
@@ -656,7 +908,10 @@ public final class LodRegionCache {
                 }
             }
         }
-        return new VoxelChunk(minY, height, topY, Arrays.copyOf(palette, paletteSize), blocks);
+        return new VoxelChunk(minY, height, topY,
+            Arrays.copyOf(palette, paletteSize),
+            Arrays.copyOf(paletteNames, paletteSize),
+            blocks);
     }
 
     /**
@@ -825,16 +1080,18 @@ public final class LodRegionCache {
         int[] colors = new int[size];
         boolean[] logs = new boolean[size];
         boolean[] solid = new boolean[size];
+        String[] names = new String[size];
         for (int p = 0; p < size; p++) {
             CompoundTag entry = palette.getCompoundOrEmpty(p);
             String name = entry.getStringOr("Name", "minecraft:air");
             colors[p] = blockColor(name);
             logs[p] = isLogName(name);
             solid[p] = isSolidBlock(name);
+            names[p] = name;
         }
         if (size == 1) {
             // 整节只有一种方块，磁盘上没有 data
-            return new SectionData(colors, logs, solid, null);
+            return new SectionData(colors, logs, solid, names, null);
         }
         Optional<long[]> rawData = blockStates.getLongArray("data");
         if (rawData.isEmpty()) {
@@ -853,7 +1110,7 @@ public final class LodRegionCache {
         } catch (Throwable t) {
             return null;
         }
-        return new SectionData(colors, logs, solid, storage);
+        return new SectionData(colors, logs, solid, names, storage);
     }
 
     /** 方块注册名是否是树干类方块（原木 / 木头 / 菌柄 / 菌丝体）。 */
@@ -893,7 +1150,7 @@ public final class LodRegionCache {
 
     /** 已解析的 section：{@code storage == null} 表示整节同一种方块。 */
     private record SectionData(int[] paletteColors, boolean[] paletteLogs, boolean[] paletteSolid,
-                               SimpleBitStorage storage) {
+                               String[] paletteNames, SimpleBitStorage storage) {
         /** {@code y}/{@code x}/{@code z} 均为 section 内的 0..15 坐标。 */
         int colorAt(int y, int x, int z) {
             int index = this.storage == null ? 0 : this.storage.get((y << 4 | z) << 4 | x);
@@ -943,6 +1200,22 @@ public final class LodRegionCache {
      * 远端森林整片刷上这个颜色就是一块过饱和的死绿。同一个色相提到纹理感正常的绿。
      */
     public static int adjustMapColor(int rgb) {
-        return (rgb & 0xFFFFFF) == 0x007C00 ? 0x5C8C3C : rgb;
+        int color = rgb & 0xFFFFFF;
+        switch (color) {
+            case 0x007C00:
+                // MapColor.PLANT（树叶）：几乎纯绿，比真实树叶纹理暗得多，整片刷上去是死绿
+                return 0x5C8C3C;
+            case 0x7FB238:
+                // MapColor.GRASS：荧光黄绿。真实草方块顶面纹理带大量明暗，平均下来更暗更灰
+                return 0x6E9B46;
+            case 0xFFFFFF:
+                // MapColor.SNOW：纯白叠加远景光照后直接过曝，整片冰原糊成一张白纸
+                return 0xE4EBF1;
+            case 0xA0A0FF:
+                // MapColor.ICE：偏紫的淡蓝，压成冰块的灰蓝
+                return 0x9FB4CF;
+            default:
+                return rgb;
+        }
     }
 }

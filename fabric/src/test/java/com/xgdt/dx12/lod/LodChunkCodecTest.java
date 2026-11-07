@@ -15,6 +15,7 @@ class LodChunkCodecTest {
 
     private static LodRegionCache.VoxelChunk sample() {
         int[] palette = {-1, 0x7A5A3A, LodRegionCache.FLAG_WATER | 0x3F76E4};
+        String[] names = {null, "minecraft:stone", "minecraft:water"};
         short[] blocks = new short[16 * 16 * HEIGHT];
         // 地面一层 + 一小块水
         for (int z = 0; z < 16; z++) {
@@ -27,7 +28,7 @@ class LodChunkCodecTest {
                 blocks[((65 - MIN_Y) * 16 + z) * 16 + x] = 2;
             }
         }
-        return new LodRegionCache.VoxelChunk(MIN_Y, HEIGHT, 65, palette, blocks);
+        return new LodRegionCache.VoxelChunk(MIN_Y, HEIGHT, 65, palette, names, blocks);
     }
 
     @Test
@@ -42,17 +43,21 @@ class LodChunkCodecTest {
         assertEquals(original.height(), decoded.height());
         assertEquals(original.topY(), decoded.topY());
         assertArrayEquals(original.palette(), decoded.palette());
+        assertArrayEquals(original.paletteNames(), decoded.paletteNames());
         assertArrayEquals(original.blocks(), decoded.blocks());
     }
 
     @Test
     void airOnlyChunkRoundTrips() {
         LodRegionCache.VoxelChunk air = new LodRegionCache.VoxelChunk(
-            MIN_Y, HEIGHT, MIN_Y, new int[]{-1}, new short[16 * 16 * HEIGHT]);
+            MIN_Y, HEIGHT, MIN_Y,
+            new int[]{-1}, new String[]{null},
+            new short[16 * 16 * HEIGHT]);
         LodRegionCache.VoxelChunk decoded = LodChunkCodec.decode(LodChunkCodec.encode(air));
         assertNotNull(decoded);
         assertEquals(MIN_Y, decoded.topY());
         assertArrayEquals(air.palette(), decoded.palette());
+        assertArrayEquals(air.paletteNames(), decoded.paletteNames());
     }
 
     @Test
@@ -66,7 +71,8 @@ class LodChunkCodecTest {
     @Test
     void decodeRejectsWrongVersion() {
         byte[] encoded = LodChunkCodec.encode(sample());
-        encoded[0] = 0x7F;
+        // 把 version 字段（低 8 位是 v2 = 0x02）改成 0x7F，decode 应拒
+        encoded[1] = 0x7F;
         assertNull(LodChunkCodec.decode(encoded));
     }
 
@@ -80,7 +86,9 @@ class LodChunkCodecTest {
     @Test
     void encodeRejectsInconsistentBlockArray() {
         LodRegionCache.VoxelChunk broken = new LodRegionCache.VoxelChunk(
-            MIN_Y, HEIGHT, 0, new int[]{-1}, new short[10]);
+            MIN_Y, HEIGHT, 0,
+            new int[]{-1}, new String[]{null},
+            new short[10]);
         assertNull(LodChunkCodec.encode(broken));
     }
 }

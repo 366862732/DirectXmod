@@ -4,6 +4,7 @@ import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
 import com.xgdt.dx12.config.Dx12Config;
 import com.xgdt.dx12.lod.LodRegionCache;
 import com.xgdt.dx12.lod.LodVoxelCache;
@@ -24,6 +25,7 @@ import net.minecraft.client.renderer.state.LightmapRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
+import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.core.BlockPos;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.util.Mth;
@@ -34,6 +36,7 @@ import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.material.MapColor;
 import org.joml.Matrix4f;
 import org.joml.Vector3fc;
+import org.joml.Vector4f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,9 +66,13 @@ public final class Dx12LodRenderer {
 
     /** 顶点步长：position(float3, 12B) + color(RGBA8, 4B)。 */
     private static final int VERTEX_STRIDE = 16;
-    /** 顶点格式 ordinal：46 = RGB32_FLOAT，6 = RGBA8_UNORM。 */
+    /** 体素顶点步长：position(12B) + color(4B) + 块空间 uv(8B) + 图集矩形 4×UNORM16(8B) = 32B。 */
+    private static final int VOXEL_VERTEX_STRIDE = 32;
+    /** 顶点格式 ordinal：46 = RGB32_FLOAT，6 = RGBA8_UNORM，45 = R32G32_FLOAT，14 = RGBA16_UNORM。 */
     private static final int FORMAT_POSITION = 46;
     private static final int FORMAT_COLOR = 6;
+    private static final int FORMAT_UV = 45;
+    private static final int FORMAT_RECT = 14;
 
     /** native 侧 kBufferUsageUav：DEFAULT 堆 + ALLOW_UNORDERED_ACCESS，compute 可写。 */
     private static final int BUFFER_USAGE_UAV = 1024;
@@ -98,8 +105,35 @@ public final class Dx12LodRenderer {
 
     /** 最远 LOD 半径（方块）。同时是 lod_distance 滑块的最大值对应的半径。 */
     private static final int MAX_RADIUS_BLOCKS = 16384;
-    /** 无位移时的兜底重建间隔（帧）：让后台陆续读到的地形逐步补齐。 */
-    private static final int REBUILD_INTERVAL = 40;
+    /** 无位移时的兜底重建间隔（帧）：让后台陆续读到的地形逐步补齐。网格降到 192 环后
+     * 一次重建只要采样十几万角点，可以比原来（156 万角点 / 40 帧）更勤快地补齐。 */
+    private static final int REBUILD_INTERVAL = 20;
+
+    /**
+     * 远景雾的完全遮挡距离（方块）。
+     *
+     * <p>雾必须跟着「实际看得清的地形」走，而不是跟着 {@code lod_distance} 的几何半径走：
+     * {@code lod_distance=1024}（不限制）时高度场铺到 16384 方块，那里的格宽已有上百方块，
+     * 只剩一片锐利的惨白色块。
+     *
+     * <p>这个值不能按「几何半径」的量级取。透视下 0～200 方块就占了屏幕的大半，
+     * 600 方块外全部挤在地平线附近的一条窄带里：雾的终点取到 1600 时，画面上占面积
+     * 最大的那一段根本没有雾，雪原就是一张白纸。voxy 参考图里整个画面都被蓝灰雾
+     * 压住，所以这里收到 720 方块。
+     */
+    private static final float LOD_FOG_FAR_BLOCKS = 720.0f;
+    /** 雾开始变浓的距离占 {@link #LOD_FOG_FAR_BLOCKS} 的比例。 */
+    private static final float LOD_FOG_START_RATIO = 0.13f;
+
+    /**
+     * 高度场几何的实际铺开半径（方块），只比雾终点稍远一点。
+     *
+     * <p>雾终点以外的格子会被雾 100% 覆盖，铺出去纯属浪费坐标轴的环数预算：
+     * 以前环数一直分到 16384 方块，其中 95% 落在看不见的地方，看得见的那 720 方块
+     * 反而只能用剩下的零头，远景全是几十方块宽的大块。现在把几何截到雾终点外侧
+     * 一点，同样的环数全部用在能看见的范围里。
+     */
+    private static final float LOD_GEOMETRY_RADIUS_BLOCKS = LOD_FOG_FAR_BLOCKS * 1.15f;
 
     /** 采样失败：高 32 位是 {@link Integer#MIN_VALUE}。 */
     private static final long UNKNOWN_SAMPLE = (long) Integer.MIN_VALUE << 32;
@@ -111,16 +145,16 @@ public final class Dx12LodRenderer {
      * 远景降噪：格宽超过 {@link #SMOOTH_START} 方块后，把角点高度往邻域均值拉，
      * 混合比例随格宽线性增长到 {@link #SMOOTH_MAX}。
      *
-     * <p>远处一格的宽度可能上百方块，单个角点若是山峰，整格就会被拉成一根巨锥
-     * （截图里的紫白色尖刺就是这么来的）。按格宽做多尺度降噪后，远景只剩宏观起伏，
-     * 与「Voxy 远景只剩山形」的观感一致。
+     * <p>以前阈值是 64 方块，而坐标轴退化后整张网格的格宽只有 1~2 方块，这个分支
+     * 从来没生效过，远景山体就是一片刀片尖刺。现在格宽从 1 长到 20，阈值收到 6，
+     * 300 方块以外开始只保留宏观山形（与「Voxy 远景只剩山形」一致），近处仍不动。
      */
-    private static final float SMOOTH_START = 64.0f;
-    private static final float SMOOTH_SPAN = 320.0f;
+    private static final float SMOOTH_START = 6.0f;
+    private static final float SMOOTH_SPAN = 24.0f;
     private static final float SMOOTH_MAX = 0.6f;
     /** 平滑后仍允许偏离邻域均值的幅度：{@code max(MIN, 格宽 * SCALE)}。 */
-    private static final float SMOOTH_LIMIT_MIN = 24.0f;
-    private static final float SMOOTH_LIMIT_SCALE = 2.0f;
+    private static final float SMOOTH_LIMIT_MIN = 6.0f;
+    private static final float SMOOTH_LIMIT_SCALE = 0.5f;
 
     /** 孤立尖刺判据：比四周最高点还高出这么多格才算「孤立」，见 {@link #removeIsolatedSpikes}。 */
     private static final int PEAK_TOLERANCE = 3;
@@ -139,22 +173,32 @@ public final class Dx12LodRenderer {
     private static final int NEAR_DETAIL_BAND = 192;
 
     /**
-     * 坐标轴单侧环数，由顶点上限反推：{@code (2*rings)² * 8 <= MAX_QUAD_VERTS}。
+     * 坐标轴单侧环数（固定值，不再由顶点上限反推）。
      *
-     * <p>留两环余量，避免等比段的取整让环数多出几环、刚好越过顶点上限。
+     * <p>以前按 {@link #MAX_QUAD_VERTS} 反推出 625 环：高度场半径只有 828 方块，
+     * 625 环意味着平均每环 1.3 方块 —— 整张远景退化成「1 方块分辨率的全分辨率
+     * 高度场」。后果有三：
+     * <ul>
+     *   <li>任何陡坡在 compute 里都被算成「一格内落差好几格」的 slope，直接刷成灰；</li>
+     *   <li>降噪（{@code cell < 64} 不处理）对全部格子失效，山体全是刀片状尖刺；</li>
+     *   <li>顶点预算顶满（625 万顶点 / 300MB 三缓冲），每次重建要采样 156 万个角点，
+     *       重建本身就把后台区块补齐的节奏拖死了。</li>
+     * </ul>
+     *
+     * <p>192 环（网格 385×385 ≈ 59 万顶点）足以让近处保持 1 方块格宽，最远处格宽
+     * 约 20 方块 —— 也就是 Voxy 那种「近处贴地、远处只剩山形」的层次。
      */
-    private static final int AXIS_RINGS =
-        (int) Math.floor(Math.sqrt(MAX_QUAD_VERTS / 8.0) / 2.0) - 2;
+    private static final int AXIS_RINGS = 192;
 
     /** 分层配色：陡坡露岩、水边显沙、高处积雪，避免整片纯绿/纯蓝。 */
-    private static final float ROCK_SLOPE = 1.5f;
-    private static final float ROCK_SPAN = 1.7f;
-    private static final float ROCK_MAX = 0.45f;
+    private static final float ROCK_SLOPE = 2.0f;
+    private static final float ROCK_SPAN = 3.0f;
+    private static final float ROCK_MAX = 0.35f;
     private static final int ROCK_COLOR = 0x8C8C8C;
     private static final int SAND_COLOR = 0xE2D6A8;
     private static final int SNOW_COLOR = 0xE8EEF4;
-    /** 远景水体的配色：MapColor.WATER 的纯蓝铺满整片湖太假，换成偏青的深水色。 */
-    private static final int WATER_DEEP_COLOR = 0x2F6FC4;
+    /** 远景水体的配色：MapColor.WATER 的纯蓝铺满整片湖太假，换成偏灰的青蓝深水色。 */
+    private static final int WATER_DEEP_COLOR = 0x2B5C86;
     /** 积雪起始高度（相对海平面）。 */
     private static final int SNOW_ABOVE_SEA = 75;
 
@@ -245,10 +289,13 @@ public final class Dx12LodRenderer {
         + "    // 按法线主轴挑一个固定系数，否则竖直墙和顶面的亮度只差几个百分点，压平的\n"
         + "    // 顶面和侧壁会糊成一整片，完全看不出方块台阶。\n"
         + "    float vertical = 1.0 - saturate(abs(normal.y));\n"
-        + "    float faceShade = 1.0 - vertical * (abs(normal.x) > abs(normal.z) ? 0.40 : 0.20);\n"
+        + "    float faceShade = 1.0 - vertical * (abs(normal.x) > abs(normal.z) ? 0.30 : 0.15);\n"
         + "    // 方向光：光源固定在西侧上方，顶面最亮、陡面暗，接近原版的方块面明暗\n"
         + "    float lambert = saturate(dot(normal, normalize(float3(0.42, 0.80, -0.42))) * 0.5 + 0.5);\n"
-        + "    rgb *= (0.88 + 0.20 * lambert) * faceShade;\n"
+        + "    // 光照系数整体压在 1.0 以内：以前是 0.88+0.20*lambert（最高 1.08），\n"
+        + "    // 再叠后面几层提亮，浅色地形（冰/雪/沙）会被推过 1.4 倍，整片钳成纯白。\n"
+        + "    // 也不能压太狠：0.70+0.30 时墙面最低到 0.49，整片远景会沉成一面深灰墙。\n"
+        + "    rgb *= (0.82 + 0.18 * lambert) * faceShade;\n"
         + "\n"
         + "    // 逐方块颗粒：按 1 方块网格取三维哈希。靠近时才有、像素跨度大到看不见\n"
         + "    // 单一方块时淡出，否则远处会出现整屏闪烁的噪点。\n"
@@ -257,13 +304,13 @@ public final class Dx12LodRenderer {
         + "    float n1 = hash31(floor(world)) - 0.5;\n"
         + "    float n2 = hash31(floor(world * 0.25) + 19.0) - 0.5;\n"
         + "    float n3 = hash31(floor(world * 0.0625) + 71.0) - 0.5;\n"
-        + "    rgb *= 1.0 + n1 * 0.08 * fine + n2 * 0.06 + n3 * 0.05;\n"
+        + "    rgb *= 1.0 + n1 * 0.06 * fine + n2 * 0.04 + n3 * 0.03;\n"
         + "\n"
         + "    // 大尺度色块抖动：只抖亮度、不往某个色相偏\n"
-        + "    rgb *= 1.0 + (hash31(floor(world * 0.125) + 5.0) - 0.5) * 0.08;\n"
+        + "    rgb *= 1.0 + (hash31(floor(world * 0.125) + 5.0) - 0.5) * 0.06;\n"
         + "\n"
         + "    // 高度明暗：高处略亮、低地略暗，远景才有体积而不是一张平色\n"
-        + "    rgb *= 1.0 + saturate((world.y - Params.x) * 0.012) * 0.10;\n"
+        + "    rgb *= 0.98 + saturate((world.y - Params.x) * 0.006) * 0.04;\n"
         + "\n"
         + "    // 顶点色 alpha = 0 是水体标记。水面是平的，不该跟着地表颗粒噪点抖，\n"
         + "    // 只用大尺度波光把水体本色提亮一点。墙面不会命中这里（alpha 由更高格决定，\n"
@@ -278,17 +325,144 @@ public final class Dx12LodRenderer {
         + "    }\n"
         + "\n"
         + "    rgb *= FogParams.z * LightTint.rgb;\n"
+        + "    // 浅色地形（冰/雪/沙）叠加光照后仍可能越过 1.0，钳一下避免整片钳成纯白\n"
+        + "    rgb = saturate(rgb);\n"
+        + "    return float4(lerp(rgb, FogColor.rgb, fog), 1.0);\n"
+        + "}\n";
+
+    /**
+     * 体素 LOD 专用顶点着色器：多传「块空间 uv」与「图集矩形」（4×UNORM16）。
+     *
+     * <p>uv 是方块空间坐标（一格 = 1.0，一格 {@code 2^shift} 方块宽的面就是 0..2^shift），
+     * 像素着色器 {@code frac} 回落到单个方块，再用矩形还原进图集里那一格——照搬 voxy
+     * 的 {@code modf(uv, tile) + getBaseUV()} 思路，大面不会被拉成一块纯色。
+     */
+    private static final String VOXEL_VERTEX_SHADER =
+        "struct VSInput\n"
+        + "{\n"
+        + "    float3 position : POSITION;\n"
+        + "    float4 color    : COLOR;\n"
+        + "    float2 uv       : TEXCOORD0;\n"
+        + "    float4 rect     : TEXCOORD1;\n"
+        + "};\n"
+        + "struct VSOutput\n"
+        + "{\n"
+        + "    float4 position : SV_POSITION;\n"
+        + "    float4 color    : COLOR;\n"
+        + "    float3 world    : TEXCOORD0;\n"
+        + "    float2 uv       : TEXCOORD1;\n"
+        + "    float4 rect     : TEXCOORD2;\n"
+        + "};\n"
+        + "VSOutput main(VSInput input)\n"
+        + "{\n"
+        + "    VSOutput output;\n"
+        + "    float3 relative = input.position - CameraPos.xyz;\n"
+        + "    output.position = mul(ViewProj, float4(relative, 1.0));\n"
+        + "    output.color = input.color;\n"
+        + "    output.world = relative;\n"
+        + "    output.uv = input.uv;\n"
+        + "    output.rect = input.rect;\n"
+        + "    return output;\n"
+        + "}\n";
+
+    /**
+     * 体素 LOD 专用像素着色器：按 voxy 的做法采样方块纹理图集。
+     *
+     * <ul>
+     *   <li>{@code frac(uv)} 把大面回落到单个方块，再乘图集矩形——每格都是完整一张贴图；</li>
+     *   <li>{@code SampleGrad} 用块空间 uv 的屏幕导数选 mip（不用 bias），远处贴图不闪；</li>
+     *   <li>alpha 裁剪要用 mip0 精确采样，粗 mip 会把透明边缘糊进来（voxy 同做法）；</li>
+     *   <li>矩形全 0 表示没有 sprite（空气/未知方块），退回顶点色。</li>
+     * </ul>
+     */
+    private static final String VOXEL_PIXEL_SHADER =
+        "Texture2D BlockTex : register(t0);\n"
+        + "SamplerState  BlockSampler : register(s0);\n"
+        + "struct VSOutput\n"
+        + "{\n"
+        + "    float4 position : SV_POSITION;\n"
+        + "    float4 color    : COLOR;\n"
+        + "    float3 world    : TEXCOORD0;\n"
+        + "    float2 uv       : TEXCOORD1;\n"
+        + "    float4 rect     : TEXCOORD2;\n"
+        + "};\n"
+        + "float4 main(VSOutput input) : SV_TARGET\n"
+        + "{\n"
+        + "    float3 rel = input.world;\n"
+        + "    float dist = length(rel);\n"
+        + "    float fog = saturate((dist - FogParams.x) / max(FogParams.y - FogParams.x, 1.0));\n"
+        + "    float2 rectSize = input.rect.zw - input.rect.xy;\n"
+        + "    bool hasTex = rectSize.x > 0.0 && rectSize.y > 0.0;\n"
+        + "    // 块空间 uv → 方块内 0..1 → 图集矩形内 0..1\n"
+        + "    float2 tiled = frac(input.uv);\n"
+        + "    float2 atlasUv = input.rect.xy + tiled * rectSize;\n"
+        + "    float4 tex = float4(1.0, 1.0, 1.0, 1.0);\n"
+        + "    if (hasTex)\n"
+        + "    {\n"
+        + "        // 导数取自连续的块空间 uv（frac 会跳变），乘矩形宽高换算到图集空间\n"
+        + "        float2 duvdx = ddx(input.uv) * rectSize;\n"
+        + "        float2 duvdy = ddy(input.uv) * rectSize;\n"
+        + "        tex = BlockTex.SampleGrad(BlockSampler, atlasUv, duvdx, duvdy);\n"
+        + "    }\n"
+        + "    // 有贴图时：贴图 × 该面的生物群系染色（顶点色 rgb 是染色值，白 = 不染色）。\n"
+        + "    // 草方块顶面 / 草 / 树叶的 PNG 本身是灰白色，颜色全靠这一步乘回来，\n"
+        + "    // 照搬 voxy 的 tintingFunction；没有 sprite 时才退回顶点色兜底。\n"
+        + "    float3 rgb = hasTex ? tex.rgb * input.color.rgb : input.color.rgb;\n"
+        + "    // 面法线：同高度场着色器（屏幕空间导数重建）\n"
+        + "    float3 face = cross(ddx(rel), ddy(rel));\n"
+        + "    float faceLen = length(face);\n"
+        + "    float3 normal = faceLen > 1e-8 ? face / faceLen : float3(0.0, 1.0, 0.0);\n"
+        + "    if (abs(normal.y) < 0.5)\n"
+        + "    {\n"
+        + "        normal = float3(abs(normal.x), 0.0, abs(normal.z));\n"
+        + "        normal = length(normal) > 1e-6 ? normalize(normal) : float3(0.0, 1.0, 0.0);\n"
+        + "    }\n"
+        + "    else\n"
+        + "    {\n"
+        + "        normal.y = abs(normal.y);\n"
+        + "        normal = normalize(normal);\n"
+        + "    }\n"
+        + "    // 面明暗：顶面 1.0、东西墙 0.7、南北墙 0.85。必须和高度场那边完全一致，\n"
+        + "    // 否则体素（<=256 方块）和高度场（>256）的接缝处会有一圈亮度跳变。\n"
+        + "    float vertical = 1.0 - saturate(abs(normal.y));\n"
+        + "    float faceShade = 1.0 - vertical * (abs(normal.x) > abs(normal.z) ? 0.30 : 0.15);\n"
+        + "    float lambert = saturate(dot(normal, normalize(float3(0.42, 0.80, -0.42))) * 0.5 + 0.5);\n"
+        + "    // 系数必须和高度场那边一模一样（0.82 + 0.18），否则体素圈外缘和高度场\n"
+        + "    // 内缘会在接缝处出现一圈亮度跳变。\n"
+        + "    rgb *= (0.82 + 0.18 * lambert) * faceShade;\n"
+        + "    // 天空光染色 + 世界亮度（白天白、夜里偏蓝，同 voxy lightmap）\n"
+        + "    rgb *= FogParams.z * LightTint.rgb;\n"
+        + "    // 水体：顶点 alpha = 0 是水体标记，纹理 alpha 通道混入做半透明\n"
+        + "    float water = 1.0 - saturate(input.color.a * 2.0);\n"
+        + "    if (water > 0.01)\n"
+        + "    {\n"
+        + "        rgb *= tex.a;\n"
+        + "    }\n"
+        + "    else if (hasTex)\n"
+        + "    {\n"
+        + "        // 树叶/草等镂空方块：必须用 mip0 精确采样判断，粗 mip 会把透明边糊掉\n"
+        + "        if (BlockTex.SampleLevel(BlockSampler, atlasUv, 0).a <= 0.1)\n"
+        + "        {\n"
+        + "            discard;\n"
+        + "        }\n"
+        + "    }\n"
+        + "    // 浅色方块（雪/冰/石英）叠上光照后可能越过 1.0，钳一下避免整片糊成纯白\n"
+        + "    rgb = saturate(rgb);\n"
         + "    return float4(lerp(rgb, FogColor.rgb, fog), 1.0);\n"
         + "}\n";
 
     /**
      * 顶点生成的 compute 着色器：<b>一个线程 = 一个格子</b>。
      *
-     * <p>每个有效格子用 {@code InterlockedAdd} 在顶点缓冲里抢 8 个槽位，写出
-     * <b>一个压平的顶面 + 两条竖直墙面</b>：顶面 4 个顶点在 {@code h00} 处压平，
-     * +X / +Z 两个方向的墙面各复用顶面边界上的 2 个顶点、再补 2 个邻居高度上的
-     * 顶点。每条内部边界只由低坐标一侧的格子负责，因此网格保持水密，不会重复画
-     * 同一面墙。
+     * <p>每个有效格子用 {@code InterlockedAdd} 在顶点缓冲里抢 4 个槽位，把<b>四个角
+     * 各自的高度</b>写进顶面（{@code x0z0=h00, x1z0=h10, x1z1=h11, x0z1=h01}），
+     * 于是整张高度场是一张连续的斜四边形网格。
+     *
+     * <p>为什么不是「压平顶面 + 竖直墙」：坐标轴是等比放大的，2000 方块外一格就有
+     * 几十方块宽。压平顶面会让整片山坡变成一圈圈巨大的等高线台阶；更致命的是顶面
+     * 高度取自<b>单个角点</b> {@code h00}，跨山谷的格子会把整个山谷抬到山脊高度，
+     * 变成一块悬空的大平板挡住近处地形，反向则把小山整片埋掉。相邻格共享同一对角点
+     * 高度，斜顶面天然水密，也就不需要竖墙。
      *
      * <p>抢到的槽位总数写进计数器，第二个 dispatch（{@code Pass == 1}，单线程）
      * 把它翻译成 ExecuteIndirect 的参数 {@code {indexCount, 1, 0, 0}} 并顺手把计数器
@@ -335,14 +509,15 @@ public final class Dx12LodRenderer {
         + "    if (j + 1 < N) { w = max(w, Axis[j + 1] - Axis[j]); }\n"
         + "    return w;\n"
         + "}\n"
-        + "// 按格宽把角点高度往四邻域均值拉（远处一格的宽度上百方块，单个山峰会被\n"
-        + "// 拉成一根巨锥）。格宽小于 64 时完全不动，保证和原版地形贴合。\n"
+        + "// 按格宽把角点高度往四邻域均值拉（远处一格的宽度几十方块，单个山峰会被\n"
+        + "// 拉成一根巨锥）。格宽小于 6 时完全不动，保证和原版地形贴合；参数必须与\n"
+        + "// Java 侧 SMOOTH_START / SMOOTH_SPAN / SMOOTH_LIMIT_* 保持一致。\n"
         + "int SmoothH(uint i, uint j)\n"
         + "{\n"
         + "    int h = RawH(i, j);\n"
         + "    if (h == UNKNOWN) { return UNKNOWN; }\n"
         + "    int cell = CellW(i, j);\n"
-        + "    if (cell < 64) { return h; }\n"
+        + "    if (cell < 6) { return h; }\n"
         + "    int sum = 0;\n"
         + "    int count = 0;\n"
         + "    if (i > 0) { int v = RawH(i - 1, j); if (v != UNKNOWN) { sum += v; count++; } }\n"
@@ -351,9 +526,9 @@ public final class Dx12LodRenderer {
         + "    if (j + 1 < N) { int v = RawH(i, j + 1); if (v != UNKNOWN) { sum += v; count++; } }\n"
         + "    if (count == 0) { return h; }\n"
         + "    float average = (float)sum / (float)count;\n"
-        + "    float blend = min(0.6, (cell - 64.0) / 320.0);\n"
+        + "    float blend = min(0.6, (cell - 6.0) / 24.0);\n"
         + "    float mixed = h + (average - h) * blend;\n"
-        + "    float limit = max(24.0, (float)cell * 2.0);\n"
+        + "    float limit = max(6.0, (float)cell * 0.5);\n"
         + "    mixed = clamp(mixed, average - limit, average + limit);\n"
         + "    return (int)round(mixed);\n"
         + "}\n"
@@ -383,15 +558,15 @@ public final class Dx12LodRenderer {
         + "    else if ((rgb & 0x01000000) != 0)\n"
         + "    {\n"
         + "        alpha = 0;\n"
-        + "        return 0x2F6FC4;\n"
+        + "        return 0x2B5C86;\n"
         + "    }\n"
-        + "    rgb = MixColor(rgb, 0x8C8C8C, smoothstep(1.5, 3.2, slope) * 0.45);\n"
+        + "    rgb = MixColor(rgb, 0x8C8C8C, smoothstep(2.0, 5.0, slope) * 0.35);\n"
         + "    if (slope < 0.45 && height <= SeaLevel + 4 && height >= SeaLevel - 4)\n"
         + "    {\n"
         + "        rgb = MixColor(rgb, 0xE2D6A8, 0.35);\n"
         + "    }\n"
-        + "    rgb = MixColor(rgb, 0xE8EEF4,\n"
-        + "        min(0.9, max(0.0, (float)(height - SnowLine) / 40.0)));\n"
+        + "    // 不再按高度硬刷「积雪」：色值完全来自地表方块自己的 MapColor（雪块本来就是\n"
+        + "    // 白色）。voxy 从不凭空加雪，凭空刷白会让非雪原的高地在远景里糊成一片白。\n"
         + "    alpha = 255;\n"
         + "    return rgb;\n"
         + "}\n"
@@ -424,10 +599,10 @@ public final class Dx12LodRenderer {
         + "    {\n"
         + "        if (tid.x == 0)\n"
         + "        {\n"
-        + "            uint cells = Counter[0] / 8;\n"
-        + "            uint maxCells = MaxVerts / 8;\n"
+        + "            uint cells = Counter[0] / 4;\n"
+        + "            uint maxCells = MaxVerts / 4;\n"
         + "            if (cells > maxCells) { cells = maxCells; }\n"
-        + "            Args[0] = cells * 18;  // 每格 18 个索引：顶面 6 + 两面墙各 6\n"
+        + "            Args[0] = cells * 6;  // 每格 6 个索引：一个斜顶面两个三角形\n"
         + "            Args[1] = 1;\n"
         + "            Args[2] = 0;\n"
         + "            Args[3] = 0;\n"
@@ -461,11 +636,10 @@ public final class Dx12LodRenderer {
         + "    // 跨在边界上的格子必须照画，否则体素/高度场之间会空出一条缝。\n"
         + "    if (min(x0, x1) >= VoxelMinX && max(x0, x1) <= VoxelMaxX\n"
         + "        && min(z0, z1) >= VoxelMinZ && max(z0, z1) <= VoxelMaxZ) { return; }\n"
-        + "    // 抢 8 个顶点槽位（顶面 4 个 + 两条墙各复用 2 个顶面顶点、再补 2 个）；\n"
-        + "    // 越界就把这一格丢掉（远处优先，保证缓冲不会写爆）。\n"
+        + "    // 抢 4 个顶点槽位（顶面四角）；越界就把这一格丢掉（远处优先，保证缓冲不会写爆）。\n"
         + "    uint slot;\n"
-        + "    InterlockedAdd(Counter[0], 8, slot);\n"
-        + "    if (slot + 8 > MaxVerts) { return; }\n"
+        + "    InterlockedAdd(Counter[0], 4, slot);\n"
+        + "    if (slot + 4 > MaxVerts) { return; }\n"
         + "    // 坡度逐格算（四点差分），颜色逐角点算：整格涂一个平均色等于把地表纹理糊\n"
         + "    // 成一团，近景一格就是一方块时四角同色还看不出来，远景一格上百方块就成了\n"
         + "    // 一块巨大的纯色补丁 —— 「太糊」主要就出在这里。\n"
@@ -477,25 +651,12 @@ public final class Dx12LodRenderer {
         + "    int c10 = ShadeCorner(Corners[j * N + i + 1].rgb, h10, slope, a10);\n"
         + "    int c01 = ShadeCorner(Corners[(j + 1) * N + i].rgb, h01, slope, a01);\n"
         + "    int c11 = ShadeCorner(Corners[(j + 1) * N + i + 1].rgb, h11, slope, a11);\n"
-        + "    // 顶面在 h00 处压平：整格是一个真正的方块平面，和邻居的高差由竖直墙补上。\n"
-        + "    // 最外圈没有邻居，墙高退回 h00，墙自然退化成零面积三角形。\n"
-        + "    int wxh = (i + 1 < span) ? h10 : h00;\n"
-        + "    int wzh = (j + 1 < span) ? h01 : h00;\n"
-        + "    // 墙颜色取更高的、暴露在外的那一格：邻居更高用邻居的顶面色，否则用本格。\n"
-        + "    int wxa = (h10 > h00) ? a10 : a00;\n"
-        + "    int wxc = (h10 > h00) ? c10 : c00;\n"
-        + "    int wza = (h01 > h00) ? a01 : a00;\n"
-        + "    int wzc = (h01 > h00) ? c01 : c00;\n"
-        + "    // 8 个顶点：0..3 顶面（都在 h00），4/5 是 +X 墙顶（h10），6/7 是 +Z 墙顶（h01）。\n"
-        + "    // 墙面底部复用 0..3 里的边界顶点，因此 8 个顶点就够画三个 quad。\n"
+        + "    // 四个角各用自己的高度：相邻格共享同一对角点，面与面之间天然对齐，\n"
+        + "    // 不会出现台阶、悬空平板或裂缝。\n"
         + "    OutVerts[slot + 0] = Vertex(x0, z0, h00, PackColor(c00, a00));\n"
-        + "    OutVerts[slot + 1] = Vertex(x1, z0, h00, PackColor(c10, a10));\n"
-        + "    OutVerts[slot + 2] = Vertex(x1, z1, h00, PackColor(c11, a11));\n"
-        + "    OutVerts[slot + 3] = Vertex(x0, z1, h00, PackColor(c01, a01));\n"
-        + "    OutVerts[slot + 4] = Vertex(x1, z0, wxh, PackColor(wxc, wxa));\n"
-        + "    OutVerts[slot + 5] = Vertex(x1, z1, wxh, PackColor(wxc, wxa));\n"
-        + "    OutVerts[slot + 6] = Vertex(x0, z1, wzh, PackColor(wzc, wza));\n"
-        + "    OutVerts[slot + 7] = Vertex(x1, z1, wzh, PackColor(wzc, wza));\n"
+        + "    OutVerts[slot + 1] = Vertex(x1, z0, h10, PackColor(c10, a10));\n"
+        + "    OutVerts[slot + 2] = Vertex(x1, z1, h11, PackColor(c11, a11));\n"
+        + "    OutVerts[slot + 3] = Vertex(x0, z1, h01, PackColor(c01, a01));\n"
         + "}\n";
 
     private final Slot[] slots = new Slot[GEOMETRY_SLOTS];
@@ -517,10 +678,19 @@ public final class Dx12LodRenderer {
      * 房屋、围墙这类几格宽的结构只有在这一圈里才认得出来。
      */
     private static final int VOXEL_FULL_DETAIL_RADIUS = 288;
+    /**
+     * shift 0→1 的过渡带宽度（方块）。
+     *
+     * <p>硬切换时贴图密度在边界处瞬间翻倍，相机跨过就闪一下（"从外面往里闪"的观感来源）。
+     * 照搬 voxy 的连续层级思路：在 {@code VOXEL_FULL_DETAIL_RADIUS} 附近留一段过渡带，
+     * 贴图密度随距离线性衰减，消除跳变。过渡带外圈仍按 shift=1 建网，但内圈保留
+     * shift=0，相机移动时新旧环平滑交叠，不再有密度突变。
+     */
+    private static final int VOXEL_TRANSITION_WIDTH = 64;
     /** 体素顶点缓冲的硬上限（约 72 MB），按「由近到远」填，放不下的远处区块直接跳过。 */
     private static final int VOXEL_MAX_VERTICES = 4_500_000;
     /** 有新区块建好时，最多每隔这么多帧重拼一次顶点缓冲（相机跨区块时不受此限）。 */
-    private static final int VOXEL_REBUILD_INTERVAL = 16;
+    private static final int VOXEL_REBUILD_INTERVAL = 32;
     /**
      * 体素环中心吸附的区块数（4 区块 = 64 方块）。相机在同一格内走动时环集合和
      * 高度场剔除矩形都不变，避免每跨 16 方块就重新采样整张远景。
@@ -621,6 +791,11 @@ public final class Dx12LodRenderer {
 
     private long lastDiagnosticNanos;
 
+    /** 体素专用管线（32B 顶点 + SRV t0）：首次调用 {@link #createVoxelPipeline} 时缓存。 */
+    private final Map<Integer, Long> voxelPipelines = new HashMap<>();
+    /** 方块纹理图集 SRV handle（{@link Dx12GpuTextureView#handle()}）。{@code 0L} = 尚未初始化。 */
+    private long voxelAtlasViewHandle;
+
     /** 角点输入（int height + int rgb）：UPLOAD 堆，作为 compute 的 t0 只读。 */
     private Dx12GpuBuffer cornerBuffer;
     private GpuBufferSlice.MappedView cornerView;
@@ -703,6 +878,9 @@ public final class Dx12LodRenderer {
         int quality = Mth.clamp(config.getLodQuality(), 0, 2);
         int base = quality == 0 ? 16 : quality == 1 ? 8 : 4;
         int radiusBlocks = Mth.clamp(config.getLodDistance() * 16, 256, MAX_RADIUS_BLOCKS);
+        // 几何只铺到雾终点外侧一点：更远的格子被雾完全盖住，铺出去只是白占环数预算。
+        int geomRadius = Math.min(radiusBlocks,
+            Math.max(256, Math.round(LOD_GEOMETRY_RADIUS_BLOCKS)));
 
         int cameraBlockX = Mth.floor(camera.pos.x);
         int cameraBlockZ = Mth.floor(camera.pos.z);
@@ -729,7 +907,10 @@ public final class Dx12LodRenderer {
         // 与视距成比例的滞回上限。
         int centerX;
         int centerZ;
-        int maxLag = Math.max(64, radiusBlocks / 8);
+        // 中心滞回上限必须跟着几何半径走：几何只铺到 geomRadius，中心一旦落后超过
+        // 一小截，相机前方的远景就会被整片截掉。以前按 radiusBlocks/8 = 2048 算，
+        // 几何半径收到 828 后这个滞后量足以把可见地形全部推出视野。
+        int maxLag = Math.max(64, geomRadius / 4);
         if (this.voxelFaceCount > 0
             && Math.abs(cameraBlockX - this.voxelDrawnCenterX) <= maxLag
             && Math.abs(cameraBlockZ - this.voxelDrawnCenterZ) <= maxLag) {
@@ -769,7 +950,8 @@ public final class Dx12LodRenderer {
         this.framesSinceBuild++;
         // 后台陆续读到新区块时才需要定时重建；站着不动且没有新数据就不重建，
         // 免得每 40 帧白采样一次几万个角点造成卡顿
-        int cachedChunks = LodRegionCache.getInstance().cachedCount();
+        LodRegionCache cache = LodRegionCache.getInstance();
+        int cachedChunks = cache.cachedCount();
         boolean rebuild = this.geometry == null
             || base != this.builtBase
             || radiusBlocks != this.builtRadius
@@ -781,9 +963,13 @@ public final class Dx12LodRenderer {
             || voxelMaxX != this.builtVoxelMaxX
             || voxelMinZ != this.builtVoxelMinZ
             || voxelMaxZ != this.builtVoxelMaxZ
-            || (this.framesSinceBuild > REBUILD_INTERVAL && cachedChunks != this.builtCachedChunks);
+            || (this.framesSinceBuild > REBUILD_INTERVAL && cachedChunks != this.builtCachedChunks)
+            // 还有区块在排队读盘：第一次采样几乎全是 miss，只等 cachedChunks 变化的话，
+            // 旧数据读完之后计数不再变化、几何会永久停在「一片空洞」，日志里那次
+            // 已采样=66/1562501 就是这么来的。pending 归零后这条自然失效。
+            || (this.framesSinceBuild > REBUILD_INTERVAL && cache.pendingCount() > 0);
         if (rebuild) {
-            rebuildGeometry(ctx, level, centerX, centerZ, radiusBlocks, base,
+            rebuildGeometry(ctx, level, centerX, centerZ, geomRadius, base,
                 fineStart, vanillaInner, voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
                 cameraBlockX, cameraBlockZ);
             this.framesSinceBuild = 0;
@@ -836,9 +1022,14 @@ public final class Dx12LodRenderer {
             .get(viewProj);
 
         // 雾：从原版视距外开始，外缘完全融进天空色，远景因此没有一条硬切边。
-        // 体素覆盖只是决定「哪里开始有细节」，雾的起点仍跟着稳定量走，避免忽浓忽淡。
-        float fogStart = Math.max(vanillaInner, radiusBlocks * 0.55f);
-        float fogEnd = Math.max(fogStart + 1.0f, radiusBlocks * 0.95f);
+        //
+        // 这里的距离必须和「实际看得清的几何」对齐，不能直接用 radiusBlocks：
+        // lod_distance=1024 时 radiusBlocks 被钳到 16384，雾起点会跑到 9000 方块外，
+        // 250~9000 方块之间的地形等于完全没有雾，远景就是一片锐利的惨白色块。
+        // 所以取 min(几何半径, 视觉上合理的远景距离)，让雾在 LOD_FOG_FAR_BLOCKS 内收尾。
+        float fogFar = Math.min(radiusBlocks, LOD_FOG_FAR_BLOCKS);
+        float fogStart = Math.max(vanillaInner, fogFar * LOD_FOG_START_RATIO);
+        float fogEnd = Math.max(fogStart + 1.0f, fogFar);
         int uniformOffset = writeUniforms(viewProj, camera, renderState, levelState, fogStart, fogEnd,
             centerX, centerZ, level.getSeaLevel());
 
@@ -853,12 +1044,27 @@ public final class Dx12LodRenderer {
                 LodVoxelCache voxelCache = LodVoxelCache.getInstance();
                 int voxelUniform = writeUniforms(viewProj, camera, renderState, levelState,
                     fogStart, fogEnd, voxelCache.anchorX(), voxelCache.anchorZ(), level.getSeaLevel());
-                Dx12Native.dx12SetVertexBuffer(ctx, 0, this.voxelVertexBuffer.handle(), 0L, VERTEX_STRIDE);
-                Dx12Native.dx12SetIndexBuffer(ctx, this.voxelIndexBuffer.handle(), 1);
-                pushUniform(ctx, voxelUniform);
-                Dx12Native.dx12DrawIndexed(ctx, this.voxelFaceCount * 6, 1, 0, 0, 0);
+                long voxelPipeline = voxelPipelineFor(color.getFormat().ordinal());
+                if (voxelPipeline != 0L) {
+                    Dx12Native.dx12SetPipeline(ctx, voxelPipeline, true);
+                    Dx12Native.dx12SetVertexBuffer(ctx, 0, this.voxelVertexBuffer.handle(),
+                        0L, VOXEL_VERTEX_STRIDE);
+                    Dx12Native.dx12SetIndexBuffer(ctx, this.voxelIndexBuffer.handle(), 1);
+                    // 图集 SRV 可用时推 CBV+SRV 两条；不可用时只推 CBV。
+                    // 不能先调 pushUniform 再调 pushVoxelTexture：native 侧每次
+                    // dx12PushDescriptors 都会写一条新的 descriptor table，两次调用
+                    // 互相覆盖导致 SRV 槽位错乱。pushVoxelTexture 本身已带 CBV。
+                    long atlasHandle = ensureVoxelAtlasView(minecraft);
+                    if (atlasHandle != 0L) {
+                        pushVoxelTexture(ctx, voxelUniform, atlasHandle);
+                    } else {
+                        pushVoxelNoTexture(ctx, voxelUniform);
+                    }
+                    Dx12Native.dx12DrawIndexed(ctx, this.voxelFaceCount * 6, 1, 0, 0, 0);
+                }
             }
             if (hasHeightfield) {
+                Dx12Native.dx12SetPipeline(ctx, pipeline, true);
                 Dx12Native.dx12SetVertexBuffer(ctx, 0, slot.vertexBuffer.handle(), 0L, VERTEX_STRIDE);
                 pushUniform(ctx, uniformOffset);
                 if (slot.quadMode) {
@@ -966,7 +1172,11 @@ public final class Dx12LodRenderer {
                     if (d * 16 + 16 <= vanillaInner) {
                         continue;
                     }
-                    int shift = d * 16 <= VOXEL_FULL_DETAIL_RADIUS ? 0 : 1;
+                    // shift 0→1 加过渡带：VOXEL_FULL_DETAIL_RADIUS 到 FULL+TRANSITION 仍按
+                    // 1 方块精度建网，过渡带外才降到 2 方块。相机跨过边界时贴图密度平滑
+                    // 衰减，不再瞬间翻倍闪一下。
+                    int ringRadius = d * 16;
+                    int shift = ringRadius <= VOXEL_FULL_DETAIL_RADIUS + VOXEL_TRANSITION_WIDTH ? 0 : 1;
                     // 即使已经停止绘制也要继续 get()：否则外圈永远不会排队建网，
                     // 体素就再也长不回去了。
                     LodVoxelMesher.Mesh mesh = cache.get(camChunkX + dx, camChunkZ + dz, shift);
@@ -1032,7 +1242,7 @@ public final class Dx12LodRenderer {
         int vertex = 0;
         for (int k = 0; k < count; k++) {
             LodVoxelMesher.Mesh mesh = selected[k];
-            this.voxelVertexData.position(vertex * VERTEX_STRIDE);
+            this.voxelVertexData.position(vertex * VOXEL_VERTEX_STRIDE);
             this.voxelVertexData.put(mesh.vertices(), 0, mesh.vertices().length);
             vertex += mesh.faces() * 4;
         }
@@ -1078,7 +1288,7 @@ public final class Dx12LodRenderer {
             int capacity = Math.min(VOXEL_MAX_VERTICES,
                 Math.max(vertexCapacity, Math.max(this.voxelVertexCapacity * 2, 65536)));
             closeVoxelVertex();
-            long bytes = (long) capacity * VERTEX_STRIDE;
+            long bytes = (long) capacity * VOXEL_VERTEX_STRIDE;
             Dx12GpuBuffer buffer = new Dx12GpuBuffer(
                 GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_VERTEX, bytes);
             GpuBufferSlice.MappedView view = buffer.map(0L, bytes, false, true);
@@ -1170,9 +1380,9 @@ public final class Dx12LodRenderer {
         int cellCount = (n - 1) * (n - 1);
         // GPU 建网开关：一旦失败就永久回退 CPU（每帧重试只会刷日志）
         boolean gpu = !this.computeFailed && ensureCompute(n, axis);
-        // quad 模式每格 8 个顶点（顶面 + 两条墙）+ 共享静态索引，容量按硬上限截断
+        // quad 模式每格 4 个顶点（斜顶面四个角）+ 共享静态索引，容量按硬上限截断
         // （compute 会丢弃放不下的格子）
-        int quadVerts = Math.min(cellCount * 8, MAX_QUAD_VERTS);
+        int quadVerts = Math.min(cellCount * 4, MAX_QUAD_VERTS);
 
         Slot slot = this.slots[this.rebuildIndex % GEOMETRY_SLOTS];
         if (slot == null) {
@@ -1183,7 +1393,7 @@ public final class Dx12LodRenderer {
         slot.ensure(gpu ? quadVerts : vertexCount, gpu ? 0 : cellCount * 6, gpu);
         if (gpu) {
             // 索引模式与地形无关，所有槽位共用一份；建不出来的话这一帧就退回 CPU
-            ensureQuadIndex(quadVerts / 8);
+            ensureQuadIndex(quadVerts / 4);
             if (this.quadIndexBuffer == null) {
                 gpu = false;
                 slot.ensure(vertexCount, cellCount * 6, false);
@@ -1306,18 +1516,21 @@ public final class Dx12LodRenderer {
         if (now - this.lastDiagnosticNanos > 5_000_000_000L) {
             this.lastDiagnosticNanos = now;
             // GPU 路径的可见 quad 数由 compute 阶段的 InterlockedAdd 决定，CPU 侧拿不到，
-            // 这里打的是容量（quadVerts / 8），不要再显示成 0。
+            // 这里打的是容量（quadVerts / 4），不要再显示成 0。
+            // 真实接缝格宽 = 细格段<b>第一格</b>的宽度。以前的判定取的是
+            // axis[k] - axis[k-1]，命中的是粗格段（32 方块）的最后一格，于是日志
+            // 一直显示 32，看起来像接缝处有 32 方块的大台阶。
             int seamCell = 0;
-            for (int k = 1; k < n; k++) {
+            for (int k = 1; k + 1 < n; k++) {
                 if (axis[k] >= fineStart) {
-                    seamCell = axis[k] - axis[k - 1];
+                    seamCell = axis[k + 1] - axis[k];
                     break;
                 }
             }
-            LOGGER.info("[lod] 网格={}x{} 接缝格宽={} 远端格宽={} {} 已采样={} 地形格={} 顶点容量={} 索引={} 缓存区块={} 体素面={} 体素半径={} 耗时={}ms",
-                n - 1, n - 1, seamCell, axis[n - 1] - axis[n - 2], gpuOk ? "GPU-block" : "CPU", known,
-                gpuOk ? quadVerts / 8 : emitted,
-                gpuOk ? quadVerts : vertexCount, gpuOk ? quadVerts / 8 * 18 : indexCount,
+            LOGGER.info("[lod] 网格={}x{} 接缝格宽={} 远端格宽={} {} 已采样={}/{} 地形格={} 顶点容量={} 索引={} 缓存区块={} 体素面={} 体素半径={} 耗时={}ms",
+                n - 1, n - 1, seamCell, axis[n - 1] - axis[n - 2], gpuOk ? "GPU-block" : "CPU", known, vertexCount,
+                gpuOk ? quadVerts / 4 : emitted,
+                gpuOk ? quadVerts : vertexCount, gpuOk ? quadVerts / 4 * 6 : indexCount,
                 LodRegionCache.getInstance().cachedCount(), this.voxelFaceCount, (int) this.voxelCoverRadius,
                 (System.nanoTime() - startNanos) / 1_000_000L);
         }
@@ -1484,9 +1697,7 @@ public final class Dx12LodRenderer {
                     if (slope < 0.45f && height <= seaLevel + 4 && height >= seaLevel - 4) {
                         rgb = mixColor(rgb, SAND_COLOR, 0.35f);
                     }
-                    // 高处积雪
-                    rgb = mixColor(rgb, SNOW_COLOR,
-                        Math.min(0.9f, Math.max(0.0f, (height - snowLine) / 40.0f)));
+                    // 不再按高度硬刷「积雪」：颜色来自地表方块自己的 MapColor。
                     alpha = 0xFF;
                 }
                 // 顶点坐标是相对网格中心的局部坐标（见 writeUniforms 里的 CameraPos），
@@ -1562,7 +1773,7 @@ public final class Dx12LodRenderer {
 
     /**
      * 保证共享静态索引模式够 {@code cells} 格用：第 k 格写
-     * {@code 8k+{0,1,2, 0,2,3, 1,4,5, 1,5,2, 3,2,7, 3,7,6}}（顶面 + 两面墙）。
+     * {@code 4k+{0,1,2, 0,2,3}}（一个顶面两个三角形，顶点就是四个角）。
      *
      * <p>整份模式与具体地形无关，所以只分配一次、所有槽位共用；容量不够时才重建。
      */
@@ -1572,7 +1783,7 @@ public final class Dx12LodRenderer {
             return;
         }
         int capacity = Math.max(cells, Math.max(this.quadIndexCells * 2, 1024));
-        long bytes = (long) capacity * 18L * 4L;
+        long bytes = (long) capacity * 6L * 4L;
         try {
             if (this.quadIndexView != null) {
                 try {
@@ -1594,8 +1805,8 @@ public final class Dx12LodRenderer {
             GpuBufferSlice.MappedView view = buffer.map(0L, bytes, false, true);
             IntBuffer indices = view.data().asIntBuffer();
             for (int k = 0; k < capacity; k++) {
-                int v = k * 8;
-                int o = k * 18;
+                int v = k * 4;
+                int o = k * 6;
                 // 顶面：0,1,2 / 0,2,3
                 indices.put(o, v);
                 indices.put(o + 1, v + 1);
@@ -1603,20 +1814,6 @@ public final class Dx12LodRenderer {
                 indices.put(o + 3, v);
                 indices.put(o + 4, v + 2);
                 indices.put(o + 5, v + 3);
-                // +X 墙：1,4,5 / 1,5,2
-                indices.put(o + 6, v + 1);
-                indices.put(o + 7, v + 4);
-                indices.put(o + 8, v + 5);
-                indices.put(o + 9, v + 1);
-                indices.put(o + 10, v + 5);
-                indices.put(o + 11, v + 2);
-                // +Z 墙：3,2,7 / 3,7,6
-                indices.put(o + 12, v + 3);
-                indices.put(o + 13, v + 2);
-                indices.put(o + 14, v + 7);
-                indices.put(o + 15, v + 3);
-                indices.put(o + 16, v + 7);
-                indices.put(o + 17, v + 6);
             }
             this.quadIndexBuffer = buffer;
             this.quadIndexView = view;
@@ -1630,8 +1827,8 @@ public final class Dx12LodRenderer {
     /**
      * 把采样好的角点交给 compute 展开成顶点。
      *
-     * <p>分三个 pass：先把计数器清零（缓冲首帧内容未定义）、再让每个格子抢 8 个槽位
-     * 写一个压平顶面 + 两条竖直墙、最后把总顶点数翻译成 {@code ExecuteIndirect} 的参数。
+     * <p>分三个 pass：先把计数器清零（缓冲首帧内容未定义）、再让每个格子抢 4 个槽位
+     * 写一个四角各自取高的斜顶面、最后把总顶点数翻译成 {@code ExecuteIndirect} 的参数。
      * 主线程全程不回读。
      *
      * @return {@code null} 表示成功，否则为失败原因（调用方据此永久回退 CPU）
@@ -1774,8 +1971,12 @@ public final class Dx12LodRenderer {
             }
             forward[count++] = coord;
         }
-        // 第二段：细格段保持最细格宽，正好覆盖体素外缘，接缝处两边格宽一致
-        int fineEnd = Math.min(maxRadius, coord + NEAR_DETAIL_BAND);
+        // 第二段：细格段保持最细格宽，正好覆盖体素外缘，接缝处两边格宽一致。
+        // 这一段最多花掉单侧环数的 40%：lod_quality=2 时 nearWidth=1，固定铺
+        // NEAR_DETAIL_BAND(192) 方块会一口气吃掉全部环数，剩下的环只够把格宽
+        // 从 1 放大到 2，远景就和近景一样是 1 方块分辨率 —— 灰墙就是这么来的。
+        int fineBudget = Math.max(8, AXIS_RINGS * 2 / 5);
+        int fineEnd = Math.min(maxRadius, coord + Math.min(NEAR_DETAIL_BAND, fineBudget * nearWidth));
         while (coord < fineEnd) {
             coord = Math.min(coord + nearWidth, fineEnd);
             if (count == forward.length) {
@@ -1787,10 +1988,17 @@ public final class Dx12LodRenderer {
         int remaining = AXIS_RINGS - (count - 1);
         double growth = solveGrowth(maxRadius - coord, nearWidth, remaining);
         double widthAcc = nearWidth;
+        // 用 double 累计坐标再取整：以前是每次 Math.round(宽度) 后加进 int 坐标，
+        // 取整误差逐环累加，等比段会提前撞到 maxRadius，最后一格被截成 2 方块的碎片。
+        double coordAcc = coord;
         while (coord < maxRadius) {
             widthAcc *= growth;
-            int step = Math.max(1, (int) Math.round(widthAcc));
-            coord = Math.min(coord + step, maxRadius);
+            coordAcc += widthAcc;
+            int next = coordAcc >= maxRadius ? maxRadius : (int) Math.round(coordAcc);
+            if (next <= coord) {
+                next = coord + 1;
+            }
+            coord = next;
             if (count == forward.length) {
                 forward = Arrays.copyOf(forward, count * 2);
             }
@@ -2056,9 +2264,25 @@ public final class Dx12LodRenderer {
 
         SkyRenderState sky = levelState == null ? null : levelState.skyRenderState;
         int skyColor = sky == null ? 0x8090C0 : sky.skyColor;
-        buffer.putFloat(offset + 96, ((skyColor >> 16) & 0xFF) / 255.0f);
-        buffer.putFloat(offset + 100, ((skyColor >> 8) & 0xFF) / 255.0f);
-        buffer.putFloat(offset + 104, (skyColor & 0xFF) / 255.0f);
+        // 雾色优先用原版这一帧算好的 camera.fogData.color：它已经把生物群系雾色、
+        // 日出日落的橙红混色都算进去了。只取 sky.skyColor 的话，日落时天空是橙的、
+        // 远景雾是蓝灰的，地平线上会出现一条硬邦邦的色带（截图里那道橙色/蓝灰分界）。
+        // 找不到渲染状态时才退回天空色。
+        float fogR = ((skyColor >> 16) & 0xFF) / 255.0f;
+        float fogG = ((skyColor >> 8) & 0xFF) / 255.0f;
+        float fogB = (skyColor & 0xFF) / 255.0f;
+        Vector4f vanillaFog = camera == null || camera.fogData == null ? null : camera.fogData.color;
+        if (vanillaFog != null && vanillaFog.w() > 0.0f) {
+            fogR = vanillaFog.x();
+            fogG = vanillaFog.y();
+            fogB = vanillaFog.z();
+        }
+        // 往亮度混 45% 再压暗 8%，才有 voxy 参考图里那种「蓝灰浓雾」的低饱和层次；
+        // 直接铺原版雾色会偏艳，远景像一块纯色板。
+        float fogLuma = 0.2126f * fogR + 0.7152f * fogG + 0.0722f * fogB;
+        buffer.putFloat(offset + 96, (fogR * 0.55f + fogLuma * 0.45f) * 0.92f);
+        buffer.putFloat(offset + 100, (fogG * 0.55f + fogLuma * 0.45f) * 0.92f);
+        buffer.putFloat(offset + 104, (fogB * 0.55f + fogLuma * 0.45f) * 0.92f);
         buffer.putFloat(offset + 108, 1.0f);
 
         // 天空光染色：白天白、夜里偏蓝，只调色不动整体亮度
@@ -2203,6 +2427,175 @@ public final class Dx12LodRenderer {
 
         desc.flip();
         return Dx12Native.dx12CreateGraphicsPipeline(desc);
+    }
+
+    /**
+     * 体素 LOD 专用管线：32B 顶点（POSITION + COLOR + TEXCOORD0 + TEXCOORD1）+ SRV t0（LINEAR+CLAMP）。
+     * 按颜色格式缓存。{@code 0L} = 创建失败（本帧跳过体素绘制）。
+     */
+    private long voxelPipelineFor(int colorFormat) {
+        Long cached = this.voxelPipelines.get(colorFormat);
+        if (cached != null) {
+            return cached;
+        }
+        long handle = createVoxelPipeline(colorFormat);
+        this.voxelPipelines.put(colorFormat, handle);
+        if (handle == 0L) {
+            LOGGER.error("[lod] 体素 LOD 管线创建失败（颜色格式 ordinal={}）", colorFormat);
+        }
+        return handle;
+    }
+
+    /**
+     * 体素管线：4 个输入元素（position float3 / color rgba8 / uv float2 / rect 4×UNORM16）
+     * + CBV b0 + SRV t0。SRV 类型 = 3（LINEAR+CLAMP 静态采样器，按 binding reg=0 声明）。
+     */
+    private static long createVoxelPipeline(int colorFormat) {
+        byte[] vs = (UNIFORM_HEADER + VOXEL_VERTEX_SHADER).getBytes(StandardCharsets.UTF_8);
+        byte[] ps = (UNIFORM_HEADER + VOXEL_PIXEL_SHADER).getBytes(StandardCharsets.UTF_8);
+        String[] semantics = {"POSITION", "COLOR", "TEXCOORD0", "TEXCOORD1"};
+
+        int size = 4 + vs.length + 4 + ps.length;
+        size += 4 + 12;              // colorCount + 一个颜色目标
+        size += 1 + 6;               // hasDepth + 深度状态
+        size += 4 + 1 + 4;           // topology / cull / polygonMode
+        size += 4 + 24 * 4;          // inputElementCount + 四个元素
+        size += 4;                   // semanticCount
+        for (String semantic : semantics) {
+            size += 4 + semantic.length();
+        }
+        // entryCount：CBV b0 + SRV t0（type=3, reg=0）
+        size += 4 + 2 + 2;
+
+        ByteBuffer desc = ByteBuffer.allocateDirect(size).order(ByteOrder.LITTLE_ENDIAN);
+        desc.putInt(vs.length);
+        desc.put(vs);
+        desc.putInt(ps.length);
+        desc.put(ps);
+
+        desc.putInt(1);
+        desc.putInt(colorFormat);
+        desc.put((byte) 0x0F);
+        desc.put((byte) 0);
+        for (int i = 0; i < 6; i++) {
+            desc.put((byte) 0);
+        }
+
+        desc.put((byte) 1);
+        desc.putInt(51);
+        desc.put((byte) 1);
+        desc.put((byte) 5);
+
+        desc.putInt(4);
+        desc.put((byte) 0);
+        desc.putInt(0);
+
+        // 四个输入元素：location, binding, format, offset, stride, stepRate
+        desc.putInt(4);
+        // position: location=0, binding=0, FORMAT_POSITION, offset=0, stride=VOXEL_VERTEX_STRIDE
+        desc.putInt(0);
+        desc.putInt(0);
+        desc.putInt(FORMAT_POSITION);
+        desc.putInt(0);
+        desc.putInt(VOXEL_VERTEX_STRIDE);
+        desc.putInt(0);
+        // color: location=1, binding=0, FORMAT_COLOR, offset=12
+        desc.putInt(1);
+        desc.putInt(0);
+        desc.putInt(FORMAT_COLOR);
+        desc.putInt(12);
+        desc.putInt(VOXEL_VERTEX_STRIDE);
+        desc.putInt(0);
+        // uv: location=2, binding=0, FORMAT_UV, offset=16
+        desc.putInt(2);
+        desc.putInt(0);
+        desc.putInt(FORMAT_UV);
+        desc.putInt(16);
+        desc.putInt(VOXEL_VERTEX_STRIDE);
+        desc.putInt(0);
+        // rect: location=3, binding=0, FORMAT_RECT(4×UNORM16), offset=24
+        desc.putInt(3);
+        desc.putInt(0);
+        desc.putInt(FORMAT_RECT);
+        desc.putInt(24);
+        desc.putInt(VOXEL_VERTEX_STRIDE);
+        desc.putInt(0);
+
+        desc.putInt(semantics.length);
+        for (String semantic : semantics) {
+            byte[] bytes = semantic.getBytes(StandardCharsets.UTF_8);
+            desc.putInt(bytes.length);
+            desc.put(bytes);
+        }
+
+        // 根参数：CBV b0 + SRV t0（type=3 是 LINEAR+CLAMP）
+        desc.putInt(2);
+        desc.put((byte) 0);
+        desc.put((byte) 0);
+        desc.put((byte) 3);
+        desc.put((byte) 0);
+
+        desc.flip();
+        return Dx12Native.dx12CreateGraphicsPipeline(desc);
+    }
+
+    /**
+     * 惰性初始化方块纹理图集 SRV handle。
+     *
+     * <p>取 {@code Minecraft.getAtlasManager().getAtlasOrThrow(LOCATION_BLOCKS)} 的
+     * {@link GpuTextureView}，调 {@code ((Dx12GpuTextureView) view).handle()} 得到
+     * 可直接塞进 {@code dx12PushDescriptors} 的 native 描述符指针。
+     *
+     * <p>图集还没上传时（加载阶段）{@code getTextureView()} 可能返回 null，
+     * 此时返回 0，调用方跳过 SRV 绑定（像素着色器里 UV 采样落黑，不影响渲染）。
+     */
+    private long ensureVoxelAtlasView(Minecraft minecraft) {
+        if (this.voxelAtlasViewHandle != 0L) {
+            return this.voxelAtlasViewHandle;
+        }
+        try {
+            TextureAtlas atlas = minecraft.getAtlasManager()
+                .getAtlasOrThrow(TextureAtlas.LOCATION_BLOCKS);
+            GpuTextureView view = atlas.getTextureView();
+            if (view instanceof Dx12GpuTextureView dx12View) {
+                this.voxelAtlasViewHandle = dx12View.handle();
+                return this.voxelAtlasViewHandle;
+            }
+        } catch (Throwable t) {
+            // 图集尚未初始化（加载阶段），静默返回 0，下次再试
+        }
+        return 0L;
+    }
+
+    /**
+     * 推 CBV（uniform）+ SRV（图集纹理）两条根参数。
+     * SRV type=3 对应 LINEAR+CLAMP 静态采样器，reg=0 与 {@code createVoxelPipeline} 的 t0 一致。
+     */
+    private void pushVoxelTexture(long ctx, int uniformOffset, long atlasViewHandle) {
+        if (!Dx12Native.dx12PushDescriptors(ctx,
+            new int[]{0, 3},
+            new long[]{this.uniformBuffer.handle(), atlasViewHandle},
+            new long[]{uniformOffset, 0L},
+            new long[]{UNIFORM_DATA_BYTES, 0L},
+            new int[]{0, 0},
+            new long[]{0L, 0L})) {
+            throw new IllegalStateException("体素 LOD 描述符推送失败");
+        }
+    }
+
+    /** 图集不可用：只推 CBV，但 native 侧 srvCount=0 不绑表，GPU 读上一帧残留。
+     *  因此改为推一个「空 SRV」占位（type=3, view=null）让 native 写 0 描述符，
+     *  像素着色器采到黑，再 lerp 回顶点色。 */
+    private void pushVoxelNoTexture(long ctx, int uniformOffset) {
+        if (!Dx12Native.dx12PushDescriptors(ctx,
+            new int[]{0},
+            new long[]{this.uniformBuffer.handle()},
+            new long[]{uniformOffset},
+            new long[]{UNIFORM_DATA_BYTES},
+            new int[]{0},
+            new long[]{0L})) {
+            throw new IllegalStateException("体素 LOD 描述符推送失败（无纹理）");
+        }
     }
 
     private static float fovY(Matrix4f projection) {
