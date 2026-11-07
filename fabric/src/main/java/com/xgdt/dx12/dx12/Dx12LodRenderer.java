@@ -105,9 +105,16 @@ public final class Dx12LodRenderer {
 
     /** 最远 LOD 半径（方块）。同时是 lod_distance 滑块的最大值对应的半径。 */
     private static final int MAX_RADIUS_BLOCKS = 16384;
-    /** 无位移时的兜底重建间隔（帧）：让后台陆续读到的地形逐步补齐。网格降到 192 环后
-     * 一次重建只要采样十几万角点，可以比原来（156 万角点 / 40 帧）更勤快地补齐。 */
-    private static final int REBUILD_INTERVAL = 20;
+    /**
+     * 无位移时的兜底重建冷却（毫秒）。
+     *
+     * <p>以前这里按「帧」计时（{@code framesSinceBuild > 20}），但进世界/读图时渲染线程
+     * 会被加载卡住，几十秒内根本跑不满 20 帧；第一次建网必然全是未知（区块还没读盘），
+     * 之后就一直不再重建，几何永久冻结成一片空洞 —— 日志里整局只有一条
+     * {@code 已采样=0} 的建网记录就是这么来的。改成按墙上时间冷却，低帧率/卡顿下也能
+     * 保证数据补上后一定重采样。
+     */
+    private static final long REBUILD_COOLDOWN_MS = 250L;
 
     /**
      * 远景雾的完全遮挡距离（方块）。
@@ -753,7 +760,8 @@ public final class Dx12LodRenderer {
     private Dx12GpuBuffer quadIndexBuffer;
     private GpuBufferSlice.MappedView quadIndexView;
     private int quadIndexCells;
-    private int framesSinceBuild;
+    /** 上次重建的时刻（{@link System#nanoTime()}），用于按墙上时间做重建冷却。 */
+    private long lastBuildNanos;
 
     /** 上次建网时的网格参数，任一变化都要重建。 */
     private int builtBase = -1;
@@ -765,6 +773,14 @@ public final class Dx12LodRenderer {
     private int builtCellX = Integer.MIN_VALUE;
     private int builtCellZ = Integer.MIN_VALUE;
     private int builtCachedChunks = -1;
+    /**
+     * 上次建网时有效采样的角点数（{@code -1} = 还没建过）。
+     *
+     * <p>为 0 说明整张网格一个角点都没采到（世界刚加载、区块还没进缓存），此时
+     * {@link #builtCachedChunks} 之后即使不再变化，几何也会永久停在「全空」状态 ——
+     * 日志里只有一条建网记录、已采样=0 就是这么来的。重建判据据此加一条定期重试。
+     */
+    private int builtKnown = -1;
     /** 上次建网时体素覆盖矩形（相对网格中心），变化也要重建高度场剔除区。 */
     private int builtVoxelMinX = 1;
     private int builtVoxelMaxX = 0;
@@ -947,11 +963,12 @@ public final class Dx12LodRenderer {
         int voxelMaxZ = this.voxelMaxBlockZ > this.voxelMinBlockZ
             ? this.voxelMaxBlockZ - centerZ : 0;
 
-        this.framesSinceBuild++;
         // 后台陆续读到新区块时才需要定时重建；站着不动且没有新数据就不重建，
-        // 免得每 40 帧白采样一次几万个角点造成卡顿
+        // 免得每 250ms 白采样一次十几万个角点造成卡顿。
         LodRegionCache cache = LodRegionCache.getInstance();
         int cachedChunks = cache.cachedCount();
+        boolean cooldownReady =
+            System.nanoTime() - this.lastBuildNanos > REBUILD_COOLDOWN_MS * 1_000_000L;
         boolean rebuild = this.geometry == null
             || base != this.builtBase
             || radiusBlocks != this.builtRadius
@@ -963,16 +980,18 @@ public final class Dx12LodRenderer {
             || voxelMaxX != this.builtVoxelMaxX
             || voxelMinZ != this.builtVoxelMinZ
             || voxelMaxZ != this.builtVoxelMaxZ
-            || (this.framesSinceBuild > REBUILD_INTERVAL && cachedChunks != this.builtCachedChunks)
+            || (cooldownReady && cachedChunks != this.builtCachedChunks)
             // 还有区块在排队读盘：第一次采样几乎全是 miss，只等 cachedChunks 变化的话，
             // 旧数据读完之后计数不再变化、几何会永久停在「一片空洞」，日志里那次
             // 已采样=66/1562501 就是这么来的。pending 归零后这条自然失效。
-            || (this.framesSinceBuild > REBUILD_INTERVAL && cache.pendingCount() > 0);
+            || (cooldownReady && cache.pendingCount() > 0)
+            // 上一次建网一个角点都没采到（刚进世界、区块还没就绪）：不重试就永远空着
+            || (cooldownReady && this.builtKnown == 0);
         if (rebuild) {
             rebuildGeometry(ctx, level, centerX, centerZ, geomRadius, base,
                 fineStart, vanillaInner, voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
                 cameraBlockX, cameraBlockZ);
-            this.framesSinceBuild = 0;
+            this.lastBuildNanos = System.nanoTime();
             this.builtBase = base;
             this.builtRadius = radiusBlocks;
             this.builtVanillaInner = vanillaInner;
@@ -1413,6 +1432,7 @@ public final class Dx12LodRenderer {
         int minBuildY = level.getMinY();
         int maxBuildY = level.getMaxY();
         int known = 0;
+        LodRegionCache.getInstance().resetSampleStats();
         for (int j = 0; j < n; j++) {
             int z = centerZ + axis[j];
             for (int i = 0; i < n; i++) {
@@ -1511,6 +1531,8 @@ public final class Dx12LodRenderer {
 
         slot.indexCount = indexCount;
         this.geometry = slot;
+        // 供重建判据判断「这次是不是一个角点都没采到」，需要定期重试
+        this.builtKnown = known;
 
         long now = System.nanoTime();
         if (now - this.lastDiagnosticNanos > 5_000_000_000L) {
@@ -1527,11 +1549,19 @@ public final class Dx12LodRenderer {
                     break;
                 }
             }
-            LOGGER.info("[lod] 网格={}x{} 接缝格宽={} 远端格宽={} {} 已采样={}/{} 地形格={} 顶点容量={} 索引={} 缓存区块={} 体素面={} 体素半径={} 耗时={}ms",
-                n - 1, n - 1, seamCell, axis[n - 1] - axis[n - 2], gpuOk ? "GPU-block" : "CPU", known, vertexCount,
+            // 远端格宽不能取 axis[n-1] - axis[n-2]：等比段收尾时最后一环被硬夹到
+            // maxRadius，会截成 1 方块，日志于是谎报「远端格宽=1」。取后半段最大格宽，
+            // 才是真正能代表远景精度的数字。
+            int farCell = 0;
+            for (int k = n / 2; k + 1 < n; k++) {
+                farCell = Math.max(farCell, axis[k + 1] - axis[k]);
+            }
+            LOGGER.info("[lod] 网格={}x{} 接缝格宽={} 远端格宽={} {} 已采样={}/{} 地形格={} 顶点容量={} 索引={} 缓存区块={} 体素面={} 体素半径={} 磁盘采样[{}] 耗时={}ms",
+                n - 1, n - 1, seamCell, farCell, gpuOk ? "GPU-block" : "CPU", known, vertexCount,
                 gpuOk ? quadVerts / 4 : emitted,
                 gpuOk ? quadVerts : vertexCount, gpuOk ? quadVerts / 4 * 6 : indexCount,
                 LodRegionCache.getInstance().cachedCount(), this.voxelFaceCount, (int) this.voxelCoverRadius,
+                LodRegionCache.getInstance().sampleStats(),
                 (System.nanoTime() - startNanos) / 1_000_000L);
         }
     }

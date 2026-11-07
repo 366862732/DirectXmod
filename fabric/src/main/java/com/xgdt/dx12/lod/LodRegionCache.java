@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
@@ -89,6 +90,14 @@ public final class LodRegionCache {
     private static final CompoundTag MISSING_TAG = new CompoundTag();
     /** {@link #sample(int, int)} 的「无数据」返回值。 */
     public static final long NO_SAMPLE = (long) Integer.MIN_VALUE << 32;
+
+    /**
+     * 地表颜色解析失败时的兜底色（中性灰）。
+     *
+     * <p>和渲染端 {@code Dx12LodRenderer.FALLBACK_COLOR} 取同一个值：高度有效但颜色
+     * 未知的列不能整条丢弃，否则一整片远景会因为 sections 解析失败而完全消失。
+     */
+    public static final int FALLBACK_COLOR = 0x8A8A8A;
 
     /**
      * 地表是水体的标记位（bit 24 起，与 RGB 不冲突）。
@@ -203,6 +212,16 @@ public final class LodRegionCache {
     private final Set<Long> pending = ConcurrentHashMap.newKeySet();
     /** 当前正在跑的读盘任务数，最多 {@link #WORKERS} 个。 */
     private final AtomicInteger draining = new AtomicInteger();
+
+    /*
+     * 采样诊断计数：渲染端每次重建会采样十几万个角点，全部 miss 时只靠
+     * 「已采样=0」看不出到底是数据没读到、高度解析失败、还是颜色解析失败。
+     * 三个计数分别对应 sample() 的三个失败出口，随诊断日志一起打印。
+     */
+    private final AtomicLong statNoChunk = new AtomicLong();
+    private final AtomicLong statNoHeight = new AtomicLong();
+    private final AtomicLong statNoColor = new AtomicLong();
+    private final AtomicLong statHit = new AtomicLong();
 
     /** 区块 key → 地表数据（{@link #MISSING} 表示整块读不到）。 */
     private final Map<Long, ChunkColumns> columns = Collections.synchronizedMap(
@@ -551,23 +570,49 @@ public final class LodRegionCache {
 
     /**
      * 一次性取「地表高度 + 地表颜色」的打包结果：高 32 位是高度，低 32 位是 RGB。
-     * 高度或颜色任一未知即返回 {@link #NO_SAMPLE}，渲染端据此跳过该顶点。
+     *
+     * <p>只有区块缺失或高度不可用时才返回 {@link #NO_SAMPLE}。颜色解析失败<b>不再</b>
+     * 拖累高度：以前这里是「颜色未知即整条作废」，而 {@code decodeColumns()} 只要
+     * sections 解不出来就会把整块 256 列全留 {@code -1} —— 远景于是连一个角点都统计
+     * 不到（日志里的 {@code 已采样=0/148225}），整张高度场是空的。颜色交给着色器
+     * 按坡度/高度兜底，至少地形轮廓是对的。
      */
     public long sample(int blockX, int blockZ) {
         ChunkColumns data = lookup(blockX, blockZ);
         if (data == null) {
+            this.statNoChunk.incrementAndGet();
             return NO_SAMPLE;
         }
         int index = (blockX & 15) + (blockZ & 15) * 16;
         short height = data.heights[index];
         if (height == UNAVAILABLE) {
+            this.statNoHeight.incrementAndGet();
             return NO_SAMPLE;
         }
         int rgb = data.colors[index];
         if (rgb < 0) {
-            return NO_SAMPLE;
+            this.statNoColor.incrementAndGet();
+            rgb = FALLBACK_COLOR;
+        } else {
+            this.statHit.incrementAndGet();
         }
         return ((long) height << 32) | (rgb & 0xFFFFFFFFL);
+    }
+
+    /** 清零 {@link #sample(int, int)} 的诊断计数（渲染端每次重建前调用）。 */
+    public void resetSampleStats() {
+        this.statNoChunk.set(0);
+        this.statNoHeight.set(0);
+        this.statNoColor.set(0);
+        this.statHit.set(0);
+    }
+
+    /** {@link #sample(int, int)} 的失败构成，形如 {@code 缺区块=0 无高度=0 缺颜色=148225 命中=0}。 */
+    public String sampleStats() {
+        return "缺区块=" + this.statNoChunk.get()
+            + " 无高度=" + this.statNoHeight.get()
+            + " 缺颜色=" + this.statNoColor.get()
+            + " 命中=" + this.statHit.get();
     }
 
     private ChunkColumns lookup(int blockX, int blockZ) {
