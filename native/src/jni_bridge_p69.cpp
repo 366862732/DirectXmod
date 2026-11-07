@@ -75,6 +75,12 @@ JNIEXPORT jlong JNICALL Java_com_xgdt_dx12_dx12_Dx12Native_dx12CreateComputePipe
         (int)srvCount, (int)uavCount, (int)constCount, err);
     if (!p) {
         logFail("dx12CreateComputePipeline", err);
+        // stderr 不会被启动器捕获进日志，这里把原因作为 Java 异常抛出去
+        jclass cls = env->FindClass("java/lang/IllegalStateException");
+        if (cls) {
+            std::string msg = "dx12CreateComputePipeline: " + err;
+            env->ThrowNew(cls, msg.c_str());
+        }
         return 0;
     }
     return (jlong)(uintptr_t)p;

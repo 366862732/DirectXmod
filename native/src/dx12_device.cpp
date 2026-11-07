@@ -4005,6 +4005,9 @@ bool drawIndexedIndirect(CommandContext* ctx, Dx12Object* commands, long long of
         err = "drawIndexedIndirect: invalid buffer handle"; return false;
     }
     if (!gCtx.cmdSigIndexed) { err = "drawIndexedIndirect: no indexed command signature"; return false; }
+    // ExecuteIndirect 要求参数缓冲处于 INDIRECT_ARGUMENT 状态；compute 生成参数时
+    // 它上一刻是 UNORDERED_ACCESS，这里按跟踪状态切过去（endCommandList 会回切 COMMON）。
+    transitionBufferTo(ctx, commands, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     ctx->commandList->ExecuteIndirect(gCtx.cmdSigIndexed.Get(), drawCount,
         commands->resource.Get(), (UINT64)offset, nullptr, 0);
     return true;
@@ -4018,6 +4021,7 @@ bool drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
         err = "drawIndirect: invalid buffer handle"; return false;
     }
     if (!gCtx.cmdSigNonIndexed) { err = "drawIndirect: no non-indexed command signature"; return false; }
+    transitionBufferTo(ctx, commands, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     ctx->commandList->ExecuteIndirect(gCtx.cmdSigNonIndexed.Get(), drawCount,
         commands->resource.Get(), (UINT64)offset, nullptr, 0);
     return true;

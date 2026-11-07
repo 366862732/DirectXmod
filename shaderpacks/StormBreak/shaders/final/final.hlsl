@@ -1,16 +1,25 @@
 // ===========================================================================
 // StormBreak - final tone mapping pass
 //
-// Inputs: t0 = fx:0 (sky), t1 = fx:1 (raytrace shadow), t2 = scene_depth
+// Inputs: t0 = fx:0 (sky, sRGB display space),
+//         t1 = fx:1 (raytrace shadow),
+//         t2 = scene_depth
 // Output: scene_color
 //
+// The whole pack runs in sRGB display space (Minecraft shader-pack
+// convention).  fx:0 is already sRGB-encoded by the sky pass, so this pass
+// does a gentle linearisation for physical operations (exposure, contrast),
+// then re-encodes to sRGB.  No ACES filmic curve: the image is in 0..1
+// display space and a 5x-white tone map would crush it to black.
+//
 // Pipeline:
-//   1. sRGB -> linear
+//   1. sRGB -> linear (gentle, only for physical ops)
 //   2. Raytrace shadow PCF soft edges
-//   3. Cold/warm color split (cold shadows vs warm highlights)
-//   4. Filmic tone mapping (ACES approx)
-//   5. Contrast / saturation / vignette / sharpen
-//   6. linear -> sRGB
+//   3. Cold/warm color split
+//   4. Exposure
+//   5. Contrast S-curve
+//   6. Saturation / vignette / shadow lift
+//   7. linear -> sRGB
 // ===========================================================================
 
 Texture2D<float4> InColor : register(t0);
@@ -49,25 +58,11 @@ float3 linearToSrgb(float3 c)
     return pow(saturate(c), float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
 }
 
-// ACES tone mapping fit (Narkowicz 2015). Better HDR headroom than the
-// filmic curve: values up to ~5x white still show separation.
-float3 filmicToneMap(float3 x)
-{
-    const float A = 2.51;
-    const float B = 0.03;
-    const float C = 2.43;
-    const float D = 0.59;
-    const float E = 0.14;
-    // Apply per-channel: ACES fit has enough headroom to keep HDR highlights
-    // distinct (clouds can reach 4~8 in linear space before this pass).
-    return saturate((x * (A * x + B)) / (x * (C * x + D) + E));
-}
-
-// PCF shadow sampling (3x3 soft edges)
+// PCF shadow sampling (3x3 soft edges). Offsets in Viewport units so the
+// footprint matches the actual render-target size regardless of window.
 float sampleShadowPCF(float2 uv, float depth)
 {
-    float2 texel = 1.0 / float2(300.0, 300.0);
-    // Near = sharp, far = soft
+    float2 texel = float2(Viewport.z, Viewport.w);
     float blur = lerp(0.7, 4.5, saturate(depth * 5.0));
     float2 off = texel * blur;
 
@@ -79,20 +74,18 @@ float sampleShadowPCF(float2 uv, float depth)
             sum += ShadowTex.SampleLevel(ShadowSampler, uv + off * float2(x, y), 0).r;
         }
     }
-    return sum / 9.0;
+    return saturate(sum / 9.0);
 }
 
-// ---------------------------------------------------------------------------
-// Cold/warm color split
-// ---------------------------------------------------------------------------
-
-float3 colorSplit(float3 color, float shadowMask, float warmthAmt)
+// Mild cold/warm tint.  Applied in sRGB display space (NOT linearised) so a
+// fully-shadowed scene can't be washed into a purple cast.
+float3 colorSplitSrgb(float3 color, float shadowMask, float warmthAmt)
 {
-    float3 coldTint = float3(0.88, 0.94, 1.10);  // shadows cool blue
-    float3 warmTint = float3(1.08, 1.02, 0.88);  // highlights warm gold
+    float3 coldTint = float3(0.96, 0.98, 1.03);
+    float3 warmTint = float3(1.03, 1.01, 0.97);
 
-    color = lerp(color, color * coldTint, shadowMask * warmthAmt);
-    color = lerp(color, color * warmTint, (1.0 - shadowMask) * warmthAmt * 0.3);
+    color = lerp(color, color * coldTint, shadowMask * warmthAmt * 0.45);
+    color = lerp(color, color * warmTint, (1.0 - shadowMask) * warmthAmt * 0.20);
 
     return color;
 }
@@ -105,52 +98,51 @@ float4 main(VSOutput input) : SV_TARGET
 {
     float2 uv = input.uv;
 
-    // 1. Sample inputs
+    // 1. Sample inputs.  fx:0 is sRGB display space.
     float4 skyOut = InColor.SampleLevel(InSampler, uv, 0);
     float depth = SceneDepth.SampleLevel(SceneDepthSampler, uv, 0);
     float shadow = sampleShadowPCF(uv, depth);
+    float3 srgb = skyOut.rgb;
 
-    // 2. sRGB -> linear
-    float3 color = srgbToLinear(skyOut.rgb);
-
-    // 3. Raytrace shadow (only for depth > 0)
+    // 2. Raytrace shadow (depth > 0 only).  Modest darkening with a cold
+    //    tint, so a fully-shadowed frame can't nuke the scene.
     float shadowMask = 0.0;
     if (depth > 1e-6)
     {
         shadowMask = 1.0 - shadow;
-        float3 shadowColor = float3(0.42, 0.50, 0.68);
-        color = lerp(color, color * shadowColor, shadowMask * 0.7);
+        float3 shadowColor = float3(0.60, 0.64, 0.74);
+        srgb = lerp(srgb, srgb * shadowColor, shadowMask * 0.30);
     }
 
-    // 4. Exposure (slider 0.5–2.0, not clamped)
-    color *= O_EXPOSURE;
+    // 3. Cold/warm split (sRGB space).
+    srgb = colorSplitSrgb(srgb, shadowMask, saturate(O_WARMTH));
 
-    // 5. Cold/warm split
-    color = colorSplit(color, shadowMask, saturate(O_WARMTH));
+    // 4. Linearise for physical ops.
+    float3 color = srgbToLinear(srgb);
 
-    // 6. Contrast S-curve in linear space, before tone mapping
+    // 5. Exposure.
+    color *= saturate(O_EXPOSURE);
+
+    // 6. Contrast S-curve (linear space, before re-encoding).
     float contrast = saturate(O_CONTRAST);
-    color = lerp(color, (color - 0.5) * (1.0 + contrast * 0.8) + 0.5, contrast);
+    color = lerp(color, (color - 0.5) * (1.0 + contrast * 0.7) + 0.5, contrast);
 
-    // 7. ACES tone mapping (preserves HDR highlights up to ~5x white)
-    color = filmicToneMap(color);
-
-    // 8. Saturation
+    // 7. Saturation.
     float sat = saturate(O_SATURATION);
     float lum = dot(color, float3(0.299, 0.587, 0.114));
     color = lerp(float3(lum, lum, lum), color, sat);
 
-    // 9. Vignette
+    // 8. Vignette.
     float vig = saturate(O_VIGNETTE);
     float2 vigUV = (uv - 0.5) * 2.0;
-    float vigMask = 1.0 - dot(vigUV, vigUV) * vig * 0.5;
+    float vigMask = 1.0 - dot(vigUV, vigUV) * vig * 0.4;
     color *= clamp(vigMask, 0.0, 1.0);
 
-    // 10. Shadow lift
+    // 9. Shadow lift.
     float lift = saturate(O_SHADOW_LIFT);
-    color = max(color, lift * color + lift * 0.01);
+    color = max(color, lift * color + lift * 0.015);
 
-    // 11. linear -> sRGB
+    // 10. linear -> sRGB.
     color = linearToSrgb(color);
 
     return float4(color, 1.0);

@@ -87,7 +87,60 @@ public class Dx12DeviceTest {
      * 若窗口出现红色则说明渲染链路打通；若仍黑屏，问题在该链路。
      */
     @Test
-    @Order(6)
+    @Order(7)
+    void testLodComputeShaderCompiles() throws Exception {
+        java.lang.reflect.Field field =
+            Class.forName("com.xgdt.dx12.dx12.Dx12LodRenderer").getDeclaredField("COMPUTE_SHADER");
+        field.setAccessible(true);
+        String src = (String) field.get(null);
+        byte[] bytes = src.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        System.out.println("[lod-compute] shader source bytes=" + bytes.length);
+        // 直接取渲染端的常量个数，避免以后 cbuffer 加字段时测试还停留在旧值
+        java.lang.reflect.Field constField =
+            Class.forName("com.xgdt.dx12.dx12.Dx12LodRenderer").getDeclaredField("COMPUTE_CONST_COUNT");
+        constField.setAccessible(true);
+        int constCount = constField.getInt(null);
+        String failure = null;
+        long handle = 0L;
+        try {
+            handle = Dx12Native.dx12CreateComputePipeline(bytes, 2, 3, constCount);
+        } catch (Throwable t) {
+            failure = t.toString();
+        }
+        System.out.println("[lod-compute] handle=" + handle + " failure=" + failure);
+        assertNull(failure, "LOD compute pipeline compile/create failed: " + failure);
+        assertNotEquals(0L, handle, "LOD compute pipeline handle must be non-zero");
+        Dx12Native.dx12DestroyComputePipeline(handle);
+    }
+
+    /**
+     * LOD 的顶点/像素着色器同样要离线校验。
+     *
+     * <p>像素着色器是 Java 字符串拼出来的 HLSL，语法错了只有进游戏才会暴露（画面里 LOD
+     * 整块消失，日志只有一句「LOD 管线创建失败」）。这里直接调渲染器内部那条建管线路径，
+     * 颜色格式用交换链的 RGBA8_UNORM（ordinal 6），编不过就让构建失败。
+     */
+    @Test
+    @Order(9)
+    void testLodGraphicsShadersCompile() throws Exception {
+        java.lang.reflect.Method create = Class.forName("com.xgdt.dx12.dx12.Dx12LodRenderer")
+            .getDeclaredMethod("createPipeline", int.class);
+        create.setAccessible(true);
+        String failure = null;
+        long handle = 0L;
+        try {
+            handle = (Long) create.invoke(null, 6);
+        } catch (Throwable t) {
+            failure = (t.getCause() != null ? t.getCause() : t).toString();
+        }
+        System.out.println("[lod-graphics] handle=" + handle + " failure=" + failure);
+        assertNull(failure, "LOD graphics pipeline compile/create failed: " + failure);
+        assertNotEquals(0L, handle, "LOD graphics pipeline handle must be non-zero");
+        Dx12Native.dx12DestroyPipeline(handle);
+    }
+
+    @Test
+    @Order(8)
     void testRenderLoop() {
         final int W = 640;
         final int H = 480;

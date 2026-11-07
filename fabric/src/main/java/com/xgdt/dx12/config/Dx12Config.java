@@ -33,6 +33,7 @@ public class Dx12Config {
     private static final String KEY_LOD_ENABLED = "lod_enabled";
     private static final String KEY_LOD_DISTANCE = "lod_distance";
     private static final String KEY_LOD_QUALITY = "lod_quality";
+    private static final String KEY_LOD_CACHE = "lod_cache";
 
     /** LOD 距离滑块的下限（区块）。 */
     public static final int LOD_DISTANCE_MIN = 32;
@@ -78,6 +79,8 @@ public class Dx12Config {
     private int lodDistance = 256;
     /** LOD 网格精度档位：0 = 低（每 4 区块合并），1 = 中（每 2 区块），2 = 高（每区块）。 */
     private int lodQuality = 1;
+    /** LOD 解码数据持久化缓存开关：0 = 关闭，1 = 开启（写入存档目录下的 gl4dx12_lod）。 */
+    private int lodCache = 1;
 
     private Dx12Config() {
         configPath = Path.of(System.getProperty("user.dir"), FILE_NAME);
@@ -231,6 +234,14 @@ public class Dx12Config {
         save();
     }
 
+    public int getLodCache() { return lodCache; }
+
+    public void setLodCache(int enabled) {
+        this.lodCache = enabled == 1 ? 1 : 0;
+        props.setProperty(KEY_LOD_CACHE, String.valueOf(this.lodCache));
+        save();
+    }
+
     /** LOD 是否应当生效（开关打开即生效，实际可见性由视距差决定）。 */
     public boolean isLodActive() {
         return this.lodEnabled == 1;
@@ -314,11 +325,12 @@ public class Dx12Config {
                     parseInt(props.getProperty(KEY_LOD_DISTANCE, "256"), 256)));
                 lodQuality = Math.max(0, Math.min(2,
                     parseInt(props.getProperty(KEY_LOD_QUALITY, "1"), 1)));
-                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={} xess_sr={} xess_quality={} lod={} lod_distance={} lod_quality={}",
+                lodCache = parseInt(props.getProperty(KEY_LOD_CACHE, "1"), 1) == 1 ? 1 : 0;
+                LOGGER.info("[dx12-wm] Config loaded: aa_mode={} render_scale={} upscale_mode={} frame_gen={} ngx={} dlss_sr={} dlss_quality={} dlss_fg={} xess_sr={} xess_quality={} lod={} lod_distance={} lod_quality={} lod_cache={}",
                     aaMode, renderScale, upscaleMode, frameGen,
                     ngxAppId.isEmpty() && ngxProjectId.isEmpty() ? "builtin" : "configured",
                     dlssSr, dlssQuality, dlssFg, xessSr, xessQuality,
-                    lodEnabled, lodDistance, lodQuality);
+                    lodEnabled, lodDistance, lodQuality, lodCache);
             } else {
                 LOGGER.info("[dx12-wm] No config file found, using defaults");
                 props.setProperty(KEY_AA_MODE, String.valueOf(aaMode));
@@ -340,6 +352,7 @@ public class Dx12Config {
                 props.setProperty(KEY_LOD_ENABLED, String.valueOf(lodEnabled));
                 props.setProperty(KEY_LOD_DISTANCE, String.valueOf(lodDistance));
                 props.setProperty(KEY_LOD_QUALITY, String.valueOf(lodQuality));
+                props.setProperty(KEY_LOD_CACHE, String.valueOf(lodCache));
                 save(); // save defaults
             }
         } catch (Exception e) {

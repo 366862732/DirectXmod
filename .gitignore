@@ -8,6 +8,7 @@ run/
 .project
 .settings/
 .DS_Store
+*.gz
 
 # Screenshots
 *.bmp

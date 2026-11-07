@@ -53,6 +53,27 @@ struct VSOutput
 };
 
 // ---------------------------------------------------------------------------
+// Color-space helpers.
+//
+// The whole pack runs in **sRGB display space** (the main target and the
+// scene_color endpoint are sRGB).  The sky pass computes its physics in
+// linear and encodes to sRGB before writing fx:0; the ground branch reads
+// sRGB scene.rgb and modulates it.  The final pass decodes sRGB -> linear,
+// applies exposure / contrast, and encodes back to sRGB.  Keeping this
+// consistent (no double gamma) is what removes the purple checker.
+// ---------------------------------------------------------------------------
+
+float3 linToSrgb(float3 c)
+{
+    return pow(max(c, 0.0), float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+}
+
+float3 srgbToLin(float3 c)
+{
+    return pow(c, float3(2.2, 2.2, 2.2));
+}
+
+// ---------------------------------------------------------------------------
 // Noise (integer lattice hash, stable at large coordinates)
 // ---------------------------------------------------------------------------
 
@@ -125,38 +146,47 @@ float fbm4(float2 p)
 
 static const float3 HC_ASF_BETA = float3(7.5e-5, 1.45e-4, 4.25e-4);
 
+// Atmospheric perspective is a linear operation (scatter + absorb) that
+// must run in linear space.  The sky pass works in sRGB display space, so
+// we apply a *modest* sRGB-space approximation: multiply the color toward
+// the fog color with a distance-dependent factor.  This keeps the whole
+// chain in display space and avoids the double-gamma / purple-checker bug.
+float sunUp2(float3 sunDir, float sunsetAmt)
+{
+    float up = smoothstep(-0.05, 0.15, sunDir.y);
+    return lerp(1.0, sunsetAmt, up) * 0.25;
+}
+
 float3 hcAirFog(float3 color, float2 ndc, float depth,
                 float3 sunDir, float day, float sunsetAmt)
 {
-    float strength = saturate(O_HAZE) * 3.0;
+    float strength = saturate(O_HAZE);
     if (strength <= 0.003) return color;
 
-    float4 rel4 = mul(InvViewProj, float4(ndc, depth, 1.0));
-    float3 relPos = rel4.xyz / max(abs(rel4.w), 1e-4);
-    float dist = length(relPos);
-    if (dist < 0.5) return color;
-    float3 worldDir = relPos / dist;
+    float dist;
+    if (depth <= 1e-6)
+    {
+        dist = 1.0; // sky: full fog effect on horizon haze only
+    }
+    else
+    {
+        float4 rel4 = mul(InvViewProj, float4(ndc, depth, 1.0));
+        dist = length(rel4.xyz / max(abs(rel4.w), 1e-4));
+    }
 
     strength *= clamp(300.0 / max(Misc.x, 96.0), 0.75, 1.75);
 
     float weather = saturate(1.0 - Sky.z);
     float skyLight = lerp(0.22, 1.0, day);
 
-    float opt = dist * strength * (1.0 + 2.5 * weather * weather);
-    float3 absorb = exp(-opt * HC_ASF_BETA);
+    // Fog color: cold grey-blue, slightly sun-warmed at the sun direction.
+    float sunTint = lerp(0.0, sunUp2(sunDir, sunsetAmt), 0.4);
+    float3 fogColor = float3(0.32, 0.36, 0.44) * skyLight + sunTint;
 
-    // Scatter color: cold grey-blue before storm
-    float3 scatter = lerp(float3(0.28, 0.32, 0.40), float3(0.45, 0.50, 0.58), skyLight);
-    scatter *= skyLight;
+    float opt = saturate(dist * strength * (1.0 + 2.0 * weather));
+    float f = opt * 0.35; // keep the effect gentle in sRGB space
 
-    // Sun-direction warm light (Mie forward-scattering approximation)
-    float cosSunDir = dot(worldDir, sunDir);
-    float3 sunTint = lerp(float3(1.0, 0.96, 0.90), SunsetColor.rgb * 1.35, sunsetAmt);
-    float phase = pow(saturate(cosSunDir), 8.0) * 0.55;
-    float sunUp = smoothstep(-0.10, 0.06, sunDir.y);
-    scatter += sunTint * phase * sunUp * skyLight;
-
-    return scatter * (1.0 - absorb) + color * absorb;
+    return lerp(color, fogColor, f);
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +533,12 @@ float4 main(VSOutput input) : SV_TARGET
         // 6. Aerial fog
         color = hcAirFog(color, ndc, 0.0, sunDir, day, sunsetAmt);
 
+        // Sky branch output is in linear space (physics above). Encode to sRGB
+        // so fx:0 is a uniform sRGB image everywhere: the ground branch (which
+        // starts from sRGB scene.rgb and only multiplies) stays sRGB too. The
+        // final pass then treats fx:0 as sRGB display space with no double
+        // gamma.  HDR gap peaks are softened into sRGB headroom here.
+        color = linToSrgb(max(color, 0.0));
         return float4(color, 1.0);
     }
 
@@ -522,11 +558,15 @@ float4 main(VSOutput input) : SV_TARGET
                              saturate(O_CLOUD_RAIN));
     color *= lerp(1.0, shadowTint, dapple * shadowStrength);
 
-    // Sunlight through gap projected onto ground (warm gold, HDR).
+    // Sunlight through gap projected onto ground (warm gold, sRGB-intent).
+    // Adding a linear-HDR value into sRGB data causes the purple checker,
+    // so keep the light in display space and use multiplicative modulation
+    // instead of additive HDR.
     float groundGap = godRayGap(worldPos, sunDir, CameraPosition.xyz);
     float sunUp = smoothstep(-0.05, 0.15, sunDir.y);
-    float3 groundSun = float3(1.7, 1.35, 0.80) * O_SUN_INTENSITY * sunUp;
-    color += groundSun * groundGap * groundGap * (1.0 - dapple) * 0.5;
+    float gapLight = saturate(groundGap * saturate(O_SUN_INTENSITY) * sunUp * 0.6);
+    float3 warmGold = float3(1.05, 0.95, 0.72);
+    color = lerp(color, color * warmGold, gapLight * (1.0 - dapple));
 
     return float4(color, 1.0);
 }
