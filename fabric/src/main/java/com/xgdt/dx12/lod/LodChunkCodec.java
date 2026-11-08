@@ -137,4 +137,75 @@ public final class LodChunkCodec {
         }
         return new LodRegionCache.VoxelChunk(minY, height, topY, palette, names, blocks);
     }
+
+    /*
+     * 以下是「地表列」负载：每个区块 256 列的 (高度, 地表颜色)。
+     *
+     * 高度场重建一次要采样十几万个角点、覆盖上万区块。挨个解 NBT 的话，即使三条后台
+     * 线程也要十几秒才能把第一屏远景填满，期间几何会一直停在「已采样=0」。把解析结果
+     * 按区块压进 {@link LodSectionStore}（约 1.5KB 原始 / 几百字节压缩），下次进世界
+     * 或下次重建只需读盘 + 解压，和 Voxy 一样秒开。
+     *
+     * 负载布局（小端）：
+     * <pre>
+     * u16 version
+     * u16 reserved
+     * u16 columns       (固定 256)
+     * u16 reserved
+     * i16 columns × 高度（绝对 y，Short.MIN_VALUE = 无数据）
+     * i32 columns × 地表颜色（-1 = 未知，bit24 = 水体标记）
+     * </pre>
+     *
+     * <p>版本 2 起颜色取的是压过树干后的地面方块（和高度同列）。版本 1 存的是
+     * {@code WORLD_SURFACE} 树冠色，读出来会在山坡上留下一道道深绿涂抹，必须作废重解。
+     */
+    public static final int COLUMNS_VERSION = 2;
+    private static final int COLUMNS = 256;
+    private static final int COLUMNS_HEADER = 8;
+    private static final int COLUMNS_BYTES = COLUMNS_HEADER + COLUMNS * 2 + COLUMNS * 4;
+
+    /** 编码地表列；长度不自洽时返回 {@code null}。 */
+    public static byte[] encodeColumns(LodRegionCache.ChunkColumns columns) {
+        short[] heights = columns.heights();
+        int[] colors = columns.colors();
+        if (heights.length != COLUMNS || colors.length != COLUMNS) {
+            return null;
+        }
+        ByteBuffer out = ByteBuffer.allocate(COLUMNS_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        out.putShort((short) COLUMNS_VERSION);
+        out.putShort((short) 0);
+        out.putShort((short) COLUMNS);
+        out.putShort((short) 0);
+        for (short height : heights) {
+            out.putShort(height);
+        }
+        for (int color : colors) {
+            out.putInt(color);
+        }
+        return out.array();
+    }
+
+    /** 解码地表列；版本/长度不符时返回 {@code null}。 */
+    public static LodRegionCache.ChunkColumns decodeColumns(byte[] payload) {
+        if (payload == null || payload.length != COLUMNS_BYTES) {
+            return null;
+        }
+        ByteBuffer in = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+        int version = in.getShort() & 0xFFFF;
+        in.getShort();
+        int count = in.getShort() & 0xFFFF;
+        in.getShort();
+        if (version != COLUMNS_VERSION || count != COLUMNS) {
+            return null;
+        }
+        short[] heights = new short[COLUMNS];
+        for (int i = 0; i < COLUMNS; i++) {
+            heights[i] = in.getShort();
+        }
+        int[] colors = new int[COLUMNS];
+        for (int i = 0; i < COLUMNS; i++) {
+            colors[i] = in.getInt();
+        }
+        return new LodRegionCache.ChunkColumns(heights, colors);
+    }
 }

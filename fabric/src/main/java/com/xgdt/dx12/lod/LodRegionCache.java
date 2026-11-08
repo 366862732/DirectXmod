@@ -232,14 +232,21 @@ public final class LodRegionCache {
             }
         });
 
-    /** 已确认没有高度数据的区块（region 文件不存在 / 区块未生成），避免反复入队重读。 */
-    private final Set<Long> missing = Collections.synchronizedSet(
-        Collections.newSetFromMap(new LinkedHashMap<Long, Boolean>(1024, 0.75f, true) {
+    /**
+     * 已确认没有高度数据的区块（region 文件不存在 / 区块未生成）→ 登记时刻（纳秒）。
+     *
+     * <p>以前是永久拉黑：进世界第一秒里 region 还没落盘、或服务端正往该 region 追加区块，
+     * 被记成「无数据」的区块整个会话都不会再读，远景就永久缺一块。改成带 TTL 的可重试：
+     * 过期后重新入队，真没数据的区块只是多一次 {@code Files.isRegularFile}，很便宜。
+     */
+    private static final long MISSING_TTL_NS = 15_000_000_000L;
+    private final Map<Long, Long> missing = Collections.synchronizedMap(
+        new LinkedHashMap<Long, Long>(1024, 0.75f, true) {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<Long, Long> eldest) {
                 return size() > MAX_MISSING;
             }
-        }));
+        });
 
     /** 当前存档的 region 目录；{@code null} 表示不可用（多人游戏等）。 */
     private volatile Path regionDir;
@@ -254,6 +261,14 @@ public final class LodRegionCache {
 
     /** 解码后 section 的持久化 KV 存储；{@code null} = 不可用（多人游戏/开关关闭/打开失败）。 */
     private volatile LodSectionStore store;
+    /**
+     * 高度场地表列的持久化 KV 存储（与 {@link #store} 分开一个目录）。
+     *
+     * <p>体素负载按区块存的是整块 16×16×384 的方块下标（压缩后约 7.6KB），地表列只需要
+     * 256 组 (高度, 颜色)（约 0.5KB）。两种负载长度完全不同，混在同一个 key 空间里会
+     * 互相覆盖，所以各用一份存储。
+     */
+    private volatile LodSectionStore columnStore;
     private volatile Path storeDir;
     private final Map<Long, long[]> regionStats = new ConcurrentHashMap<>();
 
@@ -496,7 +511,8 @@ public final class LodRegionCache {
     private void openStore(Path regionDir) {
         closeStore();
         Path parent = regionDir.getParent();
-        Path dir = (parent == null ? regionDir : parent).resolve("gl4dx12_lod");
+        Path base = parent == null ? regionDir : parent;
+        Path dir = base.resolve("gl4dx12_lod");
         this.storeDir = dir;
         if (Dx12Config.getInstance().getLodCache() == 0) {
             return;
@@ -509,6 +525,15 @@ public final class LodRegionCache {
             this.store = null;
             LOGGER.warn("[lod] Failed to open section store {}: {}", dir, t.toString());
         }
+        Path columnDir = base.resolve("gl4dx12_lod_columns");
+        try {
+            this.columnStore = LodSectionStore.open(columnDir);
+            LOGGER.info("[lod] Column store opened: {} ({} entries, {} KB)",
+                columnDir, this.columnStore.entryCount(), this.columnStore.sizeBytes() / 1024);
+        } catch (Throwable t) {
+            this.columnStore = null;
+            LOGGER.warn("[lod] Failed to open column store {}: {}", columnDir, t.toString());
+        }
     }
 
     private void closeStore() {
@@ -520,6 +545,17 @@ public final class LodRegionCache {
                 LOGGER.info("[lod] Section store closed: {} entries, {} KB",
                     current.entryCount(), current.sizeBytes() / 1024);
                 current.close();
+            } catch (Throwable ignored) {
+            }
+        }
+        LodSectionStore columns = this.columnStore;
+        this.columnStore = null;
+        if (columns != null) {
+            try {
+                columns.flush();
+                LOGGER.info("[lod] Column store closed: {} entries, {} KB",
+                    columns.entryCount(), columns.sizeBytes() / 1024);
+                columns.close();
             } catch (Throwable ignored) {
             }
         }
@@ -622,12 +658,25 @@ public final class LodRegionCache {
         long key = ChunkPos.pack(blockX >> 4, blockZ >> 4);
         ChunkColumns data = this.columns.get(key);
         if (data == null) {
-            if (!this.missing.contains(key)) {
+            if (!isKnownMissing(key)) {
                 request(key);
             }
             return null;
         }
         return data.heights.length == 0 ? null : data;
+    }
+
+    /** 该区块是否仍在「确认无数据」的 TTL 内；过期则移除并允许重新请求。 */
+    private boolean isKnownMissing(long key) {
+        Long stamp = this.missing.get(key);
+        if (stamp == null) {
+            return false;
+        }
+        if (System.nanoTime() - stamp >= MISSING_TTL_NS) {
+            this.missing.remove(key);
+            return false;
+        }
+        return true;
     }
 
     /** 已缓存且可读的区块数（调试用）。 */
@@ -681,15 +730,21 @@ public final class LodRegionCache {
             int bits = this.bits;
             Long key;
             while (dir != null && dimension != null && (key = this.queue.poll()) != null) {
-                this.pending.remove(key);
-                ChunkColumns decoded = readChunk(key, dir, minY, bits);
+                // 先解码再摘掉 pending：反过来的话，解码还没跑完 pendingCount() 就已经归零，
+                // 渲染端「pending > 0 就重建」的判据失效，几何会冻结在第一次全 miss 的状态。
+                ChunkColumns decoded;
+                try {
+                    decoded = readChunk(key, dir, minY, bits);
+                } finally {
+                    this.pending.remove(key);
+                }
                 // decoded == null 表示本次 IO 失败（如服务端正在写该 region），留待下次重试
                 if (decoded == null || !dir.equals(this.regionDir) || !dimension.equals(this.dimension)) {
                     continue;
                 }
                 if (decoded == MISSING) {
                     // 无数据只登记在 missing 里，不占用 columns 的容量
-                    this.missing.add(key);
+                    this.missing.put(key, System.nanoTime());
                 } else {
                     this.columns.put(key, decoded);
                     this.missing.remove(key);
@@ -713,6 +768,19 @@ public final class LodRegionCache {
      * 现读 4 字节表头，牺牲一点 IO 换取位置永远是最新的。
      */
     private ChunkColumns readChunk(long key, Path dir, int minY, int bits) {
+        int chunkX = ChunkPos.getX(key);
+        int chunkZ = ChunkPos.getZ(key);
+        Path regionFile = regionFile(dir, chunkX, chunkZ);
+        long[] stat = regionStat(regionFile, ChunkPos.pack(chunkX >> 5, chunkZ >> 5));
+        LodSectionStore columns = this.columnStore;
+        if (columns != null && stat != null) {
+            // 命中列存储就不必再解一遍 NBT：一次重建要上万区块，NBT 解析是主要瓶颈
+            byte[] payload = columns.read(key, stat[0], stat[1]);
+            ChunkColumns cached = LodChunkCodec.decodeColumns(payload);
+            if (cached != null) {
+                return cached;
+            }
+        }
         CompoundTag tag = readTag(key, dir);
         if (tag == null) {
             return null;
@@ -729,9 +797,15 @@ public final class LodRegionCache {
             if (heights == MISSING.heights) {
                 return MISSING;
             }
-            short[] colorHeights = colorHeightmap(tag, minY, bits, heights);
-            return new ChunkColumns(heights,
-                decodeColumns(tag.getListOrEmpty("sections"), heights, colorHeights));
+            ChunkColumns decoded = new ChunkColumns(heights,
+                decodeColumns(tag.getListOrEmpty("sections"), heights));
+            if (columns != null && stat != null) {
+                byte[] payload = LodChunkCodec.encodeColumns(decoded);
+                if (payload != null) {
+                    columns.write(key, payload, stat[0], stat[1]);
+                }
+            }
+            return decoded;
         } catch (Throwable t) {
             return null;
         }
@@ -742,8 +816,9 @@ public final class LodRegionCache {
      * （region 不存在、区块未生成或 IO 失败）。
      *
      * <p>优先命中 {@link LodSectionStore}：解码后的调色板+索引比 NBT 小得多，也省掉
-     * 逐 section 查注册表的开销。存储里记着 region 文件的 {@code (size, mtime)}，
-     * 签名不符（玩家改过地形 / 服务端追加了新区块）就当 miss，重新解析并回写。
+     * 逐 section 查注册表的开销。存储里记着 region 文件的 {@code (size, mtime)}，只在
+     * 大小变了（文件被重写/追加）时当 miss；mtime 单独变化多半只是自动存档顺手刷新了
+     * 时间戳，按它判 miss 等于一次存档作废整个 region 的缓存。
      */
     public VoxelChunk readVoxel(int chunkX, int chunkZ) {
         Path dir = this.regionDir;
@@ -960,23 +1035,6 @@ public final class LodRegionCache {
     }
 
     /**
-     * 上色用的高度：最高非空气方块（{@code WORLD_SURFACE}）。
-     *
-     * <p>几何高度必须跳过树叶，否则树冠把地形抬成一根根尖刺；但颜色不能跟着跳，
-     * 否则整片森林都刷成地面草的浅绿，远景变成一片光滑的绿丘陵。上色仍取最高层，
-     * 森林是深绿树冠、雪线是白的、水面是蓝的，层次才和原版一致。
-     */
-    private static short[] colorHeightmap(CompoundTag tag, int minY, int bits, short[] fallback) {
-        Optional<long[]> raw = tag.getCompoundOrEmpty("Heightmaps")
-            .getLongArray(Heightmap.Types.WORLD_SURFACE.getSerializationKey());
-        if (raw.isEmpty()) {
-            return fallback;
-        }
-        short[] heights = unpack(raw.get(), minY, bits);
-        return heights == MISSING.heights ? fallback : heights;
-    }
-
-    /**
      * 取「地表」高度图，优先 {@code MOTION_BLOCKING_NO_LEAVES}。
      *
      * <p>{@code WORLD_SURFACE} 是最高非空气方块，树冠会把高度抬十几格，远景森林因此变成
@@ -1042,12 +1100,14 @@ public final class LodRegionCache {
      * 格子一撑，就变成一根根柱子。这里从几何高度往下跳过连续原木，落到第一块非原木
      * 方块上。
      *
-     * <p><b>上色</b>：仍取 {@code WORLD_SURFACE}（含树叶、屋顶）的高度，森林是深绿
-     * 树冠、房屋是屋顶色，层次才和原版一致。
+     * <p><b>上色</b>：取的高度必须和几何用的高度是同一列（压过树干的地面顶面），
+     * 颜色才是这张高度场真正画出来的那层方块的色。以前用 {@code WORLD_SURFACE}
+     * （含树冠）取色、却按地面高度建模：森林地区的角点颜色在树叶的深绿和草地绿之间
+     * 逐点跳变，跨几十方块的大格插值后就是山坡上一道道放射状的深绿色涂抹。
      *
      * <p>任一列解不出来就留 {@code -1}，由渲染端按高度给近似色。
      */
-    private static int[] decodeColumns(ListTag sections, short[] heights, short[] colorHeights) {
+    private static int[] decodeColumns(ListTag sections, short[] heights) {
         int[] colors = new int[COLUMNS];
         Arrays.fill(colors, -1);
         if (sections == null || sections.size() == 0) {
@@ -1057,11 +1117,12 @@ public final class LodRegionCache {
         Map<Integer, SectionData> decoded = new HashMap<>();
         for (int i = 0; i < COLUMNS; i++) {
             stripLogsAt(decoded, sections, heights, i);
-            int surface = colorHeights[i];
+            // 高度图是「首个空气方块的 y」，地表方块在它下面一格；stripLogsAt 已经把
+            // heights[i] 从树干顶压回地面，这里直接用同一份高度
+            int surface = heights[i];
             if (surface == UNAVAILABLE) {
                 continue;
             }
-            // 高度图是「首个空气方块的 y」，地表方块在它下面一格
             int y = surface - 1;
             // 磁盘上的 sections[*].Y 是绝对 section 坐标（SectionPos.blockToSectionCoord）
             SectionData data = decoded.computeIfAbsent(Math.floorDiv(y, 16),

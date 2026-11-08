@@ -26,7 +26,7 @@ shot_*/
 rust/target/
 
 # IDE workspace (auto-generated)
-.idea/workspace.xml
+
 
 # Backup dirs
 backup/
@@ -65,3 +65,7 @@ copilot.exe
 *.ps1
 *.py
 Helian-MMCO_v0.6.14_Sundial-lite_edit.zip
+docs/
+temp_mc_extracted/
+DLSS/
+voxy/

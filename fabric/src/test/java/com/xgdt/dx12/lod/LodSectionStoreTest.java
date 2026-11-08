@@ -43,19 +43,21 @@ class LodSectionStoreTest {
             byte[] second = payload(2, 1024);
             store.write(7L, second, 1, 3);
             assertArrayEquals(second, store.read(7L, 1, 3));
-            assertNull(store.read(7L, 1, 2), "旧签名应失效");
+            assertArrayEquals(second, store.read(7L, 1, 2), "mtime 变了仍应命中最新值");
             assertEquals(1, store.entryCount());
         }
     }
 
     @Test
-    void staleRegionSignatureMisses(@TempDir Path dir) throws IOException {
+    void regionSizeChangeMissesButMtimeDoesNot(@TempDir Path dir) throws IOException {
         try (LodSectionStore store = LodSectionStore.open(dir)) {
             byte[] data = payload(3, 512);
             store.write(9L, data, 111, 222);
             assertNotNull(store.read(9L, 111, 222));
             assertNull(store.read(9L, 112, 222), "region size 变了应 miss");
-            assertNull(store.read(9L, 111, 223), "region mtime 变了应 miss");
+            // 自动存档每写一个区块就刷新整份 region 文件的 mtime；按 mtime 判 miss
+            // 会让一次存档作废整个 region 的缓存，远景每次进世界都要重解 NBT。
+            assertArrayEquals(data, store.read(9L, 111, 223), "region mtime 变了仍应命中");
         }
     }
 

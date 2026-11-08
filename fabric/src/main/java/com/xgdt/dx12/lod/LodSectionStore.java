@@ -181,7 +181,14 @@ public final class LodSectionStore implements AutoCloseable {
         }
     }
 
-    /** 读一条记录；签名不符、不存在或损坏时返回 {@code null}。 */
+    /**
+     * 读一条记录；不存在、region 大小变了或损坏时返回 {@code null}。
+     *
+     * <p>只看 region 文件大小、不看 mtime：自动存档每写一个区块就会刷新整个 region
+     * 文件的 mtime，按 mtime 严格比对等于一次存档就把本 region 的缓存全部作废，
+     * 远景每次进世界都要重解上万区块的 NBT。大小变了才说明文件被追加/重写，
+     * 那才可能和缓存时的内容对不上。
+     */
     public byte[] read(long key, long regionSize, long regionMtime) {
         Shard shard = shardFor(key);
         this.lock.readLock().lock();
@@ -190,7 +197,7 @@ public final class LodSectionStore implements AutoCloseable {
                 return null;
             }
             Entry entry = shard.index.get(key);
-            if (entry == null || entry.regionSize != regionSize || entry.regionMtime != regionMtime) {
+            if (entry == null || entry.regionSize != regionSize) {
                 return null;
             }
             ByteBuffer compressed = ByteBuffer.allocate(entry.compressedLength);

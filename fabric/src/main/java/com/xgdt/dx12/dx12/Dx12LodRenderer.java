@@ -176,8 +176,12 @@ public final class Dx12LodRenderer {
      *
      * <p>这一段是玩家最先盯着的远景，也是 LOD 和原版地形的接缝，必须用最细的格宽
      * 才不露馅；再往外就交给等比放大的段。
+     *
+     * <p>细格段从「原版视距圈内侧一格宽处」开始，所以宽度取 128 就能盖到视距圈外
+     * 128 方块 —— 足以罩住体素几何的外缘（常见 240~272 方块）。以前是 192，加上
+     * 细格预算固定 76 环，实际细格只铺到 236，体素外缘仍然落在粗格带上。
      */
-    private static final int NEAR_DETAIL_BAND = 192;
+    private static final int NEAR_DETAIL_BAND = 128;
 
     /**
      * 坐标轴单侧环数（固定值，不再由顶点上限反推）。
@@ -552,6 +556,16 @@ public final class Dx12LodRenderer {
         + "    int b = ClampByte((int)round(fb + (float)((to & 0xFF) - fb) * t));\n"
         + "    return (r << 16) | (g << 8) | b;\n"
         + "}\n"
+        + "// 四个角点颜色的算术平均。远景一格的宽度可达几十方块，四角各自取所在地表方块的\n"
+        + "// MapColor 再做 Gouraud 插值，会在地面上拉出一条条放射状的彩色条纹（草地绿、\n"
+        + "// 泥土棕、原木深棕沿着三角形互相涂抹）。格宽越大越先把四角色收敛到格内均值。\n"
+        + "int AvgColor(int a, int b, int c, int d)\n"
+        + "{\n"
+        + "    int r = (((a >> 16) & 0xFF) + ((b >> 16) & 0xFF) + ((c >> 16) & 0xFF) + ((d >> 16) & 0xFF)) >> 2;\n"
+        + "    int g = (((a >> 8) & 0xFF) + ((b >> 8) & 0xFF) + ((c >> 8) & 0xFF) + ((d >> 8) & 0xFF)) >> 2;\n"
+        + "    int bl = ((a & 0xFF) + (b & 0xFF) + (c & 0xFF) + (d & 0xFF)) >> 2;\n"
+        + "    return (r << 16) | (g << 8) | bl;\n"
+        + "}\n"
         + "// 单个角点的最终颜色：分层配色（露岩 / 沙滩 / 积雪 / 水体）全部按这个角点自己的\n"
         + "// 高度算，不再是整格一个平均色。一格上百方块时四角各给一个颜色，插值出来的地面\n"
         + "// 会跟着地形变，而不是糊成一块纯色。\n"
@@ -653,11 +667,29 @@ public final class Dx12LodRenderer {
         + "    float dhx = (float)(h10 + h11 - h00 - h01) * 0.5 / (float)max(1, x1 - x0);\n"
         + "    float dhz = (float)(h01 + h11 - h00 - h10) * 0.5 / (float)max(1, z1 - z0);\n"
         + "    float slope = sqrt(dhx * dhx + dhz * dhz);\n"
+        + "    int r00 = Corners[j * N + i].rgb;\n"
+        + "    int r10 = Corners[j * N + i + 1].rgb;\n"
+        + "    int r01 = Corners[(j + 1) * N + i].rgb;\n"
+        + "    int r11 = Corners[(j + 1) * N + i + 1].rgb;\n"
+        + "    // 格宽 6 方块以内完全不混（近景保持逐方块配色）；24 方块以上四角完全同色，\n"
+        + "    // 大格只剩一块干净的地表色，不再有放射状条纹。水体/未知角点不参与均值，\n"
+        + "    // 否则一条海岸线会把整格的水蓝涂到岸上。\n"
+        + "    int cellW = max(x1 - x0, z1 - z0);\n"
+        + "    float colorBlend = saturate((float)(cellW - 6) / 18.0);\n"
+        + "    if (colorBlend > 0.0 && r00 >= 0 && r10 >= 0 && r01 >= 0 && r11 >= 0\n"
+        + "        && (((r00 | r10 | r01 | r11) & 0x01000000) == 0))\n"
+        + "    {\n"
+        + "        int avg = AvgColor(r00, r10, r01, r11);\n"
+        + "        r00 = MixColor(r00, avg, colorBlend);\n"
+        + "        r10 = MixColor(r10, avg, colorBlend);\n"
+        + "        r01 = MixColor(r01, avg, colorBlend);\n"
+        + "        r11 = MixColor(r11, avg, colorBlend);\n"
+        + "    }\n"
         + "    int a00, a10, a11, a01;\n"
-        + "    int c00 = ShadeCorner(Corners[j * N + i].rgb, h00, slope, a00);\n"
-        + "    int c10 = ShadeCorner(Corners[j * N + i + 1].rgb, h10, slope, a10);\n"
-        + "    int c01 = ShadeCorner(Corners[(j + 1) * N + i].rgb, h01, slope, a01);\n"
-        + "    int c11 = ShadeCorner(Corners[(j + 1) * N + i + 1].rgb, h11, slope, a11);\n"
+        + "    int c00 = ShadeCorner(r00, h00, slope, a00);\n"
+        + "    int c10 = ShadeCorner(r10, h10, slope, a10);\n"
+        + "    int c01 = ShadeCorner(r01, h01, slope, a01);\n"
+        + "    int c11 = ShadeCorner(r11, h11, slope, a11);\n"
         + "    // 四个角各用自己的高度：相邻格共享同一对角点，面与面之间天然对齐，\n"
         + "    // 不会出现台阶、悬空平板或裂缝。\n"
         + "    OutVerts[slot + 0] = Vertex(x0, z0, h00, PackColor(c00, a00));\n"
@@ -703,11 +735,6 @@ public final class Dx12LodRenderer {
      * 高度场剔除矩形都不变，避免每跨 16 方块就重新采样整张远景。
      */
     private static final int VOXEL_CENTER_SNAP_CHUNKS = 4;
-    /**
-     * 体素实际覆盖半径的量化步长（方块）。覆盖会随区块补齐一圈圈长大，直接把
-     * 它喂给坐标轴会让整张远景反复重采样；量化后只有跨过边界才换一次坐标轴。
-     */
-    private static final int VOXEL_DETAIL_QUANTUM = 128;
 
     /** 体素顶点缓冲（CPU 映射写入）与共享静态索引。 */
     private Dx12GpuBuffer voxelVertexBuffer;
@@ -762,6 +789,14 @@ public final class Dx12LodRenderer {
     private int quadIndexCells;
     /** 上次重建的时刻（{@link System#nanoTime()}），用于按墙上时间做重建冷却。 */
     private long lastBuildNanos;
+    /**
+     * 上次重建自身的耗时（纳秒）。
+     *
+     * <p>刚进世界时区块在后台陆续读完，{@code cachedChunks} 每帧都在变，固定 250ms 的
+     * 冷却会让「采样十几万角点」的重建几乎连成一片（一次 200ms 以上），帧率掉到个位数。
+     * 冷却时间取 {@code max(250ms, 本次耗时 × 4)}，把重建占用压到 25% 以内。
+     */
+    private long lastBuildCostNanos;
 
     /** 上次建网时的网格参数，任一变化都要重建。 */
     private int builtBase = -1;
@@ -936,21 +971,12 @@ public final class Dx12LodRenderer {
             centerX = snapCenterX;
             centerZ = snapCenterZ;
         }
-        // 坐标轴细格段的起点。体素顶点预算是硬上限，实际只能铺到某个半径（常见
-        // 200~300 方块），所以细格段要跟着「实际覆盖」走，接缝处才是 1 方块细格。
-        // 但覆盖会随区块补齐一圈圈长大，直接跟着变会让整张远景反复重采样。这里把
-        // 覆盖量化到 128 方块：只有跨过量化边界才换坐标轴，细格段再往前放一个量化
-        // 步长，保证接缝永远落在细格段内部。
-        int coverage = (int) this.voxelCoverRadius;
-        int fineStart;
-        if (coverage > 0) {
-            int quantum = VOXEL_DETAIL_QUANTUM;
-            int quantized = (coverage + quantum - 1) / quantum * quantum;
-            fineStart = Math.max(0, quantized - quantum);
-        } else {
-            // 体素还没铺开（或多人游戏）：细格段从原版视距圈外开始
-            fineStart = Math.max(0, (int) vanillaInner - 16);
-        }
+        // 坐标轴细格段的起点：固定取原版视距圈内侧一格宽处，不再跟着体素覆盖量化。
+        // 圈内完全被原版地形/体素盖住，粗格不可见；圈外一律保持最细格宽，保证
+        // 近景和体素外缘不会出现 32 方块宽的巨幅斜平板。
+        // 以前跟着 voxelCoverRadius 量化（272→fineStart 256 / 240→128），既让 32
+        // 方块粗格带侵入 176~256 的可见近景，又让 fineStart 每抖动一次就整张重建。
+        int fineStart = Math.max(0, (int) vanillaInner - 16);
         // 高度场要跳过两块区域：原版视距圈（方形）和体素实际覆盖的区块矩形。
         // 矩形可能不以相机为中心，所以不能只用一个半径 —— 那只能取并集，某些方向
         // 会多叠十几格粗地形，把刚画好的体素面盖住。
@@ -968,7 +994,8 @@ public final class Dx12LodRenderer {
         LodRegionCache cache = LodRegionCache.getInstance();
         int cachedChunks = cache.cachedCount();
         boolean cooldownReady =
-            System.nanoTime() - this.lastBuildNanos > REBUILD_COOLDOWN_MS * 1_000_000L;
+            System.nanoTime() - this.lastBuildNanos
+                > Math.max(REBUILD_COOLDOWN_MS * 1_000_000L, this.lastBuildCostNanos * 4L);
         boolean rebuild = this.geometry == null
             || base != this.builtBase
             || radiusBlocks != this.builtRadius
@@ -988,9 +1015,11 @@ public final class Dx12LodRenderer {
             // 上一次建网一个角点都没采到（刚进世界、区块还没就绪）：不重试就永远空着
             || (cooldownReady && this.builtKnown == 0);
         if (rebuild) {
+            long buildStart = System.nanoTime();
             rebuildGeometry(ctx, level, centerX, centerZ, geomRadius, base,
                 fineStart, vanillaInner, voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
                 cameraBlockX, cameraBlockZ);
+            this.lastBuildCostNanos = System.nanoTime() - buildStart;
             this.lastBuildNanos = System.nanoTime();
             this.builtBase = base;
             this.builtRadius = radiusBlocks;
@@ -1705,6 +1734,9 @@ public final class Dx12LodRenderer {
                     continue;
                 }
                 int rgb = colors[index];
+                // 大格先向邻域均值色收敛，和 compute 的 AvgColor 同参数：不这样做，
+                // 远景几十方块一格的四角各带一种地表色，插值出来就是放射状涂抹条纹。
+                rgb = blendCellColor(axis, colors, n, i, j, rgb);
                 gradient(axis, heights, n, i, j, gradient);
                 float dhx = gradient[0];
                 float dhz = gradient[1];
@@ -1736,6 +1768,53 @@ public final class Dx12LodRenderer {
                 putVertex(vertices, index, axis[i], height, axis[j], rgb, alpha);
             }
         }
+    }
+
+    /**
+     * 把大格的角点颜色往 3×3 邻域均值收敛。
+     *
+     * <p>远景一格宽可达几十方块，四个角各取自己位置的地表方块 {@code MapColor} 再线性
+     * 插值，会在地面上拉出一条条放射状彩色条纹。格宽 6 方块以内不混（近景保持逐方块
+     * 配色），24 方块以上完全用均值色。水体与未知列不参与均值，避免整格被水蓝带偏。
+     * 参数与 {@code COMPUTE_SHADER} 的 {@code AvgColor} 保持一致。
+     */
+    private static int blendCellColor(int[] axis, int[] colors, int n, int i, int j, int rgb) {
+        if (rgb < 0 || LodRegionCache.isWater(rgb)) {
+            return rgb;
+        }
+        float blend = Mth.clamp((cellWidth(axis, i, j) - 6.0f) / 18.0f, 0.0f, 1.0f);
+        if (blend <= 0.0f) {
+            return rgb;
+        }
+        int sumR = 0;
+        int sumG = 0;
+        int sumB = 0;
+        int count = 0;
+        for (int dz = -1; dz <= 1; dz++) {
+            int z = j + dz;
+            if (z < 0 || z >= n) {
+                continue;
+            }
+            for (int dx = -1; dx <= 1; dx++) {
+                int x = i + dx;
+                if (x < 0 || x >= n) {
+                    continue;
+                }
+                int c = colors[z * n + x];
+                if (c < 0 || LodRegionCache.isWater(c)) {
+                    continue;
+                }
+                sumR += (c >> 16) & 0xFF;
+                sumG += (c >> 8) & 0xFF;
+                sumB += c & 0xFF;
+                count++;
+            }
+        }
+        if (count == 0) {
+            return rgb;
+        }
+        int average = ((sumR / count) << 16) | ((sumG / count) << 8) | (sumB / count);
+        return mixColor(rgb, average, blend);
     }
 
     // ------------------------------------------------------------------
@@ -2001,12 +2080,13 @@ public final class Dx12LodRenderer {
             }
             forward[count++] = coord;
         }
-        // 第二段：细格段保持最细格宽，正好覆盖体素外缘，接缝处两边格宽一致。
-        // 这一段最多花掉单侧环数的 40%：lod_quality=2 时 nearWidth=1，固定铺
-        // NEAR_DETAIL_BAND(192) 方块会一口气吃掉全部环数，剩下的环只够把格宽
-        // 从 1 放大到 2，远景就和近景一样是 1 方块分辨率 —— 灰墙就是这么来的。
-        int fineBudget = Math.max(8, AXIS_RINGS * 2 / 5);
-        int fineEnd = Math.min(maxRadius, coord + Math.min(NEAR_DETAIL_BAND, fineBudget * nearWidth));
+        // 第二段：细格段从原版视距圈内侧开始，宽度固定 NEAR_DETAIL_BAND 方块。
+        // 环数按格宽换算（quality=2 是 128 环，quality=0 只要 32 环），并给远景
+        // 等比段留出至少 8 环 —— 否则细格段会吃掉全部环数，远景退化成 1 方块
+        // 分辨率的一整片平板（以前的「灰墙」）。
+        int fineRingCap = Math.max(0, AXIS_RINGS - (count - 1) - 8);
+        int fineRings = Math.min(NEAR_DETAIL_BAND / nearWidth, fineRingCap);
+        int fineEnd = Math.min(maxRadius, coord + fineRings * nearWidth);
         while (coord < fineEnd) {
             coord = Math.min(coord + nearWidth, fineEnd);
             if (count == forward.length) {
@@ -2089,9 +2169,10 @@ public final class Dx12LodRenderer {
                 height = stripLogs(chunk, x, height, z, level.getMinY());
                 int rgb = LodRegionCache.getInstance().colorAt(x, z);
                 if (rgb < 0) {
-                    // 上色取最高层（树冠/雪/水），和磁盘侧 colorHeightmap 保持一致
-                    int colorHeight = heightOf(chunk, Heightmap.Types.WORLD_SURFACE, x & 15, z & 15);
-                    rgb = blockColorAt(level, x, colorHeight == UNKNOWN_HEIGHT ? height : colorHeight, z);
+                    // 颜色必须取这张高度场真正画出来的那一层（压过树干的地面顶面），
+                    // 不能取 WORLD_SURFACE 树冠色：森林里角点颜色会在树叶深绿和草地绿
+                    // 之间逐点跳变，跨几十方块的大格插值后就是山坡上的放射状涂抹。
+                    rgb = blockColorAt(level, x, height, z);
                 }
                 return ((long) height << 32) | (rgb & 0xFFFFFFFFL);
             }
