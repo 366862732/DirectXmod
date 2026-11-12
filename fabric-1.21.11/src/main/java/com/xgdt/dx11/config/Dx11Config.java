@@ -14,6 +14,12 @@ public final class Dx11Config {
     public static final String BACKEND_PROPERTY = "gl4dx12.backend";
     /** Safety gate for the still-incomplete backend. */
     public static final String ENABLE_PROPERTY = "gl4dx12.dx11.enabled";
+    /**
+     * Enables verbose per-frame logging (draws, bindings, clears, presents).
+     * Off by default: those messages produce gigabytes of output during normal
+     * play. Pass {@code -Dgl4dx11.debug=true} to turn them back on.
+     */
+    public static final String DEBUG_PROPERTY = "gl4dx11.debug";
 
     private static volatile String probeResult = "not run";
     private static volatile boolean probeOk;
@@ -28,6 +34,11 @@ public final class Dx11Config {
 
     public static String backend() {
         return System.getProperty(BACKEND_PROPERTY, "auto").toLowerCase(Locale.ROOT);
+    }
+
+    /** True when verbose per-frame diagnostics were explicitly requested. */
+    public static boolean debugLogging() {
+        return Boolean.getBoolean(DEBUG_PROPERTY);
     }
 
     public static boolean isDx11Requested() {

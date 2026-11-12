@@ -8,6 +8,7 @@ import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.textures.TextureFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.xgdt.dx11.config.Dx11Config;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -27,6 +28,7 @@ final class Dx11RenderPass implements RenderPass {
 
     private final Dx11Device device;
     private final long handle;
+    private final boolean debugLogging = Dx11Config.debugLogging();
     private final Map<String, GpuBufferSlice> uniforms = new HashMap<>();
     private final Map<String, TextureViewAndSampler> samplers = new HashMap<>();
     private @Nullable Dx11RenderPipeline pipeline;
@@ -124,7 +126,7 @@ final class Dx11RenderPass implements RenderPass {
     public void drawIndexed(int baseVertex, int firstIndex, int indexCount, int instanceCount) {
         this.applyBindings();
         final long draw = ++this.drawCount;
-        if (draw <= 20) {
+        if (this.debugLogging && draw <= 20) {
             LOGGER.info(
                 "[dx11] drawIndexed #{} pipeline={} baseVertex={} firstIndex={} count={} instances={}",
                 draw,
@@ -168,7 +170,7 @@ final class Dx11RenderPass implements RenderPass {
     public void draw(int firstVertex, int vertexCount) {
         this.applyBindings();
         final long draw = ++this.drawCount;
-        if (draw <= 20) {
+        if (this.debugLogging && draw <= 20) {
             LOGGER.info(
                 "[dx11] draw #{} pipeline={} firstVertex={} count={}",
                 draw,
@@ -193,7 +195,7 @@ final class Dx11RenderPass implements RenderPass {
             throw new IllegalStateException("Pipeline contains invalid shader program");
         }
 
-        final boolean log = this.bindingLogCount < 3;
+        final boolean log = this.debugLogging && this.bindingLogCount < 3;
         if (log) {
             ++this.bindingLogCount;
             LOGGER.info(

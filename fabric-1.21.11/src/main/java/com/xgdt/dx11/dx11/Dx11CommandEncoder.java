@@ -9,6 +9,7 @@ import com.mojang.blaze3d.systems.GpuQuery;
 import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
+import com.xgdt.dx11.config.Dx11Config;
 import java.nio.ByteBuffer;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
@@ -26,6 +27,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
 
     private final Dx11Device device;
+    private final boolean debugLogging = Dx11Config.debugLogging();
     private long presentCount;
     private long passCount;
     private long clearCount;
@@ -54,7 +56,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
             throw new IllegalStateException("Depth texture is closed");
         }
         final long pass = ++this.passCount;
-        if (pass <= 20) {
+        if (this.debugLogging && pass <= 20) {
             LOGGER.info("[dx11] render pass #{} '{}' {}x{} colorClear={} depth={}",
                 pass, label.get(), colorView.getWidth(0), colorView.getHeight(0),
                 clearColor.isPresent(), depthView != null);
@@ -305,7 +307,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
             throw new IllegalStateException("Cannot present a closed texture view");
         }
         final long present = ++this.presentCount;
-        if (present <= 5) {
+        if (this.debugLogging && present <= 5) {
             LOGGER.info("[dx11] presentTexture #{} '{}' {}x{} mips={}",
                 present, textureView.texture().getLabel(),
                 textureView.getWidth(0), textureView.getHeight(0), textureView.mipLevels());
@@ -352,7 +354,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
 
     private void logClear(String operation, GpuTexture texture, int color) {
         final long clear = ++this.clearCount;
-        if (clear <= 20) {
+        if (this.debugLogging && clear <= 20) {
             LOGGER.info(
                 "[dx11] clear #{} {} '{}' argb=#{}{}",
                 clear, operation, texture.getLabel(),
@@ -365,7 +367,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
 
     private void logClear(String operation, GpuTexture texture) {
         final long clear = ++this.clearCount;
-        if (clear <= 20) {
+        if (this.debugLogging && clear <= 20) {
             LOGGER.info("[dx11] clear #{} {} '{}'", clear, operation, texture.getLabel());
         }
     }

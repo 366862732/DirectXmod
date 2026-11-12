@@ -12,12 +12,14 @@ class Dx11ConfigTest {
     private String originalOsName;
     private String originalBackend;
     private String originalEnabled;
+    private String originalDebug;
 
     @BeforeEach
     void saveProperties() {
         originalOsName = System.getProperty("os.name");
         originalBackend = System.getProperty(Dx11Config.BACKEND_PROPERTY);
         originalEnabled = System.getProperty(Dx11Config.ENABLE_PROPERTY);
+        originalDebug = System.getProperty(Dx11Config.DEBUG_PROPERTY);
         Dx11Config.resetProbeState();
     }
 
@@ -26,6 +28,7 @@ class Dx11ConfigTest {
         restore("os.name", originalOsName);
         restore(Dx11Config.BACKEND_PROPERTY, originalBackend);
         restore(Dx11Config.ENABLE_PROPERTY, originalEnabled);
+        restore(Dx11Config.DEBUG_PROPERTY, originalDebug);
         Dx11Config.resetProbeState();
     }
 
@@ -95,5 +98,20 @@ class Dx11ConfigTest {
 
         Dx11Config.setProbeResult("ERROR: no adapter");
         assertFalse(Dx11Config.probeOk());
+    }
+
+    @Test
+    void verboseLoggingIsOffByDefault() {
+        System.clearProperty(Dx11Config.DEBUG_PROPERTY);
+        assertFalse(Dx11Config.debugLogging());
+    }
+
+    @Test
+    void verboseLoggingFollowsTheDebugProperty() {
+        System.setProperty(Dx11Config.DEBUG_PROPERTY, "true");
+        assertTrue(Dx11Config.debugLogging());
+
+        System.setProperty(Dx11Config.DEBUG_PROPERTY, "false");
+        assertFalse(Dx11Config.debugLogging());
     }
 }

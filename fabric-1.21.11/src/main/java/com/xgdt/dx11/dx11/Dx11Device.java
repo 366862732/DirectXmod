@@ -19,6 +19,7 @@ import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.textures.TextureFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
+import com.xgdt.dx11.config.Dx11Config;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -47,6 +48,7 @@ final class Dx11Device implements GpuDevice {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
 
     private final long handle;
+    private final boolean debugLogging = Dx11Config.debugLogging();
     private final String adapterName;
     private final String vendorName;
     private final String versionText;
@@ -166,7 +168,7 @@ final class Dx11Device implements GpuDevice {
         int[] height = new int[1];
         org.lwjgl.glfw.GLFW.glfwGetFramebufferSize(windowHandle, width, height);
         final long frame = ++this.frameCount;
-        if (frame <= 5 || frame % 600 == 0) {
+        if (this.debugLogging && (frame <= 5 || frame % 600 == 0)) {
             LOGGER.info("[dx11] flipFrame #{} size={}x{} vsync={}",
                 frame, width[0], height[0], this.vsync);
         }
@@ -181,7 +183,7 @@ final class Dx11Device implements GpuDevice {
         }
         if (!Dx11Native.nativePresent(this.handle, width[0], height[0])) {
             LOGGER.warn("[dx11] Present failed");
-        } else if (frame <= 5) {
+        } else if (this.debugLogging && frame <= 5) {
             LOGGER.info("[dx11] flipFrame #{} presented ({})",
                 frame, Dx11Native.nativeGetPresentInfo(this.handle));
         }
