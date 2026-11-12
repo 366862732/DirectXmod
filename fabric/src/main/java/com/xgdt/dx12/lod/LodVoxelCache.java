@@ -22,8 +22,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class LodVoxelCache {
 
-    /** 已建好网格的区块上限。每块典型几十 KB，4096 块约 250 MB 上限，靠 LRU 回收。 */
-    private static final int MAX_MESHES = 4096;
+    /**
+     * 已建好网格的区块上限。四级 LOD 铺到 720 方块约需 8281 块（近处大、远处小，
+     * 平均每块几十 KB），12288 给相机移动后的旧位置留出余量；LRU 回收。
+     */
+    private static final int MAX_MESHES = 12288;
     /** 确认读不到数据的区块上限，避免反复重读同一个未生成的区块。 */
     private static final int MAX_MISSING = 32768;
     /** 后台建网线程数。 */
@@ -98,6 +101,21 @@ public final class LodVoxelCache {
         return this.completed.get();
     }
 
+    /** 已缓存网格的区块数（含空气块）；诊断用。 */
+    public int readyCount() {
+        return this.ready.size();
+    }
+
+    /** 已确认读不到数据的区块数；诊断用。 */
+    public int missingCount() {
+        return this.missing.size();
+    }
+
+    /** 正在排队/建网的区块数；诊断用。 */
+    public int pendingCount() {
+        return this.pending.size();
+    }
+
     /** 缓存代次：换世界/维度或锚点漂移时递增，渲染端据此丢弃旧顶点。 */
     public int generation() {
         return this.generation.get();
@@ -146,6 +164,12 @@ public final class LodVoxelCache {
         if (this.missing.contains(key)) {
             return LodVoxelMesher.Mesh.UNAVAILABLE;
         }
+        // 图集 UV 未就绪时不排队：此时建出来的网格 UV 全是回退值，会被缓存复用，
+        // 映射补齐后整片外圈会先闪一下再跳变。更糟的是每个未命中区块每帧都会重新
+        // 入队一次，把建网线程和 completed 计数一起刷爆。等映射就绪后自然重新请求。
+        if (!LodRegionCache.getInstance().isSpriteUvReady()) {
+            return null;
+        }
         request(key);
         return null;
     }
@@ -172,8 +196,8 @@ public final class LodVoxelCache {
             // 图集 UV 映射未就绪时不建网：UV 会烘进顶点并被缓存复用，启动早期
             // spriteUvMap 还是空的，此时建网整块会落到未命中回退位置，之后映射补齐
             // 相机往里走就「外圈先闪一片再跳变」。等就绪再建一次即可。
+            // 不递增 completed：否则渲染端会以为「有新网格」而反复重拼空几何。
             if (!regionCache.isSpriteUvReady()) {
-                this.completed.incrementAndGet();
                 return;
             }
             LodRegionCache.VoxelChunk chunk = regionCache.readVoxel(key.x(), key.z());

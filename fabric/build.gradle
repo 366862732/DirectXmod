@@ -54,6 +54,9 @@ processResources {
     filesMatching('fabric.mod.json') {
         expand 'version': project.version
     }
+    // VMProtect 产物只用于本地加壳实验，不进发布 jar（否则体积从 1.4MB 涨到 4MB）。
+    exclude 'dx12_mc.vmp.dll'
+    exclude 'dx12_mc.dll.vmp'
 }
 
 tasks.withType(JavaCompile).configureEach {

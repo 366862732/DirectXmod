@@ -115,6 +115,12 @@ public final class Dx12LodRenderer {
      * 保证数据补上后一定重采样。
      */
     private static final long REBUILD_COOLDOWN_MS = 250L;
+    /**
+     * 高度场仍有角点采不到（未生成区块 / 临时读失败）且后台已空闲时，最多每隔
+     * 这么久重试一次。missing 的 TTL 是 15 秒，30 秒足够覆盖一轮「当时没落盘、
+     * 现在已经写进 region」的区块，又不会把重建线程一直压在重复 IO 上。
+     */
+    private static final long HEIGHTFIELD_RETRY_NS = 30_000_000_000L;
 
     /**
      * 远景雾的完全遮挡距离（方块）。
@@ -177,11 +183,11 @@ public final class Dx12LodRenderer {
      * <p>这一段是玩家最先盯着的远景，也是 LOD 和原版地形的接缝，必须用最细的格宽
      * 才不露馅；再往外就交给等比放大的段。
      *
-     * <p>细格段从「原版视距圈内侧一格宽处」开始，所以宽度取 128 就能盖到视距圈外
-     * 128 方块 —— 足以罩住体素几何的外缘（常见 240~272 方块）。以前是 192，加上
-     * 细格预算固定 76 环，实际细格只铺到 236，体素外缘仍然落在粗格带上。
+     * <p>体素 LOD 已经把原版视距外最近的三百多方块铺成真实方块面，细格段再铺
+     * 128 方块只会整段落在体素覆盖矩形里、被剔除掉，白白占掉环数预算。取 64
+     * 仍能罩住「体素没建好时」的近景接缝，把省下的环数全部让给等比段。
      */
-    private static final int NEAR_DETAIL_BAND = 128;
+    private static final int NEAR_DETAIL_BAND = 64;
 
     /**
      * 坐标轴单侧环数（固定值，不再由顶点上限反推）。
@@ -196,10 +202,13 @@ public final class Dx12LodRenderer {
      *       重建本身就把后台区块补齐的节奏拖死了。</li>
      * </ul>
      *
-     * <p>192 环（网格 385×385 ≈ 59 万顶点）足以让近处保持 1 方块格宽，最远处格宽
-     * 约 20 方块 —— 也就是 Voxy 那种「近处贴地、远处只剩山形」的层次。
+     * <p>后来固定成 192 环，近处 1 方块、最远处约 20 方块。体素圈把近景接走以后，
+     * 192 环的问题变成「体素外缘 300~700 方块这一段还有 6~34 方块宽的大格」，
+     * 正好是玩家一眼能看出粗糙的距离。现在改成 320 环 + 细格段 64：网格
+     * 641×641（约 41 万顶点），体素外缘约 3 方块一格，雾终点 720 处约 5 方块，
+     * 重建采样量只有 625 环方案的四分之一，仍然落在交互可接受的范围。
      */
-    private static final int AXIS_RINGS = 192;
+    private static final int AXIS_RINGS = 320;
 
     /** 分层配色：陡坡露岩、水边显沙、高处积雪，避免整片纯绿/纯蓝。 */
     private static final float ROCK_SLOPE = 2.0f;
@@ -709,14 +718,16 @@ public final class Dx12LodRenderer {
      * 体素 LOD 覆盖的半径（方块）。这一圈内不再用高度场，而是画真实方块面，
      * 于是房屋有屋顶和墙、树有树干树冠、悬崖是真正的竖直岩壁。
      *
-     * <p>再往外仍然交给高度场：那个距离上一个体素只占几个像素，画真方块纯粹浪费。
+     * <p>直接铺到雾终点（720）。以前只铺到 448，外面 448~720 仍然是插值高度场：
+     * 那一圈在屏幕上占的面积比体素圈还大，看起来就是「稍微细一点、远处还是一整片
+     * 粗斜面」。体素铺满雾终点后，画面上能看清的地形全部是真实方块面。
      */
-    private static final int VOXEL_RADIUS_BLOCKS = 448;
+    private static final int VOXEL_RADIUS_BLOCKS = 720;
     /**
-     * 保持 1 方块精度的半径。再往外按 2 方块降采样，面数掉到四分之一左右。
+     * 保持 1 方块精度的半径。再往外按 2/4/8 方块逐级降采样。
      * 房屋、围墙这类几格宽的结构只有在这一圈里才认得出来。
      */
-    private static final int VOXEL_FULL_DETAIL_RADIUS = 288;
+    private static final int VOXEL_FULL_DETAIL_RADIUS = 224;
     /**
      * shift 0→1 的过渡带宽度（方块）。
      *
@@ -726,8 +737,19 @@ public final class Dx12LodRenderer {
      * shift=0，相机移动时新旧环平滑交叠，不再有密度突变。
      */
     private static final int VOXEL_TRANSITION_WIDTH = 64;
-    /** 体素顶点缓冲的硬上限（约 72 MB），按「由近到远」填，放不下的远处区块直接跳过。 */
-    private static final int VOXEL_MAX_VERTICES = 4_500_000;
+    /** shift 1→2 的分界（方块）。1 方块精度到 288，2 方块精度到 448。 */
+    private static final int VOXEL_MEDIUM_DETAIL_RADIUS = 448;
+    /** shift 2→3 的分界（方块）。4 方块精度到 576，再往外 8 方块精度直到雾终点。 */
+    private static final int VOXEL_COARSE_DETAIL_RADIUS = 576;
+    /**
+     * 体素顶点缓冲的硬上限（约 320 MB），按「由近到远」填，放不下的远处区块直接跳过。
+     *
+     * <p>贪心合并后每区块的面数约为逐格发面的 1/4（真实存档抽样：shift0 平均 500、
+     * shift1 216、shift2 118、shift3 64 面）。按 720 方块四级环布局推算约 144 万面；
+     * 玩家所在山区比存档平均更密（448 实测比推算高约 36%），最坏接近 195 万面。
+     * 上限给到 1000 万顶点（250 万面），留出约 28% 余量，避免外圈被预算截断。
+     */
+    private static final int VOXEL_MAX_VERTICES = 10_000_000;
     /** 有新区块建好时，最多每隔这么多帧重拼一次顶点缓冲（相机跨区块时不受此限）。 */
     private static final int VOXEL_REBUILD_INTERVAL = 32;
     /**
@@ -735,6 +757,14 @@ public final class Dx12LodRenderer {
      * 高度场剔除矩形都不变，避免每跨 16 方块就重新采样整张远景。
      */
     private static final int VOXEL_CENTER_SNAP_CHUNKS = 4;
+    /**
+     * 后台空闲且体素覆盖不完整时，重试「读不到」区块的间隔（60 秒）。
+     *
+     * <p>体素区块只能从 region 文件读：原版视距边缘那一圈区块虽然已经生成，但还
+     * 活着、没落盘，第一次读必然 miss。等它们卸载/自动存档写进 region 后再给一次
+     * 机会；间隔太短会把建网线程一直压在重复 IO 上。
+     */
+    private static final long VOXEL_RETRY_INTERVAL_NS = 60_000_000_000L;
 
     /** 体素顶点缓冲（CPU 映射写入）与共享静态索引。 */
     private Dx12GpuBuffer voxelVertexBuffer;
@@ -807,7 +837,24 @@ public final class Dx12LodRenderer {
     private float builtFineStart = -1.0f;
     private int builtCellX = Integer.MIN_VALUE;
     private int builtCellZ = Integer.MIN_VALUE;
-    private int builtCachedChunks = -1;
+    /**
+     * 上次建网时的列数据版本。用单调递增的版本号而不是缓存条目数：缓存满了之后
+     * 条目数不再变化，高度场会永久冻结在第一次采样到的 47% 角点上。
+     */
+    private long builtColumnVersion = -1L;
+    /** 上次建网的总角点数与有效角点数，用于「还有空洞时定期重试」。 */
+    private int builtTotal;
+    /**
+     * 雾终点以内仍然采不到数据的角点数。
+     *
+     * <p>不能用 {@code builtTotal - builtKnown}：坐标轴是方的，四角在雾终点以外，
+     * 未探索区域永远补不上，会把「补洞重试」变成每 30 秒一次的永久重建。只有
+     * 相机 720 方块以内（真正看得见）的洞才值得重试。
+     */
+    private int builtVisibleHoles;
+    /** 高度场重建次数与上次「补洞重试」的时刻。 */
+    private int heightfieldBuilds;
+    private long lastHeightRetryNanos;
     /**
      * 上次建网时有效采样的角点数（{@code -1} = 还没建过）。
      *
@@ -841,6 +888,12 @@ public final class Dx12LodRenderer {
     private boolean activeLogged;
 
     private long lastDiagnosticNanos;
+
+    /** 体素诊断日志的节流时刻（与高度场重建解耦，站着不动也能看到体素状态）。 */
+    private long lastVoxelDiagnosticNanos;
+
+    /** 上次定时重试 missing 区块的时刻（{@link System#nanoTime()}）。 */
+    private long lastVoxelRetryNanos;
 
     /** 体素专用管线（32B 顶点 + SRV t0）：首次调用 {@link #createVoxelPipeline} 时缓存。 */
     private final Map<Integer, Long> voxelPipelines = new HashMap<>();
@@ -943,14 +996,19 @@ public final class Dx12LodRenderer {
         int snapCenterZ = Math.floorDiv(cameraBlockZ, snap) * snap;
 
         int renderDistance = Math.max(2, minecraft.options.renderDistance().get());
-        float vanillaInner = (renderDistance - 1) * 16.0f;
+        // 原版实际画到的方块半径就是 renderDistance 个区块（不是 -1）。以前按
+        // (renderDistance-1)*16 算，高度场从 64 方块就开始画，而原版地形一直铺到
+        // 80 方块：两张表面在 64~80 之间重叠，高度场是插值出来的斜平面，原版是
+        // 方块台阶，于是近处地形上会出现一层「切进去」的 LOD 面 —— 这就是穿模。
+        float vanillaInner = renderDistance * 16.0f;
         // 体素 LOD 占住原版视距外最近的一圈，高度场从它外缘开始。
         int voxelRadius = Math.min(VOXEL_RADIUS_BLOCKS, radiusBlocks);
         if (voxelRadius <= vanillaInner) {
             // LOD 整个落在原版视距圈里，体素没有存在的意义
             voxelRadius = 0;
         }
-        updateVoxelMesh(cameraBlockX, cameraBlockZ, voxelRadius, vanillaInner);
+        updateVoxelMesh(cameraBlockX, cameraBlockZ, voxelRadius, renderDistance);
+        logVoxelDiagnostic(voxelRadius);
         // 高度场中心：有体素几何时跟着体素几何的中心走。体素覆盖只增不减，
         // 所以相机在覆盖矩形内走动时中心不动，远景不会因为跨 64 方块而重采样；
         // 等体素几何真正换中心（或关闭）时再一起换。
@@ -992,10 +1050,16 @@ public final class Dx12LodRenderer {
         // 后台陆续读到新区块时才需要定时重建；站着不动且没有新数据就不重建，
         // 免得每 250ms 白采样一次十几万个角点造成卡顿。
         LodRegionCache cache = LodRegionCache.getInstance();
-        int cachedChunks = cache.cachedCount();
-        boolean cooldownReady =
-            System.nanoTime() - this.lastBuildNanos
-                > Math.max(REBUILD_COOLDOWN_MS * 1_000_000L, this.lastBuildCostNanos * 4L);
+        long columnVersion = cache.columnVersion();
+        long now = System.nanoTime();
+        boolean cooldownReady = now - this.lastBuildNanos
+            > Math.max(REBUILD_COOLDOWN_MS * 1_000_000L, this.lastBuildCostNanos * 4L);
+        // 补洞重试：仍有角点采不到（未生成区块或临时读失败）且后台已空闲时，
+        // 每 30 秒重建一次。MISSING_TTL 是 15 秒，30 秒足够让「当时读不到、
+        // 现在已经落盘」的区块重新进队列；否则高度场会永久停在第一次的 47% 覆盖率。
+        boolean holesRemain = this.builtVisibleHoles > 0;
+        boolean retryHoles = holesRemain && cache.pendingCount() == 0
+            && now - this.lastHeightRetryNanos > HEIGHTFIELD_RETRY_NS;
         boolean rebuild = this.geometry == null
             || base != this.builtBase
             || radiusBlocks != this.builtRadius
@@ -1007,20 +1071,23 @@ public final class Dx12LodRenderer {
             || voxelMaxX != this.builtVoxelMaxX
             || voxelMinZ != this.builtVoxelMinZ
             || voxelMaxZ != this.builtVoxelMaxZ
-            || (cooldownReady && cachedChunks != this.builtCachedChunks)
-            // 还有区块在排队读盘：第一次采样几乎全是 miss，只等 cachedChunks 变化的话，
-            // 旧数据读完之后计数不再变化、几何会永久停在「一片空洞」，日志里那次
-            // 已采样=66/1562501 就是这么来的。pending 归零后这条自然失效。
+            // 列数据版本单调递增：任何一次读盘完成（含确认无数据）都会触发重建。
+            || (cooldownReady && columnVersion != this.builtColumnVersion)
+            // 还有区块在排队读盘：第一次采样几乎全是 miss，pending 归零前持续重建，
+            // 让地形一圈圈长出来。
             || (cooldownReady && cache.pendingCount() > 0)
             // 上一次建网一个角点都没采到（刚进世界、区块还没就绪）：不重试就永远空着
-            || (cooldownReady && this.builtKnown == 0);
+            || (cooldownReady && this.builtKnown == 0)
+            || (cooldownReady && retryHoles);
         if (rebuild) {
             long buildStart = System.nanoTime();
+            this.heightfieldBuilds++;
             rebuildGeometry(ctx, level, centerX, centerZ, geomRadius, base,
                 fineStart, vanillaInner, voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
                 cameraBlockX, cameraBlockZ);
             this.lastBuildCostNanos = System.nanoTime() - buildStart;
             this.lastBuildNanos = System.nanoTime();
+            this.lastHeightRetryNanos = this.lastBuildNanos;
             this.builtBase = base;
             this.builtRadius = radiusBlocks;
             this.builtVanillaInner = vanillaInner;
@@ -1031,7 +1098,7 @@ public final class Dx12LodRenderer {
             this.builtVoxelMaxX = voxelMaxX;
             this.builtVoxelMinZ = voxelMinZ;
             this.builtVoxelMaxZ = voxelMaxZ;
-            this.builtCachedChunks = cachedChunks;
+            this.builtColumnVersion = columnVersion;
         }
 
         Slot slot = this.geometry;
@@ -1143,7 +1210,8 @@ public final class Dx12LodRenderer {
      * 相机跨过一个区块就立即重拼一次。后台陆续建好新区块时则按
      * {@link #VOXEL_REBUILD_INTERVAL} 帧节流，避免每帧复制几十 MB。
      */
-    private void updateVoxelMesh(int cameraBlockX, int cameraBlockZ, int voxelRadius, float vanillaInner) {
+    private void updateVoxelMesh(int cameraBlockX, int cameraBlockZ, int voxelRadius,
+                                 int renderDistance) {
         this.voxelFrames++;
         LodVoxelCache cache = LodVoxelCache.getInstance();
         cache.ensureAnchor(cameraBlockX, cameraBlockZ);
@@ -1157,6 +1225,18 @@ public final class Dx12LodRenderer {
             this.voxelBuiltRadius = -1;
             this.voxelBuiltChunkX = Integer.MIN_VALUE;
             this.voxelBuiltChunkZ = Integer.MIN_VALUE;
+        }
+        // 定时重试「读不到」的区块：玩家走动时新生成的区块会陆续写进 region 文件，
+        // 只靠跨区块时清 missing，站着不动或原地挂机就永远补不上外圈。这里在后台
+        // 完全空闲（pending=0）且覆盖还不完整时每 60 秒清一次 missing，让下一轮
+        // 重建重新读盘。间隔足够长，不会把建网线程一直压在重复 IO 上。
+        long nowNanos = System.nanoTime();
+        if (voxelRadius > 0 && cache.pendingCount() == 0
+            && nowNanos - this.lastVoxelRetryNanos > VOXEL_RETRY_INTERVAL_NS
+            && (this.voxelDrawnOuterRing <= 0
+                || this.voxelCoverRadius < voxelRadius - 16.0f)) {
+            this.lastVoxelRetryNanos = nowNanos;
+            cache.retryMissing();
         }
         int completed = cache.completedCount();
         // 环中心吸附到 64 方块网格：相机在同一格内走动时几何不动，高度场的剔除
@@ -1196,6 +1276,8 @@ public final class Dx12LodRenderer {
             return;
         }
         int chunkRadius = Math.max(1, voxelRadius >> 4);
+        int cameraChunkX = cameraBlockX >> 4;
+        int cameraChunkZ = cameraBlockZ >> 4;
         int maxFaces = VOXEL_MAX_VERTICES / 4;
         LodVoxelMesher.Mesh[] selected = this.voxelMeshScratch;
         int count = 0;
@@ -1216,15 +1298,32 @@ public final class Dx12LodRenderer {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != d) {
                         continue;
                     }
-                    // 整块都落在原版视距圈内：原版已经画过这块地形，重复画只是浪费
-                    if (d * 16 + 16 <= vanillaInner) {
+                    // 整块都落在原版实际渲染的区块方阵内：原版已经画过这块地形，
+                    // 重复画只是浪费；而且这一圈区块通常还活着、没写进 region 文件，
+                    // 读不到数据会卡住「连续完整环」的判定，让体素永远长不出来。
+                    // 原版覆盖的是以相机所在区块为中心的 renderDistance 区块方阵，
+                    // 不是以吸附中心为圆心的方块半径 —— 相机在 4 区块吸附格里偏移
+                    // 最多 48 方块，按半径跳会漏掉一侧、又重画另一侧。
+                    int worldChunkX = camChunkX + dx;
+                    int worldChunkZ = camChunkZ + dz;
+                    if (Math.max(Math.abs(worldChunkX - cameraChunkX),
+                        Math.abs(worldChunkZ - cameraChunkZ)) <= renderDistance) {
                         continue;
                     }
-                    // shift 0→1 加过渡带：VOXEL_FULL_DETAIL_RADIUS 到 FULL+TRANSITION 仍按
-                    // 1 方块精度建网，过渡带外才降到 2 方块。相机跨过边界时贴图密度平滑
-                    // 衰减，不再瞬间翻倍闪一下。
+                    // 四级 LOD：1 方块到 288（含 64 方块过渡带）、2 方块到 448、
+                    // 4 方块到 576、再往外 8 方块直到雾终点 720。相机跨过边界时
+                    // 贴图密度逐级减半，配合雾衰减不会出现明显跳变。
                     int ringRadius = d * 16;
-                    int shift = ringRadius <= VOXEL_FULL_DETAIL_RADIUS + VOXEL_TRANSITION_WIDTH ? 0 : 1;
+                    int shift;
+                    if (ringRadius <= VOXEL_FULL_DETAIL_RADIUS + VOXEL_TRANSITION_WIDTH) {
+                        shift = 0;
+                    } else if (ringRadius <= VOXEL_MEDIUM_DETAIL_RADIUS) {
+                        shift = 1;
+                    } else if (ringRadius <= VOXEL_COARSE_DETAIL_RADIUS) {
+                        shift = 2;
+                    } else {
+                        shift = 3;
+                    }
                     // 即使已经停止绘制也要继续 get()：否则外圈永远不会排队建网，
                     // 体素就再也长不回去了。
                     LodVoxelMesher.Mesh mesh = cache.get(camChunkX + dx, camChunkZ + dz, shift);
@@ -1240,7 +1339,7 @@ public final class Dx12LodRenderer {
                         continue;
                     }
                     if (count == selected.length) {
-                        int grown = Math.max(64, Math.min(selected.length * 2, 4096));
+                        int grown = Math.max(64, Math.min(selected.length * 2, 16384));
                         selected = Arrays.copyOf(selected, grown);
                         this.voxelMeshScratch = selected;
                     }
@@ -1305,6 +1404,33 @@ public final class Dx12LodRenderer {
         this.voxelMaxBlockX = (camChunkX + outerRing) * 16;
         this.voxelMinBlockZ = minChunkZ * 16;
         this.voxelMaxBlockZ = (camChunkZ + outerRing) * 16;
+    }
+
+    /**
+     * 每 5 秒打一条体素缓存诊断。
+     *
+     * <p>以前体素状态只跟着高度场重建日志一起打：站着不动、高度场不再重建时，
+     * 日志里完全看不到「体素到底建了没有」。这条日志独立节流，直接回答四个问题：
+     * 后台建好了多少块（已建）、还有多少块确认读不到（缺）、多少块在排队（排队）、
+     * 以及图集 UV 闸门是否已经打开（UV）。体素不显示时先看这几个数。
+     */
+    private void logVoxelDiagnostic(int voxelRadius) {
+        if (voxelRadius <= 0) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now - this.lastVoxelDiagnosticNanos < 5_000_000_000L) {
+            return;
+        }
+        this.lastVoxelDiagnosticNanos = now;
+        LodVoxelCache cache = LodVoxelCache.getInstance();
+        LodRegionCache region = LodRegionCache.getInstance();
+        LOGGER.info("[lod] 体素: 目标半径={} 覆盖半径={} 完整环={} 面={} 缓存[已建={} 缺={} 排队={} 完成={}] 高度场[重建={} 采样={}/{} 可见洞={}] UV={} 存储[{}]",
+            voxelRadius, (int) this.voxelCoverRadius, this.voxelDrawnOuterRing,
+            this.voxelFaceCount, cache.readyCount(), cache.missingCount(),
+            cache.pendingCount(), cache.completedCount(),
+            this.heightfieldBuilds, this.builtKnown, this.builtTotal, this.builtVisibleHoles,
+            region.isSpriteUvReady() ? "就绪" : "未就绪", region.storeStats());
     }
 
     /** 相机是否还落在上一份体素几何覆盖的区块矩形内。 */
@@ -1423,6 +1549,12 @@ public final class Dx12LodRenderer {
                                  int cameraBlockX, int cameraBlockZ) {
         long startNanos = System.nanoTime();
         int[] axis = buildAxis(radiusBlocks, base, fineStart);
+        // 让坐标轴落在体素覆盖矩形的四条边上。否则最外一圈格子会横跨接缝：
+        // 高度场（插值斜平面）和体素（真实方块面）同时画同一段地形，在体素外缘
+        // 形成一圈互相穿插的锯齿。体素覆盖越大，这一格越宽（400 方块外一格
+        // 十几方块），穿模就越明显。对齐后格子要么完全在矩形内（跳过），要么
+        // 完全在外（高度场画），接缝是干净的一条线。
+        axis = alignAxisToVoxelRect(axis, voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ);
         int n = axis.length;
         int vertexCount = n * n;
         int cellCount = (n - 1) * (n - 1);
@@ -1461,9 +1593,16 @@ public final class Dx12LodRenderer {
         int minBuildY = level.getMinY();
         int maxBuildY = level.getMaxY();
         int known = 0;
+        // 「可见洞」按相机距离算：坐标轴是方的，四角在雾终点之外，那里的未探索
+        // 区块永远补不上，不能算进补洞重试的判据。
+        int camOffX = cameraBlockX - centerX;
+        int camOffZ = cameraBlockZ - centerZ;
+        long holeRadius = (long) (LOD_FOG_FAR_BLOCKS + 32.0f) * (long) (LOD_FOG_FAR_BLOCKS + 32.0f);
+        int visibleHoles = 0;
         LodRegionCache.getInstance().resetSampleStats();
         for (int j = 0; j < n; j++) {
             int z = centerZ + axis[j];
+            int dz = axis[j] - camOffZ;
             for (int i = 0; i < n; i++) {
                 int x = centerX + axis[i];
                 int index = j * n + i;
@@ -1473,6 +1612,10 @@ public final class Dx12LodRenderer {
                     // 未探索到 / 高度图损坏：当作未知，绝不写进顶点
                     heights[index] = UNKNOWN_HEIGHT;
                     colors[index] = -1;
+                    int dx = axis[i] - camOffX;
+                    if ((long) dx * dx + (long) dz * dz <= holeRadius) {
+                        visibleHoles++;
+                    }
                     continue;
                 }
                 heights[index] = height;
@@ -1562,9 +1705,12 @@ public final class Dx12LodRenderer {
         this.geometry = slot;
         // 供重建判据判断「这次是不是一个角点都没采到」，需要定期重试
         this.builtKnown = known;
+        this.builtTotal = vertexCount;
+        this.builtVisibleHoles = visibleHoles;
 
         long now = System.nanoTime();
-        if (now - this.lastDiagnosticNanos > 5_000_000_000L) {
+        // 前 10 次重建全部打印（进世界后地形一圈圈长出来的过程），之后恢复 5 秒节流。
+        if (this.heightfieldBuilds <= 10 || now - this.lastDiagnosticNanos > 5_000_000_000L) {
             this.lastDiagnosticNanos = now;
             // GPU 路径的可见 quad 数由 compute 阶段的 InterlockedAdd 决定，CPU 侧拿不到，
             // 这里打的是容量（quadVerts / 4），不要再显示成 0。
@@ -1579,18 +1725,25 @@ public final class Dx12LodRenderer {
                 }
             }
             // 远端格宽不能取 axis[n-1] - axis[n-2]：等比段收尾时最后一环被硬夹到
-            // maxRadius，会截成 1 方块，日志于是谎报「远端格宽=1」。取后半段最大格宽，
-            // 才是真正能代表远景精度的数字。
+            // maxRadius，会截成 1 方块，日志于是谎报「远端格宽=1」。取细格段起点
+            // 之后的最大格宽，才是真正能代表远景精度的数字；不能把细格段之前的
+            // 32 方块粗格（被原版/体素盖住、不可见）算进来。
             int farCell = 0;
             for (int k = n / 2; k + 1 < n; k++) {
-                farCell = Math.max(farCell, axis[k + 1] - axis[k]);
+                if (axis[k] >= fineStart) {
+                    farCell = Math.max(farCell, axis[k + 1] - axis[k]);
+                }
             }
-            LOGGER.info("[lod] 网格={}x{} 接缝格宽={} 远端格宽={} {} 已采样={}/{} 地形格={} 顶点容量={} 索引={} 缓存区块={} 体素面={} 体素半径={} 磁盘采样[{}] 耗时={}ms",
-                n - 1, n - 1, seamCell, farCell, gpuOk ? "GPU-block" : "CPU", known, vertexCount,
+            LOGGER.info("[lod] 网格={}x{} 重建={} 接缝格宽={} 远端格宽={} {} 已采样={}/{} 可见洞={} 地形格={} 顶点容量={} 索引={} 缓存区块={} 列版本={} 体素面={} 体素半径={} 磁盘采样[{}] 存储[{}] 耗时={}ms",
+                n - 1, n - 1, this.heightfieldBuilds, seamCell, farCell, gpuOk ? "GPU-block" : "CPU",
+                known, vertexCount, visibleHoles,
                 gpuOk ? quadVerts / 4 : emitted,
                 gpuOk ? quadVerts : vertexCount, gpuOk ? quadVerts / 4 * 6 : indexCount,
-                LodRegionCache.getInstance().cachedCount(), this.voxelFaceCount, (int) this.voxelCoverRadius,
+                LodRegionCache.getInstance().cachedCount(),
+                LodRegionCache.getInstance().columnVersion(),
+                this.voxelFaceCount, (int) this.voxelCoverRadius,
                 LodRegionCache.getInstance().sampleStats(),
+                LodRegionCache.getInstance().storeStats(),
                 (System.nanoTime() - startNanos) / 1_000_000L);
         }
     }
@@ -2121,6 +2274,40 @@ public final class Dx12LodRenderer {
             axis[count - 1 + i] = forward[i];
         }
         return axis;
+    }
+
+    /**
+     * 把体素覆盖矩形的四条边并入坐标轴，保证没有格子横跨体素/高度场接缝。
+     *
+     * <p>高度场的剔除判据是「整格都在矩形里才跳过」，所以没对齐时最外一圈格子
+     * 必然同时被体素和高度场画一遍。近处格子只有 1 方块，重叠看不出来；体素外缘
+     * （几百方块外）一格有十几方块，插值出来的高度场斜面和真实方块面就会互相
+     * 穿插。把 {@code minX/maxX/minZ/maxZ} 插进轴里，边界两侧都是完整格子，
+     * 接缝只剩一条线。
+     *
+     * <p>轴是对称的（{@code -maxRadius .. +maxRadius}），所以每个边界值以及它的
+     * 相反数都要插入；矩形本身不一定对称（{@code -outerRing+1 .. outerRing}）。
+     */
+    private static int[] alignAxisToVoxelRect(int[] axis, int minX, int maxX,
+                                              int minZ, int maxZ) {
+        if (maxX <= minX || maxZ <= minZ) {
+            return axis;
+        }
+        int limit = Math.max(Math.abs(axis[0]), Math.abs(axis[axis.length - 1]));
+        int[] extra = {minX, maxX, minZ, maxZ, -minX, -maxX, -minZ, -maxZ};
+        int[] all = Arrays.copyOf(axis, axis.length + extra.length);
+        System.arraycopy(extra, 0, all, axis.length, extra.length);
+        Arrays.sort(all);
+        int count = 0;
+        for (int value : all) {
+            if (value < -limit || value > limit) {
+                continue;
+            }
+            if (count == 0 || all[count - 1] != value) {
+                all[count++] = value;
+            }
+        }
+        return count == all.length ? all : Arrays.copyOf(all, count);
     }
 
     /**

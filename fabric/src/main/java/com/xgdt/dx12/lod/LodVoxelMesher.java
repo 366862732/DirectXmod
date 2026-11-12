@@ -2,7 +2,11 @@ package com.xgdt.dx12.lod;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * 需要做与Voxy差不多的网格化，3D 体素 LOD 的核心。
@@ -12,6 +16,12 @@ import java.util.Arrays;
  * <p>这是 3D 体素 LOD 的核心：不再像高度场那样「一列一个高度、整列涂一种颜色」，
  * 而是逐格判断六个方向有没有邻居，只画露在外面的面。于是房屋有屋顶和墙、树有树干和
  * 树冠、悬崖有真实的竖直岩壁，而不会塌成一块实心色块。
+ *
+ * <p><b>贪心合并</b>：同一层、同一方向、同一种方块（名字 + 颜色 + 水体标记都相同）
+ * 的相邻面会合并成一个矩形 quad。Voxy 的远景之所以能铺得远，靠的就是这一步：
+ * 一整片 16×16 的草地顶面只发 1 个 quad，而不是 256 个。合并只改变顶点数量，
+ * 不改变几何形状；UV 按方块空间 0..格数 写入，像素着色器 {@code frac} 后仍然是
+ * 每方块一张贴图。
  *
  * <p><b>降采样</b>：{@code shift > 0} 时把 {@code 2^shift} 见方的一团方块压成一格，
  * 只要团里有实心方块这一格就算实心，颜色取团里最上面那块。用于远处保持面数可控。
@@ -35,9 +45,10 @@ public final class LodVoxelMesher {
     public static final int VERTEX_STRIDE = 32;
     /**
      * 地下剪枝的深度余量（格）。一格低于四邻列最高实心格超过这么多，就认为它被
-     * 地表包住、永远看不见。留一点余量是为了不误伤贴着地表的结构（房屋地板、洞口）。
+     * 地表包住、永远看不见。留一点余量是为了不误伤贴着地表的结构（房屋地板、洞口）；
+     * 远景里 16 格以下的洞穴入口已经小于一个像素，多剪掉一层能显著减少面数。
      */
-    private static final int PRUNE_DEPTH = 8;
+    private static final int PRUNE_DEPTH = 16;
 
     private LodVoxelMesher() {
     }
@@ -72,10 +83,6 @@ public final class LodVoxelMesher {
         int minY = chunk.minY();
         int topCell = Math.min(cellsY - 1, (chunk.topY() - minY) >> shift);
 
-        ByteBuffer out = ByteBuffer.allocate(4096 * VERTEX_STRIDE).order(ByteOrder.LITTLE_ENDIAN);
-        int vertex = 0;
-        int faces = 0;
-
         // 每列最高实心格（区块内坐标）。地下洞穴里那些「六面都朝空气、但从地表永远
         // 看不到」的面是面数的大头：一个区块动辄上千片。若一格的高度低于四邻列的最高
         // 实心格，说明它被四周的实心地形包住（悬崖面也满足这一点：更低那一侧的地表
@@ -101,16 +108,65 @@ public final class LodVoxelMesher {
             }
         }
 
+        // 1) 每格只取一次代表方块。key 高 32 位 = 方块名编号，低 32 位 = RGB
+        //    （含水体标记）；-1 = 空气。名字编号用来保证「同颜色不同方块」不会被
+        //    贪心合并到一起（否则石头和圆石可能共用一张贴图）。
+        long[] grid = new long[cells * cellsY * cells];
+        Arrays.fill(grid, -1L);
+        Map<String, Integer> nameIds = new HashMap<>();
+        List<String> idNames = new ArrayList<>();
         for (int cy = 0; cy <= topCell; cy++) {
-            int y = minY + cy * size;
+            int y0 = minY + cy * size;
             for (int cz = 0; cz < cells; cz++) {
-                int z = baseZ + cz * size;
+                int z0 = cz * size;
                 for (int cx = 0; cx < cells; cx++) {
-                    int rgb = sample(chunk, cx, cy, cz, cells, cellsY, size);
+                    int x0 = cx * size;
+                    int rgb = -1;
+                    String name = null;
+                    // 和旧版 sample()/topBlockName() 一致：取这一团里最上面的实心方块。
+                    // 降采样时用最上面那块，地形表面才不会因为取到地下泥土而整片刷成棕色。
+                    outer:
+                    for (int y = y0 + size - 1; y >= y0; y--) {
+                        for (int z = z0; z < z0 + size; z++) {
+                            for (int x = x0; x < x0 + size; x++) {
+                                int c = chunk.color(x, y, z);
+                                if (c != -1) {
+                                    rgb = c;
+                                    name = chunk.blockName(x, y, z);
+                                    break outer;
+                                }
+                            }
+                        }
+                    }
                     if (rgb < 0) {
                         continue;
                     }
-                    // 被四邻列的地表盖住的地下格：看不见，跳过
+                    int nameId = 0;
+                    if (name != null) {
+                        Integer id = nameIds.get(name);
+                        if (id == null) {
+                            id = idNames.size() + 1;
+                            nameIds.put(name, id);
+                            idNames.add(name);
+                        }
+                        nameId = id;
+                    }
+                    grid[(cy * cells + cz) * cells + cx] =
+                        ((long) nameId << 32) | (rgb & 0xFFFFFFFFL);
+                }
+            }
+        }
+
+        // 2) 标记被四邻列地表包住的地下格。邻居是否实心仍然按「团里有没有实心方块」
+        //    判断（和旧版一致），这样剪枝不会把原本被遮住的面重新露出来。
+        boolean[] pruned = new boolean[cells * cellsY * cells];
+        for (int cy = 0; cy <= topCell; cy++) {
+            for (int cz = 0; cz < cells; cz++) {
+                for (int cx = 0; cx < cells; cx++) {
+                    int idx = (cy * cells + cz) * cells + cx;
+                    if (grid[idx] == -1L) {
+                        continue;
+                    }
                     int minTop = Integer.MAX_VALUE;
                     if (cx > 0) {
                         int t = cellTops[cz * cells + cx - 1];
@@ -137,109 +193,279 @@ public final class LodVoxelMesher {
                         }
                     }
                     if (minTop != Integer.MAX_VALUE && cy < minTop - PRUNE_DEPTH) {
-                        continue;
-                    }
-                    int x = baseX + cx * size;
-                    int alpha = LodRegionCache.isWater(rgb) ? 0 : 255;
-
-                    // 取该格最上面实心方块的 6 面图集 UV 矩形与 6 面染色（下标 = Direction.ordinal()）
-                    float[][] rects = null;
-                    int[] tints = null;
-                    if (cache != null) {
-                        String blockName = topBlockName(chunk, cx, cy, cz, cells, cellsY, size);
-                        rects = cache.getSpriteUv(blockName);
-                        tints = cache.getSpriteTint(blockName);
-                    }
-
-                    // 每个方向都只在邻居不是实心时才出面
-                    if (cy + 1 >= cellsY || sample(chunk, cx, cy + 1, cz, cells, cellsY, size) < 0) {
-                        faces++;
-                        if ((vertex + 4) * VERTEX_STRIDE > out.capacity()) {
-                            out = grow(out, out.capacity() * 2, vertex * VERTEX_STRIDE);
-                        }
-                        // +Y 顶面：UP = Direction.ordinal() 1
-                        float[] r = pickRect(rects, 1);
-                        int c = faceColor(r, tints, 1, rgb);
-                        putAtlas(out, vertex, x, y + size, z, c, alpha, 0, 0, r);
-                        putAtlas(out, vertex + 1, x, y + size, z + size, c, alpha, 0, size, r);
-                        putAtlas(out, vertex + 2, x + size, y + size, z + size, c, alpha, size, size, r);
-                        putAtlas(out, vertex + 3, x + size, y + size, z, c, alpha, size, 0, r);
-                        vertex += 4;
-                    }
-                    if (cy > 0 && sample(chunk, cx, cy - 1, cz, cells, cellsY, size) < 0) {
-                        faces++;
-                        if ((vertex + 4) * VERTEX_STRIDE > out.capacity()) {
-                            out = grow(out, out.capacity() * 2, vertex * VERTEX_STRIDE);
-                        }
-                        // -Y 底面：DOWN = 0
-                        float[] r = pickRect(rects, 0);
-                        int c = faceColor(r, tints, 0, rgb);
-                        putAtlas(out, vertex, x, y, z, c, alpha, 0, 0, r);
-                        putAtlas(out, vertex + 1, x + size, y, z, c, alpha, size, 0, r);
-                        putAtlas(out, vertex + 2, x + size, y, z + size, c, alpha, size, size, r);
-                        putAtlas(out, vertex + 3, x, y, z + size, c, alpha, 0, size, r);
-                        vertex += 4;
-                    }
-                    if (cx + 1 >= cells || sample(chunk, cx + 1, cy, cz, cells, cellsY, size) < 0) {
-                        faces++;
-                        if ((vertex + 4) * VERTEX_STRIDE > out.capacity()) {
-                            out = grow(out, out.capacity() * 2, vertex * VERTEX_STRIDE);
-                        }
-                        // +X 墙面：EAST = 5
-                        float[] r = pickRect(rects, 5);
-                        int c = faceColor(r, tints, 5, rgb);
-                        putAtlas(out, vertex, x + size, y, z, c, alpha, 0, 0, r);
-                        putAtlas(out, vertex + 1, x + size, y, z + size, c, alpha, 0, size, r);
-                        putAtlas(out, vertex + 2, x + size, y + size, z + size, c, alpha, size, size, r);
-                        putAtlas(out, vertex + 3, x + size, y + size, z, c, alpha, size, 0, r);
-                        vertex += 4;
-                    }
-                    if (cx == 0 || sample(chunk, cx - 1, cy, cz, cells, cellsY, size) < 0) {
-                        faces++;
-                        if ((vertex + 4) * VERTEX_STRIDE > out.capacity()) {
-                            out = grow(out, out.capacity() * 2, vertex * VERTEX_STRIDE);
-                        }
-                        // -X 墙面：WEST = 4
-                        float[] r = pickRect(rects, 4);
-                        int c = faceColor(r, tints, 4, rgb);
-                        putAtlas(out, vertex, x, y, z, c, alpha, 0, 0, r);
-                        putAtlas(out, vertex + 1, x, y + size, z, c, alpha, 0, size, r);
-                        putAtlas(out, vertex + 2, x, y + size, z + size, c, alpha, size, size, r);
-                        putAtlas(out, vertex + 3, x, y, z + size, c, alpha, size, 0, r);
-                        vertex += 4;
-                    }
-                    if (cz + 1 >= cells || sample(chunk, cx, cy, cz + 1, cells, cellsY, size) < 0) {
-                        faces++;
-                        if ((vertex + 4) * VERTEX_STRIDE > out.capacity()) {
-                            out = grow(out, out.capacity() * 2, vertex * VERTEX_STRIDE);
-                        }
-                        // +Z 墙面：SOUTH = 3
-                        float[] r = pickRect(rects, 3);
-                        int c = faceColor(r, tints, 3, rgb);
-                        putAtlas(out, vertex, x, y, z + size, c, alpha, 0, 0, r);
-                        putAtlas(out, vertex + 1, x, y + size, z + size, c, alpha, 0, size, r);
-                        putAtlas(out, vertex + 2, x + size, y + size, z + size, c, alpha, size, size, r);
-                        putAtlas(out, vertex + 3, x + size, y, z + size, c, alpha, size, 0, r);
-                        vertex += 4;
-                    }
-                    if (cz == 0 || sample(chunk, cx, cy, cz - 1, cells, cellsY, size) < 0) {
-                        faces++;
-                        if ((vertex + 4) * VERTEX_STRIDE > out.capacity()) {
-                            out = grow(out, out.capacity() * 2, vertex * VERTEX_STRIDE);
-                        }
-                        // -Z 墙面：NORTH = 2
-                        float[] r = pickRect(rects, 2);
-                        int c = faceColor(r, tints, 2, rgb);
-                        putAtlas(out, vertex, x, y, z, c, alpha, 0, 0, r);
-                        putAtlas(out, vertex + 1, x + size, y, z, c, alpha, size, 0, r);
-                        putAtlas(out, vertex + 2, x + size, y + size, z, c, alpha, size, size, r);
-                        putAtlas(out, vertex + 3, x, y + size, z, c, alpha, 0, size, r);
-                        vertex += 4;
+                        pruned[idx] = true;
                     }
                 }
             }
         }
-        return faces == 0 ? Mesh.EMPTY : new Mesh(Arrays.copyOf(out.array(), vertex * VERTEX_STRIDE), faces);
+
+        Emitter out = new Emitter();
+        long[] mask = new long[cells * cellsY];
+        // 六个方向分别做一次「切片 → 掩码 → 贪心矩形合并」。方向编号与
+        // Direction.ordinal() 一致：0=DOWN 1=UP 2=NORTH 3=SOUTH 4=WEST 5=EAST。
+        for (int dir = 0; dir < 6; dir++) {
+            int slices;
+            int w;
+            int h;
+            switch (dir) {
+                case 0, 1 -> {
+                    // 水平切片：i = x，j = z
+                    slices = cellsY;
+                    w = cells;
+                    h = cells;
+                }
+                case 2, 3 -> {
+                    // Z 方向切片：i = x，j = y
+                    slices = cells;
+                    w = cells;
+                    h = cellsY;
+                }
+                default -> {
+                    // X 方向切片：i = z，j = y
+                    slices = cells;
+                    w = cells;
+                    h = cellsY;
+                }
+            }
+            for (int s = 0; s < slices; s++) {
+                Arrays.fill(mask, 0, w * h, -1L);
+                // 3) 生成这一层的可见面掩码
+                for (int j = 0; j < h; j++) {
+                    for (int i = 0; i < w; i++) {
+                        int cx;
+                        int cy;
+                        int cz;
+                        switch (dir) {
+                            case 0, 1 -> {
+                                cx = i;
+                                cy = s;
+                                cz = j;
+                            }
+                            case 2, 3 -> {
+                                cx = i;
+                                cy = j;
+                                cz = s;
+                            }
+                            default -> {
+                                cx = s;
+                                cy = j;
+                                cz = i;
+                            }
+                        }
+                        int idx = (cy * cells + cz) * cells + cx;
+                        long key = grid[idx];
+                        if (key == -1L || pruned[idx]) {
+                            continue;
+                        }
+                        int nx = cx;
+                        int ny = cy;
+                        int nz = cz;
+                        switch (dir) {
+                            case 0 -> ny--;
+                            case 1 -> ny++;
+                            case 2 -> nz--;
+                            case 3 -> nz++;
+                            case 4 -> nx--;
+                            default -> nx++;
+                        }
+                        if (solidAt(grid, nx, ny, nz, cells, cellsY)) {
+                            continue;
+                        }
+                        mask[j * w + i] = key;
+                    }
+                }
+                // 4) 贪心合并：先向右找同 key 的连续宽度，再整行向下扩展高度，
+                //    最后把矩形覆盖的掩码清空。每个矩形只发 4 个顶点。
+                for (int j = 0; j < h; j++) {
+                    for (int i = 0; i < w; i++) {
+                        long key = mask[j * w + i];
+                        if (key == -1L) {
+                            continue;
+                        }
+                        int width = 1;
+                        while (i + width < w && mask[j * w + i + width] == key) {
+                            width++;
+                        }
+                        int height = 1;
+                        scan:
+                        while (j + height < h) {
+                            int row = (j + height) * w;
+                            for (int k = 0; k < width; k++) {
+                                if (mask[row + i + k] != key) {
+                                    break scan;
+                                }
+                            }
+                            height++;
+                        }
+                        for (int jj = 0; jj < height; jj++) {
+                            int row = (j + jj) * w;
+                            for (int k = 0; k < width; k++) {
+                                mask[row + i + k] = -1L;
+                            }
+                        }
+
+                        int cx;
+                        int cy;
+                        int cz;
+                        switch (dir) {
+                            case 0, 1 -> {
+                                cx = i;
+                                cy = s;
+                                cz = j;
+                            }
+                            case 2, 3 -> {
+                                cx = i;
+                                cy = j;
+                                cz = s;
+                            }
+                            default -> {
+                                cx = s;
+                                cy = j;
+                                cz = i;
+                            }
+                        }
+                        int idx = (cy * cells + cz) * cells + cx;
+                        long cellKey = grid[idx];
+                        int rgb = (int) cellKey;
+                        int nameId = (int) (cellKey >>> 32);
+                        String name = nameId == 0 ? null : idNames.get(nameId - 1);
+                        float[][] rects = cache == null ? null : cache.getSpriteUv(name);
+                        int[] tints = cache == null ? null : cache.getSpriteTint(name);
+                        float[] rect = pickRect(rects, dir);
+                        int color = faceColor(rect, tints, dir, rgb);
+                        int alpha = LodRegionCache.isWater(rgb) ? 0 : 255;
+                        float u = width * (float) size;
+                        float v = height * (float) size;
+                        switch (dir) {
+                            case 0 -> { // DOWN
+                                float x0 = baseX + i * (float) size;
+                                float z0 = baseZ + j * (float) size;
+                                float y = minY + s * (float) size;
+                                emitFace(out, dir, x0, y, z0, x0 + u, y, z0 + v,
+                                    u, v, color, alpha, rect);
+                            }
+                            case 1 -> { // UP
+                                float x0 = baseX + i * (float) size;
+                                float z0 = baseZ + j * (float) size;
+                                float y = minY + (s + 1) * (float) size;
+                                emitFace(out, dir, x0, y, z0, x0 + u, y, z0 + v,
+                                    u, v, color, alpha, rect);
+                            }
+                            case 2 -> { // NORTH
+                                float x0 = baseX + i * (float) size;
+                                float y0 = minY + j * (float) size;
+                                float z = baseZ + s * (float) size;
+                                emitFace(out, dir, x0, y0, z, x0 + u, y0 + v, z,
+                                    u, v, color, alpha, rect);
+                            }
+                            case 3 -> { // SOUTH
+                                float x0 = baseX + i * (float) size;
+                                float y0 = minY + j * (float) size;
+                                float z = baseZ + (s + 1) * (float) size;
+                                emitFace(out, dir, x0, y0, z, x0 + u, y0 + v, z,
+                                    u, v, color, alpha, rect);
+                            }
+                            case 4 -> { // WEST
+                                float z0 = baseZ + i * (float) size;
+                                float y0 = minY + j * (float) size;
+                                float x = baseX + s * (float) size;
+                                emitFace(out, dir, x, y0, z0, x, y0 + v, z0 + u,
+                                    u, v, color, alpha, rect);
+                            }
+                            default -> { // EAST
+                                float z0 = baseZ + i * (float) size;
+                                float y0 = minY + j * (float) size;
+                                float x = baseX + (s + 1) * (float) size;
+                                emitFace(out, dir, x, y0, z0, x, y0 + v, z0 + u,
+                                    u, v, color, alpha, rect);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return out.faces == 0 ? Mesh.EMPTY
+            : new Mesh(Arrays.copyOf(out.out.array(), out.vertex * VERTEX_STRIDE), out.faces);
+    }
+
+    /** 顶点缓冲 + 计数器。贪心合并后每个矩形 4 个顶点，索引由渲染端静态生成。 */
+    private static final class Emitter {
+        ByteBuffer out;
+        int vertex;
+        int faces;
+
+        Emitter() {
+            this.out = ByteBuffer.allocate(4096 * VERTEX_STRIDE).order(ByteOrder.LITTLE_ENDIAN);
+        }
+
+        void ensure(int vertices) {
+            while ((this.vertex + vertices) * VERTEX_STRIDE > this.out.capacity()) {
+                this.out = grow(this.out, this.out.capacity() * 2, this.vertex * VERTEX_STRIDE);
+            }
+        }
+    }
+
+    /** 邻居格是否实心；越界当空气（与旧版区块边界行为一致）。 */
+    private static boolean solidAt(long[] grid, int x, int y, int z, int cells, int cellsY) {
+        if (x < 0 || y < 0 || z < 0 || x >= cells || y >= cellsY || z >= cells) {
+            return false;
+        }
+        return grid[(y * cells + z) * cells + x] != -1L;
+    }
+
+    /**
+     * 发一个矩形面。{@code (x0,y0,z0)..(x1,y1,z1)} 是矩形包围盒，其中法线方向的两个
+     * 端点相等；{@code u/v} 是方块空间 UV 的跨度（格数 × 2^shift）。
+     *
+     * <p>顶点顺序沿用旧版逐格发面的顺序，只是把 size 换成了合并后的 u/v，保证
+     * 三角形绕序、UV 朝向、图集矩形都和以前完全一致。
+     */
+    private static void emitFace(Emitter e, int dir,
+                                 float x0, float y0, float z0,
+                                 float x1, float y1, float z1,
+                                 float u, float v, int color, int alpha, float[] rect) {
+        e.ensure(4);
+        int o = e.vertex;
+        switch (dir) {
+            case 0 -> { // DOWN
+                putAtlas(e.out, o, x0, y0, z0, color, alpha, 0, 0, rect);
+                putAtlas(e.out, o + 1, x1, y0, z0, color, alpha, u, 0, rect);
+                putAtlas(e.out, o + 2, x1, y0, z1, color, alpha, u, v, rect);
+                putAtlas(e.out, o + 3, x0, y0, z1, color, alpha, 0, v, rect);
+            }
+            case 1 -> { // UP
+                putAtlas(e.out, o, x0, y1, z0, color, alpha, 0, 0, rect);
+                putAtlas(e.out, o + 1, x0, y1, z1, color, alpha, 0, v, rect);
+                putAtlas(e.out, o + 2, x1, y1, z1, color, alpha, u, v, rect);
+                putAtlas(e.out, o + 3, x1, y1, z0, color, alpha, u, 0, rect);
+            }
+            case 2 -> { // NORTH
+                putAtlas(e.out, o, x0, y0, z0, color, alpha, 0, 0, rect);
+                putAtlas(e.out, o + 1, x1, y0, z0, color, alpha, u, 0, rect);
+                putAtlas(e.out, o + 2, x1, y1, z0, color, alpha, u, v, rect);
+                putAtlas(e.out, o + 3, x0, y1, z0, color, alpha, 0, v, rect);
+            }
+            case 3 -> { // SOUTH
+                putAtlas(e.out, o, x0, y0, z1, color, alpha, 0, 0, rect);
+                putAtlas(e.out, o + 1, x0, y1, z1, color, alpha, 0, v, rect);
+                putAtlas(e.out, o + 2, x1, y1, z1, color, alpha, u, v, rect);
+                putAtlas(e.out, o + 3, x1, y0, z1, color, alpha, u, 0, rect);
+            }
+            case 4 -> { // WEST
+                putAtlas(e.out, o, x0, y0, z0, color, alpha, 0, 0, rect);
+                putAtlas(e.out, o + 1, x0, y1, z0, color, alpha, 0, v, rect);
+                putAtlas(e.out, o + 2, x0, y1, z1, color, alpha, u, v, rect);
+                putAtlas(e.out, o + 3, x0, y0, z1, color, alpha, u, 0, rect);
+            }
+            default -> { // EAST
+                putAtlas(e.out, o, x1, y0, z0, color, alpha, 0, 0, rect);
+                putAtlas(e.out, o + 1, x1, y0, z1, color, alpha, 0, v, rect);
+                putAtlas(e.out, o + 2, x1, y1, z1, color, alpha, u, v, rect);
+                putAtlas(e.out, o + 3, x1, y1, z0, color, alpha, u, 0, rect);
+            }
+        }
+        e.vertex += 4;
+        e.faces++;
     }
 
     // ------------------------------------------------------------------
@@ -277,55 +503,6 @@ public final class LodVoxelMesher {
         return Math.round(value * 65535f);
     }
 
-    /**
-     * 取该格最上面实心方块的名称。
-     *
-     * <p>遍历 {@code 2^shift} 见方团里的所有方块，从最上面（y 最大）向下找第一个实心方块。
-     * 全空返回 {@code null}。
-     */
-    private static String topBlockName(LodRegionCache.VoxelChunk chunk,
-                                       int cx, int cy, int cz, int cells, int cellsY, int size) {
-        int x0 = cx * size;
-        int y0 = chunk.minY() + cy * size;
-        int z0 = cz * size;
-        for (int y = y0 + size - 1; y >= y0; y--) {
-            for (int z = z0; z < z0 + size; z++) {
-                for (int x = x0; x < x0 + size; x++) {
-                    if (chunk.color(x, y, z) != -1) {
-                        return chunk.blockName(x, y, z);
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * 取一格的颜色：把 {@code 2^shift} 见方的一团方块里<b>最上面</b>的实心方块当代表，
-     * 全空返回 {@code -1}。降采样时用最上面那块，地形表面才不会因为取到地下泥土而
-     * 整片刷成棕色。
-     */
-    private static int sample(LodRegionCache.VoxelChunk chunk, int cx, int cy, int cz,
-                              int cells, int cellsY, int size) {
-        if (cx < 0 || cy < 0 || cz < 0 || cx >= cells || cy >= cellsY || cz >= cells) {
-            return -1;
-        }
-        int x0 = cx * size;
-        int y0 = chunk.minY() + cy * size;
-        int z0 = cz * size;
-        for (int y = y0 + size - 1; y >= y0; y--) {
-            for (int z = z0; z < z0 + size; z++) {
-                for (int x = x0; x < x0 + size; x++) {
-                    int rgb = chunk.color(x, y, z);
-                    if (rgb != -1) {
-                        return rgb;
-                    }
-                }
-            }
-        }
-        return -1;
-    }
-
     private static ByteBuffer grow(ByteBuffer buffer, int capacity, int used) {
         ByteBuffer bigger = ByteBuffer.allocate(capacity).order(ByteOrder.LITTLE_ENDIAN);
         System.arraycopy(buffer.array(), 0, bigger.array(), 0, used);
@@ -338,7 +515,7 @@ public final class LodVoxelMesher {
      * <p>uv 是「方块空间」坐标（一格 1.0，整面 {@code 0..size}），像素着色器
      * {@code frac} 之后再用矩形还原到图集里那一格。
      */
-    private static void putAtlas(ByteBuffer buffer, int vertex, int x, int y, int z,
+    private static void putAtlas(ByteBuffer buffer, int vertex, float x, float y, float z,
                                  int rgb, int alpha, float u, float v, float[] rect) {
         int offset = vertex * VERTEX_STRIDE;
         buffer.putFloat(offset, x);

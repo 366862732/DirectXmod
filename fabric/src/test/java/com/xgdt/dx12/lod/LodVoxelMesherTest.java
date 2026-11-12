@@ -1,7 +1,6 @@
 package com.xgdt.dx12.lod;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -121,8 +120,9 @@ class LodVoxelMesherTest {
             }
         }
         LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 0);
-        // 2×2×2 实心：6 个面各 4 片，内部的 12 个面必须被剔除
-        assertEquals(24, mesh.faces(), "实心立方体只该有外壳，内部面必须剔除");
+        // 2×2×2 实心：内部的 12 个面必须被剔除；外壳每个方向贪心合并成 1 片
+        assertEquals(6, mesh.faces(), "实心立方体只该有外壳，且每面合并成 1 片");
+        assertEquals(24, mesh.vertices().length / LodVoxelMesher.VERTEX_STRIDE);
     }
 
     @Test
@@ -149,18 +149,18 @@ class LodVoxelMesherTest {
         }
         LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 0);
 
-        // 屋顶顶面 5×5
-        assertEquals(25, facesOnPlane(mesh, 67.0f), "屋顶顶面应有 25 片");
+        // 屋顶顶面 5×5 同材质，贪心合并成 1 片
+        assertEquals(1, facesOnPlane(mesh, 67.0f), "屋顶顶面应合并成 1 片");
         // 屋顶底面只出现在中间 3×3 的架空处 —— 高度场做不到这一点
-        assertEquals(9, facesOnPlane(mesh, 66.0f), "屋顶底面（架空处）应有 9 片");
+        assertEquals(1, facesOnPlane(mesh, 66.0f), "屋顶底面（架空处）应合并成 1 片");
         // 地面顶面同样只在中间 3×3 露出来
-        assertEquals(9, facesOnPlane(mesh, 64.0f), "地面顶面（墙内）应有 9 片");
+        assertEquals(1, facesOnPlane(mesh, 64.0f), "地面顶面（墙内）应合并成 1 片");
         // 地面底面
-        assertEquals(25, facesOnPlane(mesh, 63.0f), "地面底面应有 25 片");
+        assertEquals(1, facesOnPlane(mesh, 63.0f), "地面底面应合并成 1 片");
         // 两层墙之间不该出现任何水平面
         assertEquals(0, facesOnPlane(mesh, 65.0f), "两层墙之间不该有水平面");
-        // 总面数：地面 54 + 墙 32×2 + 屋顶 54
-        assertEquals(172, mesh.faces(), "小房子总面数");
+        // 总面数：地面 6 + 墙 8 + 屋顶 6 = 20
+        assertEquals(20, mesh.faces(), "小房子总面数");
     }
 
     @Test
@@ -173,21 +173,52 @@ class LodVoxelMesherTest {
     }
 
     @Test
-    void downsamplingKeepsSurfaceAndDropsFaceCount() {
-        // 4×4×4 实心块，按 2 方块降采样后变成 2×2×2
+    void greedyMergesFlatSurfaceIntoOneQuad() {
+        // 16×16 同材质平板：顶/底各 1 片，四侧各 1 片 = 6 片。
+        Builder builder = new Builder();
+        for (int z = 0; z < 16; z++) {
+            for (int x = 0; x < 16; x++) {
+                builder.put(x, 64, z, 0x808080);
+            }
+        }
+        LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 0);
+        assertEquals(6, mesh.faces(), "16×16 平板每面应合并成 1 片");
+
+        // UV 必须跨 16 个方块；若合并后仍写 0..1，大面会被拉成一块纯色。
+        ByteBuffer buffer = ByteBuffer.wrap(mesh.vertices()).order(ByteOrder.LITTLE_ENDIAN);
+        float maxU = 0.0f;
+        float maxV = 0.0f;
+        for (int v = 0; v < mesh.faces() * 4; v++) {
+            int offset = v * LodVoxelMesher.VERTEX_STRIDE;
+            maxU = Math.max(maxU, buffer.getFloat(offset + 16));
+            maxV = Math.max(maxV, buffer.getFloat(offset + 20));
+        }
+        assertEquals(16.0f, maxU, 1.0e-4f);
+        assertEquals(16.0f, maxV, 1.0e-4f);
+    }
+
+    @Test
+    void downsamplingCoarsensGridAndKeepsSurface() {
+        // 4×4×4 实心块，按 2 方块降采样后变成 2×2×2 格；贪心合并后两者都是 6 片。
         Builder builder = new Builder();
         for (int y = 64; y < 68; y++) {
-            for (int z = 4; z < 8; z++) {
-                for (int x = 4; x < 8; x++) {
+            for (int z = 5; z < 9; z++) {
+                for (int x = 5; x < 9; x++) {
                     builder.put(x, y, z, 0x808080);
                 }
             }
         }
         LodVoxelMesher.Mesh full = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 0);
         LodVoxelMesher.Mesh half = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 1);
-        assertEquals(6 * 16, full.faces(), "4×4×4 实心：6 个面各 16 片");
-        assertEquals(6 * 4, half.faces(), "2 方块降采样后：6 个面各 4 片");
-        assertTrue(half.vertices().length < full.vertices().length);
+        assertEquals(6, full.faces(), "全精度 4×4×4 实心：每面 1 片");
+        assertEquals(6, half.faces(), "2 方块降采样后：每面仍是 1 片");
+        // 降采样后的格宽是 2，顶点 x/z 必须落在偶数坐标上（5..9 会被扩成 4..10）。
+        ByteBuffer buffer = ByteBuffer.wrap(half.vertices()).order(ByteOrder.LITTLE_ENDIAN);
+        for (int v = 0; v < half.faces() * 4; v++) {
+            int offset = v * LodVoxelMesher.VERTEX_STRIDE;
+            assertEquals(0.0f, buffer.getFloat(offset) % 2.0f, 1.0e-4f);
+            assertEquals(0.0f, buffer.getFloat(offset + 8) % 2.0f, 1.0e-4f);
+        }
     }
 
     @Test
@@ -206,7 +237,7 @@ class LodVoxelMesherTest {
         for (int y = 40; y <= 63; y++) {
             for (int z = 0; z < 16; z++) {
                 for (int x = 0; x < 16; x++) {
-                    boolean hole = x >= 6 && x < 10 && z >= 6 && z < 10 && y >= 48 && y < 52;
+                    boolean hole = x >= 6 && x < 10 && z >= 6 && z < 10 && y >= 40 && y < 44;
                     if (!hole) {
                         cave.put(x, y, z, 0x808080);
                     }

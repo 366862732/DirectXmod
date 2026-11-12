@@ -19,6 +19,9 @@ shot_*/
 *.exp
 *.lib
 
+# Python
+*.py
+
 # 本地工具链（DXC 等，仅用于离线编译光追着色器）
 .tools/
 

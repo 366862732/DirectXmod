@@ -28,7 +28,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.block.BlockStateModelSet;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.resources.model.sprite.SpriteId;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -223,6 +225,27 @@ public final class LodRegionCache {
     private final AtomicLong statNoColor = new AtomicLong();
     private final AtomicLong statHit = new AtomicLong();
 
+    /*
+     * 持久化存储的命中诊断：进世界后第一轮读盘若几乎全是 miss，说明 store 没被
+     * 复用（目录不对/版本变了/region 大小对不上），下一轮仍要解全部 NBT；
+     * 全是 hit 则说明上次退出时写进去的数据确实生效了。随 [lod] 日志一起打印。
+     */
+    private final AtomicLong statVoxelStoreHit = new AtomicLong();
+    private final AtomicLong statVoxelStoreMiss = new AtomicLong();
+    private final AtomicLong statColumnStoreHit = new AtomicLong();
+    private final AtomicLong statColumnStoreMiss = new AtomicLong();
+
+    /**
+     * 列数据加载版本：每成功读完一个区块（有数据或确认无数据）就递增。
+     *
+     * <p>渲染端以前用 {@code columns.size()} 判断「有没有新数据」。这个值在缓存达到上限、
+     * 或大量区块同时命中/淘汰时会保持不变甚至回落，高度场就会永久冻结在进世界第一秒
+     * 采到的 47% 角点上 —— 日志里的 {@code 已采样=195028/410881} 后再也没有第二条
+     * {@code 网格=} 记录，远景一片空洞。改成单调递增的版本号，任何一次读盘完成都
+     * 能可靠触发下一次重建。
+     */
+    private final AtomicLong columnVersion = new AtomicLong();
+
     /** 区块 key → 地表数据（{@link #MISSING} 表示整块读不到）。 */
     private final Map<Long, ChunkColumns> columns = Collections.synchronizedMap(
         new LinkedHashMap<Long, ChunkColumns>(2048, 0.75f, true) {
@@ -258,6 +281,14 @@ public final class LodRegionCache {
     private static final Logger LOGGER = LoggerFactory.getLogger("Dx12LodCache");
     /** region 文件 (size, mtime) 的短期缓存，避免每个区块都 stat 一次。 */
     private static final long REGION_STAT_TTL_NS = 1_000_000_000L;
+    /**
+     * 图集 UV 映射刷新失败后的重试间隔。
+     *
+     * <p>图集通常在进世界后一两秒内加载完，之前每次 {@code prepare()} 都重刷一遍，
+     * 等于每帧遍历上千个方块、烘焙全部模型部件——启动阶段白白吃掉大量帧时间。
+     * 失败后隔半秒再试，最多多等半秒就绪，代价可以忽略。
+     */
+    private static final long SPRITE_UV_RETRY_NS = 500_000_000L;
 
     /** 解码后 section 的持久化 KV 存储；{@code null} = 不可用（多人游戏/开关关闭/打开失败）。 */
     private volatile LodSectionStore store;
@@ -304,10 +335,10 @@ public final class LodRegionCache {
         }
         if (dir.equals(this.regionDir) && level.dimension().equals(this.dimension)) {
             // 图集可能晚于首次 prepare 才加载好（加载阶段 getAtlasManager 抛异常被吞掉），
-            // 此时 spriteUvReady 仍为 false、后台建网被闸门挡住。每帧补刷一次直到就绪，
-            // 避免永远停在「没有 UV」状态。
+            // 此时 spriteUvReady 仍为 false、后台建网被闸门挡住。带退避地补刷直到就绪，
+            // 避免永远停在「没有 UV」状态，也不至于每帧重刷整个方块注册表。
             if (!this.spriteUvReady) {
-                refreshSpriteUv();
+                refreshSpriteUvIfDue();
             }
             return;
         }
@@ -321,11 +352,30 @@ public final class LodRegionCache {
         this.pending.clear();
         this.queue.clear();
         this.regionStats.clear();
+        this.columnVersion.incrementAndGet();
         openStore(dir);
         // 体素网格是按方块数据建的，换世界/维度后全部失效
         LodVoxelCache.getInstance().clear();
         // 刷新方块→图集 UV 映射（atlas 在渲染线程才可用）
+        refreshSpriteUvIfDue();
+    }
+
+    /**
+     * 按 {@link #SPRITE_UV_RETRY_NS} 退避地尝试刷新图集 UV 映射；已就绪时直接返回。
+     *
+     * <p>只在渲染线程调用。失败（图集未加载）时记下下次允许重试的时刻，
+     * 成功则清掉退避。
+     */
+    private void refreshSpriteUvIfDue() {
+        if (this.spriteUvReady) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now < this.spriteUvRetryAtNanos) {
+            return;
+        }
         refreshSpriteUv();
+        this.spriteUvRetryAtNanos = this.spriteUvReady ? 0L : System.nanoTime() + SPRITE_UV_RETRY_NS;
     }
 
     /**
@@ -357,72 +407,14 @@ public final class LodRegionCache {
             var modelSet = modelManager.getBlockStateModelSet();
             var blockColors = minecraft.getBlockColors();
             for (Block block : BuiltInRegistries.BLOCK) {
-                var key = BuiltInRegistries.BLOCK.getKey(block);
-                if (key == null) {
-                    continue;
+                // 单个方块的模型异常不能拖垮整张映射：以前这里没有逐方块兜底，
+                // 一个 mod 方块在 collectParts 里抛异常就让整次刷新失败、
+                // spriteUvReady 永远为 false，体素建网闸门也就永远打不开。
+                try {
+                    refreshBlockSpriteUv(block, modelSet, blockColors);
+                } catch (Throwable ignored) {
+                    // 跳过这个方块，其余方块继续
                 }
-                String blockName = key.toString();
-                var state = block.defaultBlockState();
-                if (state.getRenderShape() == net.minecraft.world.level.block.RenderShape.INVISIBLE) {
-                    continue;
-                }
-                var model = modelSet.get(state);
-                if (model == null) {
-                    continue;
-                }
-                List<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> parts = new ArrayList<>();
-                model.collectParts(net.minecraft.util.RandomSource.create(42L), parts);
-
-                float[][] rects = new float[6][];
-                int[] tints = new int[6];
-                Arrays.fill(tints, 0xFFFFFF);
-                for (var part : parts) {
-                    for (var dir : net.minecraft.core.Direction.values()) {
-                        int idx = dir.ordinal();
-                        if (rects[idx] != null) {
-                            continue; // 该方向已取到贴图
-                        }
-                        var quads = part.getQuads(dir);
-                        if (quads == null) {
-                            continue;
-                        }
-                        for (var quad : quads) {
-                            var materialInfo = quad.materialInfo();
-                            if (materialInfo == null) {
-                                continue;
-                            }
-                            var sprite = materialInfo.sprite();
-                            if (sprite == null) {
-                                continue;
-                            }
-                            rects[idx] = new float[]{
-                                sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()
-                            };
-                            tints[idx] = tintColor(blockColors, state, materialInfo.tintIndex());
-                            break;
-                        }
-                    }
-                }
-                // 回填：没有 quad 的方向借用顶面（UP=1）或任意非空面
-                float[] fallback = rects[1];
-                if (fallback == null) {
-                    for (float[] r : rects) {
-                        if (r != null) {
-                            fallback = r;
-                            break;
-                        }
-                    }
-                }
-                if (fallback == null) {
-                    continue; // 完全没有贴图（如屏障），跳过
-                }
-                for (int i = 0; i < 6; i++) {
-                    if (rects[i] == null) {
-                        rects[i] = fallback;
-                    }
-                }
-                this.spriteUvMap.put(blockName, rects);
-                this.spriteTintMap.put(blockName, tints);
             }
             if (!this.activeLogged && LOGGER.isInfoEnabled()) {
                 LOGGER.info("[lod] 方块 sprite UV 映射已刷新：{} 项（每面独立，BlockStateModelSet）",
@@ -435,11 +427,91 @@ public final class LodRegionCache {
         }
     }
 
+    /**
+     * 刷新单个方块的六面 sprite UV 与染色值。
+     *
+     * <p>模型查询/烘焙只依赖默认方块状态，不碰世界，可以在渲染线程安全调用。
+     * 异常由 {@link #refreshSpriteUv()} 的逐方块 try/catch 吞掉，保证一个坏模型
+     * 不会让整张映射（以及体素建网闸门）永久失效。
+     */
+    private void refreshBlockSpriteUv(Block block, BlockStateModelSet modelSet,
+                                      BlockColors blockColors) {
+        var key = BuiltInRegistries.BLOCK.getKey(block);
+        if (key == null) {
+            return;
+        }
+        String blockName = key.toString();
+        var state = block.defaultBlockState();
+        if (state.getRenderShape() == net.minecraft.world.level.block.RenderShape.INVISIBLE) {
+            return;
+        }
+        var model = modelSet.get(state);
+        if (model == null) {
+            return;
+        }
+        List<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> parts = new ArrayList<>();
+        model.collectParts(net.minecraft.util.RandomSource.create(42L), parts);
+
+        float[][] rects = new float[6][];
+        int[] tints = new int[6];
+        Arrays.fill(tints, 0xFFFFFF);
+        for (var part : parts) {
+            for (var dir : net.minecraft.core.Direction.values()) {
+                int idx = dir.ordinal();
+                if (rects[idx] != null) {
+                    continue; // 该方向已取到贴图
+                }
+                var quads = part.getQuads(dir);
+                if (quads == null) {
+                    continue;
+                }
+                for (var quad : quads) {
+                    var materialInfo = quad.materialInfo();
+                    if (materialInfo == null) {
+                        continue;
+                    }
+                    var sprite = materialInfo.sprite();
+                    if (sprite == null) {
+                        continue;
+                    }
+                    rects[idx] = new float[]{
+                        sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()
+                    };
+                    tints[idx] = tintColor(blockColors, state, materialInfo.tintIndex());
+                    break;
+                }
+            }
+        }
+        // 回填：没有 quad 的方向借用顶面（UP=1）或任意非空面
+        float[] fallback = rects[1];
+        if (fallback == null) {
+            for (float[] r : rects) {
+                if (r != null) {
+                    fallback = r;
+                    break;
+                }
+            }
+        }
+        if (fallback == null) {
+            return; // 完全没有贴图（如屏障），跳过
+        }
+        for (int i = 0; i < 6; i++) {
+            if (rects[i] == null) {
+                rects[i] = fallback;
+            }
+        }
+        this.spriteUvMap.put(blockName, rects);
+        this.spriteTintMap.put(blockName, tints);
+    }
+
     /** 首次刷新时打一条日志，避免每帧都打。 */
     private boolean activeLogged;
 
     /** 方块→图集 UV 映射是否已就绪。渲染线程写、后台建网线程读，volatile 保证可见性。 */
     private volatile boolean spriteUvReady;
+
+    /** 下次允许重试图集 UV 刷新的时刻（{@link System#nanoTime()}）；0 = 立即允许。 */
+    private volatile long spriteUvRetryAtNanos;
 
     /**
      * 取方块名对应的 6 面图集 UV 矩形数组（下标 = {@code Direction.ordinal()}，
@@ -495,7 +567,7 @@ public final class LodRegionCache {
      * 方块→图集 UV 映射是否已就绪。
      *
      * <p>后台建网线程据此做闸门：{@code refreshSpriteUv()} 只在渲染线程 {@code prepare()}
-     * 时跑一次，启动早期尚未刷新。若此时就建网，整块 UV 会落到未命中的回退位置
+     * 时按半秒退避重试，启动早期尚未刷新。若此时就建网，整块 UV 会落到未命中的回退位置
      * （[0,0,0,0]），之后映射补齐再往里走就会「外圈先闪一片、再跳变」。闸门保证
      * 只在映射就绪后才把区块烘成带 UV 的网格。
      */
@@ -510,6 +582,11 @@ public final class LodRegionCache {
      */
     private void openStore(Path regionDir) {
         closeStore();
+        // 换维度后重新统计，避免把上一个维度的命中数混进来
+        this.statVoxelStoreHit.set(0);
+        this.statVoxelStoreMiss.set(0);
+        this.statColumnStoreHit.set(0);
+        this.statColumnStoreMiss.set(0);
         Path parent = regionDir.getParent();
         Path base = parent == null ? regionDir : parent;
         Path dir = base.resolve("gl4dx12_lod");
@@ -575,6 +652,8 @@ public final class LodRegionCache {
         this.spriteUvMap.clear();
         this.spriteTintMap.clear();
         this.spriteUvReady = false;
+        this.spriteUvRetryAtNanos = 0L;
+        this.columnVersion.incrementAndGet();
         closeStore();
         this.storeDir = null;
         LodVoxelCache.getInstance().clear();
@@ -651,6 +730,19 @@ public final class LodRegionCache {
             + " 命中=" + this.statHit.get();
     }
 
+    /**
+     * 持久化存储的命中构成，形如 {@code 体素[命中=120 未命中=4] 列[命中=8000 未命中=12]}。
+     *
+     * <p>命中说明上一轮写进 {@code gl4dx12_lod*} 的数据被复用，省掉了 NBT 解析；
+     * 若进世界后第一轮几乎全是未命中，多半是 store 目录/版本对不上，缓存没生效。
+     */
+    public String storeStats() {
+        return "体素[命中=" + this.statVoxelStoreHit.get()
+            + " 未命中=" + this.statVoxelStoreMiss.get() + "]"
+            + " 列[命中=" + this.statColumnStoreHit.get()
+            + " 未命中=" + this.statColumnStoreMiss.get() + "]";
+    }
+
     private ChunkColumns lookup(int blockX, int blockZ) {
         if (this.regionDir == null) {
             return null;
@@ -682,6 +774,14 @@ public final class LodRegionCache {
     /** 已缓存且可读的区块数（调试用）。 */
     public int cachedCount() {
         return this.columns.size();
+    }
+
+    /**
+     * 列数据加载版本：每成功读完一个区块（含确认「该区块不存在」）递增。
+     * 渲染端用它作为高度场重建的触发条件，避免缓存数量饱和后几何永久冻结。
+     */
+    public long columnVersion() {
+        return this.columnVersion.get();
     }
 
     /**
@@ -749,6 +849,9 @@ public final class LodRegionCache {
                     this.columns.put(key, decoded);
                     this.missing.remove(key);
                 }
+                // 有数据或确认无数据都算一次「列数据状态变化」：渲染端据此重建高度场。
+                // 只在有数据时递增的话，最后一批全是未生成区块时会漏掉一次重建。
+                this.columnVersion.incrementAndGet();
             }
         } catch (Throwable ignored) {
             // 后台线程不允许抛出，否则后续请求全部失效
@@ -778,8 +881,10 @@ public final class LodRegionCache {
             byte[] payload = columns.read(key, stat[0], stat[1]);
             ChunkColumns cached = LodChunkCodec.decodeColumns(payload);
             if (cached != null) {
+                this.statColumnStoreHit.incrementAndGet();
                 return cached;
             }
+            this.statColumnStoreMiss.incrementAndGet();
         }
         CompoundTag tag = readTag(key, dir);
         if (tag == null) {
@@ -835,9 +940,11 @@ public final class LodRegionCache {
             if (payload != null) {
                 VoxelChunk cached = LodChunkCodec.decode(payload);
                 if (cached != null) {
+                    this.statVoxelStoreHit.incrementAndGet();
                     return cached;
                 }
             }
+            this.statVoxelStoreMiss.incrementAndGet();
         }
         CompoundTag tag = readTag(key, dir);
         if (tag == null || tag == MISSING_TAG) {

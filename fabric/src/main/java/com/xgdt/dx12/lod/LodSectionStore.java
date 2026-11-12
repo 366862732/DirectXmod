@@ -488,9 +488,8 @@ public final class LodSectionStore implements AutoCloseable {
             while (length < rawLength && !inflater.finished()) {
                 int produced = inflater.inflate(out, length, rawLength - length);
                 if (produced == 0) {
-                    if (inflater.needsInput() || inflater.needsDictionary()) {
-                        break;
-                    }
+                    // 没有产出就说明数据不完整（或需要字典）；继续循环只会空转
+                    break;
                 }
                 length += produced;
             }
