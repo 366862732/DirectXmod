@@ -77,6 +77,15 @@ processResources {
     if (dx11NativeDll != null) {
         from(dx11NativeDll)
     }
+    // The standalone module sits one level below the repository root. Include
+    // the project's license files in the mod jar so redistributed builds carry
+    // the same terms as the source tree.
+    ['LICENSE', 'NOTICE', 'ASSET-LICENSE'].each { name ->
+        def licenseFile = file("../${name}")
+        if (licenseFile.isFile()) {
+            from(licenseFile)
+        }
+    }
 }
 
 // Minecraft 1.21.11 does not ship LWJGL shaderc/spvc (the 26.2 Vulkan
@@ -131,10 +140,4 @@ tasks.register('runDx11Probe', JavaExec) {
     mainClass = 'com.xgdt.dx11.Dx11ProbeMain'
     systemProperty 'gl4dx11.nativePath', System.getProperty('gl4dx11.nativePath', '')
     jvmArgs '--enable-native-access=ALL-UNNAMED'
-}
-
-jar {
-    from('LICENSE') {
-        rename { "${it}_${project.base.archivesName.get()}" }
-    }
 }

@@ -24,7 +24,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * through {@link VertexFormat#getOffset}, so the written data and the input
  * layout remain consistent.</p>
  *
- * <p>The padding is only applied when the user opted into the D3D11 backend,
+ * <p>The padding is only applied when the D3D11 backend is actually active,
  * leaving the vanilla OpenGL path byte-for-byte unchanged.</p>
  */
 @Environment(EnvType.CLIENT)
@@ -42,7 +42,7 @@ public class VertexFormatBuilderMixin {
         String name,
         VertexFormatElement element,
         CallbackInfoReturnable<VertexFormat.Builder> cir) {
-        if (!Boolean.getBoolean(Dx11Config.ENABLE_PROPERTY)) {
+        if (!Dx11Config.shouldUseDx11()) {
             return;
         }
         if (element == VertexFormatElement.LINE_WIDTH && (this.offset & 3) != 0) {

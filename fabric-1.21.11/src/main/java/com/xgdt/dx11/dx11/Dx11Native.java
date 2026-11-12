@@ -57,9 +57,14 @@ public final class Dx11Native {
 
         try {
             String libName = "dx11_mc.dll";
-            Path dllDir = Path.of(System.getProperty("user.dir"), "dx11mod");
-            Files.createDirectories(dllDir);
+            // Keep the extracted DLL out of the game/working directory. The
+            // launcher's working directory is not guaranteed to be writable,
+            // and a per-process temp directory avoids clobbering another
+            // running instance.
+            Path dllDir = Files.createTempDirectory("gl4dx11-native-");
+            dllDir.toFile().deleteOnExit();
             Path dllPath = dllDir.resolve(libName);
+            dllPath.toFile().deleteOnExit();
 
             try (InputStream in = Dx11Native.class.getResourceAsStream("/" + libName)) {
                 if (in == null) {

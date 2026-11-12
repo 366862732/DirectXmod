@@ -240,6 +240,7 @@ std::string runProbe() {
     }
 
     ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<IDXGIAdapter1> softwareAdapter;
     for (UINT index = 0;; ++index) {
         ComPtr<IDXGIAdapter1> candidate;
         hr = factory->EnumAdapters1(index, candidate.GetAddressOf());
@@ -255,6 +256,11 @@ std::string runProbe() {
             continue;
         }
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+            // Keep the first render-only adapter as a fallback. GPU-less CI
+            // machines and some VMs only expose WARP this way.
+            if (!softwareAdapter) {
+                softwareAdapter = candidate;
+            }
             continue;
         }
         adapter = candidate;
@@ -262,7 +268,10 @@ std::string runProbe() {
     }
 
     if (!adapter) {
-        return "ERROR: no hardware DXGI adapter found";
+        adapter = softwareAdapter;
+    }
+    if (!adapter) {
+        return "ERROR: no DXGI adapter found (hardware or WARP)";
     }
 
     DXGI_ADAPTER_DESC1 adapterDesc{};

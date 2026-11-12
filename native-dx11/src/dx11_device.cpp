@@ -456,6 +456,7 @@ Device* createDevice(HWND hwnd, std::string& error) {
     }
 
     ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<IDXGIAdapter1> softwareAdapter;
     for (UINT index = 0;; ++index) {
         ComPtr<IDXGIAdapter1> candidate;
         hr = factory->EnumAdapters1(index, candidate.GetAddressOf());
@@ -471,13 +472,21 @@ Device* createDevice(HWND hwnd, std::string& error) {
             continue;
         }
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+            // Keep the first render-only adapter as a fallback. GPU-less CI
+            // machines and some VMs only expose WARP this way.
+            if (!softwareAdapter) {
+                softwareAdapter = candidate;
+            }
             continue;
         }
         adapter = candidate;
         break;
     }
     if (!adapter) {
-        error = "no hardware DXGI adapter found";
+        adapter = softwareAdapter;
+    }
+    if (!adapter) {
+        error = "no DXGI adapter found (hardware or WARP)";
         return nullptr;
     }
 
