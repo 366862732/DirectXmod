@@ -274,18 +274,32 @@ std::string runProbe() {
         return "ERROR: no DXGI adapter found (hardware or WARP)";
     }
 
-    DXGI_ADAPTER_DESC1 adapterDesc{};
-    hr = adapter->GetDesc1(&adapterDesc);
-    if (FAILED(hr)) {
-        return "ERROR: GetDesc1 failed: " + hresultToString(hr);
-    }
-
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_9_1;
     std::string error;
+    const bool onSoftwareAdapter =
+        softwareAdapter && adapter.Get() == softwareAdapter.Get();
     if (!createDevice(adapter.Get(), device, context, featureLevel, error)) {
-        return "ERROR: D3D11CreateDevice failed: " + error;
+        // A hardware adapter can be enumerated but still fail device creation
+        // (broken driver, remote session, ...). Retry with WARP before giving up.
+        if (onSoftwareAdapter || !softwareAdapter) {
+            return "ERROR: D3D11CreateDevice failed: " + error;
+        }
+        device.Reset();
+        context.Reset();
+        featureLevel = D3D_FEATURE_LEVEL_9_1;
+        error.clear();
+        adapter = softwareAdapter;
+        if (!createDevice(adapter.Get(), device, context, featureLevel, error)) {
+            return "ERROR: D3D11CreateDevice failed on hardware and WARP: " + error;
+        }
+    }
+
+    DXGI_ADAPTER_DESC1 adapterDesc{};
+    hr = adapter->GetDesc1(&adapterDesc);
+    if (FAILED(hr)) {
+        return "ERROR: GetDesc1 failed: " + hresultToString(hr);
     }
 
     if (featureLevel < D3D_FEATURE_LEVEL_10_0) {

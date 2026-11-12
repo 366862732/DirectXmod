@@ -1,11 +1,16 @@
 package com.xgdt.dx11.dx11;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.HexFormat;
 
 /**
  * JNI bridge for {@code dx11_mc.dll}.
@@ -57,14 +62,7 @@ public final class Dx11Native {
 
         try {
             String libName = "dx11_mc.dll";
-            // Keep the extracted DLL out of the game/working directory. The
-            // launcher's working directory is not guaranteed to be writable,
-            // and a per-process temp directory avoids clobbering another
-            // running instance.
-            Path dllDir = Files.createTempDirectory("gl4dx11-native-");
-            dllDir.toFile().deleteOnExit();
-            Path dllPath = dllDir.resolve(libName);
-            dllPath.toFile().deleteOnExit();
+            Path dllPath;
 
             try (InputStream in = Dx11Native.class.getResourceAsStream("/" + libName)) {
                 if (in == null) {
@@ -72,10 +70,43 @@ public final class Dx11Native {
                     return;
                 }
                 byte[] jarBytes = in.readAllBytes();
-                boolean upToDate = Files.exists(dllPath)
-                    && Arrays.equals(jarBytes, Files.readAllBytes(dllPath));
+
+                // Keep the DLL out of the game/working directory and name the
+                // directory after the DLL contents. Windows cannot delete a
+                // loaded DLL, so a stable per-build path avoids leaving a new
+                // gl4dx11-native-* directory behind on every launch while an
+                // updated build still extracts to a fresh path.
+                Path dllDir = Path.of(
+                    System.getProperty("java.io.tmpdir"), "gl4dx11", sha256Hex(jarBytes));
+                Files.createDirectories(dllDir);
+                dllPath = dllDir.resolve(libName);
+
+                boolean upToDate = false;
+                if (Files.isRegularFile(dllPath)) {
+                    try {
+                        upToDate = Arrays.equals(jarBytes, Files.readAllBytes(dllPath));
+                    } catch (IOException ignored) {
+                        // Unreadable file: rewrite it below.
+                    }
+                }
                 if (!upToDate) {
-                    Files.write(dllPath, jarBytes);
+                    // Write to a temporary file first so another process never
+                    // sees a partially written DLL at the shared path.
+                    Path temp = Files.createTempFile(dllDir, libName, ".tmp");
+                    try {
+                        Files.write(temp, jarBytes);
+                        try {
+                            Files.move(
+                                temp,
+                                dllPath,
+                                StandardCopyOption.REPLACE_EXISTING,
+                                StandardCopyOption.ATOMIC_MOVE);
+                        } catch (AtomicMoveNotSupportedException e) {
+                            Files.move(temp, dllPath, StandardCopyOption.REPLACE_EXISTING);
+                        }
+                    } finally {
+                        Files.deleteIfExists(temp);
+                    }
                 }
             }
 
@@ -84,6 +115,15 @@ public final class Dx11Native {
             System.out.println("[dx11] Native library loaded from: " + dllPath);
         } catch (Throwable t) {
             System.err.println("[dx11] Failed to load native library: " + t);
+        }
+    }
+
+    private static String sha256Hex(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(bytes));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
         }
     }
 

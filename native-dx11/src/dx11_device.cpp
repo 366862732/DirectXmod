@@ -490,11 +490,8 @@ Device* createDevice(HWND hwnd, std::string& error) {
         return nullptr;
     }
 
-    DXGI_ADAPTER_DESC1 adapterDesc{};
-    if (FAILED(adapter->GetDesc1(&adapterDesc))) {
-        error = "GetDesc1 failed";
-        return nullptr;
-    }
+    const bool onSoftwareAdapter =
+        softwareAdapter && adapter.Get() == softwareAdapter.Get();
 
     const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1,
@@ -522,6 +519,24 @@ Device* createDevice(HWND hwnd, std::string& error) {
             levels + 1, levelCount - 1, D3D11_SDK_VERSION,
             d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
     }
+    if (FAILED(hr) && !onSoftwareAdapter && softwareAdapter) {
+        // A hardware adapter can be enumerated but still fail device creation
+        // (broken driver, remote session, ...). Retry with WARP before giving up.
+        adapter = softwareAdapter;
+        d3dDevice.Reset();
+        context.Reset();
+        featureLevel = D3D_FEATURE_LEVEL_9_1;
+        hr = D3D11CreateDevice(
+            adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+            levels, levelCount, D3D11_SDK_VERSION,
+            d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
+        if (hr == E_INVALIDARG) {
+            hr = D3D11CreateDevice(
+                adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+                levels + 1, levelCount - 1, D3D11_SDK_VERSION,
+                d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
+        }
+    }
     if (FAILED(hr)) {
         error = "D3D11CreateDevice failed: " + hresultToString(hr);
         return nullptr;
@@ -529,6 +544,12 @@ Device* createDevice(HWND hwnd, std::string& error) {
     if (featureLevel < D3D_FEATURE_LEVEL_10_0) {
         error = std::string("D3D11 feature level 10_0 or newer required, got ") +
                 featureLevelName(featureLevel);
+        return nullptr;
+    }
+
+    DXGI_ADAPTER_DESC1 adapterDesc{};
+    if (FAILED(adapter->GetDesc1(&adapterDesc))) {
+        error = "GetDesc1 failed";
         return nullptr;
     }
 

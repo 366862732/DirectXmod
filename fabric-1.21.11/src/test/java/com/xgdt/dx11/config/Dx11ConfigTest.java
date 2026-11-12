@@ -18,6 +18,7 @@ class Dx11ConfigTest {
         originalOsName = System.getProperty("os.name");
         originalBackend = System.getProperty(Dx11Config.BACKEND_PROPERTY);
         originalEnabled = System.getProperty(Dx11Config.ENABLE_PROPERTY);
+        Dx11Config.resetProbeState();
     }
 
     @AfterEach
@@ -25,6 +26,7 @@ class Dx11ConfigTest {
         restore("os.name", originalOsName);
         restore(Dx11Config.BACKEND_PROPERTY, originalBackend);
         restore(Dx11Config.ENABLE_PROPERTY, originalEnabled);
+        Dx11Config.resetProbeState();
     }
 
     private static void restore(String key, String value) {
@@ -74,6 +76,16 @@ class Dx11ConfigTest {
         System.setProperty(Dx11Config.BACKEND_PROPERTY, "dx11");
         System.setProperty(Dx11Config.ENABLE_PROPERTY, "true");
         assertFalse(Dx11Config.shouldUseDx11());
+    }
+
+    @Test
+    void probeIsNotRunWhenTheBackendIsNotEnabled() {
+        System.setProperty("os.name", "Windows 10");
+        System.setProperty(Dx11Config.BACKEND_PROPERTY, "dx11");
+        System.clearProperty(Dx11Config.ENABLE_PROPERTY);
+
+        assertFalse(Dx11Config.shouldUseDx11());
+        assertEquals("not run", Dx11Config.probeResult());
     }
 
     @Test

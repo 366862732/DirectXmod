@@ -6,10 +6,8 @@ import java.util.Locale;
 /**
  * Early, dependency-free configuration for the D3D11 backport.
  *
- * <p>The backend is opt-in while it is being developed. Once the full
- * {@code GpuDevice} implementation is complete the default will become
- * {@code auto}: probe D3D11 feature level 10_1+ and use it when available,
- * otherwise leave the vanilla OpenGL path untouched.</p>
+ * <p>The backend is opt-in: without {@link #ENABLE_PROPERTY} no native
+ * library is loaded and the vanilla OpenGL path is untouched.</p>
  */
 public final class Dx11Config {
     /** auto | dx11 | gl */
@@ -66,16 +64,19 @@ public final class Dx11Config {
     }
 
     /**
-     * True only when the native probe succeeded and the user explicitly enabled
-     * the experimental backend. This keeps 1.21.11 bootable with OpenGL while
-     * the D3D11 implementation is being completed.
+     * True only when the user explicitly enabled the backend and the native
+     * probe succeeded. The property is checked before the probe so a normal
+     * launch never loads {@code dx11_mc.dll} or creates a D3D11 device.
      */
     public static boolean shouldUseDx11() {
+        if (!Boolean.getBoolean(ENABLE_PROPERTY)) {
+            return false;
+        }
         if (!isDx11Requested()) {
             return false;
         }
         ensureProbe();
-        return probeOk && Boolean.getBoolean(ENABLE_PROPERTY);
+        return probeOk;
     }
 
     public static void setProbeResult(String result) {
@@ -89,5 +90,11 @@ public final class Dx11Config {
 
     public static boolean probeOk() {
         return probeOk;
+    }
+
+    /** Test hook: restores the process-wide probe state to its initial values. */
+    static void resetProbeState() {
+        probeAttempted = false;
+        setProbeResult("not run");
     }
 }
