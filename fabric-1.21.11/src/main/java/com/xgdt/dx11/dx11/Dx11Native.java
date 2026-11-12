@@ -22,6 +22,12 @@ import java.util.HexFormat;
  * runtime so a missing compiler DLL produces a clean probe error instead of a
  * DLL load failure.</p>
  *
+ * <p>The DLL is extracted into {@code <gameDir>/dx11mod/}, matching the
+ * D3D12 module's {@code dx12mod/} layout, so users can find and replace it.
+ * If that directory is not writable, or the file is locked by another running
+ * instance, a content-addressed copy under {@code %TEMP%/gl4dx11/} is used
+ * instead.</p>
+ *
  * <p>For development, {@code -Dgl4dx11.nativePath=C:\path\to\dx11_mc.dll}
  * bypasses JAR extraction and loads the given DLL directly.</p>
  */
@@ -62,60 +68,75 @@ public final class Dx11Native {
 
         try {
             String libName = "dx11_mc.dll";
-            Path dllPath;
 
             try (InputStream in = Dx11Native.class.getResourceAsStream("/" + libName)) {
                 if (in == null) {
                     System.err.println("[dx11] " + libName + " not found in JAR resources");
                     return;
                 }
-                byte[] jarBytes = in.readAllBytes();
-
-                // Keep the DLL out of the game/working directory and name the
-                // directory after the DLL contents. Windows cannot delete a
-                // loaded DLL, so a stable per-build path avoids leaving a new
-                // gl4dx11-native-* directory behind on every launch while an
-                // updated build still extracts to a fresh path.
-                Path dllDir = Path.of(
-                    System.getProperty("java.io.tmpdir"), "gl4dx11", sha256Hex(jarBytes));
-                Files.createDirectories(dllDir);
-                dllPath = dllDir.resolve(libName);
-
-                boolean upToDate = false;
-                if (Files.isRegularFile(dllPath)) {
-                    try {
-                        upToDate = Arrays.equals(jarBytes, Files.readAllBytes(dllPath));
-                    } catch (IOException ignored) {
-                        // Unreadable file: rewrite it below.
-                    }
-                }
-                if (!upToDate) {
-                    // Write to a temporary file first so another process never
-                    // sees a partially written DLL at the shared path.
-                    Path temp = Files.createTempFile(dllDir, libName, ".tmp");
-                    try {
-                        Files.write(temp, jarBytes);
-                        try {
-                            Files.move(
-                                temp,
-                                dllPath,
-                                StandardCopyOption.REPLACE_EXISTING,
-                                StandardCopyOption.ATOMIC_MOVE);
-                        } catch (AtomicMoveNotSupportedException e) {
-                            Files.move(temp, dllPath, StandardCopyOption.REPLACE_EXISTING);
-                        }
-                    } finally {
-                        Files.deleteIfExists(temp);
-                    }
-                }
+                Path dllPath = extractLibrary(in.readAllBytes(), libName);
+                System.load(dllPath.toAbsolutePath().toString());
+                loaded = true;
+                System.out.println("[dx11] Native library loaded from: " + dllPath);
             }
-
-            System.load(dllPath.toAbsolutePath().toString());
-            loaded = true;
-            System.out.println("[dx11] Native library loaded from: " + dllPath);
         } catch (Throwable t) {
             System.err.println("[dx11] Failed to load native library: " + t);
         }
+    }
+
+    /**
+     * Writes the DLL next to the game, matching the D3D12 module's
+     * {@code dx12mod/} layout. Falls back to a content-addressed temp copy if
+     * the instance directory is not writable or the file is locked by another
+     * running instance.
+     */
+    private static Path extractLibrary(byte[] jarBytes, String libName) throws IOException {
+        Path instanceDir = Path.of(System.getProperty("user.dir"), "dx11mod");
+        try {
+            return writeLibrary(instanceDir, jarBytes, libName);
+        } catch (IOException e) {
+            System.err.println(
+                "[dx11] Could not write to " + instanceDir + " (" + e
+                    + "); falling back to the temp directory.");
+        }
+
+        Path tempDir = Path.of(
+            System.getProperty("java.io.tmpdir"), "gl4dx11", sha256Hex(jarBytes));
+        return writeLibrary(tempDir, jarBytes, libName);
+    }
+
+    private static Path writeLibrary(Path dir, byte[] jarBytes, String libName) throws IOException {
+        Files.createDirectories(dir);
+        Path dllPath = dir.resolve(libName);
+
+        boolean upToDate = false;
+        if (Files.isRegularFile(dllPath)) {
+            try {
+                upToDate = Arrays.equals(jarBytes, Files.readAllBytes(dllPath));
+            } catch (IOException ignored) {
+                // Unreadable file: rewrite it below.
+            }
+        }
+        if (!upToDate) {
+            // Write to a temporary file first so another process never sees a
+            // partially written DLL at the shared path.
+            Path temp = Files.createTempFile(dir, libName, ".tmp");
+            try {
+                Files.write(temp, jarBytes);
+                try {
+                    Files.move(
+                        temp,
+                        dllPath,
+                        StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(temp, dllPath, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                Files.deleteIfExists(temp);
+            }
+        }
+        return dllPath;
     }
 
     private static String sha256Hex(byte[] bytes) {
