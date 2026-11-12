@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "gl4dx11",
+  "version": "${version}",
+  "name": "DirectXMod D3D11 (1.21.11)",
+  "description": "Additive Direct3D 11 feature-level 10_1 backend for Minecraft 1.21.11, targeting Intel HD 3000-class hardware.",
+  "authors": [
+    "xiaozi Graphics Development Team"
+  ],
+  "contact": {},
+  "license": "Apache 2.0",
+  "icon": "assets/gl4dx11/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.xgdt.dx11.Dx11Mod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21"
+  },
+  "mixins": [
+    "gl4dx11.mixins.json"
+  ]
+}

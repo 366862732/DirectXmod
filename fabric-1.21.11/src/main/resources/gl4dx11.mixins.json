@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "com.xgdt.dx11.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "RenderSystemMixin",
+    "VertexFormatBuilderMixin",
+    "WindowMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

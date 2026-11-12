@@ -1,0 +1,140 @@
+plugins {
+    id 'fabric-loom' version '1.15.5'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_name
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+}
+
+loom {
+    mods {
+        register('gl4dx11') {
+            sourceSet(sourceSets['main'])
+        }
+    }
+    mixin {
+        // Loom 1.15 disables the Mixin annotation processor by default.  The
+        // processor is what generates the refmap that translates the named
+        // targets in these mixins to intermediary names in the remapped jar.
+        useLegacyMixinAp = true
+        defaultRefmapName = 'gl4dx11-refmap.json'
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+    // 1.21.11 is still an obfuscated release.  The non-obfuscated Loom plugin
+    // therefore left several rendering classes as `fzf`, `fyy`, ... .  Use the
+    // standard Loom plugin with Mojang's official mappings so the Java layer
+    // sees the same names as 26.2 (`GpuSampler`, `ShaderSource`, ...).
+    mappings loom.officialMojangMappings()
+
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // @WrapOperation is supplied by Fabric Loader at runtime, but it is not on
+    // the compile classpath.  Compile against the oldest MixinExtras that
+    // Fabric Loader 0.19.x ships (0.5.4) so the annotation stays compatible.
+    compileOnly 'io.github.llamalad7:mixinextras-fabric:0.5.4'
+
+    // Shader translation: GLSL -> SPIR-V -> HLSL SM4.x.
+    // 1.21.11's vanilla LWJGL set does not include these modules, so the
+    // D3D11 backend adds them explicitly at the same LWJGL version.
+    implementation 'org.lwjgl:lwjgl-shaderc:3.3.3'
+    implementation 'org.lwjgl:lwjgl-spvc:3.3.3'
+    runtimeOnly 'org.lwjgl:lwjgl-shaderc:3.3.3:natives-windows'
+    runtimeOnly 'org.lwjgl:lwjgl-spvc:3.3.3:natives-windows'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.12.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Package the separately built native DLL when it exists.  The native project
+// is built with native-dx11/build.bat (MSVC); a Java-only checkout simply
+// omits it, and Dx11Native falls back to -Dgl4dx11.nativePath.
+def dx11NativeDll = [
+    file('../native-dx11/build/bin/Release/dx11_mc.dll'),
+    file('../native-dx11/build/bin/Debug/dx11_mc.dll'),
+].find { it.isFile() }
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+    if (dx11NativeDll != null) {
+        from(dx11NativeDll)
+    }
+}
+
+// Minecraft 1.21.11 does not ship LWJGL shaderc/spvc (the 26.2 Vulkan
+// backend does), and Fabric Loader does not put Gradle's runtimeOnly
+// dependencies on a production classpath.  Merge the two LWJGL modules and
+// their Windows natives into the final remapped jar so a normal launcher
+// installation has everything it needs.  These classes are outside the
+// Minecraft mapping namespace, so the remap pass leaves them unchanged.
+def bundledLwjglModules = ['lwjgl-shaderc-3.3.3', 'lwjgl-spvc-3.3.3']
+// Loom's RemapJarTask extends org.gradle.jvm.tasks.Jar, not
+// org.gradle.api.tasks.bundling.Jar, so it cannot be typed as Jar here.
+// RemapJarTask.copy() builds the archive from these sources and then remaps
+// that archive in place, so the extra entries survive the remap pass.
+tasks.named('remapJar') {
+    // Resolve the runtime classpath lazily: resolving it while the build
+    // script is evaluated conflicts with Loom's own configuration setup.
+    from {
+        configurations.runtimeClasspath.filter { dependency ->
+            bundledLwjglModules.any { dependency.name.startsWith(it) }
+        }.collect { zipTree(it) }
+    } {
+        exclude 'META-INF/MANIFEST.MF'
+        exclude 'META-INF/INDEX.LIST'
+        exclude 'META-INF/versions/**'
+        exclude 'module-info.class'
+        // Both libraries ship the same directory entries; keep the first.
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(Test).configureEach {
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    useJUnitPlatform()
+}
+
+// Standalone Phase 0 probe. Windows only; pass the locally built DLL with
+//   gradlew runDx11Probe -Dgl4dx11.nativePath=C:\path\to\dx11_mc.dll
+tasks.register('runDx11Probe', JavaExec) {
+    group = 'verification'
+    description = 'Runs the standalone D3D11 feature-level probe (Windows only).'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.xgdt.dx11.Dx11ProbeMain'
+    systemProperty 'gl4dx11.nativePath', System.getProperty('gl4dx11.nativePath', '')
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+}
+
+jar {
+    from('LICENSE') {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
