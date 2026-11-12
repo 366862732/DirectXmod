@@ -205,41 +205,44 @@ final class Dx11RenderPass implements RenderPass {
                 this.samplers.keySet());
         }
 
-        for (RenderPipeline.UniformDescription description : current.info().getUniforms()) {
-            GpuBufferSlice slice = this.uniforms.get(description.name());
-            if (log) {
-                LOGGER.info(
-                    "[dx11]   uniform '{}' type={} present={} slot={}",
-                    description.name(), description.type(), slice != null,
-                    current.uniformSlot(description.name()));
-            }
-            if (slice == null) {
+        // Upload every uniform the pass has set that the compiled shaders
+        // actually reference.  Iterating the pipeline's declared uniform list
+        // is not enough: vanilla binds uniforms that the pipeline itself does
+        // not declare (notably "Globals" from RenderSystem.bindDefaultUniforms)
+        // and only the compiled binding list knows about them.  The D3D12
+        // backend does the same through pipeline.buildBindings().
+        for (Map.Entry<String, GpuBufferSlice> entry : this.uniforms.entrySet()) {
+            String name = entry.getKey();
+            GpuBufferSlice slice = entry.getValue();
+            Dx11Buffer buffer = (Dx11Buffer) slice.buffer();
+            TextureFormat texelFormat = current.texelFormat(name);
+            if (texelFormat != null) {
+                Integer slot = current.textureSlot(name);
+                if (log) {
+                    LOGGER.info(
+                        "[dx11]   texel buffer '{}' slot={} format={}",
+                        name, slot, texelFormat);
+                }
+                if (slot != null) {
+                    Dx11Native.nativePassSetTexelBuffer(
+                        this.handle,
+                        slot,
+                        buffer.handle(),
+                        texelFormat.ordinal());
+                }
                 continue;
             }
-            Dx11Buffer buffer = (Dx11Buffer) slice.buffer();
-            switch (description.type()) {
-                case UNIFORM_BUFFER -> {
-                    Integer slot = current.uniformSlot(description.name());
-                    if (slot != null) {
-                        Dx11Native.nativePassSetUniform(
-                            this.handle,
-                            slot,
-                            buffer.handle(),
-                            slice.offset(),
-                            slice.length());
-                    }
-                }
-                case TEXEL_BUFFER -> {
-                    Integer slot = current.textureSlot(description.name());
-                    if (slot != null) {
-                        TextureFormat format = current.texelFormat(description.name());
-                        Dx11Native.nativePassSetTexelBuffer(
-                            this.handle,
-                            slot,
-                            buffer.handle(),
-                            format == null ? 1 : format.ordinal());
-                    }
-                }
+            Integer slot = current.uniformSlot(name);
+            if (log) {
+                LOGGER.info("[dx11]   uniform '{}' slot={}", name, slot);
+            }
+            if (slot != null) {
+                Dx11Native.nativePassSetUniform(
+                    this.handle,
+                    slot,
+                    buffer.handle(),
+                    slice.offset(),
+                    slice.length());
             }
         }
 
