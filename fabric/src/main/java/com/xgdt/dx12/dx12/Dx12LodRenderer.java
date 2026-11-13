@@ -94,9 +94,17 @@ public final class Dx12LodRenderer {
      */
     private static final int MAX_QUAD_VERTS = 6_300_000;
 
-    /** uniform 槽位大小（CBV 偏移需 256 对齐）与在飞帧数。 */
+    /**
+     * uniform 槽位大小（CBV 偏移需 256 对齐）与环大小。
+     *
+     * <p>一帧最多写两次：高度场一次、体素一次。命令列表三帧在飞，所以环必须至少
+     * 是 {@code 3 帧 × 2 次 = 6} 个槽位。以前按「3 帧」只开 3 个槽位，第二帧的
+     * 高度场 uniform 就会覆盖第一帧的体素 uniform（两者 CameraPos 的参考中心不同），
+     * GPU 晚一帧执行时整片体素地形会瞬移到错误位置 —— 表现就是全屏闪烁。
+     * 留到 8 个槽位，给后续新增的 uniform 写入留余量。
+     */
     private static final int UNIFORM_SLOT = 256;
-    private static final int UNIFORM_RING = 3;
+    private static final int UNIFORM_RING = 8;
     /** 实际写入字节数：float4x4 + CameraPos + FogParams + FogColor + LightTint + Params。 */
     private static final int UNIFORM_DATA_BYTES = 144;
 
@@ -766,11 +774,24 @@ public final class Dx12LodRenderer {
      */
     private static final long VOXEL_RETRY_INTERVAL_NS = 60_000_000_000L;
 
-    /** 体素顶点缓冲（CPU 映射写入）与共享静态索引。 */
-    private Dx12GpuBuffer voxelVertexBuffer;
-    private GpuBufferSlice.MappedView voxelVertexView;
-    private ByteBuffer voxelVertexData;
-    private int voxelVertexCapacity;
+    /**
+     * 体素顶点缓冲槽位数。
+     *
+     * <p>命令列表三帧在飞：写第 N 帧的顶点数据时，第 N-1、N-2 帧的 GPU 命令可能
+     * 还在读同一块 UPLOAD 缓冲。单缓冲原地重写会让在飞帧读到写了一半的顶点，
+     * 表现就是整片体素地形撕裂/闪烁。这里按高度场同样的三槽轮换，写入的槽位
+     * 至少三帧内不会被 GPU 引用。
+     */
+    private static final int VOXEL_VERTEX_SLOTS = 3;
+    /** 体素顶点缓冲（CPU 映射写入），按帧轮换。 */
+    private final Dx12GpuBuffer[] voxelVertexBuffers = new Dx12GpuBuffer[VOXEL_VERTEX_SLOTS];
+    private final GpuBufferSlice.MappedView[] voxelVertexViews =
+        new GpuBufferSlice.MappedView[VOXEL_VERTEX_SLOTS];
+    private final ByteBuffer[] voxelVertexData = new ByteBuffer[VOXEL_VERTEX_SLOTS];
+    private final int[] voxelVertexCapacity = new int[VOXEL_VERTEX_SLOTS];
+    /** 当前正在绘制的顶点槽位。 */
+    private int voxelVertexSlot;
+    /** 共享静态索引（内容不变，不需要按帧轮换）。 */
     private Dx12GpuBuffer voxelIndexBuffer;
     private GpuBufferSlice.MappedView voxelIndexView;
     private int voxelIndexCapacity;
@@ -1152,9 +1173,10 @@ public final class Dx12LodRenderer {
             new byte[]{0}, null, depth.handle(), 0, (byte) 0, 0.0, 0, 0, width, height);
         try {
             Dx12Native.dx12SetPipeline(ctx, pipeline, true);
-            // 体素 LOD 先画：顶点坐标是绝对世界坐标，所以参考中心传 0，和高度场
-            // （相对网格中心）用的 uniform 不是同一个槽位。
-            if (this.voxelFaceCount > 0 && this.voxelVertexBuffer != null
+            // 体素 LOD 先画：顶点坐标是「世界坐标 − 锚点」，所以参考中心传锚点，
+            // 和高度场（相对网格中心）用的 uniform 不是同一个槽位。
+            Dx12GpuBuffer voxelBuffer = this.voxelVertexBuffers[this.voxelVertexSlot];
+            if (this.voxelFaceCount > 0 && voxelBuffer != null
                 && this.voxelIndexBuffer != null) {
                 LodVoxelCache voxelCache = LodVoxelCache.getInstance();
                 int voxelUniform = writeUniforms(viewProj, camera, renderState, levelState,
@@ -1162,7 +1184,7 @@ public final class Dx12LodRenderer {
                 long voxelPipeline = voxelPipelineFor(color.getFormat().ordinal());
                 if (voxelPipeline != 0L) {
                     Dx12Native.dx12SetPipeline(ctx, voxelPipeline, true);
-                    Dx12Native.dx12SetVertexBuffer(ctx, 0, this.voxelVertexBuffer.handle(),
+                    Dx12Native.dx12SetVertexBuffer(ctx, 0, voxelBuffer.handle(),
                         0L, VOXEL_VERTEX_STRIDE);
                     Dx12Native.dx12SetIndexBuffer(ctx, this.voxelIndexBuffer.handle(), 1);
                     // 图集 SRV 可用时推 CBV+SRV 两条；不可用时只推 CBV。
@@ -1375,24 +1397,29 @@ public final class Dx12LodRenderer {
             clearVoxelCover();
             return;
         }
+        // 写入下一槽位，而不是当前正在绘制的槽位：上一帧/上上帧的 GPU 命令可能
+        // 还在读当前槽位，原地重写会让远景读到一半新一半旧的顶点。
+        int writeSlot = (this.voxelVertexSlot + 1) % VOXEL_VERTEX_SLOTS;
         try {
-            ensureVoxelBuffers(totalFaces * 4, totalFaces * 6);
+            ensureVoxelBuffers(writeSlot, totalFaces * 4, totalFaces * 6);
         } catch (Throwable t) {
             LOGGER.error("[lod] 体素顶点缓冲创建失败，本帧跳过体素 LOD", t);
             clearVoxelCover();
             return;
         }
-        if (this.voxelVertexData == null) {
+        ByteBuffer vertexData = this.voxelVertexData[writeSlot];
+        if (vertexData == null) {
             clearVoxelCover();
             return;
         }
         int vertex = 0;
         for (int k = 0; k < count; k++) {
             LodVoxelMesher.Mesh mesh = selected[k];
-            this.voxelVertexData.position(vertex * VOXEL_VERTEX_STRIDE);
-            this.voxelVertexData.put(mesh.vertices(), 0, mesh.vertices().length);
+            vertexData.position(vertex * VOXEL_VERTEX_STRIDE);
+            vertexData.put(mesh.vertices(), 0, mesh.vertices().length);
             vertex += mesh.faces() * 4;
         }
+        this.voxelVertexSlot = writeSlot;
         this.voxelFaceCount = totalFaces;
         this.voxelDrawnCenterX = camChunkX * 16;
         this.voxelDrawnCenterZ = camChunkZ * 16;
@@ -1455,22 +1482,26 @@ public final class Dx12LodRenderer {
         this.voxelMaxBlockZ = 0;
     }
 
-    /** 体素顶点缓冲（CPU 映射）与 4 顶点/面的共享静态索引。 */
-    private void ensureVoxelBuffers(int vertexCapacity, int indexCapacity) {
-        if (this.voxelVertexBuffer == null || this.voxelVertexBuffer.isClosed()
-            || this.voxelVertexCapacity < vertexCapacity) {
+    /** 体素顶点缓冲（CPU 映射，按槽位轮换）与 4 顶点/面的共享静态索引。 */
+    private void ensureVoxelBuffers(int slot, int vertexCapacity, int indexCapacity) {
+        if (this.voxelVertexBuffers[slot] == null || this.voxelVertexBuffers[slot].isClosed()
+            || this.voxelVertexCapacity[slot] < vertexCapacity) {
+            // 12.5% 余量：体素面数会随相机中心换环小幅波动，留一点余量避免每次
+            // 重建都重新分配两百多 MB 的缓冲；比翻倍增长省下约 1/4 显存/内存。
+            int wanted = vertexCapacity + (vertexCapacity >> 3);
             int capacity = Math.min(VOXEL_MAX_VERTICES,
-                Math.max(vertexCapacity, Math.max(this.voxelVertexCapacity * 2, 65536)));
-            closeVoxelVertex();
+                Math.max(wanted, Math.max(this.voxelVertexCapacity[slot], 65536)));
+            closeVoxelVertex(slot);
             long bytes = (long) capacity * VOXEL_VERTEX_STRIDE;
             Dx12GpuBuffer buffer = new Dx12GpuBuffer(
                 GpuBuffer.USAGE_MAP_WRITE | GpuBuffer.USAGE_VERTEX, bytes);
             GpuBufferSlice.MappedView view = buffer.map(0L, bytes, false, true);
-            this.voxelVertexBuffer = buffer;
-            this.voxelVertexView = view;
-            this.voxelVertexData = view.data();
-            this.voxelVertexData.order(ByteOrder.LITTLE_ENDIAN);
-            this.voxelVertexCapacity = capacity;
+            this.voxelVertexBuffers[slot] = buffer;
+            this.voxelVertexViews[slot] = view;
+            ByteBuffer data = view.data();
+            data.order(ByteOrder.LITTLE_ENDIAN);
+            this.voxelVertexData[slot] = data;
+            this.voxelVertexCapacity[slot] = capacity;
         }
         if (this.voxelIndexBuffer == null || this.voxelIndexBuffer.isClosed()
             || this.voxelIndexCapacity < indexCapacity) {
@@ -1499,23 +1530,23 @@ public final class Dx12LodRenderer {
         }
     }
 
-    private void closeVoxelVertex() {
-        if (this.voxelVertexView != null) {
+    private void closeVoxelVertex(int slot) {
+        if (this.voxelVertexViews[slot] != null) {
             try {
-                this.voxelVertexView.close();
+                this.voxelVertexViews[slot].close();
             } catch (Throwable ignored) {
             }
-            this.voxelVertexView = null;
+            this.voxelVertexViews[slot] = null;
         }
-        this.voxelVertexData = null;
-        if (this.voxelVertexBuffer != null) {
+        this.voxelVertexData[slot] = null;
+        if (this.voxelVertexBuffers[slot] != null) {
             try {
-                this.voxelVertexBuffer.close();
+                this.voxelVertexBuffers[slot].close();
             } catch (Throwable ignored) {
             }
-            this.voxelVertexBuffer = null;
+            this.voxelVertexBuffers[slot] = null;
         }
-        this.voxelVertexCapacity = 0;
+        this.voxelVertexCapacity[slot] = 0;
     }
 
     private void closeVoxelIndex() {
