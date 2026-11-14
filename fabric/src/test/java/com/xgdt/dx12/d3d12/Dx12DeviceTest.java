@@ -258,7 +258,7 @@ public class Dx12DeviceTest {
         vsField.setAccessible(true);
         String fullscreenVs = (String) vsField.get(null);
         java.lang.reflect.Method createPipeline = renderer.getDeclaredMethod("createPipeline",
-            String.class, String.class, int.class, int.class, int.class, int.class);
+            String.class, String.class, int.class, int[].class, int.class, int.class);
         createPipeline.setAccessible(true);
 
         int sceneFormat = 6;   // RGBA8_UNORM，与交换链一致
@@ -278,12 +278,25 @@ public class Dx12DeviceTest {
                 continue;
             }
             int format = pass.writesSceneColor() ? sceneFormat : fxFormat;
+            int[] inputTypes = new int[pass.inputs().size()];
+            for (int i = 0; i < inputTypes.length; i++) {
+                inputTypes[i] = 3;   // 默认线性 / CLAMP
+                String input = pass.inputs().get(i);
+                if (input.startsWith("texture:")) {
+                    var decl = manifest.texture(input.substring("texture:".length()).trim());
+                    if (decl != null) {
+                        inputTypes[i] = decl.linear()
+                            ? (decl.wrap() ? 7 : 3)
+                            : (decl.wrap() ? 1 : 4);
+                    }
+                }
+            }
             String fragment = new String(source, java.nio.charset.StandardCharsets.UTF_8);
             String failure = null;
             long handle = 0L;
             try {
                 handle = (Long) createPipeline.invoke(null, fullscreenVs, fragment, format,
-                    pass.inputs().size(), pass.srvBufferCount(), pass.uavBufferCount());
+                    inputTypes, pass.srvBufferCount(), pass.uavBufferCount());
             } catch (Throwable t) {
                 failure = (t.getCause() != null ? t.getCause() : t).toString();
             }

@@ -10,13 +10,17 @@ import com.mojang.math.Axis;
 import com.xgdt.dx12.shaderpack.ShaderPack;
 import com.xgdt.dx12.shaderpack.ShaderPackManager;
 import com.xgdt.dx12.shaderpack.ShaderPackManifest;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
@@ -52,6 +56,10 @@ import org.slf4j.LoggerFactory;
  *       不产出图像、不参与 {@code lastOutput}。</li>
  *   <li>声明了 {@code buffers} 的 composite pass 同样可以用
  *       {@code StructuredBuffer}（{@code t} 从纹理之后接着编号）/ {@code RWStructuredBuffer}。</li>
+ *   <li>输入除内置端点外还可以是 {@code texture:NAME}，引用 pipeline.json 顶层
+ *       {@code textures[]} 声明的包内纹理。{@code depth > 1} 的纹理按 3D 体积纹理
+ *       创建（HLSL {@code Texture3D} / {@code sampler3D}），其余按 2D 创建；
+ *       {@code wrap} 决定静态采样器寻址（WRAP 用绑定类型 7，CLAMP 用 3）。</li>
  * </ul>
  */
 @Environment(EnvType.CLIENT)
@@ -77,6 +85,9 @@ public final class Dx12ShaderPackRenderer {
      * 光追 pass 的 {@code RWTexture2D} 输出必须带这一位。
      */
     private static final int USAGE_UNORDERED_ACCESS = 32;
+
+    /** 自定义 usage 位 64 = 3D 体积纹理（{@code sampler3D} 噪声卷），与 native 一致。 */
+    private static final int USAGE_VOLUME_3D = 64;
 
     /**
      * 自动注入到每个光影着色器头部的 uniform 声明。
@@ -182,6 +193,11 @@ public final class Dx12ShaderPackRenderer {
     /** 主目标 / 深度纹理句柄 -> SRV 视图（RenderTarget 重建后句柄变化，自动失效）。 */
     private final Map<Long, Dx12GpuTextureView> sceneViews = new HashMap<>();
     private final List<Intermediate> intermediates = new ArrayList<>();
+    /**
+     * 包内自定义纹理（{@code texture:NAME}）。独立于 {@link #sceneViews}：后者每帧
+     * 会被 {@link #retainViews} 按主目标句柄裁掉，自定义纹理会因此每帧重建。
+     */
+    private final Map<String, PackTexture> packTextures = new HashMap<>();
     /** 上一帧最终画面的副本（{@code history_color} 端点），仅在有 pass 使用时分配。 */
     private Intermediate history;
 
@@ -243,7 +259,7 @@ public final class Dx12ShaderPackRenderer {
                 invalidate();
                 this.loadedPackId = pack.id();
             }
-            execute(ctx, pack, color, depth, width, height, minecraft);
+            execute(ctx, encoder, pack, color, depth, width, height, minecraft);
             this.failureLogged = false;
         } catch (Throwable t) {
             if (!this.failureLogged) {
@@ -253,7 +269,8 @@ public final class Dx12ShaderPackRenderer {
         }
     }
 
-    private void execute(long ctx, ShaderPack pack, Dx12GpuTexture color, Dx12GpuTexture depth,
+    private void execute(long ctx, Dx12CommandEncoderBackend encoder, ShaderPack pack,
+                         Dx12GpuTexture color, Dx12GpuTexture depth,
                          int width, int height, Minecraft minecraft) {
         ShaderPackManifest manifest = pack.manifest();
         List<ShaderPackManifest.Pass> passes = new ArrayList<>();
@@ -308,6 +325,10 @@ public final class Dx12ShaderPackRenderer {
         ensureUniformBuffer();
         long uniformHandle = this.uniformBuffer.handle();
 
+        // 自定义纹理必须在第一个 BeginRenderPass 之前上传（纹理拷贝不能录在渲染里，
+        // 且 writeToTexture 会按需打开命令列表）。
+        uploadPackTextures(encoder, pack, manifest, passes);
+
         String lastOutput = "scene_color";
         int passIndex = 0;
 
@@ -351,7 +372,7 @@ public final class Dx12ShaderPackRenderer {
                 inputs.add(resolveInput(input, color, colorView, depth, depthView));
             }
 
-            long pipeline = pipelineFor(pack, pass, output.formatOrdinal(), inputs.size());
+            long pipeline = pipelineFor(pack, pass, output.formatOrdinal(), inputs);
             if (pipeline == 0L) {
                 LOGGER.error("[shaderpack][DIAG] pipeline==0 for composite pass '{}': "
                     + "D3DCompile failed or resource mismatch. pass inputs={}, output={}",
@@ -498,7 +519,8 @@ public final class Dx12ShaderPackRenderer {
         if (cached != null) {
             return cached;
         }
-        long handle = createPipeline(FULLSCREEN_VS, ACCUM_PS, GpuFormat.RGBA16_FLOAT.ordinal(), 2, 0, 0);
+        long handle = createPipeline(FULLSCREEN_VS, ACCUM_PS, GpuFormat.RGBA16_FLOAT.ordinal(),
+            new int[]{3, 3}, 0, 0);
         this.pipelineCache.put(key, handle);
         return handle;
     }
@@ -765,6 +787,15 @@ public final class Dx12ShaderPackRenderer {
         if ("history_color".equals(name)) {
             return historyRef();
         }
+        if (name.startsWith("texture:")) {
+            String textureName = name.substring("texture:".length()).trim();
+            PackTexture texture = this.packTextures.get(textureName);
+            if (texture == null) {
+                throw new IllegalArgumentException("未上传的自定义纹理: " + name);
+            }
+            return new Dx12TextureRef(texture.texture(), texture.view(),
+                texture.texture().getFormat().ordinal(), texture.bindingType());
+        }
         if (name.startsWith("fx:")) {
             try {
                 int index = Integer.parseInt(name.substring(3).trim());
@@ -774,7 +805,85 @@ public final class Dx12ShaderPackRenderer {
             }
         }
         throw new IllegalArgumentException("未知的输入目标: " + name
-            + "（可用：scene_color / scene_depth / history_color / fx:N）");
+            + "（可用：scene_color / scene_depth / history_color / fx:N / texture:NAME）");
+    }
+
+    /**
+     * 上传本帧被 pass 引用的自定义纹理（{@code texture:NAME}），已上传过的直接复用。
+     *
+     * <p>体积纹理逐切片上传：native 侧的 {@code copyBufferToTexture} 对
+     * {@code TEXTURE3D} 会把 {@code layer} 当作 dstZ（subresource 只有 mip 一维）。
+     */
+    private void uploadPackTextures(Dx12CommandEncoderBackend encoder, ShaderPack pack,
+                                    ShaderPackManifest manifest,
+                                    List<ShaderPackManifest.Pass> passes) {
+        Set<String> referenced = new LinkedHashSet<>();
+        for (ShaderPackManifest.Pass pass : passes) {
+            for (String input : pass.inputs()) {
+                if (input.startsWith("texture:")) {
+                    referenced.add(input.substring("texture:".length()).trim());
+                }
+            }
+        }
+        for (String name : referenced) {
+            if (this.packTextures.containsKey(name)) {
+                continue;
+            }
+            ShaderPackManifest.TextureDecl decl = manifest.texture(name);
+            if (decl == null) {
+                throw new IllegalArgumentException("pass 引用了未声明的纹理: texture:" + name);
+            }
+            this.packTextures.put(name, createPackTexture(encoder, pack, decl));
+        }
+    }
+
+    private PackTexture createPackTexture(Dx12CommandEncoderBackend encoder, ShaderPack pack,
+                                          ShaderPackManifest.TextureDecl decl) {
+        GpuFormat[] formats = GpuFormat.values();
+        if (decl.format() < 0 || decl.format() >= formats.length) {
+            throw new IllegalArgumentException("纹理 '" + decl.name() + "' 的 format 越界: "
+                + decl.format());
+        }
+        GpuFormat format = formats[decl.format()];
+        byte[] bytes;
+        try {
+            bytes = pack.readBytes(decl.path());
+        } catch (IOException e) {
+            throw new UncheckedIOException("读取纹理失败: " + decl.path(), e);
+        }
+        if (bytes == null) {
+            throw new IllegalArgumentException("找不到纹理资源: " + decl.path());
+        }
+        int texelBytes = format.blockSize();
+        long sliceBytes = (long) decl.width() * decl.height() * texelBytes;
+        long expected = sliceBytes * decl.depth();
+        if (bytes.length < expected) {
+            throw new IllegalArgumentException("纹理 '" + decl.name() + "' 数据不足: 需要 "
+                + expected + " 字节，实际 " + bytes.length);
+        }
+
+        int usage = GpuTexture.USAGE_TEXTURE_BINDING | (decl.volume() ? USAGE_VOLUME_3D : 0);
+        Dx12GpuTexture texture = new Dx12GpuTexture(usage, "shaderpack " + decl.name(),
+            format, decl.width(), decl.height(), decl.depth(), 1);
+        for (int z = 0; z < decl.depth(); z++) {
+            ByteBuffer slice = ByteBuffer.wrap(bytes, (int) (z * sliceBytes), (int) sliceBytes)
+                .slice();
+            encoder.writeToTexture(texture, slice, 0, z, 0, 0, decl.width(), decl.height());
+        }
+        Dx12GpuTextureView view = new Dx12GpuTextureView(texture, 0, 1);
+
+        // 静态采样器类型：7 = linear + WRAP，3 = linear + CLAMP，1 = point + WRAP，
+        // 4 = point/mip-linear + CLAMP（见 native createGraphicsPipeline）。
+        int bindingType;
+        if (decl.linear()) {
+            bindingType = decl.wrap() ? 7 : 3;
+        } else {
+            bindingType = decl.wrap() ? 1 : 4;
+        }
+        LOGGER.info("[shaderpack] 上传自定义纹理 '{}' {}x{}x{} fmt={} wrap={} type={}",
+            decl.name(), decl.width(), decl.height(), decl.depth(), decl.format(),
+            decl.wrap(), bindingType);
+        return new PackTexture(texture, view, bindingType);
     }
 
     private Dx12TextureRef intermediateRef(int index, int width, int height) {
@@ -1037,11 +1146,20 @@ public final class Dx12ShaderPackRenderer {
     // ------------------------------------------------------------------
 
     private long pipelineFor(ShaderPack pack, ShaderPackManifest.Pass pass, int format,
-                             int inputCount) {
+                             List<Dx12TextureRef> inputs) {
         int srvBuffers = pass.srvBufferCount();
         int uavBuffers = pass.uavBufferCount();
-        String key = pack.id() + "|" + pass.name() + "|" + format + "|" + inputCount
-            + "|" + srvBuffers + "|" + uavBuffers;
+        int[] inputTypes = new int[inputs.size()];
+        StringBuilder keyBuilder = new StringBuilder(pack.id()).append('|').append(pass.name())
+            .append('|').append(format).append('|').append(inputs.size())
+            .append('|').append(srvBuffers).append('|').append(uavBuffers);
+        for (int i = 0; i < inputTypes.length; i++) {
+            inputTypes[i] = inputs.get(i).bindingType();
+            // 采样器类型必须进缓存键：同为 1 个输入，type 3（CLAMP）与 7（WRAP）
+            // 是不同的根签名/静态采样器组合，否则会互相撞键。
+            keyBuilder.append('|').append(inputTypes[i]);
+        }
+        String key = keyBuilder.toString();
         Long cached = this.pipelineCache.get(key);
         if (cached != null) {
             return cached;
@@ -1066,7 +1184,7 @@ public final class Dx12ShaderPackRenderer {
             this.pipelineCache.put(key, 0L);
             return 0L;
         }
-        long handle = createPipeline(vertexSource, fragmentSource, format, inputCount,
+        long handle = createPipeline(vertexSource, fragmentSource, format, inputTypes,
             srvBuffers, uavBuffers);
         this.pipelineCache.put(key, handle);
         return handle;
@@ -1078,7 +1196,7 @@ public final class Dx12ShaderPackRenderer {
         if (cached != null) {
             return cached;
         }
-        long handle = createPipeline(FULLSCREEN_VS, COPY_PS, format, 1, 0, 0);
+        long handle = createPipeline(FULLSCREEN_VS, COPY_PS, format, new int[]{3}, 0, 0);
         this.pipelineCache.put(key, handle);
         return handle;
     }
@@ -1091,10 +1209,11 @@ public final class Dx12ShaderPackRenderer {
      * {@code D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND} 一致。
      */
     private static long createPipeline(String vertexSource, String fragmentSource, int format,
-                                       int inputCount, int srvBufferCount, int uavBufferCount) {
+                                       int[] inputTypes, int srvBufferCount, int uavBufferCount) {
         byte[] vs = (UNIFORM_HEADER + vertexSource).getBytes(StandardCharsets.UTF_8);
         byte[] ps = (UNIFORM_HEADER + fragmentSource).getBytes(StandardCharsets.UTF_8);
 
+        int inputCount = inputTypes.length;
         int entryCount = inputCount + srvBufferCount + uavBufferCount + 1;
         int size = 4 + vs.length + 4 + ps.length;
         size += 4 + 12;             // colorCount=1 + 一个颜色目标
@@ -1128,7 +1247,8 @@ public final class Dx12ShaderPackRenderer {
 
         desc.putInt(entryCount);
         for (int i = 0; i < inputCount; i++) {
-            desc.put((byte) 3);  // SRV + 线性/CLAMP 静态采样器
+            // 每输入采样器类型：3 = 线性/CLAMP，7 = 线性/WRAP（3D 噪声卷）等。
+            desc.put((byte) inputTypes[i]);
             desc.put((byte) i);  // t{i} / s{i}
         }
         for (int i = 0; i < srvBufferCount; i++) {
@@ -1251,6 +1371,10 @@ public final class Dx12ShaderPackRenderer {
             this.history.close();
             this.history = null;
         }
+        for (PackTexture texture : this.packTextures.values()) {
+            texture.close();
+        }
+        this.packTextures.clear();
         this.hasPrevFrame = false;
 
         this.lastNanos = 0L;
@@ -1258,7 +1382,19 @@ public final class Dx12ShaderPackRenderer {
     }
 
     private record Dx12TextureRef(Dx12GpuTexture texture, Dx12GpuTextureView view,
-                                  int formatOrdinal) {
+                                  int formatOrdinal, int bindingType) {
+        /** 默认按线性/CLAMP（type 3）采样：内置端点与中间纹理都用它。 */
+        private Dx12TextureRef(Dx12GpuTexture texture, Dx12GpuTextureView view, int formatOrdinal) {
+            this(texture, view, formatOrdinal, 3);
+        }
+    }
+
+    /** 包内自定义纹理：纹理 + 独立 SRV 视图 + 采样器绑定类型（3/7/1/4）。 */
+    private record PackTexture(Dx12GpuTexture texture, Dx12GpuTextureView view, int bindingType) {
+        private void close() {
+            this.view.close();
+            this.texture.close();
+        }
     }
 
     /** 结构化缓冲（SSBO）：{@code unordered} 为 true 时按 UAV 绑定，否则按只读 SRV。 */
