@@ -29,10 +29,12 @@ import java.util.Map;
  * <p><b>区块边界</b>：邻居在区块外时一律当成空气。相邻两块实心方块之间的面本来就埋在
  * 实体内部看不见，多画一层不影响观感，却省掉了跨区块取邻居的复杂度。
  *
- * <p><b>纹理</b>：顶点带「方块空间 UV」+「图集矩形」。UV 按方块重复（一格是
- * {@code 2^shift} 个方块宽，UV 就是 0..{@code 2^shift}），像素着色器里 {@code frac}
- * 回落到单个方块，再乘图集矩形——和 voxy 一样，32 格宽的大面不会把一张 16px 贴图
- * 拉成一块纯色。矩形取自 {@code LodRegionCache} 的每面 sprite（草地侧面/原木年轮各自
+ * <p><b>纹理</b>：顶点带「LOD 格空间 UV」+「图集矩形」。UV 按 LOD 格重复（一格是
+ * {@code 2^shift} 个方块宽，UV 跨度就是格数，不是方块数），像素着色器里 {@code frac}
+ * 回落到单格，再乘图集矩形。这一点和 voxy 的 {@code getCornerUV} 一致：voxy 的
+ * {@code quadSizeAddin = faceSize.yw + quadSize - 1} 也是按 LOD 格计 UV，而不是按方块。
+ * 若按方块重复，远处每个方块一张 16px 贴图会缩到亚像素，被 mip 平均成一块纯色——
+ * 这正是远景发糊的主因；按格重复则整格共用一张贴图，远处仍能看出纹理层次。矩形取自 {@code LodRegionCache} 的每面 sprite（草地侧面/原木年轮各自
  * 正确）；查不到时矩形为 0，着色器退回顶点色。
  *
  * <p>顶点格式：{@code float3 position + RGBA8 color + float2 uv + R16G16B16A16 rect}，
@@ -334,49 +336,54 @@ public final class LodVoxelMesher {
                         float[] rect = pickRect(rects, dir);
                         int color = faceColor(rect, tints, dir, rgb);
                         int alpha = LodRegionCache.isWater(rgb) ? 0 : 255;
-                        float u = width * (float) size;
-                        float v = height * (float) size;
+                        // 几何跨度按方块算，UV 跨度按 LOD 格算：一格一张贴图。
+                        // size>1 时贴图会按格拉伸（2 方块格 = 贴图放大 2 倍），
+                        // 和 voxy 的 LOD 纹理比例一致。
+                        float spanU = width * (float) size;
+                        float spanV = height * (float) size;
+                        float u = width;
+                        float v = height;
                         switch (dir) {
                             case 0 -> { // DOWN
                                 float x0 = baseX + i * (float) size;
                                 float z0 = baseZ + j * (float) size;
                                 float y = minY + s * (float) size;
-                                emitFace(out, dir, x0, y, z0, x0 + u, y, z0 + v,
+                                emitFace(out, dir, x0, y, z0, x0 + spanU, y, z0 + spanV,
                                     u, v, color, alpha, rect);
                             }
                             case 1 -> { // UP
                                 float x0 = baseX + i * (float) size;
                                 float z0 = baseZ + j * (float) size;
                                 float y = minY + (s + 1) * (float) size;
-                                emitFace(out, dir, x0, y, z0, x0 + u, y, z0 + v,
+                                emitFace(out, dir, x0, y, z0, x0 + spanU, y, z0 + spanV,
                                     u, v, color, alpha, rect);
                             }
                             case 2 -> { // NORTH
                                 float x0 = baseX + i * (float) size;
                                 float y0 = minY + j * (float) size;
                                 float z = baseZ + s * (float) size;
-                                emitFace(out, dir, x0, y0, z, x0 + u, y0 + v, z,
+                                emitFace(out, dir, x0, y0, z, x0 + spanU, y0 + spanV, z,
                                     u, v, color, alpha, rect);
                             }
                             case 3 -> { // SOUTH
                                 float x0 = baseX + i * (float) size;
                                 float y0 = minY + j * (float) size;
                                 float z = baseZ + (s + 1) * (float) size;
-                                emitFace(out, dir, x0, y0, z, x0 + u, y0 + v, z,
+                                emitFace(out, dir, x0, y0, z, x0 + spanU, y0 + spanV, z,
                                     u, v, color, alpha, rect);
                             }
                             case 4 -> { // WEST
                                 float z0 = baseZ + i * (float) size;
                                 float y0 = minY + j * (float) size;
                                 float x = baseX + s * (float) size;
-                                emitFace(out, dir, x, y0, z0, x, y0 + v, z0 + u,
+                                emitFace(out, dir, x, y0, z0, x, y0 + spanV, z0 + spanU,
                                     u, v, color, alpha, rect);
                             }
                             default -> { // EAST
                                 float z0 = baseZ + i * (float) size;
                                 float y0 = minY + j * (float) size;
                                 float x = baseX + (s + 1) * (float) size;
-                                emitFace(out, dir, x, y0, z0, x, y0 + v, z0 + u,
+                                emitFace(out, dir, x, y0, z0, x, y0 + spanV, z0 + spanU,
                                     u, v, color, alpha, rect);
                             }
                         }
@@ -415,7 +422,7 @@ public final class LodVoxelMesher {
 
     /**
      * 发一个矩形面。{@code (x0,y0,z0)..(x1,y1,z1)} 是矩形包围盒，其中法线方向的两个
-     * 端点相等；{@code u/v} 是方块空间 UV 的跨度（格数 × 2^shift）。
+     * 端点相等；{@code u/v} 是 LOD 格空间 UV 的跨度（格数，不是方块数）。
      *
      * <p>顶点顺序沿用旧版逐格发面的顺序，只是把 size 换成了合并后的 u/v，保证
      * 三角形绕序、UV 朝向、图集矩形都和以前完全一致。
@@ -510,9 +517,9 @@ public final class LodVoxelMesher {
     }
 
     /**
-     * 写一个 32B 顶点：position + color + 块空间 uv + 图集矩形（4×UNORM16）。
+     * 写一个 32B 顶点：position + color + LOD 格空间 uv + 图集矩形（4×UNORM16）。
      *
-     * <p>uv 是「方块空间」坐标（一格 1.0，整面 {@code 0..size}），像素着色器
+     * <p>uv 是「LOD 格空间」坐标（一个 LOD 格 1.0，整面 {@code 0..格数}），像素着色器
      * {@code frac} 之后再用矩形还原到图集里那一格。
      */
     private static void putAtlas(ByteBuffer buffer, int vertex, float x, float y, float z,

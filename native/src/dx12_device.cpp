@@ -2819,12 +2819,25 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     //    shader register 仍取 binding 的 reg（= 条目序号），与 HLSL 声明一一对应。
     std::vector<uint8_t> cbvRegs;
     std::vector<D3D12_DESCRIPTOR_RANGE> srvRanges;
+    std::vector<D3D12_DESCRIPTOR_RANGE> uavRanges;
     std::vector<D3D12_STATIC_SAMPLER_DESC> staticSamplers;
     cbvRegs.reserve(desc.bindings.size());
     srvRanges.reserve(desc.bindings.size());
+    uavRanges.reserve(4);
     for (const PipelineDesc::Binding& b : desc.bindings) {
         if (b.type == 0) {
             cbvRegs.push_back(b.reg);
+            continue;
+        }
+        if (b.type == 5) {
+            // UAV（SSBO）：单独一张描述符表，root 参数排在 SRV 表之后。
+            D3D12_DESCRIPTOR_RANGE r{};
+            r.NumDescriptors = 1;
+            r.RegisterSpace = 0;
+            r.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+            r.BaseShaderRegister = b.reg;
+            r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            uavRanges.push_back(r);
             continue;
         }
         D3D12_DESCRIPTOR_RANGE r{};
@@ -2834,14 +2847,18 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         r.BaseShaderRegister = b.reg;
         r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRanges.push_back(r);
-        if (b.type == 1 || b.type == 3) {
+        if (b.type == 1 || b.type == 3 || b.type == 4) {
             D3D12_STATIC_SAMPLER_DESC s{};
             // type=1：原版渲染路径（point + WRAP），对齐 MC 默认采样器；
-            // type=3：光影包后处理（linear + CLAMP），供全屏 pass 采样输入纹理。
+            // type=3：光影包后处理（linear + CLAMP），供全屏 pass 采样输入纹理；
+            // type=4：体素 LOD（min/mag point + mip linear + CLAMP）。对齐 voxy 的
+            //         GL_NEAREST_MIPMAP_LINEAR min + GL_NEAREST mag：放大时保留像素
+            //         清晰度（linear 放大正是近处 LOD 发软的原因），mip 之间仍线性过渡。
             s.Filter = b.type == 3
                 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR
-                : D3D12_FILTER_MIN_MAG_MIP_POINT;
-            if (b.type == 3) {
+                : (b.type == 4 ? D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR
+                               : D3D12_FILTER_MIN_MAG_MIP_POINT);
+            if (b.type == 3 || b.type == 4) {
                 s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
                 s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
                 s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -2883,6 +2900,16 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         D3D12_ROOT_DESCRIPTOR_TABLE table{};
         table.NumDescriptorRanges = (UINT)srvRanges.size();
         table.pDescriptorRanges = srvRanges.data();
+        D3D12_ROOT_PARAMETER p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable = table;
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(p);
+    }
+    if (!uavRanges.empty()) {
+        D3D12_ROOT_DESCRIPTOR_TABLE table{};
+        table.NumDescriptorRanges = (UINT)uavRanges.size();
+        table.pDescriptorRanges = uavRanges.data();
         D3D12_ROOT_PARAMETER p{};
         p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p.DescriptorTable = table;
@@ -3660,21 +3687,24 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     if (!ctx || !ctx->listOpen) { err = "pushDescriptors: no open command list"; return false; }
     UINT count = (UINT)bindings.size();
     if (count == 0) return true;
-    // B：CBV 走 root descriptor（不占堆槽位），只有 SRV 需要写瞬时描述符堆。
+    // B：CBV 走 root descriptor（不占堆槽位），SRV / UAV 都需要写瞬时描述符堆。
     UINT cbvCount = 0;
     UINT srvCount = 0;
+    UINT uavCount = 0;
     for (const DrawBinding& b : bindings) {
         if (b.type == 0) {
             ++cbvCount;
+        } else if (b.type == 5) {
+            ++uavCount;
         } else {
             ++srvCount;
         }
     }
-    if (ctx->nextDrawSlot + srvCount > syncRingCapacity()) {
+    if (ctx->nextDrawSlot + srvCount + uavCount > syncRingCapacity()) {
         // 诊断：带上槽位画像，便于定位是哪条路径的 burst 超限（图集上传等）。
         err = "pushDescriptors: draw descriptor heap exhausted for this frame (next="
             + std::to_string((long long)ctx->nextDrawSlot)
-            + " need=" + std::to_string((long long)srvCount)
+            + " need=" + std::to_string((long long)(srvCount + uavCount))
             + " cap=" + std::to_string((long long)syncRingCapacity())
             + " section=" + std::to_string((long long)kDrawHeapPerFrame)
             + " fence=" + std::to_string((long long)ctx->fenceValue) + ")";
@@ -3703,9 +3733,11 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
     SIZE_T base = (SIZE_T)(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += base;
-    // 稠密编号：cbvIdx -> root 参数索引；srvIdx -> SRV 堆槽 / SRV 表内序号。
+    // 稠密编号：cbvIdx -> root 参数索引；srvIdx -> SRV 堆槽 / SRV 表内序号；
+    // uavIdx -> UAV 堆槽（紧跟在 SRV 槽之后）/ UAV 表内序号。
     UINT cbvIdx = 0;
     UINT srvIdx = 0;
+    UINT uavIdx = 0;
     for (UINT i = 0; i < count; ++i) {
         const DrawBinding& b = bindings[i];
         DBG_LOG_DEBUG("pushDesc[%u] type=%d buf=%p view=%p off=%lld len=%lld texel=%d",
@@ -3832,12 +3864,65 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 break;
             }
             default:
+                if (b.type == 5) {  // UAV：结构化缓冲（SSBO）
+                    D3D12_CPU_DESCRIPTOR_HANDLE dst{
+                        cpu.ptr + (SIZE_T)(srvCount + uavIdx) * gCtx.drawInc };
+                    if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer
+                        || !b.buffer->resource) {
+                        err = "pushDescriptors: invalid buffer for UAV entry " + std::to_string(i);
+                        return false;
+                    }
+                    if (!(b.buffer->usage & kBufferUsageUav)) {
+                        err = "pushDescriptors: UAV buffer was not created with kBufferUsageUav (1024)";
+                        return false;
+                    }
+                    transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    const UINT stride = (UINT)std::max(1, b.texelFormat);
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                    uav.Format = DXGI_FORMAT_UNKNOWN;
+                    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                    uav.Buffer.FirstElement = (UINT)(b.offset / stride);
+                    uav.Buffer.NumElements = (UINT)(b.length / stride);
+                    uav.Buffer.StructureByteStride = stride;
+                    uav.Buffer.CounterOffsetInBytes = 0;
+                    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+                    gCtx.device->CreateUnorderedAccessView(b.buffer->resource.Get(),
+                        nullptr, &uav, dst);
+                    ++uavIdx;
+                    break;
+                }
+                if (b.type == 6) {  // SRV：结构化缓冲（SSBO 只读）
+                    D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)srvIdx * gCtx.drawInc };
+                    if (!b.buffer || b.buffer->kind != Dx12Object::Kind::Buffer
+                        || !b.buffer->resource) {
+                        err = "pushDescriptors: invalid buffer for structured SRV entry "
+                            + std::to_string(i);
+                        return false;
+                    }
+                    transitionBufferTo(ctx, b.buffer,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    const UINT stride = (UINT)std::max(1, b.texelFormat);
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    srv.Format = DXGI_FORMAT_UNKNOWN;
+                    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    srv.Buffer.FirstElement = (UINT)(b.offset / stride);
+                    srv.Buffer.NumElements = (UINT)(b.length / stride);
+                    srv.Buffer.StructureByteStride = stride;
+                    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+                    gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(),
+                        &srv, dst);
+                    ++srvIdx;
+                    break;
+                }
                 err = "pushDescriptors: unknown binding type " + std::to_string(b.type);
                 return false;
         }
     }
-    ctx->nextDrawSlot += srvCount;
-    // SRV 表位于 root 参数索引 cbvCount（在 CBV root descriptor 之后）。
+    ctx->nextDrawSlot += srvCount + uavCount;
+    // SRV 表位于 root 参数索引 cbvCount（在 CBV root descriptor 之后），
+    // UAV 表紧随其后（cbvCount + 1，仅当本管线存在 SRV 表时偏移 1）。
     // gpuRoot 必须指向本帧实际写入位置（ring buffer 偏移 base），
     // 而不是 heap 起始处。否则多帧飞环时每帧的命令列表都把根表绑定到
     // 同一 GPU 地址（heap start），导致 GPU 读到前帧残留的描述符 → 黑屏。
@@ -3855,6 +3940,23 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 (unsigned long long)base, (unsigned)srvCount);
         }
         ctx->commandList->SetGraphicsRootDescriptorTable(cbvCount, gpuRoot);
+    }
+    if (uavCount > 0) {
+        D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot =
+            gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
+        gpuRoot.ptr += base + (SIZE_T)srvCount * gCtx.drawInc;
+        ctx->commandList->SetGraphicsRootDescriptorTable(
+            cbvCount + (srvCount > 0 ? 1u : 0u), gpuRoot);
+        // UAV 之间的写后读必须显式插 UAV barrier（状态过渡不覆盖这一语义）。
+        for (UINT i = 0; i < count; ++i) {
+            const DrawBinding& b = bindings[i];
+            if (b.type != 5 || !b.buffer || !b.buffer->resource) continue;
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrier.UAV.pResource = b.buffer->resource.Get();
+            ctx->commandList->ResourceBarrier(1, &barrier);
+        }
     }
     return true;
 }

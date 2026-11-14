@@ -33,6 +33,16 @@ import net.fabricmc.api.Environment;
  *       "fragment": "shaders/final.hlsl",
  *       "inputs": ["fx:0"],
  *       "output": "scene_color"
+ *     },
+ *     {
+ *       "name": "simulate",                    // compute pass（cs_5_1）
+ *       "type": "compute",
+ *       "fragment": "shaders/simulate.hlsl",   // compute 里该字段承载 CS 源码
+ *       "groups": [64, 1, 1],                  // 工作组数；缺省由 params/视口推导
+ *       "buffers": [                           // SSBO 声明（结构化缓冲）
+ *         { "name": "particles", "stride": 32, "count": 4096, "access": "uav" }
+ *       ],
+ *       "params": [1.0, 0.0, 0.0, 0.0]
  *     }
  *   ]
  * }
@@ -108,7 +118,7 @@ public final class ShaderPackManifest {
         return new ShaderPackManifest(version, List.copyOf(passes), replacesVanillaSky);
     }
 
-    /** 单个后处理 pass。 */
+    /** 单个后处理 pass（或 compute pass）。 */
     @Environment(EnvType.CLIENT)
     public static final class Pass {
         private final String name;
@@ -116,17 +126,22 @@ public final class ShaderPackManifest {
         private final String vertex;
         private final String fragment;
         private final List<String> inputs;
+        private final List<BufferDecl> buffers;
+        private final int[] groups;
         private final String output;
         private final float[] params;
         private final boolean enabled;
 
         private Pass(String name, String type, String vertex, String fragment, List<String> inputs,
-                     String output, float[] params, boolean enabled) {
+                     List<BufferDecl> buffers, int[] groups, String output, float[] params,
+                     boolean enabled) {
             this.name = name;
             this.type = type;
             this.vertex = vertex;
             this.fragment = fragment;
             this.inputs = inputs;
+            this.buffers = buffers;
+            this.groups = groups;
             this.output = output;
             this.params = params;
             this.enabled = enabled;
@@ -137,8 +152,9 @@ public final class ShaderPackManifest {
         }
 
         /**
-         * pass 类型：{@code composite}（默认，全屏三角形 + HLSL 片元）
-         * 或 {@code raytrace}（native DXR：深度重建世界位置 → 太阳阴影可见性）。
+         * pass 类型：{@code composite}（默认，全屏三角形 + HLSL 片元）、
+         * {@code raytrace}（native DXR：深度重建世界位置 → 太阳阴影可见性）
+         * 或 {@code compute}（cs_5_1 计算着色器，只能读写结构化缓冲 SSBO）。
          */
         public String type() {
             return this.type;
@@ -146,6 +162,34 @@ public final class ShaderPackManifest {
 
         public boolean isRaytrace() {
             return "raytrace".equals(this.type);
+        }
+
+        public boolean isCompute() {
+            return "compute".equals(this.type);
+        }
+
+        /** SSBO 声明（按声明顺序：SRV 先占 t0..，UAV 先占 u0..）。 */
+        public List<BufferDecl> buffers() {
+            return this.buffers;
+        }
+
+        /** compute pass 的工作组数；全 0 表示由渲染器按视口 / params 推导。 */
+        public int[] groups() {
+            return this.groups.clone();
+        }
+
+        public int srvBufferCount() {
+            int count = 0;
+            for (BufferDecl decl : this.buffers) {
+                if (!decl.unordered()) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        public int uavBufferCount() {
+            return this.buffers.size() - srvBufferCount();
         }
 
         /** 自定义顶点着色器路径；{@code null} = 使用内置全屏三角形 VS。 */
@@ -185,11 +229,13 @@ public final class ShaderPackManifest {
             String name = json.has("name") ? json.get("name").getAsString() : "pass";
             String type = json.has("type") ? json.get("type").getAsString() : "composite";
             boolean raytrace = "raytrace".equals(type);
+            boolean compute = "compute".equals(type);
             String vertex = json.has("vertex") && !json.get("vertex").isJsonNull()
                 ? json.get("vertex").getAsString() : null;
             String fragment = json.has("fragment") ? json.get("fragment").getAsString() : null;
             if (!raytrace && (fragment == null || fragment.isBlank())) {
-                throw new IllegalArgumentException("Pass '" + name + "' has no fragment shader");
+                throw new IllegalArgumentException("Pass '" + name + "' has no "
+                    + (compute ? "compute shader" : "fragment shader"));
             }
             List<String> inputs = new ArrayList<>();
             if (json.has("inputs")) {
@@ -197,7 +243,21 @@ public final class ShaderPackManifest {
                     inputs.add(e.getAsString());
                 }
             }
-            String output = json.has("output") ? json.get("output").getAsString() : "scene_color";
+            List<BufferDecl> buffers = new ArrayList<>();
+            if (json.has("buffers")) {
+                for (JsonElement e : json.getAsJsonArray("buffers")) {
+                    buffers.add(BufferDecl.parse(e.getAsJsonObject()));
+                }
+            }
+            int[] groups = new int[3];
+            if (json.has("groups")) {
+                JsonArray g = json.getAsJsonArray("groups");
+                for (int i = 0; i < 3 && i < g.size(); i++) {
+                    groups[i] = g.get(i).getAsInt();
+                }
+            }
+            String output = compute ? null
+                : json.has("output") ? json.get("output").getAsString() : "scene_color";
             float[] params = new float[4];
             if (json.has("params")) {
                 JsonArray p = json.getAsJsonArray("params");
@@ -206,7 +266,36 @@ public final class ShaderPackManifest {
                 }
             }
             boolean enabled = !json.has("enabled") || json.get("enabled").getAsBoolean();
-            return new Pass(name, type, vertex, fragment, List.copyOf(inputs), output, params, enabled);
+            return new Pass(name, type, vertex, fragment, List.copyOf(inputs),
+                List.copyOf(buffers), groups, output, params, enabled);
+        }
+    }
+
+    /**
+     * 结构化缓冲（SSBO）声明。
+     *
+     * <p>渲染器按 {@code stride × count} 分配一块 {@code Dx12GpuBuffer}；
+     * {@code access = "srv"} 对应 HLSL 的 {@code StructuredBuffer<T>}，
+     * {@code access = "uav"} 对应 {@code RWStructuredBuffer<T>}。
+     * 每类按声明顺序从 {@code t0} / {@code u0} 起编号。
+     */
+    @Environment(EnvType.CLIENT)
+    public record BufferDecl(String name, int stride, int count, boolean unordered) {
+        static BufferDecl parse(JsonObject json) {
+            String name = json.has("name") ? json.get("name").getAsString() : "buffer";
+            int stride = json.has("stride") ? json.get("stride").getAsInt() : 16;
+            int count = json.has("count") ? json.get("count").getAsInt() : 1;
+            String access = json.has("access") ? json.get("access").getAsString() : "uav";
+            if (stride <= 0 || count <= 0) {
+                throw new IllegalArgumentException("Buffer '" + name
+                    + "' has invalid stride/count: " + stride + "/" + count);
+            }
+            return new BufferDecl(name, stride, count, !"srv".equals(access));
+        }
+
+        /** 字节数（不低于 4，D3D12 结构化缓冲 stride 必须 4 字节对齐）。 */
+        public long byteSize() {
+            return (long) this.stride * this.count;
         }
     }
 }

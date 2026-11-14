@@ -198,6 +198,32 @@ class LodVoxelMesherTest {
     }
 
     @Test
+    void downsampledQuadKeepsOneTexturePerLodCell() {
+        // 16×16 平板按 2 方块降采样 → 8×8 个 LOD 格。UV 必须跨 8 格（每格一张贴图），
+        // 而不是 16 个方块。按方块重复会让远处每个方块都缩成亚像素，mip 平均后糊成纯色；
+        // voxy 的 quad_util.glsl 也是按 LOD 格计 UV（quadSizeAddin = quadSize）。
+        Builder builder = new Builder();
+        for (int z = 0; z < 16; z++) {
+            for (int x = 0; x < 16; x++) {
+                builder.put(x, 64, z, 0x808080);
+            }
+        }
+        LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 1);
+        assertEquals(6, mesh.faces(), "16×16 平板降采样后每面仍应合并成 1 片");
+
+        ByteBuffer buffer = ByteBuffer.wrap(mesh.vertices()).order(ByteOrder.LITTLE_ENDIAN);
+        float maxU = 0.0f;
+        float maxV = 0.0f;
+        for (int v = 0; v < mesh.faces() * 4; v++) {
+            int offset = v * LodVoxelMesher.VERTEX_STRIDE;
+            maxU = Math.max(maxU, buffer.getFloat(offset + 16));
+            maxV = Math.max(maxV, buffer.getFloat(offset + 20));
+        }
+        assertEquals(8.0f, maxU, 1.0e-4f, "UV 应按 8 个 LOD 格重复，而不是 16 个方块");
+        assertEquals(8.0f, maxV, 1.0e-4f, "UV 应按 8 个 LOD 格重复，而不是 16 个方块");
+    }
+
+    @Test
     void downsamplingCoarsensGridAndKeepsSurface() {
         // 4×4×4 实心块，按 2 方块降采样后变成 2×2×2 格；贪心合并后两者都是 6 片。
         Builder builder = new Builder();

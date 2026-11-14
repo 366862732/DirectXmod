@@ -2,6 +2,7 @@ package com.xgdt.dx12.d3d12;
 
 import com.xgdt.dx12.dx12.Dx12Native;
 import org.junit.jupiter.api.*;
+import java.nio.ByteBuffer;
 import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -156,6 +157,117 @@ public class Dx12DeviceTest {
         assertNull(failure, "LOD voxel pipeline compile/create failed: " + failure);
         assertNotEquals(0L, handle, "LOD voxel pipeline handle must be non-zero");
         Dx12Native.dx12DestroyPipeline(handle);
+    }
+
+    @Test
+    @Order(11)
+    void testTextureUploadReadback() {
+        final int TEX = 64;
+        final int FORMAT_RGBA8 = 6;
+        final int USAGE_RW = 15;   // COPY_DST | COPY_SRC | TEXTURE_BINDING | RENDER_ATTACHMENT
+        Dx12DeviceContext device = Dx12DeviceContext.create();
+        assertNotNull(device, "Device context must be created");
+
+        long ctx = Dx12Native.dx12CreateCommandEncoder();
+        assertNotEquals(0L, ctx, "Command encoder must be created");
+
+        long tex = Dx12Native.dx12CreateTexture(USAGE_RW, FORMAT_RGBA8, TEX, TEX, 1, 1);
+        assertNotEquals(0L, tex, "Texture must be created");
+
+        // 源图：64×64 全尺寸，用于对照组（行距 256 字节，走对齐路径）
+        long srcBytes = (long) TEX * TEX * 4;
+        long upload = Dx12Native.dx12CreateBuffer(2 /* MAP_WRITE */, srcBytes);
+        assertNotEquals(0L, upload, "Upload buffer must be created");
+        ByteBuffer mapped = Dx12Native.dx12MapBuffer(upload, 0, srcBytes, false, true);
+        assertNotNull(mapped, "Upload buffer must be mappable");
+        fillPattern(mapped, TEX, TEX, 0);
+        Dx12Native.dx12UnmapBuffer(upload);
+
+        long rb = Dx12Native.dx12CreateBuffer(1 /* MAP_READ */, srcBytes);
+        assertNotEquals(0L, rb, "Readback buffer must be created");
+
+        try {
+            // 1) 对齐路径：整张 64×64 上传（RowPitch=256）
+            Dx12Native.dx12BeginCommandList(ctx);
+            Dx12Native.dx12WriteToTexture(ctx, upload, 0, TEX, TEX, tex, 0, 0, 0, 0);
+            Dx12Native.dx12CopyTextureToBuffer(ctx, tex, 0, 0, 0, 0, TEX, TEX, rb, 0);
+            long fence = Dx12Native.dx12Submit(ctx);
+            assertTrue(Dx12Native.dx12WaitForFence(ctx, fence, 10_000_000_000L), "GPU must finish");
+
+            ByteBuffer out = Dx12Native.dx12MapBuffer(rb, 0, srcBytes, true, false);
+            assertNotNull(out, "Readback buffer must be mappable");
+            int mismatches = countMismatches(out, TEX, 0, 0, TEX, TEX, 0);
+            Dx12Native.dx12UnmapBuffer(rb);
+            System.out.printf("  [tex] 64x64 aligned upload mismatches=%d%n", mismatches);
+            assertEquals(0, mismatches, "64x64 (RowPitch=256) upload must round-trip");
+
+            // 2) 非对齐路径：16×16 / 8×8 / 4×4 子图写进同一个 64×64 纹理的不同位置。
+            //    读回始终走整张 64×64（RowPitch=256）的对齐路径，避免读回端踩同一个坑。
+            int[][] cases = {{16, 0, 0}, {8, 32, 0}, {4, 0, 32}};
+            for (int[] c : cases) {
+                int size = c[0], dx = c[1], dy = c[2];
+                long bytes = (long) size * size * 4;
+                ByteBuffer src = Dx12Native.dx12MapBuffer(upload, 0, bytes, false, true);
+                assertNotNull(src, "Upload buffer must be mappable");
+                fillPattern(src, size, size, 17);
+                Dx12Native.dx12UnmapBuffer(upload);
+
+                Dx12Native.dx12BeginCommandList(ctx);
+                Dx12Native.dx12CopyBufferToTexture(ctx, upload, 0, size, size, tex, 0, 0, dx, dy, size, size);
+                Dx12Native.dx12CopyTextureToBuffer(ctx, tex, 0, 0, 0, 0, TEX, TEX, rb, 0);
+                fence = Dx12Native.dx12Submit(ctx);
+                assertTrue(Dx12Native.dx12WaitForFence(ctx, fence, 10_000_000_000L), "GPU must finish");
+
+                out = Dx12Native.dx12MapBuffer(rb, 0, srcBytes, true, false);
+                assertNotNull(out, "Readback buffer must be mappable");
+                mismatches = countMismatches(out, TEX, dx, dy, size, size, 17);
+                Dx12Native.dx12UnmapBuffer(rb);
+                System.out.printf("  [tex] %dx%d unaligned upload (dst %d,%d) mismatches=%d%n",
+                    size, size, dx, dy, mismatches);
+                assertEquals(0, mismatches, size + "x" + size + " (RowPitch=" + (size * 4)
+                    + ") upload must round-trip");
+            }
+        } finally {
+            Dx12Native.dx12DestroyResource(rb);
+            Dx12Native.dx12DestroyResource(upload);
+            Dx12Native.dx12DestroyResource(tex);
+            Dx12Native.dx12DestroyCommandEncoder(ctx);
+        }
+    }
+
+    /** 写入可重复计算的 RGBA8 图案；上传/读回两端都用同一公式生成期望值。 */
+    private static void fillPattern(ByteBuffer buf, int w, int h, int seed) {
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = (y * w + x) * 4;
+                buf.put(i, (byte) (x * 13 + y * 7 + seed));
+                buf.put(i + 1, (byte) (x * 5 + y * 11 + seed * 3));
+                buf.put(i + 2, (byte) (x * 3 + y * 17 + seed * 5));
+                buf.put(i + 3, (byte) 0xFF);
+            }
+        }
+    }
+
+    /** 比较纹理 (dx,dy) 处 w×h 区域与 {@link #fillPattern} 的期望值。 */
+    private static int countMismatches(ByteBuffer out, int texW, int dx, int dy,
+                                       int w, int h, int seed) {
+        int bad = 0;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int o = ((dy + y) * texW + (dx + x)) * 4;
+                int er = (x * 13 + y * 7 + seed) & 0xFF;
+                int eg = (x * 5 + y * 11 + seed * 3) & 0xFF;
+                int eb = (x * 3 + y * 17 + seed * 5) & 0xFF;
+                int ar = out.get(o) & 0xFF;
+                int ag = out.get(o + 1) & 0xFF;
+                int ab = out.get(o + 2) & 0xFF;
+                int aa = out.get(o + 3) & 0xFF;
+                if (ar != er || ag != eg || ab != eb || aa != 0xFF) {
+                    ++bad;
+                }
+            }
+        }
+        return bad;
     }
 
     @Test

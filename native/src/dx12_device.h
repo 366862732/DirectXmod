@@ -561,7 +561,9 @@ struct PipelineDesc {
         std::string semanticName;  // HLSL 声明的语义名（如 "POSITION"、"TEXCOORD0"）；空串则回退到 "TEXCOORD"
     };
     struct Binding {
-        uint8_t type = 0;  // 0=CBV，1=SRV+static sampler，2=SRV
+        // 0=CBV，1=SRV+static sampler，2=SRV(texel)，3=SRV+linear/CLAMP，
+        // 4=SRV+point/mip-linear，5=UAV（结构化缓冲 / SSBO）
+        uint8_t type = 0;
         uint8_t reg = 0;
     };
 
@@ -687,16 +689,19 @@ bool setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType,
 //   type 0 = CBV（buffer + offset + length，offset 须 256 对齐）
 //   type 1 = SRV（复制 texture view 的现有描述符）
 //   type 2 = SRV（texel buffer，按 texelFormat 建 Buffer SRV）
+//   type 5 = UAV（结构化缓冲 SSBO，texelFormat = 元素字节数，length = 字节数）
+//   type 6 = SRV（结构化缓冲 SSBO 只读，texelFormat = 元素字节数，length = 字节数）
 struct DrawBinding {
     uint8_t type = 0;
-    Dx12Object* buffer = nullptr;   // CBV / TEXEL 的 buffer
-    long long offset = 0;           // CBV offset
-    long long length = 0;           // CBV length（内部向上取整 256）
-    int texelFormat = 0;            // TEXEL SRV 的 GpuFormat ordinal
+    Dx12Object* buffer = nullptr;   // CBV / TEXEL / SSBO 的 buffer
+    long long offset = 0;           // CBV offset / SSBO 起始字节
+    long long length = 0;           // CBV length（内部向上取整 256）/ SSBO 总字节
+    int texelFormat = 0;            // TEXEL SRV 的 GpuFormat ordinal / SSBO 元素字节数
     Dx12Object* view = nullptr;     // SAMPLED_IMAGE 的 texture view
 };
 // B（拆根签名）：CBV 走 root descriptor（SetGraphicsRootConstantBufferView，不占堆
-// 槽位），SRV 写入本帧 drawHeap 瞬时槽位并 SetGraphicsRootDescriptorTable(cbvCount)。
+// 槽位），SRV 与 UAV 分别写入本帧 drawHeap 瞬时槽位并
+// SetGraphicsRootDescriptorTable(cbvCount) / (cbvCount + (srvCount > 0 ? 1 : 0))。
 bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings,
     std::string& err);
 

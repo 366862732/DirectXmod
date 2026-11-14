@@ -66,7 +66,7 @@ public final class Dx12LodRenderer {
 
     /** 顶点步长：position(float3, 12B) + color(RGBA8, 4B)。 */
     private static final int VERTEX_STRIDE = 16;
-    /** 体素顶点步长：position(12B) + color(4B) + 块空间 uv(8B) + 图集矩形 4×UNORM16(8B) = 32B。 */
+    /** 体素顶点步长：position(12B) + color(4B) + LOD 格空间 uv(8B) + 图集矩形 4×UNORM16(8B) = 32B。 */
     private static final int VOXEL_VERTEX_STRIDE = 32;
     /** 顶点格式 ordinal：46 = RGB32_FLOAT，6 = RGBA8_UNORM，45 = R32G32_FLOAT，14 = RGBA16_UNORM。 */
     private static final int FORMAT_POSITION = 46;
@@ -105,8 +105,11 @@ public final class Dx12LodRenderer {
      */
     private static final int UNIFORM_SLOT = 256;
     private static final int UNIFORM_RING = 8;
-    /** 实际写入字节数：float4x4 + CameraPos + FogParams + FogColor + LightTint + Params。 */
-    private static final int UNIFORM_DATA_BYTES = 144;
+    /**
+     * 实际写入字节数：float4x4 + CameraPos + FogParams + FogColor + LightTint + Params
+     * + PbrParams（PBR 高光参数）。
+     */
+    private static final int UNIFORM_DATA_BYTES = 160;
 
     /** 几何环：与命令列表的帧在飞数一致，避免覆写 GPU 仍在读取的顶点缓冲。 */
     private static final int GEOMETRY_SLOTS = 3;
@@ -143,8 +146,16 @@ public final class Dx12LodRenderer {
      * 压住，所以这里收到 720 方块。
      */
     private static final float LOD_FOG_FAR_BLOCKS = 720.0f;
-    /** 雾开始变浓的距离占 {@link #LOD_FOG_FAR_BLOCKS} 的比例。 */
-    private static final float LOD_FOG_START_RATIO = 0.13f;
+    /**
+     * 雾开始变浓的距离占 {@link #LOD_FOG_FAR_BLOCKS} 的比例。
+     *
+     * <p>voxy 的远景在可视范围内几乎没有雾：它的 LOD 片元着色器不写雾，只在最后
+     * 合成时按原版 {@code FOG_START/END_DISTANCE}（默认 0/1024）叠一层，且最多只
+     * 叠到 54%。以前这里从 13%（约 94 方块）就开始压雾，200~600 方块全被蓝灰雾
+     * 盖住，看起来就是「糊」。现在只让最后约 28%（518~720）淡出，既保留 voxy
+     * 那种清晰的远景，又能把 720 处的体素/高度场接缝藏进雾里。
+     */
+    private static final float LOD_FOG_START_RATIO = 0.72f;
 
     /**
      * 高度场几何的实际铺开半径（方块），只比雾终点稍远一点。
@@ -239,6 +250,7 @@ public final class Dx12LodRenderer {
         + "    float4 FogColor;     // rgb = 雾色\n"
         + "    float4 LightTint;    // rgb = 天空光染色（夜里偏蓝）\n"
         + "    float4 Params;       // x = 海平面高度\n"
+        + "    float4 PbrParams;    // x = 高光强度, y = 粗糙度, z = 金属度\n"
         + "};\n";
 
     private static final String VERTEX_SHADER =
@@ -311,7 +323,8 @@ public final class Dx12LodRenderer {
         + "\n"
         + "    // 顶面就是地表本色。以前还按「绿色占比」往泥土色拉一部分，结果每级台阶的\n"
         + "    // 边缘都刷成一条棕带，远景整片是竖条纹。草坡就该是草色，露岩交给坡度分层。\n"
-        + "    float3 rgb = top;\n"
+        + "    float3 albedo = top;\n"
+        + "    float3 rgb = albedo;\n"
         + "\n"
         + "    // 方块面明暗：原版是顶面 1.0、南北墙 0.8、东西墙 0.6。LOD 的墙全是竖直面，\n"
         + "    // 按法线主轴挑一个固定系数，否则竖直墙和顶面的亮度只差几个百分点，压平的\n"
@@ -352,6 +365,30 @@ public final class Dx12LodRenderer {
         + "        rgb = lerp(rgb, surface, water);\n"
         + "    }\n"
         + "\n"
+        + "    // ---- PBR 近似（高度场 / 体素两套像素着色器必须逐字一致）----\n"
+        + "    // 场景只有一路固定方向光，用 Blinn-Phong 高光瓣 + Fresnel 环境项近似：\n"
+        + "    //   PbrParams.x = 高光强度, y = 粗糙度（0 光滑 / 1 全粗糙）, z = 金属度\n"
+        + "    float3 lightDir = normalize(float3(0.42, 0.80, -0.42));\n"
+        + "    float3 viewDir = normalize(-rel);\n"
+        + "    float3 halfDir = normalize(lightDir + viewDir);\n"
+        + "    float rough = saturate(PbrParams.y);\n"
+        + "    float waterHint = 1.0 - saturate(input.color.a * 2.0);\n"
+        + "    // 水面永远是光滑镜面\n"
+        + "    rough = lerp(rough, 0.05, waterHint);\n"
+        + "    float shininess = 2.0 / max(rough * rough, 0.0025) - 2.0;\n"
+        + "    // (n+8)/(8π)：让不同粗糙度下的高光总能量大致守恒\n"
+        + "    float spec = saturate(pow(saturate(dot(normal, halfDir)), shininess)\n"
+        + "        * (shininess + 8.0) * 0.0397887);\n"
+        + "    float ndl = saturate(dot(normal, lightDir));\n"
+        + "    float fresnel = pow(1.0 - saturate(dot(normal, viewDir)), 5.0);\n"
+        + "    // 电介质高光偏白，金属高光带本体色\n"
+        + "    float3 specTint = lerp(float3(1.0, 1.0, 1.0), albedo, saturate(PbrParams.z));\n"
+        + "    rgb += specTint * spec * PbrParams.x * ndl * (1.0 - rough * 0.5);\n"
+        + "    // 环境反射：用雾色/天空光近似，掠射角靠 Fresnel 增强\n"
+        + "    float3 envColor = FogColor.rgb * FogParams.z + LightTint.rgb * 0.10;\n"
+        + "    rgb += envColor * specTint * fresnel * PbrParams.x\n"
+        + "        * (0.04 + saturate(PbrParams.z) * 0.5);\n"
+        + "\n"
         + "    rgb *= FogParams.z * LightTint.rgb;\n"
         + "    // 浅色地形（冰/雪/沙）叠加光照后仍可能越过 1.0，钳一下避免整片钳成纯白\n"
         + "    rgb = saturate(rgb);\n"
@@ -359,11 +396,12 @@ public final class Dx12LodRenderer {
         + "}\n";
 
     /**
-     * 体素 LOD 专用顶点着色器：多传「块空间 uv」与「图集矩形」（4×UNORM16）。
+     * 体素 LOD 专用顶点着色器：多传「LOD 格空间 uv」与「图集矩形」（4×UNORM16）。
      *
-     * <p>uv 是方块空间坐标（一格 = 1.0，一格 {@code 2^shift} 方块宽的面就是 0..2^shift），
-     * 像素着色器 {@code frac} 回落到单个方块，再用矩形还原进图集里那一格——照搬 voxy
-     * 的 {@code modf(uv, tile) + getBaseUV()} 思路，大面不会被拉成一块纯色。
+     * <p>uv 是 LOD 格空间坐标（一格 = 1.0，一个 {@code 2^shift} 方块宽的 LOD 格就是 1），
+     * 像素着色器 {@code frac} 回落到单个 LOD 格，再用矩形还原进图集里那一格——和 voxy
+     * 的 {@code quadSizeAddin = quadSize} 一致：每个 LOD 格铺一张完整贴图，而不是每个
+     * 方块铺一张。远处若按方块重复，16px 贴图会缩到亚像素并被 mip 平均成纯色。
      */
     private static final String VOXEL_VERTEX_SHADER =
         "struct VSInput\n"
@@ -397,8 +435,8 @@ public final class Dx12LodRenderer {
      * 体素 LOD 专用像素着色器：按 voxy 的做法采样方块纹理图集。
      *
      * <ul>
-     *   <li>{@code frac(uv)} 把大面回落到单个方块，再乘图集矩形——每格都是完整一张贴图；</li>
-     *   <li>{@code SampleGrad} 用块空间 uv 的屏幕导数选 mip（不用 bias），远处贴图不闪；</li>
+     *   <li>{@code frac(uv)} 把大面回落到单个 LOD 格，再乘图集矩形——每格都是完整一张贴图；</li>
+     *   <li>{@code SampleGrad} 用格空间 uv 的屏幕导数选 mip（不用 bias），远处贴图不闪；</li>
      *   <li>alpha 裁剪要用 mip0 精确采样，粗 mip 会把透明边缘糊进来（voxy 同做法）；</li>
      *   <li>矩形全 0 表示没有 sprite（空气/未知方块），退回顶点色。</li>
      * </ul>
@@ -421,13 +459,13 @@ public final class Dx12LodRenderer {
         + "    float fog = saturate((dist - FogParams.x) / max(FogParams.y - FogParams.x, 1.0));\n"
         + "    float2 rectSize = input.rect.zw - input.rect.xy;\n"
         + "    bool hasTex = rectSize.x > 0.0 && rectSize.y > 0.0;\n"
-        + "    // 块空间 uv → 方块内 0..1 → 图集矩形内 0..1\n"
+        + "    // LOD 格空间 uv → 格内 0..1 → 图集矩形内 0..1\n"
         + "    float2 tiled = frac(input.uv);\n"
         + "    float2 atlasUv = input.rect.xy + tiled * rectSize;\n"
         + "    float4 tex = float4(1.0, 1.0, 1.0, 1.0);\n"
         + "    if (hasTex)\n"
         + "    {\n"
-        + "        // 导数取自连续的块空间 uv（frac 会跳变），乘矩形宽高换算到图集空间\n"
+        + "        // 导数取自连续的格空间 uv（frac 会跳变），乘矩形宽高换算到图集空间\n"
         + "        float2 duvdx = ddx(input.uv) * rectSize;\n"
         + "        float2 duvdy = ddy(input.uv) * rectSize;\n"
         + "        tex = BlockTex.SampleGrad(BlockSampler, atlasUv, duvdx, duvdy);\n"
@@ -435,7 +473,8 @@ public final class Dx12LodRenderer {
         + "    // 有贴图时：贴图 × 该面的生物群系染色（顶点色 rgb 是染色值，白 = 不染色）。\n"
         + "    // 草方块顶面 / 草 / 树叶的 PNG 本身是灰白色，颜色全靠这一步乘回来，\n"
         + "    // 照搬 voxy 的 tintingFunction；没有 sprite 时才退回顶点色兜底。\n"
-        + "    float3 rgb = hasTex ? tex.rgb * input.color.rgb : input.color.rgb;\n"
+        + "    float3 albedo = hasTex ? tex.rgb * input.color.rgb : input.color.rgb;\n"
+        + "    float3 rgb = albedo;\n"
         + "    // 面法线：同高度场着色器（屏幕空间导数重建）\n"
         + "    float3 face = cross(ddx(rel), ddy(rel));\n"
         + "    float faceLen = length(face);\n"
@@ -458,6 +497,29 @@ public final class Dx12LodRenderer {
         + "    // 系数必须和高度场那边一模一样（0.82 + 0.18），否则体素圈外缘和高度场\n"
         + "    // 内缘会在接缝处出现一圈亮度跳变。\n"
         + "    rgb *= (0.82 + 0.18 * lambert) * faceShade;\n"
+        + "    // ---- PBR 近似（高度场 / 体素两套像素着色器必须逐字一致）----\n"
+        + "    // 场景只有一路固定方向光，用 Blinn-Phong 高光瓣 + Fresnel 环境项近似：\n"
+        + "    //   PbrParams.x = 高光强度, y = 粗糙度（0 光滑 / 1 全粗糙）, z = 金属度\n"
+        + "    float3 lightDir = normalize(float3(0.42, 0.80, -0.42));\n"
+        + "    float3 viewDir = normalize(-rel);\n"
+        + "    float3 halfDir = normalize(lightDir + viewDir);\n"
+        + "    float rough = saturate(PbrParams.y);\n"
+        + "    float waterHint = 1.0 - saturate(input.color.a * 2.0);\n"
+        + "    // 水面永远是光滑镜面\n"
+        + "    rough = lerp(rough, 0.05, waterHint);\n"
+        + "    float shininess = 2.0 / max(rough * rough, 0.0025) - 2.0;\n"
+        + "    // (n+8)/(8π)：让不同粗糙度下的高光总能量大致守恒\n"
+        + "    float spec = saturate(pow(saturate(dot(normal, halfDir)), shininess)\n"
+        + "        * (shininess + 8.0) * 0.0397887);\n"
+        + "    float ndl = saturate(dot(normal, lightDir));\n"
+        + "    float fresnel = pow(1.0 - saturate(dot(normal, viewDir)), 5.0);\n"
+        + "    // 电介质高光偏白，金属高光带本体色\n"
+        + "    float3 specTint = lerp(float3(1.0, 1.0, 1.0), albedo, saturate(PbrParams.z));\n"
+        + "    rgb += specTint * spec * PbrParams.x * ndl * (1.0 - rough * 0.5);\n"
+        + "    // 环境反射：用雾色/天空光近似，掠射角靠 Fresnel 增强\n"
+        + "    float3 envColor = FogColor.rgb * FogParams.z + LightTint.rgb * 0.10;\n"
+        + "    rgb += envColor * specTint * fresnel * PbrParams.x\n"
+        + "        * (0.04 + saturate(PbrParams.z) * 0.5);\n"
         + "    // 天空光染色 + 世界亮度（白天白、夜里偏蓝，同 voxy lightmap）\n"
         + "    rgb *= FogParams.z * LightTint.rgb;\n"
         + "    // 水体：顶点 alpha = 0 是水体标记，纹理 alpha 通道混入做半透明\n"
@@ -2606,12 +2668,12 @@ public final class Dx12LodRenderer {
             fogG = vanillaFog.y();
             fogB = vanillaFog.z();
         }
-        // 往亮度混 45% 再压暗 8%，才有 voxy 参考图里那种「蓝灰浓雾」的低饱和层次；
-        // 直接铺原版雾色会偏艳，远景像一块纯色板。
-        float fogLuma = 0.2126f * fogR + 0.7152f * fogG + 0.0722f * fogB;
-        buffer.putFloat(offset + 96, (fogR * 0.55f + fogLuma * 0.45f) * 0.92f);
-        buffer.putFloat(offset + 100, (fogG * 0.55f + fogLuma * 0.45f) * 0.92f);
-        buffer.putFloat(offset + 104, (fogB * 0.55f + fogLuma * 0.45f) * 0.92f);
+        // 直接用原版这一帧的雾色，不再往灰里混。voxy 的合成 pass 也是直接
+        // mix(colour, fogColour, fogLerp)，雾色和天空/地平线同源；以前混 45% 亮度
+        // 会把远景压成灰紫色，和蓝色天空之间出现一条硬邦邦的灰带。
+        buffer.putFloat(offset + 96, fogR);
+        buffer.putFloat(offset + 100, fogG);
+        buffer.putFloat(offset + 104, fogB);
         buffer.putFloat(offset + 108, 1.0f);
 
         // 天空光染色：白天白、夜里偏蓝，只调色不动整体亮度
@@ -2635,6 +2697,13 @@ public final class Dx12LodRenderer {
         buffer.putFloat(offset + 132, 0.0f);
         buffer.putFloat(offset + 136, 0.0f);
         buffer.putFloat(offset + 140, 0.0f);
+
+        // PbrParams：远景地形整体偏粗糙，只在陡面/水面留下一点方向性高光。
+        // x = 高光强度, y = 粗糙度, z = 金属度（地形全是电介质，0）
+        buffer.putFloat(offset + 144, 0.35f);
+        buffer.putFloat(offset + 148, 0.85f);
+        buffer.putFloat(offset + 152, 0.0f);
+        buffer.putFloat(offset + 156, 0.0f);
         return offset;
     }
 
@@ -2759,7 +2828,7 @@ public final class Dx12LodRenderer {
     }
 
     /**
-     * 体素 LOD 专用管线：32B 顶点（POSITION + COLOR + TEXCOORD0 + TEXCOORD1）+ SRV t0（LINEAR+CLAMP）。
+     * 体素 LOD 专用管线：32B 顶点（POSITION + COLOR + TEXCOORD0 + TEXCOORD1）+ SRV t0（POINT 放大 + LINEAR mip + CLAMP）。
      * 按颜色格式缓存。{@code 0L} = 创建失败（本帧跳过体素绘制）。
      */
     private long voxelPipelineFor(int colorFormat) {
@@ -2777,7 +2846,9 @@ public final class Dx12LodRenderer {
 
     /**
      * 体素管线：4 个输入元素（position float3 / color rgba8 / uv float2 / rect 4×UNORM16）
-     * + CBV b0 + SRV t0。SRV 类型 = 3（LINEAR+CLAMP 静态采样器，按 binding reg=0 声明）。
+     * + CBV b0 + SRV t0。SRV 类型 = 4（POINT 放大 + LINEAR mip + CLAMP 静态采样器，
+     * 按 binding reg=0 声明）。对齐 voxy：{@code GL_NEAREST} 放大保留方块像素感，
+     * {@code GL_NEAREST_MIPMAP_LINEAR} 缩小避免远处闪烁。
      */
     private static long createVoxelPipeline(int colorFormat) {
         byte[] vs = (UNIFORM_HEADER + VOXEL_VERTEX_SHADER).getBytes(StandardCharsets.UTF_8);
@@ -2793,7 +2864,7 @@ public final class Dx12LodRenderer {
         for (String semantic : semantics) {
             size += 4 + semantic.length();
         }
-        // entryCount：CBV b0 + SRV t0（type=3, reg=0）
+        // entryCount：CBV b0 + SRV t0（type=4, reg=0）
         size += 4 + 2 + 2;
 
         ByteBuffer desc = ByteBuffer.allocateDirect(size).order(ByteOrder.LITTLE_ENDIAN);
@@ -2857,11 +2928,11 @@ public final class Dx12LodRenderer {
             desc.put(bytes);
         }
 
-        // 根参数：CBV b0 + SRV t0（type=3 是 LINEAR+CLAMP）
+        // 根参数：CBV b0 + SRV t0（type=4 是 POINT 放大 + LINEAR mip + CLAMP）
         desc.putInt(2);
         desc.put((byte) 0);
         desc.put((byte) 0);
-        desc.put((byte) 3);
+        desc.put((byte) 4);
         desc.put((byte) 0);
 
         desc.flip();
@@ -2898,7 +2969,8 @@ public final class Dx12LodRenderer {
 
     /**
      * 推 CBV（uniform）+ SRV（图集纹理）两条根参数。
-     * SRV type=3 对应 LINEAR+CLAMP 静态采样器，reg=0 与 {@code createVoxelPipeline} 的 t0 一致。
+     * 这里的 type=3 是描述符类型（SRV），reg=0 与 {@code createVoxelPipeline} 的 t0 一致；
+     * 采样器过滤方式由管线里的 type=4 静态采样器决定。
      */
     private void pushVoxelTexture(long ctx, int uniformOffset, long atlasViewHandle) {
         if (!Dx12Native.dx12PushDescriptors(ctx,

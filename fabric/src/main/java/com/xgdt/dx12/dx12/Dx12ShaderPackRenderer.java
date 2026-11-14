@@ -27,6 +27,7 @@ import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
 import net.minecraft.util.Mth;
 import org.joml.Matrix4f;
+import org.joml.Vector3f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +46,12 @@ import org.slf4j.LoggerFactory;
  *   <li>输入纹理按 manifest 的 {@code inputs} 顺序对应 {@code register(t0..tN-1)}，
  *       静态采样器对应 {@code register(s0..sN-1)}（线性过滤 + CLAMP）。</li>
  *   <li>内置 uniform 常量缓冲固定在 {@code register(b0)}，见 {@link #UNIFORM_HEADER}。</li>
+ *   <li>{@code type = "compute"} 的 pass 走 {@code cs_5_1}：入口 {@code main}，
+ *       {@code register(b0)} 是 4 个 32bit root constants（= {@code params} 的位模式，
+ *       用 {@code asfloat} 取回），SSBO 按声明顺序排在 SRV {@code t0..} / UAV {@code u0..}，
+ *       不产出图像、不参与 {@code lastOutput}。</li>
+ *   <li>声明了 {@code buffers} 的 composite pass 同样可以用
+ *       {@code StructuredBuffer}（{@code t} 从纹理之后接着编号）/ {@code RWStructuredBuffer}。</li>
  * </ul>
  */
 @Environment(EnvType.CLIENT)
@@ -52,15 +59,17 @@ public final class Dx12ShaderPackRenderer {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12-shaderpack");
 
     /** 每个 pass 的 uniform 槽位字节数（CBV 偏移需 256 对齐）。 */
-    private static final int UNIFORM_SLOT = 512;
+    private static final int UNIFORM_SLOT = 1024;
     /** 在飞帧数（与 3-frame flight 同步）：每帧一份槽位，避免 CPU 回头覆写 GPU 仍在读的数据。 */
     private static final int UNIFORM_FRAMES = 3;
     /** 每帧最多缓存的 pass 数（超出部分复用最后一槽）。 */
     private static final int UNIFORM_PASSES = 8;
     private static final int UNIFORM_RING = UNIFORM_FRAMES * UNIFORM_PASSES;
-    /** 实际写入的 uniform 字节数（368 = 23 个 float4，见 {@link #UNIFORM_HEADER}）。 */
-    private static final int UNIFORM_DATA_BYTES = 368;
+    /** 实际写入的 uniform 字节数（512 = 32 个 float4，见 {@link #UNIFORM_HEADER}）。 */
+    private static final int UNIFORM_DATA_BYTES = 512;
     private static final int MAX_OPTIONS = 24;
+    /** 自定义 buffer usage 位 1024 = UAV（与 native {@code kBufferUsageUav} 一致）。 */
+    private static final int BUFFER_USAGE_UAV = 1024;
 
     /**
      * 自定义 usage 位 32 = UAV（{@code GpuTexture} 的官方位只到 16）。
@@ -74,7 +83,12 @@ public final class Dx12ShaderPackRenderer {
      *
      * <p>偏移：Viewport 0 / Time 16 / CameraPosition 32 / SunDirection 48 /
      * PassParams 64 / Sky 80 / SkyColor 96 / SunsetColor 112 / Misc 128 /
-     * InvViewProj 144 / ViewRotation 208 / Options 272。
+     * InvViewProj 144 / ViewRotation 208 / Options 272 /
+     * ViewProj 368 / PrevViewProj 432 / PrevCameraPosition 496。
+     *
+     * <p>{@code ViewProj} + {@code PrevViewProj} + {@code PrevCameraPosition} 供
+     * 运动模糊 / 时域重投影把当前像素映射回上一帧（相机相对世界坐标：
+     * {@code prevRel = rel + CameraPosition.xyz - PrevCameraPosition.xyz}）。
      *
      * <p>{@code Options[0..5]} 按 {@code shaders.properties} 中 {@code option.*}
      * 的书写顺序填入（第 n 个设置 = {@code Options[n / 4][n % 4]}，最多 24 个）。
@@ -94,6 +108,9 @@ public final class Dx12ShaderPackRenderer {
             float4x4 InvViewProj;   // inverse(projection * viewRotation)：相机相对世界的反投影
             float4x4 ViewRotation;  // 世界 -> 相机（仅旋转）
             float4 Options[6];      // shaders.properties 的 option.* 值（最多 24 个）
+            float4x4 ViewProj;      // projection * viewRotation（本帧）
+            float4x4 PrevViewProj;  // 上一帧的 projection * viewRotation（首帧 = 本帧）
+            float4 PrevCameraPosition; // 上一帧相机世界坐标
         };
         """;
 
@@ -158,9 +175,19 @@ public final class Dx12ShaderPackRenderer {
 
     /** (packId, passName, outputFormat) -> native pipeline handle。 */
     private final Map<String, Long> pipelineCache = new HashMap<>();
+    /** (packId, passName) -> native compute pipeline handle。 */
+    private final Map<String, Long> computeCache = new HashMap<>();
+    /** (packId, passName, bufferName) -> 结构化缓冲（SSBO）。 */
+    private final Map<String, Ssbo> ssboCache = new HashMap<>();
     /** 主目标 / 深度纹理句柄 -> SRV 视图（RenderTarget 重建后句柄变化，自动失效）。 */
     private final Map<Long, Dx12GpuTextureView> sceneViews = new HashMap<>();
     private final List<Intermediate> intermediates = new ArrayList<>();
+    /** 上一帧最终画面的副本（{@code history_color} 端点），仅在有 pass 使用时分配。 */
+    private Intermediate history;
+
+    private final Matrix4f prevViewProj = new Matrix4f();
+    private final Vector3f prevCameraPos = new Vector3f();
+    private boolean hasPrevFrame;
 
     private Dx12GpuBuffer uniformBuffer;
     private GpuBufferSlice.MappedView uniformView;
@@ -264,6 +291,18 @@ public final class Dx12ShaderPackRenderer {
             intermediate(i, width, height);
         }
 
+        // history_color 只有被真正引用时才分配（否则每帧白白多一次全屏拷贝）。
+        boolean usesHistory = false;
+        for (ShaderPackManifest.Pass pass : passes) {
+            if (pass.inputs().contains("history_color")) {
+                usesHistory = true;
+                break;
+            }
+        }
+        if (usesHistory) {
+            ensureHistory(ctx, width, height);
+        }
+
         // 首次执行时 ensureUniformBuffer 尚未被 writeUniforms 触发，
         // 这里必须先建好，否则 handle() 会 NPE。
         ensureUniformBuffer();
@@ -288,6 +327,16 @@ public final class Dx12ShaderPackRenderer {
                 passIndex = dispatchRaytracePass(ctx, pack, pass, depthView, width, height,
                     minecraft, passIndex);
                 lastOutput = pass.output();
+                continue;
+            }
+            if (pass.isCompute()) {
+                int next = dispatchComputePass(ctx, pack, pass, width, height, passIndex);
+                if (next < 0) {
+                    // compute 失败（建管线 / dispatch）：本帧链中止，避免后续 pass 读到垃圾。
+                    return;
+                }
+                // compute 不产出图像 ⇒ lastOutput 保持不变。
+                passIndex = next;
                 continue;
             }
             boolean sceneColor = pass.writesSceneColor();
@@ -322,7 +371,7 @@ public final class Dx12ShaderPackRenderer {
             // open 状态，下一帧原版 createRenderPass 会直接崩“already open”。
             try {
                 Dx12Native.dx12SetPipeline(ctx, pipeline, false);
-                pushDescriptors(ctx, inputs, uniformHandle, uniformOffset);
+                pushDescriptors(ctx, inputs, ssboList(pack, pass), uniformHandle, uniformOffset);
                 Dx12Native.dx12Draw(ctx, 3, 1, 0, 0);
             } finally {
                 Dx12Native.dx12EndRenderPass(ctx);
@@ -352,11 +401,39 @@ public final class Dx12ShaderPackRenderer {
             }
         }
 
+        // 把本帧最终画面留一份给下一帧的 history_color（运动模糊 / 时域重投影）。
+        if (usesHistory) {
+            captureHistory(ctx, pack, color, colorView, sceneFormat, width, height,
+                minecraft, uniformHandle, passIndex);
+        }
+
         // ITRP 风格离线渲染：把本帧混入累积缓冲并展示累积结果（截图也在这一步抓取）。
         if (OfflineRender.framePrepared()) {
             offlineAccumulate(ctx, pack, color, colorView, sceneFormat, width, height,
                 minecraft, uniformHandle, passIndex);
         }
+
+        // 帧尾统一滚动“上一帧”相机状态：本帧所有 writeUniforms 都已写完。
+        capturePreviousCamera(minecraft);
+    }
+
+    /** 记录本帧相机矩阵与位置，作为下一帧的 {@code PrevViewProj} / {@code PrevCameraPosition}。 */
+    private void capturePreviousCamera(Minecraft minecraft) {
+        GameRenderState renderState = minecraft.gameRenderer == null ? null
+            : minecraft.gameRenderer.gameRenderState();
+        LevelRenderState levelState = renderState == null ? null : renderState.levelRenderState;
+        CameraRenderState camera = levelState == null ? null : levelState.cameraRenderState;
+        if (camera == null) {
+            this.hasPrevFrame = false;
+            return;
+        }
+        this.prevViewProj.set(levelProjection(camera, renderState)).mul(camera.viewRotationMatrix);
+        if (camera.pos != null) {
+            this.prevCameraPos.set((float) camera.pos.x, (float) camera.pos.y, (float) camera.pos.z);
+        } else {
+            this.prevCameraPos.set(0.0f, 0.0f, 0.0f);
+        }
+        this.hasPrevFrame = true;
     }
 
     /**
@@ -419,7 +496,7 @@ public final class Dx12ShaderPackRenderer {
         if (cached != null) {
             return cached;
         }
-        long handle = createPipeline(FULLSCREEN_VS, ACCUM_PS, GpuFormat.RGBA16_FLOAT.ordinal(), 2);
+        long handle = createPipeline(FULLSCREEN_VS, ACCUM_PS, GpuFormat.RGBA16_FLOAT.ordinal(), 2, 0, 0);
         this.pipelineCache.put(key, handle);
         return handle;
     }
@@ -476,6 +553,195 @@ public final class Dx12ShaderPackRenderer {
     }
 
     // ------------------------------------------------------------------
+    // compute pass / SSBO
+    // ------------------------------------------------------------------
+
+    /**
+     * 录一次 compute dispatch（{@code cs_5_1}）。
+     *
+     * <p>根签名由 native 固定：{@code b0} = 4 个 32bit root constants（{@code PassParams}
+     * 的位模式，着色器用 {@code asfloat()} 取回），随后一张描述符表
+     * （{@code StructuredBuffer} 占 {@code t0..}，{@code RWStructuredBuffer} 占 {@code u0..}）。
+     * SSBO 按 manifest 声明顺序分配并按 (pack, pass, buffer) 缓存，跨帧保留内容。
+     *
+     * @return 下一个 pass 的 uniform 槽位索引；{@code -1} 表示失败（本帧链中止）
+     */
+    private int dispatchComputePass(long ctx, ShaderPack pack, ShaderPackManifest.Pass pass,
+                                    int width, int height, int passIndex) {
+        long pipeline = computePipelineFor(pack, pass);
+        if (pipeline == 0L) {
+            LOGGER.error("[shaderpack] compute pass '{}' 管线创建失败（{}）",
+                pass.name(), pass.fragment());
+            return -1;
+        }
+        List<ShaderPackManifest.BufferDecl> decls = pass.buffers();
+        int srvCount = pass.srvBufferCount();
+        int uavCount = pass.uavBufferCount();
+        if (srvCount + uavCount == 0) {
+            // 没有绑定的 compute 管线 native 会直接报 "pipeline has no bindings"。
+            LOGGER.warn("[shaderpack] compute pass '{}' 未声明 buffers，跳过", pass.name());
+            return passIndex;
+        }
+        long[] srvBuffers = new long[srvCount];
+        int[] srvCounts = new int[srvCount];
+        int[] srvStrides = new int[srvCount];
+        long[] uavBuffers = new long[uavCount];
+        int[] uavCounts = new int[uavCount];
+        int[] uavStrides = new int[uavCount];
+        int s = 0;
+        int u = 0;
+        for (ShaderPackManifest.BufferDecl decl : decls) {
+            Ssbo ssbo = ssbo(pack, pass, decl);
+            if (decl.unordered()) {
+                uavBuffers[u] = ssbo.buffer.handle();
+                uavCounts[u] = ssbo.count;
+                uavStrides[u] = ssbo.stride;
+                u++;
+            } else {
+                srvBuffers[s] = ssbo.buffer.handle();
+                srvCounts[s] = ssbo.count;
+                srvStrides[s] = ssbo.stride;
+                s++;
+            }
+        }
+        float[] params = pass.params();
+        int[] constants = new int[4];
+        for (int i = 0; i < 4; i++) {
+            constants[i] = Float.floatToRawIntBits(params[i]);
+        }
+        int[] groups = pass.groups();
+        int groupX = groups[0];
+        int groupY = groups[1];
+        int groupZ = groups[2];
+        if (groupX <= 0 && groupY <= 0 && groupZ <= 0) {
+            // 未声明 groups：按视口推导，便于逐像素写缓冲（64 = CS 常见线程组宽）。
+            groupX = (width + 63) / 64;
+            groupY = (height + 63) / 64;
+            groupZ = 1;
+        }
+        String error = Dx12Native.dx12DispatchCompute(ctx, pipeline, constants,
+            srvBuffers, new int[srvCount], srvCounts, srvStrides,
+            uavBuffers, new int[uavCount], uavCounts, uavStrides,
+            Math.max(1, groupX), Math.max(1, groupY), Math.max(1, groupZ));
+        if (error != null) {
+            LOGGER.error("[shaderpack] compute pass '{}' 失败: {}", pass.name(), error);
+            return -1;
+        }
+        return passIndex + 1;
+    }
+
+    /** compute 管线缓存（键 = pack + pass；SSBO 布局变了必须重新加载光影包）。 */
+    private long computePipelineFor(ShaderPack pack, ShaderPackManifest.Pass pass) {
+        String key = pack.id() + "|cs|" + pass.name();
+        Long cached = this.computeCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        long handle;
+        try {
+            String source = pack.readText(pass.fragment());
+            if (source == null || source.isBlank()) {
+                throw new IllegalArgumentException("找不到 compute 着色器: " + pass.fragment());
+            }
+            handle = Dx12Native.dx12CreateComputePipeline(
+                source.getBytes(StandardCharsets.UTF_8),
+                pass.srvBufferCount(), pass.uavBufferCount(), 4);
+        } catch (Throwable t) {
+            LOGGER.error("[shaderpack] compute 管线 '{}' 编译失败", pass.name(), t);
+            handle = 0L;
+        }
+        this.computeCache.put(key, handle);
+        return handle;
+    }
+
+    /** 把 pass 声明的 {@code buffers} 映射成缓存中的 SSBO（顺序 = 声明顺序）。 */
+    private List<Ssbo> ssboList(ShaderPack pack, ShaderPackManifest.Pass pass) {
+        List<ShaderPackManifest.BufferDecl> decls = pass.buffers();
+        if (decls.isEmpty()) {
+            return List.of();
+        }
+        List<Ssbo> result = new ArrayList<>(decls.size());
+        for (ShaderPackManifest.BufferDecl decl : decls) {
+            result.add(ssbo(pack, pass, decl));
+        }
+        return result;
+    }
+
+    /**
+     * 按 (pack, buffer 名) 分配 / 复用结构化缓冲。
+     *
+     * <p>键里<b>不带 pass 名</b>：compute pass 写入的 SSBO 必须能被后续 composite pass
+     * 以只读方式读到，同一个名字在整包内共享同一块资源。若先被声明成只读（UPLOAD 堆）、
+     * 之后又被 compute 以 UAV 引用，则重建为带 {@code kBufferUsageUav} 的 DEFAULT 堆缓冲。
+     */
+    private Ssbo ssbo(ShaderPack pack, ShaderPackManifest.Pass pass,
+                      ShaderPackManifest.BufferDecl decl) {
+        String key = pack.id() + "|buf|" + decl.name();
+        Ssbo cached = this.ssboCache.get(key);
+        if (cached != null && cached.stride == decl.stride() && cached.count == decl.count()
+            && (!decl.unordered() || cached.unordered)) {
+            return cached;
+        }
+        // UAV 必须 DEFAULT 堆（不可 map）；只读 SSBO 放 UPLOAD 堆，方便包初始化数据。
+        int usage = decl.unordered() ? BUFFER_USAGE_UAV : GpuBuffer.USAGE_MAP_WRITE;
+        Dx12GpuBuffer buffer = new Dx12GpuBuffer(usage, decl.byteSize());
+        Ssbo created = new Ssbo(buffer, decl.stride(), decl.count(), decl.unordered());
+        if (cached != null) {
+            cached.buffer.close();
+        }
+        this.ssboCache.put(key, created);
+        return created;
+    }
+
+    // ------------------------------------------------------------------
+    // history_color（运动模糊 / 时域重投影）
+    // ------------------------------------------------------------------
+
+    /** 分配上一帧画面副本（RGBA16F），首次分配时清成黑色避免读到未初始化内存。 */
+    private void ensureHistory(long ctx, int width, int height) {
+        Intermediate current = this.history;
+        if (current != null && current.width == width && current.height == height) {
+            return;
+        }
+        if (current != null) {
+            current.close();
+        }
+        Dx12GpuTexture texture = new Dx12GpuTexture(
+            GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT,
+            "shaderpack history", GpuFormat.RGBA16_FLOAT, width, height, 1, 1);
+        Dx12GpuTextureView view = new Dx12GpuTextureView(texture, 0, 1);
+        this.history = new Intermediate(texture, view, width, height);
+        Dx12Native.dx12ClearColorTexture(ctx, texture.handle(), 0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
+    private Dx12TextureRef historyRef() {
+        Intermediate current = this.history;
+        return new Dx12TextureRef(current.texture, current.view,
+            current.texture.getFormat().ordinal());
+    }
+
+    /** 把本帧最终主目标内容拷进 history，供下一帧的 {@code history_color} 采样。 */
+    private void captureHistory(long ctx, ShaderPack pack, Dx12GpuTexture color,
+                                Dx12GpuTextureView colorView, int sceneFormat, int width, int height,
+                                Minecraft minecraft, long uniformHandle, int passIndex) {
+        long pipeline = copyPipeline(GpuFormat.RGBA16_FLOAT.ordinal());
+        if (pipeline == 0L) {
+            return;
+        }
+        int offset = writeUniforms(pack, width, height, minecraft, null, passIndex);
+        Dx12Native.dx12BeginRenderPass(ctx, new long[]{this.history.texture.handle()},
+            new int[]{0}, new byte[]{0}, null, 0L, 0, (byte) 0, 0.0, 0, 0, width, height);
+        try {
+            Dx12Native.dx12SetPipeline(ctx, pipeline, false);
+            pushDescriptors(ctx, List.of(new Dx12TextureRef(color, colorView, sceneFormat)),
+                uniformHandle, offset);
+            Dx12Native.dx12Draw(ctx, 3, 1, 0, 0);
+        } finally {
+            Dx12Native.dx12EndRenderPass(ctx);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 输入 / 输出
     // ------------------------------------------------------------------
 
@@ -488,6 +754,9 @@ public final class Dx12ShaderPackRenderer {
         if ("scene_depth".equals(name)) {
             return new Dx12TextureRef(depth, depthView, depth.getFormat().ordinal());
         }
+        if ("history_color".equals(name)) {
+            return historyRef();
+        }
         if (name.startsWith("fx:")) {
             try {
                 int index = Integer.parseInt(name.substring(3).trim());
@@ -497,7 +766,7 @@ public final class Dx12ShaderPackRenderer {
             }
         }
         throw new IllegalArgumentException("未知的输入目标: " + name
-            + "（可用：scene_color / scene_depth / fx:N）");
+            + "（可用：scene_color / scene_depth / history_color / fx:N）");
     }
 
     private Dx12TextureRef intermediateRef(int index, int width, int height) {
@@ -577,11 +846,6 @@ public final class Dx12ShaderPackRenderer {
             cameraY = (float) camera.pos.y;
             cameraZ = (float) camera.pos.z;
         }
-        // TEMP DEBUG：确认 sky pass（passIndex=0）的 uniform 槽位与相机坐标（诊断完删除）。
-        if (passIndex == 0 && this.frameIndex % 60 == 0) {
-            LOGGER.info("[shaderpack] sky uniform slot={} camera=({}, {}, {})",
-                base, cameraX, cameraY, cameraZ);
-        }
 
         buffer.putFloat(base, width);
         buffer.putFloat(base + 4, height);
@@ -628,10 +892,11 @@ public final class Dx12ShaderPackRenderer {
 
         // InvViewProj / ViewRotation（JOML 与 HLSL 默认列主序一致，直接按存储序写入）
         float[] matrix = new float[16];
-        Matrix4f invViewProj = new Matrix4f();
+        Matrix4f viewProj = new Matrix4f();
         if (camera != null) {
-            invViewProj.set(levelProjection(camera, renderState)).mul(camera.viewRotationMatrix).invert();
+            viewProj.set(levelProjection(camera, renderState)).mul(camera.viewRotationMatrix);
         }
+        Matrix4f invViewProj = new Matrix4f(viewProj).invert();
         invViewProj.get(matrix);
         for (int i = 0; i < 16; i++) {
             buffer.putFloat(base + 144 + i * 4, matrix[i]);
@@ -649,6 +914,24 @@ public final class Dx12ShaderPackRenderer {
         for (int i = 0; i < MAX_OPTIONS; i++) {
             buffer.putFloat(base + 272 + i * 4, options[i]);
         }
+
+        // ViewProj（本帧）/ PrevViewProj / PrevCameraPosition：运动模糊重投影用。
+        viewProj.get(matrix);
+        for (int i = 0; i < 16; i++) {
+            buffer.putFloat(base + 368 + i * 4, matrix[i]);
+        }
+        Matrix4f prevViewProj = this.hasPrevFrame ? this.prevViewProj : viewProj;
+        prevViewProj.get(matrix);
+        for (int i = 0; i < 16; i++) {
+            buffer.putFloat(base + 432 + i * 4, matrix[i]);
+        }
+        float prevX = this.hasPrevFrame ? this.prevCameraPos.x : cameraX;
+        float prevY = this.hasPrevFrame ? this.prevCameraPos.y : cameraY;
+        float prevZ = this.hasPrevFrame ? this.prevCameraPos.z : cameraZ;
+        buffer.putFloat(base + 496, prevX);
+        buffer.putFloat(base + 500, prevY);
+        buffer.putFloat(base + 504, prevZ);
+        buffer.putFloat(base + 508, 1.0f);
         return base;
     }
 
@@ -747,7 +1030,10 @@ public final class Dx12ShaderPackRenderer {
 
     private long pipelineFor(ShaderPack pack, ShaderPackManifest.Pass pass, int format,
                              int inputCount) {
-        String key = pack.id() + "|" + pass.name() + "|" + format + "|" + inputCount;
+        int srvBuffers = pass.srvBufferCount();
+        int uavBuffers = pass.uavBufferCount();
+        String key = pack.id() + "|" + pass.name() + "|" + format + "|" + inputCount
+            + "|" + srvBuffers + "|" + uavBuffers;
         Long cached = this.pipelineCache.get(key);
         if (cached != null) {
             return cached;
@@ -772,7 +1058,8 @@ public final class Dx12ShaderPackRenderer {
             this.pipelineCache.put(key, 0L);
             return 0L;
         }
-        long handle = createPipeline(vertexSource, fragmentSource, format, inputCount);
+        long handle = createPipeline(vertexSource, fragmentSource, format, inputCount,
+            srvBuffers, uavBuffers);
         this.pipelineCache.put(key, handle);
         return handle;
     }
@@ -783,21 +1070,24 @@ public final class Dx12ShaderPackRenderer {
         if (cached != null) {
             return cached;
         }
-        long handle = createPipeline(FULLSCREEN_VS, COPY_PS, format, 1);
+        long handle = createPipeline(FULLSCREEN_VS, COPY_PS, format, 1, 0, 0);
         this.pipelineCache.put(key, handle);
         return handle;
     }
 
     /**
      * 打包 {@link Dx12Native#dx12CreateGraphicsPipeline} 的 desc：
-     * SRV t0..tN-1 在前（type=3：线性 + CLAMP 静态采样器），CBV b0 最后。
+     * 纹理 SRV {@code t0..tN-1}（type=3：线性 + CLAMP 静态采样器）→ 结构化 SRV
+     * （type=6，{@code t} 从 {@code tN} 继续编号）→ UAV（type=5，{@code u0..}）
+     * → CBV {@code b0}。描述符表槽位按本顺序稠密排列，与 native 的
+     * {@code D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND} 一致。
      */
     private static long createPipeline(String vertexSource, String fragmentSource, int format,
-                                       int inputCount) {
+                                       int inputCount, int srvBufferCount, int uavBufferCount) {
         byte[] vs = (UNIFORM_HEADER + vertexSource).getBytes(StandardCharsets.UTF_8);
         byte[] ps = (UNIFORM_HEADER + fragmentSource).getBytes(StandardCharsets.UTF_8);
 
-        int entryCount = inputCount + 1;
+        int entryCount = inputCount + srvBufferCount + uavBufferCount + 1;
         int size = 4 + vs.length + 4 + ps.length;
         size += 4 + 12;             // colorCount=1 + 一个颜色目标
         size += 1;                  // hasDepth=0
@@ -833,6 +1123,14 @@ public final class Dx12ShaderPackRenderer {
             desc.put((byte) 3);  // SRV + 线性/CLAMP 静态采样器
             desc.put((byte) i);  // t{i} / s{i}
         }
+        for (int i = 0; i < srvBufferCount; i++) {
+            desc.put((byte) 6);                          // 结构化 SRV（只读 SSBO）
+            desc.put((byte) (inputCount + i));           // t{inputCount + i}
+        }
+        for (int i = 0; i < uavBufferCount; i++) {
+            desc.put((byte) 5);  // UAV（可写 SSBO）
+            desc.put((byte) i);  // u{i}
+        }
         desc.put((byte) 0);      // CBV
         desc.put((byte) 0);      // b0
 
@@ -842,21 +1140,50 @@ public final class Dx12ShaderPackRenderer {
 
     private static void pushDescriptors(long ctx, List<Dx12TextureRef> inputs,
                                         long uniformHandle, int uniformOffset) {
-        int count = inputs.size();
-        int[] types = new int[count + 1];
-        long[] buffers = new long[count + 1];
-        long[] offsets = new long[count + 1];
-        long[] lengths = new long[count + 1];
-        int[] texelFormats = new int[count + 1];
-        long[] views = new long[count + 1];
-        for (int i = 0; i < count; i++) {
+        pushDescriptors(ctx, inputs, List.of(), uniformHandle, uniformOffset);
+    }
+
+    private static void pushDescriptors(long ctx, List<Dx12TextureRef> inputs,
+                                        List<Ssbo> ssbos, long uniformHandle,
+                                        int uniformOffset) {
+        int count = inputs.size() + ssbos.size() + 1;
+        int[] types = new int[count];
+        long[] buffers = new long[count];
+        long[] offsets = new long[count];
+        long[] lengths = new long[count];
+        int[] texelFormats = new int[count];
+        long[] views = new long[count];
+        int i = 0;
+        for (Dx12TextureRef input : inputs) {
             types[i] = 1;
-            views[i] = inputs.get(i).view().handle();
+            views[i] = input.view().handle();
+            i++;
         }
-        types[count] = 0;
-        buffers[count] = uniformHandle;
-        offsets[count] = uniformOffset;
-        lengths[count] = UNIFORM_DATA_BYTES;
+        // SSBO 顺序必须与 createPipeline 的 entry 顺序一致：先只读、后可写。
+        for (Ssbo ssbo : ssbos) {
+            if (ssbo.unordered()) {
+                continue;
+            }
+            types[i] = 6;
+            buffers[i] = ssbo.buffer.handle();
+            lengths[i] = ssbo.byteSize();
+            texelFormats[i] = ssbo.stride;
+            i++;
+        }
+        for (Ssbo ssbo : ssbos) {
+            if (!ssbo.unordered()) {
+                continue;
+            }
+            types[i] = 5;
+            buffers[i] = ssbo.buffer.handle();
+            lengths[i] = ssbo.byteSize();
+            texelFormats[i] = ssbo.stride;
+            i++;
+        }
+        types[i] = 0;
+        buffers[i] = uniformHandle;
+        offsets[i] = uniformOffset;
+        lengths[i] = UNIFORM_DATA_BYTES;
         if (!Dx12Native.dx12PushDescriptors(ctx, types, buffers, offsets, lengths,
             texelFormats, views)) {
             throw new IllegalStateException("dx12PushDescriptors 失败");
@@ -899,12 +1226,40 @@ public final class Dx12ShaderPackRenderer {
             }
             this.uniformBuffer = null;
         }
+
+        for (Long handle : this.computeCache.values()) {
+            if (handle != null && handle != 0L) {
+                Dx12Native.dx12DestroyComputePipeline(handle);
+            }
+        }
+        this.computeCache.clear();
+        for (Ssbo ssbo : this.ssboCache.values()) {
+            ssbo.close();
+        }
+        this.ssboCache.clear();
+        if (this.history != null) {
+            this.history.close();
+            this.history = null;
+        }
+        this.hasPrevFrame = false;
+
         this.lastNanos = 0L;
         this.loadedPackId = "";
     }
 
     private record Dx12TextureRef(Dx12GpuTexture texture, Dx12GpuTextureView view,
                                   int formatOrdinal) {
+    }
+
+    /** 结构化缓冲（SSBO）：{@code unordered} 为 true 时按 UAV 绑定，否则按只读 SRV。 */
+    private record Ssbo(Dx12GpuBuffer buffer, int stride, int count, boolean unordered) {
+        private long byteSize() {
+            return (long) this.stride * this.count;
+        }
+
+        private void close() {
+            this.buffer.close();
+        }
     }
 
     private record Intermediate(Dx12GpuTexture texture, Dx12GpuTextureView view,
