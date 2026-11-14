@@ -54,12 +54,16 @@ public final class ShaderPackManifest {
 
     private final int version;
     private final List<Pass> passes;
+    /** 包内自定义纹理（体积噪声卷 / 银河图等），由 pass 的 {@code texture:NAME} 输入引用。 */
+    private final List<TextureDecl> textures;
     /** 包是否用程序化天空（含体积云）替换原版天空；为 true 时屏蔽原版方块云。 */
     private final boolean replacesVanillaSky;
 
-    private ShaderPackManifest(int version, List<Pass> passes, boolean replacesVanillaSky) {
+    private ShaderPackManifest(int version, List<Pass> passes, List<TextureDecl> textures,
+                               boolean replacesVanillaSky) {
         this.version = version;
         this.passes = passes;
+        this.textures = textures;
         this.replacesVanillaSky = replacesVanillaSky;
     }
 
@@ -69,6 +73,20 @@ public final class ShaderPackManifest {
 
     public List<Pass> passes() {
         return this.passes;
+    }
+
+    public List<TextureDecl> textures() {
+        return this.textures;
+    }
+
+    /** 按名字查找自定义纹理；未声明返回 {@code null}。 */
+    public TextureDecl texture(String name) {
+        for (TextureDecl decl : this.textures) {
+            if (decl.name().equals(name)) {
+                return decl;
+            }
+        }
+        return null;
     }
 
     public boolean replacesVanillaSky() {
@@ -113,9 +131,51 @@ public final class ShaderPackManifest {
         for (JsonElement element : array) {
             passes.add(Pass.parse(element.getAsJsonObject()));
         }
+        List<TextureDecl> textures = new ArrayList<>();
+        if (root.has("textures")) {
+            for (JsonElement element : root.getAsJsonArray("textures")) {
+                textures.add(TextureDecl.parse(element.getAsJsonObject()));
+            }
+        }
         boolean replacesVanillaSky = root.has("replaceVanillaSky")
             && root.get("replaceVanillaSky").getAsBoolean();
-        return new ShaderPackManifest(version, List.copyOf(passes), replacesVanillaSky);
+        return new ShaderPackManifest(version, List.copyOf(passes), List.copyOf(textures),
+            replacesVanillaSky);
+    }
+
+    /**
+     * 包内自定义纹理声明。
+     *
+     * <p>{@code depth > 1} 时创建为 3D 体积纹理（HLSL {@code Texture3D} /
+     * {@code sampler3D}），否则为普通 2D 纹理。{@code format} 是
+     * {@code GpuFormat} 的 ordinal（6 = RGBA8_UNORM、41 = RG16_FLOAT、
+     * 43 = RGBA16_FLOAT）。数据按行优先紧凑排列，逐切片上传。
+     */
+    @Environment(EnvType.CLIENT)
+    public record TextureDecl(String name, String path, int format, int width, int height,
+                              int depth, boolean linear, boolean wrap) {
+        static TextureDecl parse(JsonObject json) {
+            String name = json.has("name") ? json.get("name").getAsString() : "texture";
+            String path = json.has("path") ? json.get("path").getAsString() : null;
+            if (path == null || path.isBlank()) {
+                throw new IllegalArgumentException("Texture '" + name + "' has no path");
+            }
+            int format = json.has("format") ? json.get("format").getAsInt() : 6;
+            int width = json.has("width") ? json.get("width").getAsInt() : 1;
+            int height = json.has("height") ? json.get("height").getAsInt() : 1;
+            int depth = json.has("depth") ? json.get("depth").getAsInt() : 1;
+            if (width <= 0 || height <= 0 || depth <= 0) {
+                throw new IllegalArgumentException("Texture '" + name
+                    + "' has invalid size: " + width + "x" + height + "x" + depth);
+            }
+            boolean linear = !json.has("filter") || "linear".equals(json.get("filter").getAsString());
+            boolean wrap = !json.has("wrap") || json.get("wrap").getAsBoolean();
+            return new TextureDecl(name, path, format, width, height, depth, linear, wrap);
+        }
+
+        public boolean volume() {
+            return this.depth > 1;
+        }
     }
 
     /** 单个后处理 pass（或 compute pass）。 */

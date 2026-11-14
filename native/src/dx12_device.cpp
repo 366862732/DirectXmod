@@ -1081,8 +1081,13 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
     DXGI_FORMAT dxgi = toDxgiFormat(format);
     if (dxgi == DXGI_FORMAT_UNKNOWN) { err = "unsupported format ordinal " + std::to_string(format); return nullptr; }
 
+    // usage 位 64 = 3D 体积纹理（光影包的 sampler3D 噪声卷）。原版 GpuTexture 的
+    // 位域里没有这个语义，这里复用空闲位：Dimension 切 TEXTURE3D，depthOrLayers
+    // 直接作为深度（不是数组层）。
+    const bool isVolume = (usage & 64) != 0;
     D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Dimension = isVolume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                              : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = std::max(1u, (UINT)width);
     desc.Height = std::max(1u, (UINT)height);
     desc.DepthOrArraySize = std::max(1u, (UINT)depthOrLayers);
@@ -1097,7 +1102,7 @@ Dx12Object* createTexture(int usage, int format, int width, int height,
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Texture;
     obj->usage = usage;
-    obj->size = (long long)desc.Width * desc.Height;
+    obj->size = (long long)desc.Width * desc.Height * (isVolume ? desc.DepthOrArraySize : 1);
     obj->dxgiFormat = dxgi;
     HRESULT hr = gCtx.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
@@ -1262,7 +1267,19 @@ Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel,
     }
     srv.Format = viewFormat;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    if (texture->usage & 16) {  // CUBEMAP_COMPATIBLE
+    const bool isVolume =
+        texture->resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (isVolume) {
+        // 3D 体积纹理（sampler3D / texture3D）：subresource 只有 mip 维度，
+        // SRV 也必须用 Texture3D 描述，否则 D3D12 调试层直接把 view 判为非法。
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv.Texture3D.MipLevels = (UINT)std::max(1, mipLevels);
+        srv.Texture3D.MostDetailedMip = (UINT)std::max(0, baseMipLevel);
+        dbgLog("createTextureView: 3D srv slot=%d fmt=%d mip=%d most=%d depth=%d",
+            slot, (int)texture->dxgiFormat, (int)srv.Texture3D.MipLevels,
+            (int)srv.Texture3D.MostDetailedMip,
+            (int)texture->resource->GetDesc().DepthOrArraySize);
+    } else if (texture->usage & 16) {  // CUBEMAP_COMPATIBLE
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         srv.TextureCube.MipLevels = (UINT)std::max(1, mipLevels);
         srv.TextureCube.MostDetailedMip = (UINT)std::max(0, baseMipLevel);
@@ -2350,7 +2367,14 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
     transitionBufferTo(ctx, srcBuf, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    UINT subresource = (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    // 3D 体积纹理的 subresource 只有 mip 一维，切片序号必须作为 dstZ 传入；
+    // 2D 数组纹理才把 layer 编进 subresource。
+    const bool isVolume =
+        dstTex->resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    UINT subresource = isVolume
+        ? (UINT)mip
+        : (UINT)(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    UINT dstZ = isVolume ? (UINT)std::max(0, layer) : 0u;
     if (dstTex->usage & 16) {  // CUBEMAP_COMPATIBLE：确认 6 个面是否逐一上传
         DBG_LOG_DEBUG("copyBufferToTexture: CUBE dst=%p mip=%d layer=%d subres=%u srcOff=%lld srcW=%d srcH=%d w=%d h=%d rowBytes=%u aligned=%d",
             (void*)dstTex, mip, layer, subresource, (long long)srcOffset,
@@ -2370,7 +2394,7 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
         dst.pResource = dstTex->resource.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = subresource;
-        ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, nullptr);
+        ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, dstZ, &src, nullptr);
     } else {
         // 逐行拷贝：每行 1 像素高，footprint 行距 = 源行距（可能未 256 对齐，
         // 部分驱动允许；这是紧凑数据上传的常见做法）。
@@ -2388,7 +2412,7 @@ bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcO
             dst.pResource = dstTex->resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.SubresourceIndex = subresource;
-            ctx->commandList->CopyTextureRegion(&dst, dstX, dstY + row, 0, &src, nullptr);
+            ctx->commandList->CopyTextureRegion(&dst, dstX, dstY + row, dstZ, &src, nullptr);
         }
     }
     // P11：目标纹理显式回切 COMMON（显式进入的 COPY_DEST 不会随命令列表完成
@@ -2847,14 +2871,15 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
         r.BaseShaderRegister = b.reg;
         r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRanges.push_back(r);
-        if (b.type == 1 || b.type == 3 || b.type == 4) {
+        if (b.type == 1 || b.type == 3 || b.type == 4 || b.type == 7) {
             D3D12_STATIC_SAMPLER_DESC s{};
             // type=1：原版渲染路径（point + WRAP），对齐 MC 默认采样器；
             // type=3：光影包后处理（linear + CLAMP），供全屏 pass 采样输入纹理；
             // type=4：体素 LOD（min/mag point + mip linear + CLAMP）。对齐 voxy 的
             //         GL_NEAREST_MIPMAP_LINEAR min + GL_NEAREST mag：放大时保留像素
             //         清晰度（linear 放大正是近处 LOD 发软的原因），mip 之间仍线性过渡。
-            s.Filter = b.type == 3
+            // type=7：光影包 3D 噪声卷（linear + WRAP），对应 .mcmeta 的 clamp=false。
+            s.Filter = (b.type == 3 || b.type == 7)
                 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR
                 : (b.type == 4 ? D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR
                                : D3D12_FILTER_MIN_MAG_MIP_POINT);
@@ -3776,6 +3801,7 @@ bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindin
                 ++cbvIdx;
                 break;
             }
+            case 7:   // type=7：SRV + 线性/WRAP 静态采样器（3D 噪声卷）
             case 3:   // type=3：SRV + 线性/CLAMP 静态采样器（光影包路径）
             case 1: {  // SRV：复制 texture view 的现有描述符
                 D3D12_CPU_DESCRIPTOR_HANDLE dst{ cpu.ptr + (SIZE_T)srvIdx * gCtx.drawInc };

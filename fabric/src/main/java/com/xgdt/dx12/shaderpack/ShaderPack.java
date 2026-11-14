@@ -175,6 +175,39 @@ public final class ShaderPack implements Closeable {
         return readTextStatic(this.path, this.zip, relativePath);
     }
 
+    /** 读取包内二进制资源（.dat 体积噪声 / .png 等原始字节）；找不到返回 {@code null}。 */
+    public byte[] readBytes(String relativePath) throws IOException {
+        if (this.zip == null) {
+            Path base = Files.isDirectory(this.path) ? this.path : this.path.getParent();
+            for (String candidate : candidates(relativePath)) {
+                Path file = base.resolve(candidate);
+                if (Files.isRegularFile(file)) {
+                    return Files.readAllBytes(file);
+                }
+            }
+            return null;
+        }
+        for (String candidate : candidates(relativePath)) {
+            ZipEntry entry = this.zip.getEntry(candidate);
+            if (entry != null) {
+                try (InputStream in = this.zip.getInputStream(entry)) {
+                    return in.readAllBytes();
+                }
+            }
+        }
+        String normalized = normalize(relativePath);
+        Enumeration<? extends ZipEntry> entries = this.zip.entries();
+        while (entries.hasMoreElements()) {
+            ZipEntry entry = entries.nextElement();
+            if (normalize(entry.getName()).equals(normalized)) {
+                try (InputStream in = this.zip.getInputStream(entry)) {
+                    return in.readAllBytes();
+                }
+            }
+        }
+        return null;
+    }
+
     private static String readTextStatic(Path path, ZipFile zip, String relativePath)
         throws IOException {
         if (zip == null) {
