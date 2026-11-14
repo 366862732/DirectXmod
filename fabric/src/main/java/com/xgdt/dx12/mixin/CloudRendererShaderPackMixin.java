@@ -3,6 +3,8 @@ package com.xgdt.dx12.mixin;
 import com.xgdt.dx12.shaderpack.ShaderPack;
 import com.xgdt.dx12.shaderpack.ShaderPackManager;
 import net.minecraft.client.renderer.CloudRenderer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -18,10 +20,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(CloudRenderer.class)
 public class CloudRendererShaderPackMixin {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx12-cloud-mixin");
+    private static int calls;
+
     @Inject(method = "render", at = @At("HEAD"), cancellable = true, remap = false)
     private void dx12_suppressVanillaClouds(CallbackInfo ci) {
         ShaderPack pack = ShaderPackManager.getInstance().activeIfEnabled();
-        if (pack != null && pack.manifest().replacesVanillaSky()) {
+        boolean replace = pack != null && pack.manifest().replacesVanillaSky();
+        if (calls++ % 120 == 0) {
+            LOGGER.info("[cloud-mixin] calls={} pack={} replaceVanillaSky={}",
+                calls, pack == null ? "null" : pack.id(), replace);
+        }
+        if (replace) {
             ci.cancel();
         }
     }

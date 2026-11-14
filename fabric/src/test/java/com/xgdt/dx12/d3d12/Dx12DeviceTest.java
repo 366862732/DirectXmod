@@ -235,6 +235,66 @@ public class Dx12DeviceTest {
         }
     }
 
+    /**
+     * 光影包（Foxy）全 pass 离线编译校验。
+     *
+     * <p>包里的 HLSL 只在进游戏实际渲染时才会被 {@code D3DCompile} 编译，语法错误
+     * 不会让构建失败。这里按 {@code pipeline.json} 逐 pass 走渲染器同一条建管线路径：
+     * composite 调 {@code createPipeline}（自带 {@code UNIFORM_HEADER} + 全屏 VS，
+     * 并带上真实的 srv/uav 数量），compute 调 {@code dx12CreateComputePipeline}。
+     */
+    @Test
+    @Order(12)
+    void testShaderPackPassesCompile() throws Exception {
+        java.nio.file.Path packRoot = java.nio.file.Path.of("..", "shaderpacks", "Foxy");
+        Assumptions.assumeTrue(java.nio.file.Files.isDirectory(packRoot),
+            "Foxy shaderpack not found: " + packRoot.toAbsolutePath());
+        var manifest = com.xgdt.dx12.shaderpack.ShaderPackManifest.parse(
+            java.nio.file.Files.readString(packRoot.resolve("shaders/pipeline.json")));
+        assertFalse(manifest.passes().isEmpty(), "pipeline.json must declare passes");
+
+        Class<?> renderer = Class.forName("com.xgdt.dx12.dx12.Dx12ShaderPackRenderer");
+        java.lang.reflect.Field vsField = renderer.getDeclaredField("FULLSCREEN_VS");
+        vsField.setAccessible(true);
+        String fullscreenVs = (String) vsField.get(null);
+        java.lang.reflect.Method createPipeline = renderer.getDeclaredMethod("createPipeline",
+            String.class, String.class, int.class, int.class, int.class, int.class);
+        createPipeline.setAccessible(true);
+
+        int sceneFormat = 6;   // RGBA8_UNORM，与交换链一致
+        int fxFormat = com.mojang.blaze3d.GpuFormat.RGBA16_FLOAT.ordinal();
+        for (var pass : manifest.passes()) {
+            if (pass.isRaytrace()) {
+                continue;   // 内置 DXR pass，没有 HLSL 源码
+            }
+            byte[] source = java.nio.file.Files.readAllBytes(packRoot.resolve(pass.fragment()));
+            if (pass.isCompute()) {
+                long handle = Dx12Native.dx12CreateComputePipeline(source,
+                    pass.srvBufferCount(), pass.uavBufferCount(), 4);
+                System.out.printf("  [pack] compute '%s' handle=%d srv=%d uav=%d%n",
+                    pass.name(), handle, pass.srvBufferCount(), pass.uavBufferCount());
+                assertNotEquals(0L, handle, "compute pass '" + pass.name() + "' failed to compile");
+                Dx12Native.dx12DestroyComputePipeline(handle);
+                continue;
+            }
+            int format = pass.writesSceneColor() ? sceneFormat : fxFormat;
+            String fragment = new String(source, java.nio.charset.StandardCharsets.UTF_8);
+            String failure = null;
+            long handle = 0L;
+            try {
+                handle = (Long) createPipeline.invoke(null, fullscreenVs, fragment, format,
+                    pass.inputs().size(), pass.srvBufferCount(), pass.uavBufferCount());
+            } catch (Throwable t) {
+                failure = (t.getCause() != null ? t.getCause() : t).toString();
+            }
+            System.out.printf("  [pack] composite '%s' handle=%d failure=%s%n",
+                pass.name(), handle, failure);
+            assertNull(failure, "composite pass '" + pass.name() + "' threw: " + failure);
+            assertNotEquals(0L, handle, "composite pass '" + pass.name() + "' failed to compile");
+            Dx12Native.dx12DestroyPipeline(handle);
+        }
+    }
+
     /** 写入可重复计算的 RGBA8 图案；上传/读回两端都用同一公式生成期望值。 */
     private static void fillPattern(ByteBuffer buf, int w, int h, int seed) {
         for (int y = 0; y < h; y++) {

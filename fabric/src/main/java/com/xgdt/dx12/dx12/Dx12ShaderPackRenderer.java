@@ -197,7 +197,7 @@ public final class Dx12ShaderPackRenderer {
     private long lastNanos;
     private float deltaSeconds;
     private boolean failureLogged;
-    private int rtStatsFrames;
+    private long rtStatsLastNanos;
 
     private Dx12ShaderPackRenderer() {
     }
@@ -315,8 +315,10 @@ public final class Dx12ShaderPackRenderer {
         // 不能在 render pass 内录制，所以在第一个 BeginRenderPass 之前调用）。
         if (hasRaytrace) {
             Dx12Native.dx12RtBuildScene(ctx);
-            if (++this.rtStatsFrames >= 120) {
-                this.rtStatsFrames = 0;
+            // 按时间节流：菜单/暂停时帧率可达数千，按帧计数会瞬间刷屏。
+            long nowNanos = System.nanoTime();
+            if (nowNanos - this.rtStatsLastNanos >= 3_000_000_000L) {
+                this.rtStatsLastNanos = nowNanos;
                 LOGGER.info("[shaderpack] RT stats: {} | {}", Dx12Native.dx12RtStats(),
                     Dx12RtScene.debugSummary());
             }
@@ -654,15 +656,21 @@ public final class Dx12ShaderPackRenderer {
         return handle;
     }
 
-    /** 把 pass 声明的 {@code buffers} 映射成缓存中的 SSBO（顺序 = 声明顺序）。 */
-    private List<Ssbo> ssboList(ShaderPack pack, ShaderPackManifest.Pass pass) {
+    /**
+     * 把 pass 声明的 {@code buffers} 映射成缓存中的 SSBO（顺序 = 声明顺序）。
+     *
+     * <p>绑定模式必须取自<b>本 pass 的声明</b>，不能用缓存对象的 {@code unordered}：
+     * 同一块缓冲在 compute pass 里是 UAV、在后续 composite pass 里只是只读 SRV，
+     * 沿用一个标志会让描述符表与根签名错位（native 侧直接崩）。
+     */
+    private List<SsboBinding> ssboList(ShaderPack pack, ShaderPackManifest.Pass pass) {
         List<ShaderPackManifest.BufferDecl> decls = pass.buffers();
         if (decls.isEmpty()) {
             return List.of();
         }
-        List<Ssbo> result = new ArrayList<>(decls.size());
+        List<SsboBinding> result = new ArrayList<>(decls.size());
         for (ShaderPackManifest.BufferDecl decl : decls) {
-            result.add(ssbo(pack, pass, decl));
+            result.add(new SsboBinding(ssbo(pack, pass, decl), decl.unordered()));
         }
         return result;
     }
@@ -1144,7 +1152,7 @@ public final class Dx12ShaderPackRenderer {
     }
 
     private static void pushDescriptors(long ctx, List<Dx12TextureRef> inputs,
-                                        List<Ssbo> ssbos, long uniformHandle,
+                                        List<SsboBinding> ssbos, long uniformHandle,
                                         int uniformOffset) {
         int count = inputs.size() + ssbos.size() + 1;
         int[] types = new int[count];
@@ -1160,20 +1168,22 @@ public final class Dx12ShaderPackRenderer {
             i++;
         }
         // SSBO 顺序必须与 createPipeline 的 entry 顺序一致：先只读、后可写。
-        for (Ssbo ssbo : ssbos) {
-            if (ssbo.unordered()) {
+        for (SsboBinding binding : ssbos) {
+            if (binding.writable()) {
                 continue;
             }
+            Ssbo ssbo = binding.ssbo();
             types[i] = 6;
             buffers[i] = ssbo.buffer.handle();
             lengths[i] = ssbo.byteSize();
             texelFormats[i] = ssbo.stride;
             i++;
         }
-        for (Ssbo ssbo : ssbos) {
-            if (!ssbo.unordered()) {
+        for (SsboBinding binding : ssbos) {
+            if (!binding.writable()) {
                 continue;
             }
+            Ssbo ssbo = binding.ssbo();
             types[i] = 5;
             buffers[i] = ssbo.buffer.handle();
             lengths[i] = ssbo.byteSize();
@@ -1260,6 +1270,10 @@ public final class Dx12ShaderPackRenderer {
         private void close() {
             this.buffer.close();
         }
+    }
+
+    /** 某 pass 对某个 SSBO 的绑定方式：资源来自共享缓存，读写模式取自本 pass 的声明。 */
+    private record SsboBinding(Ssbo ssbo, boolean writable) {
     }
 
     private record Intermediate(Dx12GpuTexture texture, Dx12GpuTextureView view,

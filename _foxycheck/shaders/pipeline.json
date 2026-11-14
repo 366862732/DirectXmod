@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "replaceVanillaSky": true,
+  "passes": [
+    {
+      "name": "blackhole_particles",
+      "type": "compute",
+      "fragment": "shaders/compute/blackhole_particles.hlsl",
+      "buffers": [
+        { "name": "blackhole", "stride": 32, "count": 512, "access": "uav" }
+      ],
+      "groups": [8, 1, 1],
+      "params": [1.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "name": "sky",
+      "fragment": "shaders/composite/sky.hlsl",
+      "inputs": ["scene_color", "scene_depth"],
+      "buffers": [
+        { "name": "blackhole", "stride": 32, "count": 512, "access": "srv" }
+      ],
+      "output": "fx:0",
+      "params": [1.0, 35.0, 28.0, 1.0]
+    },
+    {
+      "name": "shadow",
+      "type": "raytrace",
+      "output": "fx:1",
+      "params": [1.0, 512.0, 0.06, 0.0]
+    },
+    {
+      "name": "ssr",
+      "fragment": "shaders/composite/ssr.hlsl",
+      "inputs": ["fx:0", "scene_depth"],
+      "output": "fx:2",
+      "params": [0.6, 48.0, 0.35, 24.0]
+    },
+    {
+      "name": "motionblur",
+      "fragment": "shaders/composite/motionblur.hlsl",
+      "inputs": ["fx:2", "history_color", "scene_depth"],
+      "output": "fx:3",
+      "params": [0.85, 24.0, 0.15, 0.0]
+    },
+    {
+      "name": "final",
+      "fragment": "shaders/final/final.hlsl",
+      "inputs": ["fx:3", "fx:1", "scene_depth"],
+      "output": "scene_color",
+      "params": [0.85, 0.0, 0.0, 0.0]
+    }
+  ]
+}
