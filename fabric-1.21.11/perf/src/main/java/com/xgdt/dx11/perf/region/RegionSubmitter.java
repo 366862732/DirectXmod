@@ -37,6 +37,8 @@ import org.jspecify.annotations.Nullable;
  */
 public final class RegionSubmitter {
     private static final RegionIndexBuffer REGION_INDICES = new RegionIndexBuffer();
+    private static final Comparator<RegionVertexSlice> BY_ARENA_OFFSET =
+        Comparator.comparingLong(RegionVertexSlice::offset);
 
     private RegionSubmitter() {
     }
@@ -160,7 +162,7 @@ public final class RegionSubmitter {
             }
 
             List<RegionVertexSlice> slices = entry.getValue();
-            slices.sort(Comparator.comparingLong(RegionVertexSlice::offset));
+            slices.sort(BY_ARENA_OFFSET);
             List<RegionRuns.Span> spans = new ArrayList<>(slices.size());
             for (RegionVertexSlice slice : slices) {
                 spans.add(new RegionRuns.Span(

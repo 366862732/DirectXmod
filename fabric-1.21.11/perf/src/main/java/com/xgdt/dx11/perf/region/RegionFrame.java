@@ -4,8 +4,9 @@ import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.xgdt.dx11.perf.PerfConfig;
 import com.xgdt.dx11.perf.PerfState;
-import java.util.HashMap;
-import java.util.Map;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import java.util.Arrays;
 import net.minecraft.client.renderer.DynamicUniforms;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
@@ -24,14 +25,30 @@ import org.slf4j.LoggerFactory;
  * visible section's origin, visibility and atlas size; and this class writes
  * the region uniforms once the section list has been walked.  The submitter
  * then only looks slices up by region.</p>
+ *
+ * <p>The visible set is keyed by a packed primitive {@code long} and stamped
+ * with the preparation pass number, so the common path allocates nothing per
+ * visible section: no {@link RegionPos} key and no boxed visibility value.  A
+ * key is appended to the reusable frame list only on its first section of the
+ * pass; later sections just raise the stored maximum.</p>
  */
 public final class RegionFrame {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
     private static final long WARN_INTERVAL_NANOS = 10_000_000_000L;
-    private static final Map<RegionPos, Float> VISIBLE = new HashMap<>();
-    private static final Map<RegionPos, GpuBufferSlice> UNIFORMS = new HashMap<>();
 
-    private static @Nullable Matrix4f matrix;
+    /** 21 bits per region axis, which covers every coordinate inside the world border. */
+    private static final int AXIS_BITS = 21;
+    private static final long AXIS_MASK = (1L << AXIS_BITS) - 1L;
+
+    private static final Long2LongOpenHashMap VISIBLE = new Long2LongOpenHashMap();
+    private static final Long2ObjectOpenHashMap<GpuBufferSlice> UNIFORMS =
+        new Long2ObjectOpenHashMap<>();
+    private static final Matrix4f MATRIX = new Matrix4f();
+
+    private static long[] frameRegionKeys = new long[256];
+    private static int frameRegionCount;
+    private static int frame;
+
     private static @Nullable RegionSize regionSize;
     private static int atlasWidth;
     private static int atlasHeight;
@@ -51,7 +68,7 @@ public final class RegionFrame {
      */
     public static void begin(
         Matrix4fc modelView, double viewX, double viewY, double viewZ) {
-        reset();
+        beginFrame();
         cameraX = viewX;
         cameraY = viewY;
         cameraZ = viewZ;
@@ -67,9 +84,20 @@ public final class RegionFrame {
         if (!needed) {
             return;
         }
-        matrix = new Matrix4f(modelView);
+        MATRIX.set(modelView);
         regionSize = PerfState.config().regionSize();
         recording = true;
+    }
+
+    /** Resets the per-pass state without clearing the stamped visibility map. */
+    private static void beginFrame() {
+        frame = frame == Integer.MAX_VALUE ? 1 : frame + 1;
+        frameRegionCount = 0;
+        UNIFORMS.clear();
+        regionSize = null;
+        atlasWidth = 0;
+        atlasHeight = 0;
+        recording = false;
     }
 
     /** Camera X captured at the start of the frame's chunk preparation. */
@@ -102,15 +130,22 @@ public final class RegionFrame {
         if (size == null) {
             return;
         }
-        RegionPos pos = RegionPos.fromSection(
-            Math.floorDiv(blockX, 16),
-            Math.floorDiv(blockY, 16),
-            Math.floorDiv(blockZ, 16),
-            size);
-        Float current = VISIBLE.get(pos);
-        if (current == null || visibility > current) {
-            VISIBLE.put(pos, visibility);
+        int regionX = Math.floorDiv(blockX >> 4, size.sectionsX());
+        int regionY = Math.floorDiv(blockY >> 4, size.sectionsY());
+        int regionZ = Math.floorDiv(blockZ >> 4, size.sectionsZ());
+        long key = pack(regionX, regionY, regionZ);
+        long entry = VISIBLE.get(key);
+        if ((int) (entry >>> 32) == frame) {
+            if (visibility <= Float.intBitsToFloat((int) entry)) {
+                return;
+            }
+        } else {
+            if (frameRegionCount == frameRegionKeys.length) {
+                frameRegionKeys = Arrays.copyOf(frameRegionKeys, frameRegionCount << 1);
+            }
+            frameRegionKeys[frameRegionCount++] = key;
         }
+        VISIBLE.put(key, ((long) frame << 32) | (Float.floatToRawIntBits(visibility) & 0xFFFFFFFFL));
     }
 
     /**
@@ -124,45 +159,41 @@ public final class RegionFrame {
             return;
         }
         recording = false;
-        if (RegionVertexSlice.liveRebasedSlices() == 0
-            || matrix == null
-            || regionSize == null
+        int count = frameRegionCount;
+        RegionSize size = regionSize;
+        if (count == 0
+            || RegionVertexSlice.liveRebasedSlices() == 0
+            || size == null
             || atlasWidth <= 0
-            || atlasHeight <= 0
-            || VISIBLE.isEmpty()) {
+            || atlasHeight <= 0) {
             return;
         }
 
-        RegionSize size = regionSize;
-        RegionPos[] positions = new RegionPos[VISIBLE.size()];
         DynamicUniforms.ChunkSectionInfo[] infos =
-            new DynamicUniforms.ChunkSectionInfo[positions.length];
-        int index = 0;
-        for (Map.Entry<RegionPos, Float> entry : VISIBLE.entrySet()) {
-            RegionPos pos = entry.getKey();
-            positions[index] = pos;
-            infos[index] = new DynamicUniforms.ChunkSectionInfo(
-                matrix,
-                pos.originBlockX(size),
-                pos.originBlockY(size),
-                pos.originBlockZ(size),
-                entry.getValue(),
+            new DynamicUniforms.ChunkSectionInfo[count];
+        for (int i = 0; i < count; i++) {
+            long key = frameRegionKeys[i];
+            float visibility = Float.intBitsToFloat((int) VISIBLE.get(key));
+            infos[i] = new DynamicUniforms.ChunkSectionInfo(
+                MATRIX,
+                unpackX(key) * size.blocksX(),
+                unpackY(key) * size.blocksY(),
+                unpackZ(key) * size.blocksZ(),
+                visibility,
                 atlasWidth,
                 atlasHeight);
-            index++;
         }
 
         GpuBufferSlice[] slices = RenderSystem.getDynamicUniforms().writeChunkSections(infos);
-        int count = Math.min(positions.length, slices.length);
-        for (int i = 0; i < count; i++) {
-            UNIFORMS.put(positions[i], slices[i]);
+        int written = Math.min(count, slices.length);
+        for (int i = 0; i < written; i++) {
+            UNIFORMS.put(frameRegionKeys[i], slices[i]);
         }
-        VISIBLE.clear();
     }
 
     /** The region uniform written for this frame, or {@code null}. */
     public static @Nullable GpuBufferSlice uniform(RegionPos pos) {
-        return UNIFORMS.get(pos);
+        return UNIFORMS.get(pack(pos.x(), pos.y(), pos.z()));
     }
 
     /** Throttled diagnostic for a rebased slice whose region uniform is gone. */
@@ -179,9 +210,10 @@ public final class RegionFrame {
 
     /** Drops all per-frame state, for example on a level change. */
     public static void reset() {
+        frame = 0;
+        frameRegionCount = 0;
         VISIBLE.clear();
         UNIFORMS.clear();
-        matrix = null;
         regionSize = null;
         atlasWidth = 0;
         atlasHeight = 0;
@@ -189,5 +221,24 @@ public final class RegionFrame {
         cameraY = 0.0;
         cameraZ = 0.0;
         recording = false;
+    }
+
+    /** Packs region coordinates into one primitive key (x, then y, then z). */
+    static long pack(int x, int y, int z) {
+        return ((long) (x & AXIS_MASK) << (AXIS_BITS * 2))
+            | ((long) (y & AXIS_MASK) << AXIS_BITS)
+            | (z & AXIS_MASK);
+    }
+
+    static int unpackX(long key) {
+        return (int) (key << 1 >> 43);
+    }
+
+    static int unpackY(long key) {
+        return (int) (key << 22 >> 43);
+    }
+
+    static int unpackZ(long key) {
+        return (int) (key << 43 >> 43);
     }
 }
