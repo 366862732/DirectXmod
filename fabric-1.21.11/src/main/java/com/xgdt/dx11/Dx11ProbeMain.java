@@ -1,5 +1,6 @@
 package com.xgdt.dx11;
 
+import com.xgdt.dx11.config.Dx11Config;
 import com.xgdt.dx11.dx11.Dx11Native;
 
 /**
@@ -25,6 +26,7 @@ public final class Dx11ProbeMain {
 
         final String result;
         try {
+            Dx11Config.applyFeatureLevelCap();
             result = Dx11Native.dx11Probe();
         } catch (Throwable t) {
             System.err.println("[dx11] Probe threw an exception.");

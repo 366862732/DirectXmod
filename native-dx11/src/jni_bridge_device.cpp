@@ -112,6 +112,51 @@ Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateDevice(
 }
 
 JNIEXPORT void JNICALL
+Java_com_xgdt_dx11_dx11_Dx11Native_nativeSetMaxFeatureLevel(
+    JNIEnv* env, jclass, jint major, jint minor) {
+    D3D_FEATURE_LEVEL level = static_cast<D3D_FEATURE_LEVEL>(0);
+    if (major == 9 && minor == 1) {
+        level = D3D_FEATURE_LEVEL_9_1;
+    } else if (major == 9 && minor == 2) {
+        level = D3D_FEATURE_LEVEL_9_2;
+    } else if (major == 9 && minor == 3) {
+        level = D3D_FEATURE_LEVEL_9_3;
+    } else if (major == 10 && minor == 0) {
+        level = D3D_FEATURE_LEVEL_10_0;
+    } else if (major == 10 && minor == 1) {
+        level = D3D_FEATURE_LEVEL_10_1;
+    } else if (major == 11 && minor == 0) {
+        level = D3D_FEATURE_LEVEL_11_0;
+    } else if (major == 11 && minor == 1) {
+        level = D3D_FEATURE_LEVEL_11_1;
+    }
+#ifdef D3D_FEATURE_LEVEL_12_0
+    else if (major == 12 && minor == 0) {
+        level = D3D_FEATURE_LEVEL_12_0;
+    }
+#endif
+#ifdef D3D_FEATURE_LEVEL_12_1
+    else if (major == 12 && minor == 1) {
+        level = D3D_FEATURE_LEVEL_12_1;
+    }
+#endif
+#ifdef D3D_FEATURE_LEVEL_12_2
+    else if (major == 12 && minor == 2) {
+        level = D3D_FEATURE_LEVEL_12_2;
+    }
+#endif
+
+    if (level == 0) {
+        throwIllegalState(
+            env,
+            "nativeSetMaxFeatureLevel: unsupported level " +
+                std::to_string(major) + "_" + std::to_string(minor));
+        return;
+    }
+    setFeatureLevelCap(level);
+}
+
+JNIEXPORT void JNICALL
 Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyDevice(
     JNIEnv*, jclass, jlong handle) {
     destroyDevice(fromHandle<Device>(handle));

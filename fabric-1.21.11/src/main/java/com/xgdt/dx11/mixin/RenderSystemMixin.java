@@ -8,6 +8,9 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.systems.SamplerCache;
 import com.xgdt.dx11.config.Dx11Config;
 import com.xgdt.dx11.dx11.Dx11State;
+import com.xgdt.dx11.perf.immediate.BufferPool;
+import com.xgdt.dx11.perf.immediate.sign.SignTextCache;
+import com.xgdt.dx11.perf.overlay.PerfOverlayStats;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.renderer.DynamicUniforms;
@@ -83,4 +86,19 @@ public class RenderSystemMixin {
             original.call(windowHandle);
         }
     }
+
+    /**
+     * Frame boundary for the ImmediatelyFast-style buffer pool.  A feature
+     * renderer that throws between borrow and release would otherwise leave a
+     * native segment pinned for the session.
+     */
+    @Inject(method = "flipFrame", at = @At("HEAD"))
+    private static void dx11$endImmediateFrame(CallbackInfo ci) {
+        PerfOverlayStats.onFrameBoundary();
+        if (Dx11Config.shouldUseDx11()) {
+            BufferPool.endFrame();
+            SignTextCache.endFrame();
+        }
+    }
+
 }

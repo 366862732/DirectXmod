@@ -20,6 +20,7 @@ import com.mojang.blaze3d.textures.TextureFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.xgdt.dx11.config.Dx11Config;
+import com.xgdt.dx11.perf.region.CompactTerrainFormat;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,6 +47,8 @@ import org.slf4j.LoggerFactory;
  */
 final class Dx11Device implements GpuDevice {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
+    private static final Identifier TERRAIN_VERTEX_SHADER =
+        Identifier.parse("minecraft:core/terrain");
 
     private final long handle;
     private final boolean debugLogging = Dx11Config.debugLogging();
@@ -80,6 +83,7 @@ final class Dx11Device implements GpuDevice {
     }
 
     static Dx11Device create(long windowHandle, @Nullable ShaderSource shaderSource) {
+        Dx11Config.applyFeatureLevelCap();
         long handle = Dx11Native.nativeCreateDevice(nativeWindowHandle(windowHandle));
         if (handle == 0L) {
             throw new IllegalStateException("nativeCreateDevice returned 0");
@@ -350,6 +354,8 @@ final class Dx11Device implements GpuDevice {
             module.close();
         }
         this.shaderCache.clear();
+        CompactTerrainFormat.resetShaderInputs();
+        com.xgdt.dx11.perf.region.PerfTerrainPipelines.reset();
     }
 
     @Override
@@ -405,6 +411,25 @@ final class Dx11Device implements GpuDevice {
             ShaderDefines defines = pipeline.getShaderDefines();
             Dx11IntermediaryShaderModule vertex = this.getOrCompileShader(
                 pipeline.getVertexShader(), ShaderType.VERTEX, defines, vertexSource);
+            Set<String> usedInputs = vertex.usedInputNames();
+            if (pipeline.getVertexFormat() == CompactTerrainFormat.FORMAT) {
+                // Validate the actual linked interface.  A shader pack that
+                // reads Normal or any other dropped input cannot be drawn
+                // with 24-byte vertices, even if an earlier variant looked
+                // compatible.
+                if (!CompactTerrainFormat.acceptsShaderInputs(usedInputs)) {
+                    LOGGER.info(
+                        "[dx11-perf] Compact pipeline {} rejected; terrain shader reads {}",
+                        pipeline.getLocation(),
+                        usedInputs);
+                    return Dx11RenderPipeline.invalid(this, pipeline);
+                }
+                CompactTerrainFormat.noteTerrainShaderInputs(usedInputs);
+            } else if (pipeline.getVertexShader().equals(TERRAIN_VERTEX_SHADER)) {
+                // Record the vanilla terrain interface so uploads can avoid
+                // even trying compact mode for a known-incompatible pack.
+                CompactTerrainFormat.noteTerrainShaderInputs(usedInputs);
+            }
             Dx11IntermediaryShaderModule fragment = this.getOrCompileShader(
                 pipeline.getFragmentShader(), ShaderType.FRAGMENT, defines, fragmentSource);
             Dx11CompiledShader compiled = this.shaderCompiler.compile(pipeline, vertex, fragment);
@@ -538,6 +563,9 @@ final class Dx11Device implements GpuDevice {
         // Values are DXGI_FORMAT enum constants.  The component type must match
         // the GLSL shader input: Color is normalized ubyte, Normal is signed
         // byte, UV1/UV2 are ivec2 (signed shorts) and so on.
+        if (element == CompactTerrainFormat.packedUv0()) {
+            return 35;  // DXGI_FORMAT_R16G16_UNORM: packed terrain UV0
+        }
         return switch (element.type()) {
             case FLOAT -> switch (element.count()) {
                 case 1 -> 41;   // DXGI_FORMAT_R32_FLOAT

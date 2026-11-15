@@ -41,6 +41,7 @@ final class Dx11Buffer extends GpuBuffer implements Dx11Resource {
         if (this.handle == 0L) {
             throw new IllegalStateException("Could not create D3D11 buffer");
         }
+        com.xgdt.dx11.perf.PerfCounters.onUpload(data.remaining());
         device.register(this);
     }
 
