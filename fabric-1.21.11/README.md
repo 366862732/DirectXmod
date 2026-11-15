@@ -32,6 +32,9 @@ The performance jar adds:
 - translucent region sorting and optional fog/entity culling
 - ImmediatelyFast-style immediate-mode batching, text lookup, GUI layer
   lookup, map atlas caching and sign-text buffering
+- Lithium-style client tick micro-optimizations: a resolved entity-type lookup
+  cache, a client-side ambient sound short-circuit, and a biome-particle lookup
+  skip
 - `/dx11perf` counters and a FPS/CPU/GPU debug overlay
 
 The OpenGL renderer remains the fallback. The layer is only active after a
@@ -85,6 +88,9 @@ enabled:
   "fogOcclusion": true,
   "deferredOffscreenUpdates": true,
   "entityCulling": true,
+  "fastEntityLookup": true,
+  "skipClientAmbientSounds": true,
+  "fastAmbientParticles": true,
   "signTextBuffering": true
 }
 ```
@@ -113,6 +119,11 @@ The two umbrellas are independent:
 - `regionEnabled` covers region arenas/uploads, coalesced region draws, compact
   vertices, translucent region sorting, upload budget, fog occlusion, deferred
   offscreen uploads and entity culling.
+
+`fastEntityLookup`, `skipClientAmbientSounds` and `fastAmbientParticles` are
+independent client tick optimizations. `performancemode` switches them with the
+two umbrellas, but they can also be toggled on their own and never trigger a
+chunk rebuild.
 
 ## Commands
 

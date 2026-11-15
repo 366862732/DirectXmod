@@ -82,6 +82,16 @@ public final class PerfConfig {
     public boolean entityCulling = true;
     public boolean visibleTextureAnimation = true;
 
+    // Lithium-style client tick micro-optimizations.  Independent of the
+    // region renderer and the ImmediatelyFast layer, but still part of the
+    // perf layer's optimization set.
+    /** Fastutil reference map plus a resolved-type fast path for entity queries. */
+    public boolean fastEntityLookup = true;
+    /** Skip ambient sound attempts for client-side mobs (Breeze excepted). */
+    public boolean skipClientAmbientSounds = true;
+    /** Skip the biome-particle attribute lookup when no particle can spawn. */
+    public boolean fastAmbientParticles = true;
+
     // ImmediatelyFast-style non-terrain optimizations.  Each one is
     // independent so a regression can be isolated without rebuilding.
     /**
