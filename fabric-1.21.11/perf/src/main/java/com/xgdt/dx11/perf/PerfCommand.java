@@ -102,7 +102,9 @@ public final class PerfCommand {
                     || flag.equals("skipclientambientsounds")
                     || flag.equals("ambientsounds")
                     || flag.equals("fastambientparticles")
-                    || flag.equals("particles"));
+                    || flag.equals("particles")
+                    || flag.equals("fastentityqueries")
+                    || flag.equals("entityqueries"));
             }
             default -> false;
         };
@@ -131,6 +133,7 @@ public final class PerfCommand {
             + " fastEntityLookup=" + config.fastEntityLookup
             + " skipClientAmbientSounds=" + config.skipClientAmbientSounds
             + " fastAmbientParticles=" + config.fastAmbientParticles
+            + " fastEntityQueries=" + config.fastEntityQueries
             + "\n" + snapshot.format()
             + "\n" + RegionManager.describe()
             + "\n" + com.xgdt.dx11.terrain.CompactTerrainFormat.describe()
@@ -223,6 +226,7 @@ public final class PerfCommand {
         config.fastEntityLookup = enabled;
         config.skipClientAmbientSounds = enabled;
         config.fastAmbientParticles = enabled;
+        config.fastEntityQueries = enabled;
         config.visibleTextureAnimation = enabled;
         config.immediateEnabled = enabled;
         config.immediateBatching = enabled;
@@ -253,6 +257,7 @@ public final class PerfCommand {
             && config.fastEntityLookup
             && config.skipClientAmbientSounds
             && config.fastAmbientParticles
+            && config.fastEntityQueries
             && config.visibleTextureAnimation
             && config.immediateEnabled
             && config.immediateBatching
@@ -351,6 +356,10 @@ public final class PerfCommand {
                 config.fastAmbientParticles = !config.fastAmbientParticles;
                 yield config.fastAmbientParticles;
             }
+            case "fastentityqueries", "entityqueries" -> {
+                config.fastEntityQueries = !config.fastEntityQueries;
+                yield config.fastEntityQueries;
+            }
             case "visibletextureanimation", "textures" -> {
                 config.visibleTextureAnimation = !config.visibleTextureAnimation;
                 yield config.visibleTextureAnimation;
@@ -437,6 +446,7 @@ public final class PerfCommand {
                                             fogOcclusion, deferredOffscreenUpdates,
                                             entityCulling, fastEntityLookup,
                                             skipClientAmbientSounds, fastAmbientParticles,
+                                            fastEntityQueries,
                                             visibleTextureAnimation,
                                             immediateBatching, fastTextLookup,
                                             skipTextSorting, fontAtlasResizing,

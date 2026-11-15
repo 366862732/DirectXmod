@@ -12,6 +12,7 @@
     "DebugScreenOverlayMixin",
     "EntityRenderDispatcherMixin",
     "EntityRendererAccessor",
+    "EntitySectionStorageMixin",
     "FogRendererMixin",
     "GameRendererAccessor",
     "GameRendererTimingMixin",

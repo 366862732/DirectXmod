@@ -12,6 +12,7 @@ public final class MicroStats {
     private static long ambientParticleSkips;
     private static long entityLookupHits;
     private static long ambientSoundSkips;
+    private static long entityQueryFastPaths;
 
     private MicroStats() {
     }
@@ -28,10 +29,15 @@ public final class MicroStats {
         ambientSoundSkips++;
     }
 
+    public static void entityQueryFastPath() {
+        entityQueryFastPaths++;
+    }
+
     public static void reset() {
         ambientParticleSkips = 0;
         entityLookupHits = 0;
         ambientSoundSkips = 0;
+        entityQueryFastPaths = 0;
     }
 
     public static String describe() {
@@ -41,6 +47,8 @@ public final class MicroStats {
             + " entityLookup=" + config.fastEntityLookup
             + " entityLookupHits=" + entityLookupHits
             + " ambientSounds=" + config.skipClientAmbientSounds
-            + " ambientSoundSkips=" + ambientSoundSkips;
+            + " ambientSoundSkips=" + ambientSoundSkips
+            + " entityQueries=" + config.fastEntityQueries
+            + " entityQueryFastPaths=" + entityQueryFastPaths;
     }
 }

@@ -91,6 +91,8 @@ public final class PerfConfig {
     public boolean skipClientAmbientSounds = true;
     /** Skip the biome-particle attribute lookup when no particle can spawn. */
     public boolean fastAmbientParticles = true;
+    /** Visit only the entity sections inside small entity-query boxes. */
+    public boolean fastEntityQueries = true;
 
     // ImmediatelyFast-style non-terrain optimizations.  Each one is
     // independent so a regression can be isolated without rebuilding.
