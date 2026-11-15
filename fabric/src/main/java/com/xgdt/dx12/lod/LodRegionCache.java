@@ -420,6 +420,13 @@ public final class LodRegionCache {
                 LOGGER.info("[lod] 方块 sprite UV 映射已刷新：{} 项（每面独立，BlockStateModelSet）",
                     this.spriteUvMap.size());
                 this.activeLogged = true;
+                // 一次性打印几个代表方块的 UP 面 rect，确认不是 0 也不是 0..1 整图
+                for (String name : new String[]{"minecraft:oak_leaves", "minecraft:grass_block",
+                    "minecraft:stone", "minecraft:dirt", "minecraft:water"}) {
+                    float[][] rects = this.spriteUvMap.get(name);
+                    LOGGER.info("[lod] sprite rect {} UP={}", name,
+                        rects == null || rects[1] == null ? "null" : Arrays.toString(rects[1]));
+                }
             }
             this.spriteUvReady = !this.spriteUvMap.isEmpty();
         } catch (Throwable t) {

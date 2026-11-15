@@ -473,7 +473,9 @@ public final class Dx12LodRenderer {
         + "    // 有贴图时：贴图 × 该面的生物群系染色（顶点色 rgb 是染色值，白 = 不染色）。\n"
         + "    // 草方块顶面 / 草 / 树叶的 PNG 本身是灰白色，颜色全靠这一步乘回来，\n"
         + "    // 照搬 voxy 的 tintingFunction；没有 sprite 时才退回顶点色兜底。\n"
-        + "    float3 albedo = hasTex ? tex.rgb * input.color.rgb : input.color.rgb;\n"
+        + "    // 诊断：没有 sprite 的格子涂成品红，便于一眼区分「rect 没传到 GPU」和\n"
+        + "    // 「rect 有值但采样结果发白」。修复后改回顶点色兜底。\n"
+        + "    float3 albedo = hasTex ? tex.rgb * input.color.rgb : float3(1.0, 0.0, 1.0);\n"
         + "    float3 rgb = albedo;\n"
         + "    // 面法线：同高度场着色器（屏幕空间导数重建）\n"
         + "    float3 face = cross(ddx(rel), ddy(rel));\n"
@@ -983,6 +985,28 @@ public final class Dx12LodRenderer {
     /** 方块纹理图集 SRV handle（{@link Dx12GpuTextureView#handle()}）。{@code 0L} = 尚未初始化。 */
     private long voxelAtlasViewHandle;
 
+    // ---- 临时诊断：图集内容读回（定位「LOD 只有顶点色、没有贴图细节」）----
+    /** 0 = 未录制，1 = 已录制待读回，2 = 已完成。 */
+    private int atlasDiagState;
+    private int atlasDiagFrameCounter;
+    private int atlasDiagRecordedFrame;
+    /** 提前返回的日志只打前几次，避免刷屏。 */
+    private int atlasDiagAttempts;
+    private boolean voxelAtlasViewLogged;
+    private boolean voxelDrawLogged;
+    private Dx12GpuBuffer atlasDiagBuffer;
+    private int atlasDiagWidth;
+    private int atlasDiagHeight;
+    private int atlasDiagMips;
+    /** 体素顶点样本只打一次。 */
+    private boolean voxelVertexDumped;
+
+    /** 诊断用的方块（注册名）：树叶/草方块/石头/泥土/水，覆盖染色与不染色两类。 */
+    private static final String[] ATLAS_DIAG_BLOCKS = {
+        "minecraft:oak_leaves", "minecraft:grass_block", "minecraft:stone",
+        "minecraft:dirt", "minecraft:water"
+    };
+
     /** 角点输入（int height + int rgb）：UPLOAD 堆，作为 compute 的 t0 只读。 */
     private Dx12GpuBuffer cornerBuffer;
     private GpuBufferSlice.MappedView cornerView;
@@ -1009,6 +1033,12 @@ public final class Dx12LodRenderer {
     public void renderFrame() {
         if (!Dx12Config.getInstance().isLodActive() || !Dx12Device.isInitialized()) {
             return;
+        }
+        // 图集读回诊断：录制发生在 execute() 末尾，等 5 帧（三帧在飞 + 余量）后读回。
+        this.atlasDiagFrameCounter++;
+        if (this.atlasDiagState == 1
+            && this.atlasDiagFrameCounter - this.atlasDiagRecordedFrame >= 5) {
+            readAtlasDiag(Minecraft.getInstance());
         }
         Minecraft minecraft = Minecraft.getInstance();
         ClientLevel level = minecraft.level;
@@ -1254,6 +1284,12 @@ public final class Dx12LodRenderer {
                     // dx12PushDescriptors 都会写一条新的 descriptor table，两次调用
                     // 互相覆盖导致 SRV 槽位错乱。pushVoxelTexture 本身已带 CBV。
                     long atlasHandle = ensureVoxelAtlasView(minecraft);
+                    if (!this.voxelDrawLogged) {
+                        this.voxelDrawLogged = true;
+                        LOGGER.info("[lod-diag] 体素绘制：面={} pipeline={} atlasView={} slot={}",
+                            this.voxelFaceCount, voxelPipeline, atlasHandle,
+                            this.voxelVertexSlot);
+                    }
                     if (atlasHandle != 0L) {
                         pushVoxelTexture(ctx, voxelUniform, atlasHandle);
                     } else {
@@ -1277,6 +1313,10 @@ public final class Dx12LodRenderer {
             }
         } finally {
             Dx12Native.dx12EndRenderPass(ctx);
+        }
+        // 图集内容读回：渲染 pass 结束后、命令列表仍打开时录制一次复制。
+        if (this.atlasDiagState == 0) {
+            recordAtlasDiag(ctx, minecraft);
         }
     }
 
@@ -1483,6 +1523,10 @@ public final class Dx12LodRenderer {
         }
         this.voxelVertexSlot = writeSlot;
         this.voxelFaceCount = totalFaces;
+        if (!this.voxelVertexDumped && totalFaces > 0) {
+            this.voxelVertexDumped = true;
+            dumpVoxelVertices(vertexData, totalFaces);
+        }
         this.voxelDrawnCenterX = camChunkX * 16;
         this.voxelDrawnCenterZ = camChunkZ * 16;
         // 只把「连续完整环」算进覆盖矩形：高度场会精确跳过这块矩形，多算一格就会
@@ -2939,6 +2983,246 @@ public final class Dx12LodRenderer {
         return Dx12Native.dx12CreateGraphicsPipeline(desc);
     }
 
+    // ------------------------------------------------------------------
+    // 临时诊断：图集 mip 内容读回
+    // ------------------------------------------------------------------
+
+    /**
+     * 在渲染命令列表里录制一次「图集 mip0/1/2 → 读回缓冲」的复制。
+     *
+     * <p>必须在 {@code endRenderPass} 之后、命令列表仍打开时调用：纹理此时是
+     * PIXEL_SHADER_RESOURCE，{@code copyTextureToBuffer} 会自行过渡到 COPY_SOURCE
+     * 再回切 COMMON。
+     */
+    private void recordAtlasDiag(long ctx, Minecraft minecraft) {
+        if (this.atlasDiagAttempts == 0) {
+            this.atlasDiagAttempts = 1;
+            LOGGER.info("[lod-diag] recordAtlasDiag 已进入");
+        }
+        long textureHandle = 0L;
+        int width = 0;
+        int height = 0;
+        int mips = 0;
+        try {
+            TextureAtlas atlas = minecraft.getAtlasManager()
+                .getAtlasOrThrow(TextureAtlas.LOCATION_BLOCKS);
+            GpuTexture texture = atlas.getTexture();
+            if (!(texture instanceof Dx12GpuTexture dx12Texture)) {
+                if (this.atlasDiagAttempts < 4) {
+                    this.atlasDiagAttempts++;
+                    LOGGER.warn("[lod-diag] 图集纹理不是 Dx12GpuTexture：{}",
+                        texture == null ? "null" : texture.getClass().getName());
+                }
+                return;
+            }
+            textureHandle = dx12Texture.handle();
+            width = texture.getWidth(0);
+            height = texture.getHeight(0);
+            mips = Math.min(texture.getMipLevels(), 3);
+        } catch (Throwable t) {
+            if (this.atlasDiagAttempts < 4) {
+                this.atlasDiagAttempts++;
+                LOGGER.warn("[lod-diag] 取方块图集失败", t);
+            }
+            return;  // 图集还没准备好，下一帧再试
+        }
+        if (textureHandle == 0L || width <= 0 || height <= 0 || mips <= 0) {
+            if (this.atlasDiagAttempts < 4) {
+                this.atlasDiagAttempts++;
+                LOGGER.warn("[lod-diag] 图集句柄/尺寸无效：handle={} {}x{} mips={}",
+                    textureHandle, width, height, mips);
+            }
+            return;
+        }
+        int[] offsets = new int[mips];
+        long bytes = 0L;
+        for (int m = 0; m < mips; m++) {
+            int mw = Math.max(1, width >> m);
+            int mh = Math.max(1, height >> m);
+            bytes = (bytes + 511L) & ~511L;  // D3D12 placed footprint 要求 512 对齐
+            offsets[m] = (int) bytes;
+            bytes += (long) mw * mh * 4L;
+        }
+        try {
+            this.atlasDiagBuffer = new Dx12GpuBuffer(GpuBuffer.USAGE_MAP_READ, bytes);
+        } catch (Throwable t) {
+            LOGGER.warn("[lod-diag] 图集读回缓冲创建失败", t);
+            this.atlasDiagState = 2;
+            return;
+        }
+        for (int m = 0; m < mips; m++) {
+            int mw = Math.max(1, width >> m);
+            int mh = Math.max(1, height >> m);
+            Dx12Native.dx12CopyTextureToBuffer(ctx, textureHandle, m, 0, 0, 0, mw, mh,
+                this.atlasDiagBuffer.handle(), offsets[m]);
+        }
+        this.atlasDiagWidth = width;
+        this.atlasDiagHeight = height;
+        this.atlasDiagMips = mips;
+        this.atlasDiagRecordedFrame = this.atlasDiagFrameCounter;
+        this.atlasDiagState = 1;
+        LOGGER.info("[lod-diag] 图集读回已录制：{}x{} mips={} bytes={}",
+            width, height, mips, bytes);
+    }
+
+    /** 读回并打印图集各 mip 的统计值与诊断方块的 rect 内均值。 */
+    private void readAtlasDiag(Minecraft minecraft) {
+        this.atlasDiagState = 2;
+        Dx12GpuBuffer buffer = this.atlasDiagBuffer;
+        this.atlasDiagBuffer = null;
+        if (buffer == null) {
+            return;
+        }
+        int width = this.atlasDiagWidth;
+        int height = this.atlasDiagHeight;
+        int mips = this.atlasDiagMips;
+        try (GpuBufferSlice.MappedView view = buffer.map(0, buffer.size(), true, false)) {
+            ByteBuffer data = view.data();
+            int[] offsets = new int[mips];
+            long bytes = 0L;
+            for (int m = 0; m < mips; m++) {
+                int mw = Math.max(1, width >> m);
+                int mh = Math.max(1, height >> m);
+                bytes = (bytes + 511L) & ~511L;
+                offsets[m] = (int) bytes;
+                bytes += (long) mw * mh * 4L;
+            }
+            for (int m = 0; m < mips; m++) {
+                dumpAtlasMipStats(data, offsets[m], Math.max(1, width >> m),
+                    Math.max(1, height >> m), m);
+                dumpAtlasMipPng(data, offsets[m], Math.max(1, width >> m),
+                    Math.max(1, height >> m), m, minecraft);
+            }
+            LodRegionCache region = LodRegionCache.getInstance();
+            for (String name : ATLAS_DIAG_BLOCKS) {
+                float[][] rects = region.getSpriteUv(name);
+                if (rects == null || rects.length < 6 || rects[1] == null) {
+                    LOGGER.info("[lod-diag] sprite {} = 无 rect", name);
+                    continue;
+                }
+                float[] rect = rects[1];
+                LOGGER.info("[lod-diag] sprite {} rect(UP) = [{}, {}, {}, {}]",
+                    name, rect[0], rect[1], rect[2], rect[3]);
+                for (int m = 0; m < mips; m++) {
+                    dumpAtlasRectStats(data, offsets[m], Math.max(1, width >> m),
+                        Math.max(1, height >> m), rect, name, m);
+                }
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("[lod-diag] 图集读回失败", t);
+        } finally {
+            buffer.close();
+        }
+    }
+
+    private static void dumpAtlasMipStats(ByteBuffer data, int offset, int width, int height,
+                                          int mip) {
+        long pixels = (long) width * height;
+        long white = 0L;
+        long transparent = 0L;
+        long sumR = 0L;
+        long sumG = 0L;
+        long sumB = 0L;
+        for (long i = 0; i < pixels; i++) {
+            int o = offset + (int) (i * 4L);
+            int r = data.get(o) & 0xFF;
+            int g = data.get(o + 1) & 0xFF;
+            int b = data.get(o + 2) & 0xFF;
+            int a = data.get(o + 3) & 0xFF;
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            if (a == 0) {
+                transparent++;
+            }
+            if (r >= 250 && g >= 250 && b >= 250 && a >= 250) {
+                white++;
+            }
+        }
+        LOGGER.info("[lod-diag] mip{} {}x{} 平均RGB=({},{},{}) 纯白={}% 全透明={}%",
+            mip, width, height, sumR / pixels, sumG / pixels, sumB / pixels,
+            white * 100.0 / pixels, transparent * 100.0 / pixels);
+    }
+
+    /** 把读回的 mip 写成 PNG（游戏目录下），便于直接看图集内容。 */
+    private static void dumpAtlasMipPng(ByteBuffer data, int offset, int width, int height,
+                                        int mip, Minecraft minecraft) {
+        try {
+            java.awt.image.BufferedImage image = new java.awt.image.BufferedImage(
+                width, height, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int o = offset + ((y * width) + x) * 4;
+                    int r = data.get(o) & 0xFF;
+                    int g = data.get(o + 1) & 0xFF;
+                    int b = data.get(o + 2) & 0xFF;
+                    int a = data.get(o + 3) & 0xFF;
+                    image.setRGB(x, y, (a << 24) | (r << 16) | (g << 8) | b);
+                }
+            }
+            java.io.File out = new java.io.File(minecraft.gameDirectory,
+                "dx12_atlas_diag_mip" + mip + ".png");
+            javax.imageio.ImageIO.write(image, "png", out);
+            LOGGER.info("[lod-diag] 图集 mip{} 已写出 {}", mip, out.getAbsolutePath());
+        } catch (Throwable t) {
+            LOGGER.warn("[lod-diag] 图集 mip{} 写出失败", mip, t);
+        }
+    }
+
+    private static void dumpAtlasRectStats(ByteBuffer data, int offset, int width, int height,
+                                           float[] rect, String name, int mip) {
+        int x0 = Math.max(0, Math.min(width - 1, Math.round(rect[0] * width)));
+        int y0 = Math.max(0, Math.min(height - 1, Math.round(rect[1] * height)));
+        int x1 = Math.max(x0 + 1, Math.min(width, Math.round(rect[2] * width)));
+        int y1 = Math.max(y0 + 1, Math.min(height, Math.round(rect[3] * height)));
+        long count = 0L;
+        long sumR = 0L;
+        long sumG = 0L;
+        long sumB = 0L;
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                int o = offset + ((y * width) + x) * 4;
+                if ((data.get(o + 3) & 0xFF) == 0) {
+                    continue;
+                }
+                sumR += data.get(o) & 0xFF;
+                sumG += data.get(o + 1) & 0xFF;
+                sumB += data.get(o + 2) & 0xFF;
+                count++;
+            }
+        }
+        int center = offset + (((y0 + y1) / 2) * width + (x0 + x1) / 2) * 4;
+        if (count == 0L) {
+            LOGGER.info("[lod-diag]   mip{} {} 区域=({},{})-({},{}) 全透明",
+                mip, name, x0, y0, x1, y1);
+        } else {
+            LOGGER.info("[lod-diag]   mip{} {} 区域=({},{})-({},{}) 均值RGB=({},{},{}) 中心=({},{},{},{})",
+                mip, name, x0, y0, x1, y1, sumR / count, sumG / count, sumB / count,
+                data.get(center) & 0xFF, data.get(center + 1) & 0xFF,
+                data.get(center + 2) & 0xFF, data.get(center + 3) & 0xFF);
+        }
+    }
+
+    /** 一次性打印 CPU 侧写入的体素顶点样本（位置/颜色/UV/rect），确认 rect 不是 0。 */
+    private static void dumpVoxelVertices(ByteBuffer vertexData, int faces) {
+        int count = Math.min(8, faces * 4);
+        StringBuilder sb = new StringBuilder();
+        for (int v = 0; v < count; v++) {
+            int o = v * VOXEL_VERTEX_STRIDE;
+            sb.append(String.format(
+                "%n  v%d pos=(%.1f,%.1f,%.1f) rgba=%08X uv=(%.2f,%.2f) rect=(%.5f,%.5f,%.5f,%.5f)",
+                v,
+                vertexData.getFloat(o), vertexData.getFloat(o + 4), vertexData.getFloat(o + 8),
+                vertexData.getInt(o + 12),
+                vertexData.getFloat(o + 16), vertexData.getFloat(o + 20),
+                (vertexData.getShort(o + 24) & 0xFFFF) / 65535.0f,
+                (vertexData.getShort(o + 26) & 0xFFFF) / 65535.0f,
+                (vertexData.getShort(o + 28) & 0xFFFF) / 65535.0f,
+                (vertexData.getShort(o + 30) & 0xFFFF) / 65535.0f));
+        }
+        LOGGER.info("[lod-diag] 体素顶点样本（CPU 侧，面={}）:{}", faces, sb);
+    }
+
     /**
      * 惰性初始化方块纹理图集 SRV handle。
      *
@@ -2959,10 +3243,29 @@ public final class Dx12LodRenderer {
             GpuTextureView view = atlas.getTextureView();
             if (view instanceof Dx12GpuTextureView dx12View) {
                 this.voxelAtlasViewHandle = dx12View.handle();
+                if (!this.voxelAtlasViewLogged) {
+                    this.voxelAtlasViewLogged = true;
+                    GpuTexture texture = atlas.getTexture();
+                    LOGGER.info("[lod-diag] 体素图集 SRV 已绑定 handle={} label={} {}x{} mips={}",
+                        this.voxelAtlasViewHandle,
+                        texture == null ? "null" : texture.getLabel(),
+                        texture == null ? -1 : texture.getWidth(0),
+                        texture == null ? -1 : texture.getHeight(0),
+                        texture == null ? -1 : texture.getMipLevels());
+                }
                 return this.voxelAtlasViewHandle;
             }
+            if (!this.voxelAtlasViewLogged) {
+                this.voxelAtlasViewLogged = true;
+                LOGGER.warn("[lod-diag] 体素图集 view 类型不符：{}",
+                    view == null ? "null" : view.getClass().getName());
+            }
         } catch (Throwable t) {
-            // 图集尚未初始化（加载阶段），静默返回 0，下次再试
+            // 图集尚未初始化（加载阶段），下次再试；只记录第一次，避免刷屏
+            if (!this.voxelAtlasViewLogged) {
+                this.voxelAtlasViewLogged = true;
+                LOGGER.warn("[lod-diag] 体素图集 SRV 获取失败", t);
+            }
         }
         return 0L;
     }

@@ -143,6 +143,10 @@
             <Procedure MapAddress="Java_com_xgdt_dx12_dx12_Dx12Native_dx12WriteTimestamp" Options="0" />
             <Procedure MapAddress="Java_com_xgdt_dx12_dx12_Dx12Native_dx12WriteToTexture" Options="0" />
             <Procedure MapAddress="Java_com_xgdt_dx12_dx12_Dx12Native_dx12XessIsActive" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx12_dx12_Dx12Native_dx12XessIsAvailable" Options="0" />
+            <Procedure MapAddress="dxrDemoStandalone" Options="0" />
+            <Procedure MapAddress="dxrSmokeTestStandalone" Options="0" />
+            <Procedure MapAddress="EntryPoint" Options="0" />
         </Procedures>
     </Protection>
     <LicenseManager ProductCode="roU5qhnhphM=" Algorithm="RSA" Bits="3072" PublicExp="AAEAAQ==" PrivateExp="mxrKMPAzErQOEkE25YmhQzdKOy54IwuyQAYSrzBUW8bGRozHvwd4/fVwhDRMVap23LnJt+9TBbcysSwuRx2HgPE72OdsJnNTeUpc6lfbPg7XR/s86qGCfGT2R6k5fla4Rcpj4oOHNAUFwkancnVXw2y2LVopa/usoXq1XkDffR/BSiSSx8x+t6Vc4beDiviQeSpq3I/QwHQdKbDjS53chNyxO1a6Vv59vVqvCAG7S2UU/QKOmPsmWfCpZ/syIfRPsobxOOF+6HU5t9MdRLNI5W/l0kto151q/DjYdMucqqbEMxrVYmTECHQM2D6nGs3KwPZsdyINYuRuZMnbwB4QqiLZKbH9GiYM7Yo7UQ4L1GIh45CgDxcPIXZRuonNvzeM41JthcSuc8oG5Ybs1OmnOiVVcP+Q0A1GduyUKp/FMJK+hYyC/vgCK/rYFq4+G+cHxhjruDOoEClQop++ssnnI9JG8XJtFbhx8PxTZX1lISygcJ0z8miuguQC8bEnHYGV" Modulus="3XAG75nbSa43Rz/9AQBMzriyyBYDXZrEZl5LncyiwIPj2yTHvDongJ5e6f5AfTl1xUIgNa0ik3M5Ir4KeBxSddF2ApKHbLoHPfZR52N7JoqRJ+St03pMZpYm2duijcXfHHvspIKpS8W4zbHQCP59bM9w70+Ll5ClrhitG3HH2nm7NG/w/VBE0VQpVGI/LQs76MtqyH+gFOgLuKEVepPXCY9Il6/cS9NvUPtsdGEqRbjxga82loxRbSi5JrNIEDsV0zvUv52rQAxf0caXkZS0k1UcHvTwmwFnE/nJSFnervMzc6kkhaddlfWe6+0CHGUjX7YoaB9BxBcdULaLBf1CDE3oeVz5d/HLX4aasi4i2jpCe7EcJN9bFBFBASmL/ijByrLCIU6JGAX31aphCpi1QjjUS1b1FtadgtzeHMusHho0oHFLcJCqpIrD+bxtn7/aj80dX52hZHevSS6cYR+Sw4T02qAQhNiLyI1pNMZqZrbs9O+6JozekdfUNMdO0zhp" />
