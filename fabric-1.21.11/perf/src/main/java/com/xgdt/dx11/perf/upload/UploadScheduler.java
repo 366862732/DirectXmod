@@ -2,7 +2,7 @@ package com.xgdt.dx11.perf.upload;
 
 import com.mojang.blaze3d.vertex.MeshData;
 import com.xgdt.dx11.perf.PerfConfig;
-import com.xgdt.dx11.perf.PerfCounters;
+import com.xgdt.dx11.metrics.Dx11Metrics;
 import com.xgdt.dx11.perf.PerfState;
 import com.xgdt.dx11.perf.culling.VisibleSections;
 import java.util.ArrayList;
@@ -207,14 +207,14 @@ public final class UploadScheduler {
         int ran = 0;
         for (int rank = 0; rank < selection.count(); rank++) {
             Runnable task = pending.get(ranked[rank]);
-            long before = PerfCounters.uploadBytes();
+            long before = Dx11Metrics.uploadBytes();
             try {
                 task.run();
             } catch (RuntimeException e) {
                 failedUploads++;
                 warn("Section upload failed: " + e);
             }
-            long delta = PerfCounters.uploadBytes() - before;
+            long delta = Dx11Metrics.uploadBytes() - before;
             if (delta > 0L) {
                 bytesUsed += delta;
             }

@@ -4,7 +4,7 @@ import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.systems.GpuQuery;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.xgdt.dx11.perf.PerfCounters;
+import com.xgdt.dx11.metrics.Dx11Metrics;
 import java.lang.management.ManagementFactory;
 import java.util.Locale;
 import java.util.OptionalLong;
@@ -43,7 +43,7 @@ public final class PerfOverlayStats {
     private static double cpuLoad = -1.0D;
     private static double processLoad = -1.0D;
 
-    private static PerfCounters.Snapshot windowSnapshot = PerfCounters.snapshot();
+    private static Dx11Metrics.Snapshot windowSnapshot = Dx11Metrics.snapshot();
     private static long windowStartNanos;
     private static int windowFrames;
     private static double drawsPerFrame;
@@ -206,7 +206,7 @@ public final class PerfOverlayStats {
     private static void updateCounterWindow(long now) {
         if (windowStartNanos == 0L) {
             windowStartNanos = now;
-            windowSnapshot = PerfCounters.snapshot();
+            windowSnapshot = Dx11Metrics.snapshot();
             windowFrames = 0;
         }
         windowFrames++;
@@ -214,8 +214,8 @@ public final class PerfOverlayStats {
         if (elapsed < COUNTER_WINDOW_NS) {
             return;
         }
-        PerfCounters.Snapshot current = PerfCounters.snapshot();
-        PerfCounters.Snapshot delta = current.delta(windowSnapshot);
+        Dx11Metrics.Snapshot current = Dx11Metrics.snapshot();
+        Dx11Metrics.Snapshot delta = current.delta(windowSnapshot);
         drawsPerFrame = windowFrames == 0
             ? 0.0D
             : delta.draws() / (double) windowFrames;

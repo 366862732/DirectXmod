@@ -3,7 +3,7 @@ package com.xgdt.dx11.perf.immediate;
 /**
  * Render-thread counters for the ImmediatelyFast-style features.
  *
- * <p>These are deliberately separate from {@code PerfCounters}: the region
+ * <p>These are deliberately separate from {@code Dx11Metrics}: the region
  * renderer's snapshot format is used by existing validation scripts, and the
  * new counters are only meaningful when the corresponding feature is on.
  * Every increment happens on the render thread, so plain longs are enough.</p>

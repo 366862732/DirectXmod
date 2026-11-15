@@ -1,5 +1,8 @@
 package com.xgdt.dx11.perf.region;
 
+import com.xgdt.dx11.terrain.CompactTerrainFormat;
+import com.xgdt.dx11.terrain.TerrainPipelines;
+
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.CompactVectorArray;
@@ -438,7 +441,7 @@ public final class RegionUploader {
         // pipeline validates the real shader variant before any vertex is
         // packed.  This also lets compact mode come back after a shader reload
         // without waiting for a vanilla terrain draw.
-        return PerfTerrainPipelines.isUsable(layer);
+        return TerrainPipelines.isUsable(layer);
     }
 
     /**

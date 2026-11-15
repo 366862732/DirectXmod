@@ -1,5 +1,7 @@
 package com.xgdt.dx11.perf;
 
+import com.xgdt.dx11.metrics.Dx11Metrics;
+
 import com.xgdt.dx11.perf.overlay.PerfOverlayStats;
 import com.xgdt.dx11.perf.region.RegionManager;
 import com.xgdt.dx11.perf.region.RegionSize;
@@ -102,7 +104,7 @@ public final class PerfCommand {
 
     private static String stats() {
         PerfConfig config = PerfState.config();
-        PerfCounters.Snapshot snapshot = PerfCounters.snapshot();
+        Dx11Metrics.Snapshot snapshot = Dx11Metrics.snapshot();
         return "DX11 perf | active=" + PerfState.active()
             + " layer=" + PerfState.layerActive()
             + " immediate=" + PerfState.immediateActive()
@@ -122,7 +124,7 @@ public final class PerfCommand {
             + " entityCulling=" + config.entityCulling
             + "\n" + snapshot.format()
             + "\n" + RegionManager.describe()
-            + "\n" + com.xgdt.dx11.perf.region.CompactTerrainFormat.describe()
+            + "\n" + com.xgdt.dx11.terrain.CompactTerrainFormat.describe()
             + "\n" + com.xgdt.dx11.perf.region.RegionTranslucentSorter.describe()
             + "\n" + com.xgdt.dx11.perf.upload.UploadScheduler.describe()
             + "\n" + com.xgdt.dx11.perf.culling.FogOcclusion.describe()
@@ -132,8 +134,8 @@ public final class PerfCommand {
     }
 
     private static String reset() {
-        PerfCounters.reset();
-        com.xgdt.dx11.perf.region.CompactTerrainFormat.resetStats();
+        Dx11Metrics.reset();
+        com.xgdt.dx11.terrain.CompactTerrainFormat.resetStats();
         com.xgdt.dx11.perf.culling.FogOcclusion.resetStats();
         com.xgdt.dx11.perf.culling.EntityCulling.resetStats();
         com.xgdt.dx11.perf.upload.UploadScheduler.resetStats();

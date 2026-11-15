@@ -1,0 +1,76 @@
+plugins {
+    id 'fabric-loom' version '1.15.5'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = 'gl4dx11-perf'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+}
+
+loom {
+    mods {
+        register('gl4dx11-perf') {
+            sourceSet(sourceSets['main'])
+        }
+    }
+    mixin {
+        // See the core build: Loom 1.15 disables the Mixin annotation processor
+        // by default, and the processor generates the refmap used at runtime.
+        useLegacyMixinAp = true
+        defaultRefmapName = 'gl4dx11-perf-refmap.json'
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // @WrapOperation is supplied by Fabric Loader at runtime.
+    compileOnly 'io.github.llamalad7:mixinextras-fabric:0.5.4'
+
+    // The performance layer compiles against the core mod but never bundles it.
+    modImplementation project(':')
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.12.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+    // Carry the repository license files in the optional jar as well.
+    ['LICENSE', 'NOTICE', 'ASSET-LICENSE'].each { name ->
+        def licenseFile = file("../../${name}")
+        if (licenseFile.isFile()) {
+            from(licenseFile)
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(Test).configureEach {
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    useJUnitPlatform()
+}

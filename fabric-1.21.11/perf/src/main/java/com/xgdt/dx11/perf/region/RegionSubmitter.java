@@ -1,5 +1,7 @@
 package com.xgdt.dx11.perf.region;
 
+import com.xgdt.dx11.terrain.TerrainPipelines;
+
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
@@ -7,7 +9,7 @@ import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.xgdt.dx11.perf.PerfConfig;
-import com.xgdt.dx11.perf.PerfCounters;
+import com.xgdt.dx11.metrics.Dx11Metrics;
 import com.xgdt.dx11.perf.PerfState;
 import com.xgdt.dx11.perf.culling.FogCuller;
 import com.xgdt.dx11.perf.culling.FogOcclusion;
@@ -212,19 +214,19 @@ public final class RegionSubmitter {
             }
             pass.setUniform(uniformName, uniform);
             for (RegionRuns.Run run : plan.runs()) {
-                if (run.compact() && !PerfTerrainPipelines.isUsable(layer)) {
+                if (run.compact() && !TerrainPipelines.isUsable(layer)) {
                     // The compact layout cannot be drawn by the vanilla
                     // pipeline; skip rather than binding an invalid pipeline.
                     continue;
                 }
                 RenderPipeline wanted = run.compact()
-                    ? PerfTerrainPipelines.compact(layer)
+                    ? TerrainPipelines.compact(layer)
                     : layer.pipeline();
                 if (wanted != boundPipeline) {
                     pass.setPipeline(wanted);
                     boundPipeline = wanted;
                 }
-                PerfCounters.onRegionRun();
+                Dx11Metrics.onRegionRun();
                 pass.drawIndexed(run.startVertex(), 0, run.indexCount(), 1);
             }
         }
@@ -315,11 +317,11 @@ public final class RegionSubmitter {
 
         RenderPipeline boundPipeline = null;
         for (TranslucentPlan plan : plans) {
-            if (plan.compact && !PerfTerrainPipelines.isUsable(layer)) {
+            if (plan.compact && !TerrainPipelines.isUsable(layer)) {
                 continue;
             }
             RenderPipeline wanted = plan.compact
-                ? PerfTerrainPipelines.compact(layer)
+                ? TerrainPipelines.compact(layer)
                 : layer.pipeline();
             if (wanted != boundPipeline) {
                 pass.setPipeline(wanted);
@@ -328,7 +330,7 @@ public final class RegionSubmitter {
             pass.setVertexBuffer(plan.slot, plan.buffer.gpuBuffer());
             pass.setUniform(uniformName, plan.uniform);
             pass.setIndexBuffer(plan.index.gpuBuffer(), VertexFormat.IndexType.INT);
-            PerfCounters.onRegionRun();
+            Dx11Metrics.onRegionRun();
             pass.drawIndexed(0, 0, plan.indexCount, 1);
         }
         return true;
@@ -404,11 +406,11 @@ public final class RegionSubmitter {
                 continue;
             }
 
-            if (slice.compact() && !PerfTerrainPipelines.isUsable(slice.layer())) {
+            if (slice.compact() && !TerrainPipelines.isUsable(slice.layer())) {
                 continue;
             }
             RenderPipeline wanted = slice.compact()
-                ? PerfTerrainPipelines.compact(slice.layer())
+                ? TerrainPipelines.compact(slice.layer())
                 : slice.layer().pipeline();
             if (wanted != boundPipeline) {
                 pass.setPipeline(wanted);

@@ -1,5 +1,7 @@
 package com.xgdt.dx11.perf;
 
+import com.xgdt.dx11.metrics.Dx11Metrics;
+
 import com.xgdt.dx11.config.Dx11Config;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -144,7 +146,7 @@ public final class PerfState {
             && !active
             && Boolean.getBoolean(FORCE_IMMEDIATE_PROPERTY);
         layerActive = active || forceImmediate;
-        PerfCounters.setEnabled(layerActive);
+        Dx11Metrics.setEnabled(layerActive);
         com.xgdt.dx11.perf.immediate.ImmediateFlags.apply(layerActive, current);
         if (forceImmediate) {
             LOGGER.info("[dx11-perf] Immediate feature layer forced on for validation");

@@ -1,5 +1,7 @@
 package com.xgdt.dx11.perf.region;
 
+import com.xgdt.dx11.terrain.CompactTerrainFormat;
+
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 

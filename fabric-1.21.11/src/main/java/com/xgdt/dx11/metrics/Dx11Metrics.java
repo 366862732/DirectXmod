@@ -1,4 +1,4 @@
-package com.xgdt.dx11.perf;
+package com.xgdt.dx11.metrics;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * existing D3D11 command stream.  Counters are session totals; the debug
  * logger and {@code /dx11perf reset} take care of windows and resets.</p>
  */
-public final class PerfCounters {
+public final class Dx11Metrics {
     private static final AtomicLong DRAWS = new AtomicLong();
     private static final AtomicLong INDEXED_DRAWS = new AtomicLong();
     private static final AtomicLong BUFFER_BINDS = new AtomicLong();
@@ -22,7 +22,7 @@ public final class PerfCounters {
     private static final AtomicLong REGION_RUNS = new AtomicLong();
     private static volatile boolean enabled;
 
-    private PerfCounters() {
+    private Dx11Metrics() {
     }
 
     public static void setEnabled(boolean value) {

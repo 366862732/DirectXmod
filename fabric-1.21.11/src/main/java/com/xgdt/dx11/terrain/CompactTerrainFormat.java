@@ -1,4 +1,4 @@
-package com.xgdt.dx11.perf.region;
+package com.xgdt.dx11.terrain;
 
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
@@ -238,7 +238,7 @@ public final class CompactTerrainFormat {
     }
 
     /** Emits at most one warning when compact mode is requested but unusable. */
-    static void warnShaderIncompatibleOnce() {
+    public static void warnShaderIncompatibleOnce() {
         if (warnedUnsupported || !shaderObserved() || shaderCompatible()) {
             return;
         }

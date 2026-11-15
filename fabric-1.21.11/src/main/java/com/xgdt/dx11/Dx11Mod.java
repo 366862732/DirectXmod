@@ -4,7 +4,6 @@ import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.xgdt.dx11.config.Dx11Config;
-import com.xgdt.dx11.perf.PerfState;
 import net.fabricmc.api.ClientModInitializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,10 +21,6 @@ public final class Dx11Mod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        // Load the experimental perf config even when the D3D11 backend is off:
-        // /dx11perf must be able to explain why the perf layer is inactive.
-        PerfState.init();
-
         if (!Dx11Config.isWindows()) {
             LOGGER.info("[dx11] Not running on Windows; D3D11 backend disabled.");
             return;
@@ -43,10 +38,9 @@ public final class Dx11Mod implements ClientModInitializer {
 
         Dx11Config.ensureProbe();
         String result = Dx11Config.probeResult();
-        PerfState.refresh();
         if (result.startsWith("OK")) {
             LOGGER.info("[dx11] Probe: {}", result);
-            LOGGER.info("[dx11] D3D11 backend selected. perf active={}", PerfState.active());
+            LOGGER.info("[dx11] D3D11 backend selected.");
         } else {
             LOGGER.warn("[dx11] Probe: {}", result);
             LOGGER.warn("[dx11] D3D11 probe failed; using the vanilla OpenGL path.");

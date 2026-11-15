@@ -9,7 +9,7 @@ import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.textures.TextureFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.xgdt.dx11.config.Dx11Config;
-import com.xgdt.dx11.perf.PerfCounters;
+import com.xgdt.dx11.metrics.Dx11Metrics;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -112,7 +112,7 @@ final class Dx11RenderPass implements RenderPass {
             throw new IllegalArgumentException("Vertex buffer slot is out of range: " + slot);
         }
         this.vertexBuffer = (Dx11Buffer) buffer;
-        PerfCounters.onBufferBind();
+        Dx11Metrics.onBufferBind();
         Dx11Native.nativePassSetVertexBuffer(this.handle, this.vertexBuffer.handle());
     }
 
@@ -120,15 +120,15 @@ final class Dx11RenderPass implements RenderPass {
     public void setIndexBuffer(GpuBuffer buffer, VertexFormat.IndexType indexType) {
         this.indexBuffer = (Dx11Buffer) buffer;
         this.indexType = indexType;
-        PerfCounters.onBufferBind();
+        Dx11Metrics.onBufferBind();
         Dx11Native.nativePassSetIndexBuffer(
             this.handle, this.indexBuffer.handle(), indexType == VertexFormat.IndexType.INT);
     }
 
     @Override
     public void drawIndexed(int baseVertex, int firstIndex, int indexCount, int instanceCount) {
-        PerfCounters.onDraw();
-        PerfCounters.onIndexedDraw();
+        Dx11Metrics.onDraw();
+        Dx11Metrics.onIndexedDraw();
         this.applyBindings();
         final long draw = ++this.drawCount;
         if (this.debugLogging && draw <= 20) {
@@ -173,7 +173,7 @@ final class Dx11RenderPass implements RenderPass {
 
     @Override
     public void draw(int firstVertex, int vertexCount) {
-        PerfCounters.onDraw();
+        Dx11Metrics.onDraw();
         this.applyBindings();
         final long draw = ++this.drawCount;
         if (this.debugLogging && draw <= 20) {
@@ -245,7 +245,7 @@ final class Dx11RenderPass implements RenderPass {
                 LOGGER.info("[dx11]   uniform '{}' slot={}", name, slot);
             }
             if (slot != null) {
-                PerfCounters.onUniformBind();
+                Dx11Metrics.onUniformBind();
                 Dx11Native.nativePassSetUniform(
                     this.handle,
                     slot,

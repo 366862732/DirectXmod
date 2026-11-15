@@ -1,4 +1,4 @@
-package com.xgdt.dx11.perf.region;
+package com.xgdt.dx11.terrain;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -8,11 +8,11 @@ import com.mojang.blaze3d.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import org.junit.jupiter.api.Test;
 
-class PerfTerrainPipelinesTest {
+class TerrainPipelinesTest {
     @Test
     void clonesCopyEverythingExceptTheVertexFormat() {
         RenderPipeline base = ChunkSectionLayer.SOLID.pipeline();
-        RenderPipeline compact = PerfTerrainPipelines.compact(ChunkSectionLayer.SOLID);
+        RenderPipeline compact = TerrainPipelines.compact(ChunkSectionLayer.SOLID);
 
         assertNotSame(base, compact);
         assertSame(CompactTerrainFormat.FORMAT, compact.getVertexFormat());
@@ -36,12 +36,12 @@ class PerfTerrainPipelinesTest {
 
     @Test
     void cachesOnePipelinePerLayer() {
-        RenderPipeline first = PerfTerrainPipelines.compact(ChunkSectionLayer.CUTOUT);
-        RenderPipeline second = PerfTerrainPipelines.compact(ChunkSectionLayer.CUTOUT);
+        RenderPipeline first = TerrainPipelines.compact(ChunkSectionLayer.CUTOUT);
+        RenderPipeline second = TerrainPipelines.compact(ChunkSectionLayer.CUTOUT);
 
         assertSame(first, second);
         assertSame(
             CompactTerrainFormat.FORMAT,
-            PerfTerrainPipelines.compact(ChunkSectionLayer.TRANSLUCENT).getVertexFormat());
+            TerrainPipelines.compact(ChunkSectionLayer.TRANSLUCENT).getVertexFormat());
     }
 }

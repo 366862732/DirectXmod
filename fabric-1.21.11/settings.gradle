@@ -10,3 +10,7 @@ pluginManagement {
 }
 
 rootProject.name = 'gl4dx11-1.21.11'
+
+// Optional performance layer.  The root project is the standalone D3D11
+// engine; this subproject produces the separate gl4dx11-perf jar.
+include 'perf'

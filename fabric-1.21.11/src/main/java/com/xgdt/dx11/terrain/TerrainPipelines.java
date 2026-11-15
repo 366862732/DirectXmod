@@ -1,4 +1,4 @@
-package com.xgdt.dx11.perf.region;
+package com.xgdt.dx11.terrain;
 
 import com.mojang.blaze3d.pipeline.CompiledRenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
@@ -23,14 +23,14 @@ import org.slf4j.LoggerFactory;
  * backend on first use.  They are cached per layer because building a
  * {@link RenderPipeline} is a one-time setup cost.</p>
  */
-public final class PerfTerrainPipelines {
+public final class TerrainPipelines {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
     private static final Map<ChunkSectionLayer, RenderPipeline> COMPACT =
         new EnumMap<>(ChunkSectionLayer.class);
     private static final Set<ChunkSectionLayer> UNAVAILABLE =
         EnumSet.noneOf(ChunkSectionLayer.class);
 
-    private PerfTerrainPipelines() {
+    private TerrainPipelines() {
     }
 
     /**

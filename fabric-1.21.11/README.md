@@ -1,12 +1,30 @@
 # DirectXMod D3D11 (Minecraft 1.21.11)
 
-This module implements the additive Direct3D 11 backend for Minecraft 1.21.11
-and the experimental performance layer used with `native-dx11`. It is not part
-of the 26.2 / D3D12 backend.
+This module implements the additive Direct3D 11 backend for Minecraft 1.21.11.
+It ships as two jars:
+
+| Jar | Contents | Required |
+| --- | --- | --- |
+| `build/libs/gl4dx11-0.1.0.jar` | the D3D11 rendering engine | yes |
+| `perf/build/libs/gl4dx11-perf-0.1.0.jar` | the optional performance layer | no |
+
+The core jar works on its own: install it and Minecraft renders through D3D11
+with vanilla optimization behaviour. Add the performance jar alongside it for
+the region renderer, immediate-mode batching, culling, upload scheduling and the
+`/dx11perf` overlay. Delete the performance jar to return to plain D3D11.
+
+The performance jar depends on the core jar; the core never references the
+performance jar. This module is not part of the 26.2 / D3D12 backend.
+
+## Install
+
+Put both jars in the Fabric `mods` folder, or only the core jar for plain D3D11
+rendering. The performance jar declares a Fabric dependency on `gl4dx11`, so a
+version mismatch fails at startup instead of at render time.
 
 ## Scope
 
-The layer adds:
+The performance jar adds:
 
 - region-based terrain storage, coalesced region draws and a per-frame upload
   budget
@@ -32,7 +50,9 @@ gradlew.bat build
 ```
 
 The native build writes `native-dx11\build\bin\Release\dx11_mc.dll`. The
-Gradle build packages it when present.
+Gradle build packages it into the core jar when present. `gradlew build` builds
+both jars; `gradlew :build` builds only the core jar and `gradlew :perf:build`
+only the performance jar.
 
 ## Running
 
@@ -46,12 +66,13 @@ probe. Useful development properties:
 | `-Dgl4dx11.nativePath=C:\path\dx11_mc.dll` | Load a locally built DLL |
 | `-Dgl4dx11.maxFeatureLevel=10_1` | Clamp the requested feature level |
 | `-Dgl4dx11.debug=true` | Verbose per-frame D3D11 logging (very noisy) |
-| `-Dgl4dx11.perf.enabled=true` | Force the performance layer on |
+| `-Dgl4dx11.perf.enabled=true` | Force the performance layer on (performance jar only) |
 
 ## Configuration
 
-The layer is configured in `config/gl4dx11-perf.json`, created on first
-launch. New or missing configs start with every performance feature enabled:
+The performance jar is configured in `config/gl4dx11-perf.json`, created on
+first launch. New or missing configs start with every performance feature
+enabled:
 
 ```json
 {
@@ -94,6 +115,8 @@ The two umbrellas are independent:
   offscreen uploads and entity culling.
 
 ## Commands
+
+These commands exist only when the performance jar is installed.
 
 ```text
 /dx11perf stats | reset | leaks | reload | save

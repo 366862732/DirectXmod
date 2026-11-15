@@ -1,5 +1,7 @@
 package com.xgdt.dx11.perf;
 
+import com.xgdt.dx11.metrics.Dx11Metrics;
+
 import java.util.Locale;
 
 /**
@@ -17,7 +19,7 @@ public final class PerfDebugHud {
         if (!PerfState.active() || !PerfState.config().debugHud) {
             return null;
         }
-        PerfCounters.Snapshot snapshot = PerfCounters.snapshot();
+        Dx11Metrics.Snapshot snapshot = Dx11Metrics.snapshot();
         return String.format(
             Locale.ROOT,
             "DX11 perf: ON | region %s | draws %d | binds %d | uniforms %d | passes %d | uploads %d / %.2f MiB",

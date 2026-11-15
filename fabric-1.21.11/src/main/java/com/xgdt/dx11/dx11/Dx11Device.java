@@ -20,7 +20,7 @@ import com.mojang.blaze3d.textures.TextureFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.xgdt.dx11.config.Dx11Config;
-import com.xgdt.dx11.perf.region.CompactTerrainFormat;
+import com.xgdt.dx11.terrain.CompactTerrainFormat;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -355,7 +355,7 @@ final class Dx11Device implements GpuDevice {
         }
         this.shaderCache.clear();
         CompactTerrainFormat.resetShaderInputs();
-        com.xgdt.dx11.perf.region.PerfTerrainPipelines.reset();
+        com.xgdt.dx11.terrain.TerrainPipelines.reset();
     }
 
     @Override

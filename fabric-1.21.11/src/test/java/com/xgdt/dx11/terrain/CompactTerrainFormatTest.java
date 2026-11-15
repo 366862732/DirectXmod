@@ -1,4 +1,4 @@
-package com.xgdt.dx11.perf.region;
+package com.xgdt.dx11.terrain;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

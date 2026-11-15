@@ -1,5 +1,7 @@
 package com.xgdt.dx11.perf;
 
+import com.xgdt.dx11.metrics.Dx11Metrics;
+
 import java.util.Locale;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,7 +17,7 @@ import org.slf4j.LoggerFactory;
 public final class PerfDebugLog {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
     private static volatile long lastLogNanos;
-    private static volatile PerfCounters.Snapshot lastSnapshot = new PerfCounters.Snapshot(0, 0, 0, 0, 0, 0, 0, 0);
+    private static volatile Dx11Metrics.Snapshot lastSnapshot = new Dx11Metrics.Snapshot(0, 0, 0, 0, 0, 0, 0, 0);
 
     private PerfDebugLog() {
     }
@@ -35,8 +37,8 @@ public final class PerfDebugLog {
             return;
         }
 
-        PerfCounters.Snapshot current = PerfCounters.snapshot();
-        PerfCounters.Snapshot delta = current.delta(lastSnapshot);
+        Dx11Metrics.Snapshot current = Dx11Metrics.snapshot();
+        Dx11Metrics.Snapshot delta = current.delta(lastSnapshot);
         lastSnapshot = current;
         lastLogNanos = now;
 
