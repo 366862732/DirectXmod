@@ -39,8 +39,12 @@ dependencies {
     // @WrapOperation is supplied by Fabric Loader at runtime.
     compileOnly 'io.github.llamalad7:mixinextras-fabric:0.5.4'
 
-    // The performance layer compiles against the core mod but never bundles it.
-    modImplementation project(':')
+    // The performance layer compiles against the core mod but never bundles
+    // it.  compileOnly is deliberate: a Loom `modImplementation project(':')`
+    // reads the core jar while configuring this project, which fails on a
+    // clean checkout because that jar has not been built yet.
+    compileOnly project(':')
+    testImplementation project(':')
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.12.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
