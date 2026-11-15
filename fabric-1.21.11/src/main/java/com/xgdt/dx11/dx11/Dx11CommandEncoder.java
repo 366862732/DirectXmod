@@ -10,6 +10,7 @@ import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.xgdt.dx11.config.Dx11Config;
+import com.xgdt.dx11.metrics.Dx11Metrics;
 import java.nio.ByteBuffer;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
@@ -69,6 +70,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
             clearColor.orElse(0),
             depthView != null && clearDepth.isPresent(),
             clearDepth.orElse(0.0));
+        Dx11Metrics.onRenderPass();
         return new Dx11RenderPass(this.device, handle);
     }
 
@@ -136,6 +138,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
         }
         Dx11Native.nativeWriteToBuffer(
             buffer.handle(), slice.offset(), MemoryUtil.memAddress(data), data.remaining());
+        Dx11Metrics.onUpload(data.remaining());
     }
 
     @Override
@@ -157,6 +160,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
             ((Dx11Buffer) destination.buffer()).handle(),
             destination.offset(),
             source.length());
+        Dx11Metrics.onUpload(source.length());
     }
 
     @Override

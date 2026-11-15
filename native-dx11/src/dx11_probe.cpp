@@ -90,16 +90,8 @@ bool createDevice(
     ComPtr<ID3D11DeviceContext>& context,
     D3D_FEATURE_LEVEL& featureLevel,
     std::string& error) {
-    const D3D_FEATURE_LEVEL levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
-        D3D_FEATURE_LEVEL_9_3,
-        D3D_FEATURE_LEVEL_9_2,
-        D3D_FEATURE_LEVEL_9_1,
-    };
-    constexpr UINT levelCount = static_cast<UINT>(sizeof(levels) / sizeof(levels[0]));
+    const std::vector<D3D_FEATURE_LEVEL> levels = availableFeatureLevels();
+    const UINT levelCount = static_cast<UINT>(levels.size());
     constexpr UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
     HRESULT hr = D3D11CreateDevice(
@@ -107,14 +99,14 @@ bool createDevice(
         D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
         flags,
-        levels,
+        levels.data(),
         levelCount,
         D3D11_SDK_VERSION,
         device.GetAddressOf(),
         &featureLevel,
         context.GetAddressOf());
 
-    if (hr == E_INVALIDARG) {
+    if (hr == E_INVALIDARG && levels.front() == D3D_FEATURE_LEVEL_11_1) {
         // The D3D11.1 runtime is not installed (for example Windows 7 without
         // the platform update). Retry without the 11_1 request.
         hr = D3D11CreateDevice(
@@ -122,7 +114,7 @@ bool createDevice(
             D3D_DRIVER_TYPE_UNKNOWN,
             nullptr,
             flags,
-            levels + 1,
+            levels.data() + 1,
             levelCount - 1,
             D3D11_SDK_VERSION,
             device.GetAddressOf(),
@@ -329,6 +321,7 @@ std::string runProbe() {
 
     std::ostringstream result;
     result << "OK adapter=\"" << narrow(adapterDesc.Description) << "\""
+           << " build=\"" << __DATE__ << " " << __TIME__ << "\""
            << " vendor=0x" << hex16(adapterDesc.VendorId)
            << " device=0x" << hex16(adapterDesc.DeviceId)
            << " vram=" << (adapterDesc.DedicatedVideoMemory / (1024ull * 1024ull)) << "MB"

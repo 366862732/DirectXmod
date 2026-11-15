@@ -16,6 +16,7 @@
 #include <wrl/client.h>
 
 #include <string>
+#include <vector>
 
 namespace dx11mc {
 
@@ -29,6 +30,16 @@ std::string hresultToString(HRESULT hr);
 
 // "D3D_FEATURE_LEVEL_10_1" etc.
 const char* featureLevelName(D3D_FEATURE_LEVEL level);
+
+// Optional validation clamp. A non-zero cap makes both the probe and the
+// persistent device request only levels at or below it. This lets a WARP
+// device that reports 11_0/12_1 exercise the real FL10.x code path.
+void setFeatureLevelCap(D3D_FEATURE_LEVEL level);
+D3D_FEATURE_LEVEL featureLevelCap();
+
+// Descending list of levels to pass to D3D11CreateDevice, capped when a
+// feature-level cap was set. Never empty.
+std::vector<D3D_FEATURE_LEVEL> availableFeatureLevels();
 
 using D3DCompileFn = HRESULT(WINAPI*)(
     LPCVOID pSrcData,
