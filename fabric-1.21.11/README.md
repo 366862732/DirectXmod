@@ -35,6 +35,8 @@ The performance jar adds:
 - Lithium-style client tick micro-optimizations: a resolved entity-type lookup
   cache, a client-side ambient sound short-circuit, a biome-particle lookup
   skip, and bounded entity-section queries for small boxes
+- stb_rect_pack sprite-atlas stitching for large atlases, which shortens
+  startup and resource reloads
 - `/dx11perf` counters and a FPS/CPU/GPU debug overlay
 
 The OpenGL renderer remains the fallback. The layer is only active after a
@@ -92,6 +94,7 @@ enabled:
   "skipClientAmbientSounds": true,
   "fastAmbientParticles": true,
   "fastEntityQueries": true,
+  "fastStitcher": true,
   "signTextBuffering": true
 }
 ```
@@ -121,10 +124,16 @@ The two umbrellas are independent:
   vertices, translucent region sorting, upload budget, fog occlusion, deferred
   offscreen uploads and entity culling.
 
-`fastEntityLookup`, `skipClientAmbientSounds`, `fastAmbientParticles` and
-`fastEntityQueries` are independent client tick optimizations.
+`fastEntityLookup`, `skipClientAmbientSounds`, `fastAmbientParticles`,
+`fastEntityQueries` and `fastStitcher` are independent optimizations.
 `performancemode` switches them with the two umbrellas, but they can also be
 toggled on their own and never trigger a chunk rebuild.
+
+`fastStitcher` is the only one of them that loads resources instead of ticking:
+atlases with fewer than 100 sprites keep vanilla's exact layout, larger ones are
+packed with `stb_rect_pack`. Sprite positions stay aligned to `1 << mipLevel`, so
+mip filtering cannot bleed neighbouring sprites. The flag applies at the next
+resource reload, so `/dx11perf toggle fastStitcher` takes effect after F3+T.
 
 ## Commands
 

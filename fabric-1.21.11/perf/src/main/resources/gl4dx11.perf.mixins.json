@@ -25,6 +25,8 @@
     "RenderSystemPerfMixin",
     "ScheduleResortMixin",
     "SectionRenderDispatcherMixin",
+    "StitcherHolderMixin",
+    "StitcherMixin",
     "immediate.AbstractSignRendererMixin",
     "immediate.FeatureRenderDispatcherMixin",
     "immediate.FontGlyphVisitorMixin",

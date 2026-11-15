@@ -94,6 +94,11 @@ public final class PerfConfig {
     /** Visit only the entity sections inside small entity-query boxes. */
     public boolean fastEntityQueries = true;
 
+    // Resource-loading optimizations.  They do not change steady-state frame
+    // time; they shorten startup and every resource reload.
+    /** Pack large atlases with stb_rect_pack instead of the growing tree. */
+    public boolean fastStitcher = true;
+
     // ImmediatelyFast-style non-terrain optimizations.  Each one is
     // independent so a regression can be isolated without rebuilding.
     /**
