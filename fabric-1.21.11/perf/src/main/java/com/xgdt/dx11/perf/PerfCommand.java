@@ -145,6 +145,7 @@ public final class PerfCommand {
             + "\n" + com.xgdt.dx11.perf.culling.FogOcclusion.describe()
             + "\n" + com.xgdt.dx11.perf.culling.EntityCulling.describe()
             + "\n" + MicroStats.describe()
+            + "\n" + com.xgdt.dx11.perf.texture.StitcherStats.describe()
             + "\n" + com.xgdt.dx11.perf.immediate.ImmediateStats.describe()
             + "\nconfig=" + PerfState.configPath();
     }
@@ -155,6 +156,7 @@ public final class PerfCommand {
         com.xgdt.dx11.perf.culling.FogOcclusion.resetStats();
         com.xgdt.dx11.perf.culling.EntityCulling.resetStats();
         MicroStats.reset();
+        com.xgdt.dx11.perf.texture.StitcherStats.reset();
         com.xgdt.dx11.perf.upload.UploadScheduler.resetStats();
         com.xgdt.dx11.perf.immediate.ImmediateStats.reset();
         return "DX11 perf counters reset.";

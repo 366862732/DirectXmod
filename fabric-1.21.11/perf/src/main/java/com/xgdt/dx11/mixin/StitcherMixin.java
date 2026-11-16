@@ -3,6 +3,7 @@ package com.xgdt.dx11.mixin;
 import com.xgdt.dx11.perf.PerfState;
 import com.xgdt.dx11.perf.texture.StbStitcher;
 import com.xgdt.dx11.perf.texture.StbStitcher.PackedAtlas;
+import com.xgdt.dx11.perf.texture.StitcherStats;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -74,6 +75,7 @@ public abstract class StitcherMixin {
             return;
         }
         if (!StbStitcher.isWorthPacking(this.texturesToBeStitched.size())) {
+            StitcherStats.skipped();
             return;
         }
 
@@ -81,12 +83,14 @@ public abstract class StitcherMixin {
         sorted.sort(HOLDER_COMPARATOR);
         PackedAtlas packed = StbStitcher.pack(sorted, this.maxWidth, this.maxHeight, this.mipLevel);
         if (packed == null) {
+            StitcherStats.fellBack();
             return;
         }
 
         this.storageX = packed.width();
         this.storageY = packed.height();
         this.dx11$packed = packed;
+        StitcherStats.packed(packed.sprites().size(), packed.width(), packed.height());
         ci.cancel();
     }
 
