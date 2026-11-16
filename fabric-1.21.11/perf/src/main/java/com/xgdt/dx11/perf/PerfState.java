@@ -78,6 +78,19 @@ public final class PerfState {
         return config;
     }
 
+    /**
+     * Allocation- and lock-free config read for hot paths.
+     *
+     * <p>{@link #config()} goes through the synchronized {@link #init()} guard,
+     * which is fine once per frame but not once per model face.  This variant
+     * only touches the volatile field, falling back to the full path during the
+     * short window before the client entrypoint has initialized the layer.</p>
+     */
+    public static PerfConfig current() {
+        PerfConfig current = config;
+        return current != null ? current : config();
+    }
+
     public static Path configPath() {
         init();
         return configPath;

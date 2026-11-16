@@ -20,6 +20,7 @@
     "LevelRendererLifecycleMixin",
     "LevelRendererPrepareMixin",
     "MobMixin",
+    "ModelBlockRendererMixin",
     "PerfCommandMixin",
     "RenderSectionUploadMixin",
     "RenderSystemPerfMixin",

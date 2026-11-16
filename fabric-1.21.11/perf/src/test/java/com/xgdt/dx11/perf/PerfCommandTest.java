@@ -15,6 +15,9 @@ class PerfCommandTest {
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle compactVerticesForce"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle translucentRegion"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle regionEnabled"));
+        assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle cullLeafFaces"));
+        assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle leafcull"));
+        assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle leaves"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle sodium"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf performancemode on"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf performancemode off"));
@@ -62,6 +65,7 @@ class PerfCommandTest {
         assertFalse(config.skipClientAmbientSounds);
         assertFalse(config.fastAmbientParticles);
         assertFalse(config.fastEntityQueries);
+        assertFalse(config.cullLeafFaces);
         assertFalse(config.fastStitcher);
         assertFalse(config.visibleTextureAnimation);
         assertFalse(config.immediateEnabled);
@@ -85,6 +89,7 @@ class PerfCommandTest {
         assertTrue(config.skipClientAmbientSounds);
         assertTrue(config.fastAmbientParticles);
         assertTrue(config.fastEntityQueries);
+        assertTrue(config.cullLeafFaces);
         assertTrue(config.fastStitcher);
         assertTrue(config.immediateEnabled);
         assertTrue(config.signTextBuffering);

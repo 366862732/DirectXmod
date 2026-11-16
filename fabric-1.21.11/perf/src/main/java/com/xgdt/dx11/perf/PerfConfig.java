@@ -94,6 +94,21 @@ public final class PerfConfig {
     /** Visit only the entity sections inside small entity-query boxes. */
     public boolean fastEntityQueries = true;
 
+    // Hidden-face culling.  Only faces that no shape test can reject are
+    // removed, so the block geometry and lighting stay vanilla.
+    /**
+     * Drop leaf faces that have another leaf layer directly behind them.
+     * Toggling this rebuilds the world's chunk meshes.
+     */
+    public boolean cullLeafFaces = true;
+    /**
+     * Consecutive leaf blocks required behind a face before it is dropped.
+     * {@code 1} removes every face between two touching leaves, {@code 2}
+     * (default) also requires a second leaf layer, and higher values are
+     * progressively more conservative.
+     */
+    public int leafCullDepth = 2;
+
     // Resource-loading optimizations.  They do not change steady-state frame
     // time; they shorten startup and every resource reload.
     /** Pack large atlases with stb_rect_pack instead of the growing tree. */
@@ -237,6 +252,8 @@ public final class PerfConfig {
             clamp("perf.compactPositionBits", this.compactPositionBits, 16, 20, warnings);
         this.translucentSortBudget =
             clamp("perf.translucentSortBudget", this.translucentSortBudget, 0, 64, warnings);
+        this.leafCullDepth =
+            clamp("perf.leafCullDepth", this.leafCullDepth, 1, 4, warnings);
         this.fontAtlasSize =
             clampAtlasSize("perf.fontAtlasSize", this.fontAtlasSize, 256, 8192, warnings);
         this.mapAtlasSize =

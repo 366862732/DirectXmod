@@ -136,6 +136,8 @@ public final class PerfCommand {
             + " skipClientAmbientSounds=" + config.skipClientAmbientSounds
             + " fastAmbientParticles=" + config.fastAmbientParticles
             + " fastEntityQueries=" + config.fastEntityQueries
+            + " cullLeafFaces=" + config.cullLeafFaces
+            + " leafCullDepth=" + config.leafCullDepth
             + " fastStitcher=" + config.fastStitcher
             + "\n" + snapshot.format()
             + "\n" + RegionManager.describe()
@@ -144,6 +146,7 @@ public final class PerfCommand {
             + "\n" + com.xgdt.dx11.perf.upload.UploadScheduler.describe()
             + "\n" + com.xgdt.dx11.perf.culling.FogOcclusion.describe()
             + "\n" + com.xgdt.dx11.perf.culling.EntityCulling.describe()
+            + "\n" + com.xgdt.dx11.perf.culling.LeafFaceCulling.describe()
             + "\n" + MicroStats.describe()
             + "\n" + com.xgdt.dx11.perf.texture.StitcherStats.describe()
             + "\n" + com.xgdt.dx11.perf.immediate.ImmediateStats.describe()
@@ -155,6 +158,7 @@ public final class PerfCommand {
         com.xgdt.dx11.terrain.CompactTerrainFormat.resetStats();
         com.xgdt.dx11.perf.culling.FogOcclusion.resetStats();
         com.xgdt.dx11.perf.culling.EntityCulling.resetStats();
+        com.xgdt.dx11.perf.culling.LeafFaceCulling.resetStats();
         MicroStats.reset();
         com.xgdt.dx11.perf.texture.StitcherStats.reset();
         com.xgdt.dx11.perf.upload.UploadScheduler.resetStats();
@@ -232,6 +236,7 @@ public final class PerfCommand {
         config.skipClientAmbientSounds = enabled;
         config.fastAmbientParticles = enabled;
         config.fastEntityQueries = enabled;
+        config.cullLeafFaces = enabled;
         config.fastStitcher = enabled;
         config.visibleTextureAnimation = enabled;
         config.immediateEnabled = enabled;
@@ -264,6 +269,7 @@ public final class PerfCommand {
             && config.skipClientAmbientSounds
             && config.fastAmbientParticles
             && config.fastEntityQueries
+            && config.cullLeafFaces
             && config.fastStitcher
             && config.visibleTextureAnimation
             && config.immediateEnabled
@@ -367,6 +373,10 @@ public final class PerfCommand {
                 config.fastEntityQueries = !config.fastEntityQueries;
                 yield config.fastEntityQueries;
             }
+            case "cullleaffaces", "leafcull", "leaves" -> {
+                config.cullLeafFaces = !config.cullLeafFaces;
+                yield config.cullLeafFaces;
+            }
             case "faststitcher", "stitcher" -> {
                 config.fastStitcher = !config.fastStitcher;
                 yield config.fastStitcher;
@@ -458,6 +468,7 @@ public final class PerfCommand {
                                             entityCulling, fastEntityLookup,
                                             skipClientAmbientSounds, fastAmbientParticles,
                                             fastEntityQueries,
+                                            cullLeafFaces (or leafcull/leaves),
                                             fastStitcher,
                                             visibleTextureAnimation,
                                             immediateBatching, fastTextLookup,
