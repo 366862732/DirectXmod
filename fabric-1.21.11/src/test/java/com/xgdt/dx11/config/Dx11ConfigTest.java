@@ -91,10 +91,13 @@ class Dx11ConfigTest {
         System.clearProperty(Dx11Config.MAX_FEATURE_LEVEL_PROPERTY);
 
         // No enable property exists: the probe must be attempted anyway.  The
-        // unit-test JVM has no Windows DLL, so the probe fails and the game
-        // falls back to OpenGL.
-        assertFalse(Dx11Config.shouldUseDx11());
+        // outcome depends on the machine (a real adapter, or the DLL supplied
+        // through -Dgl4dx11.nativePath / JAVA_TOOL_OPTIONS, can make it
+        // succeed), so assert that the backend decision matches the probe
+        // result instead of assuming failure.
+        boolean useDx11 = Dx11Config.shouldUseDx11();
         assertNotEquals("not run", Dx11Config.probeResult());
+        assertEquals(Dx11Config.probeOk(), useDx11);
     }
 
     @Test

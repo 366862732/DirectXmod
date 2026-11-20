@@ -96,7 +96,17 @@ public final class PerfCommand {
                     || flag.equals("deferredoffscreenupdates")
                     || flag.equals("deferred")
                     || flag.equals("entityculling")
-                    || flag.equals("entities"));
+                    || flag.equals("entities")
+                    || flag.equals("fastentitylookup")
+                    || flag.equals("fastentities")
+                    || flag.equals("skipclientambientsounds")
+                    || flag.equals("ambientsounds")
+                    || flag.equals("fastambientparticles")
+                    || flag.equals("particles")
+                    || flag.equals("fastentityqueries")
+                    || flag.equals("entityqueries")
+                    || flag.equals("faststitcher")
+                    || flag.equals("stitcher"));
             }
             default -> false;
         };
@@ -122,6 +132,13 @@ public final class PerfCommand {
             + " fogOcclusion=" + config.fogOcclusion
             + " deferredOffscreen=" + config.deferredOffscreenUpdates
             + " entityCulling=" + config.entityCulling
+            + " fastEntityLookup=" + config.fastEntityLookup
+            + " skipClientAmbientSounds=" + config.skipClientAmbientSounds
+            + " fastAmbientParticles=" + config.fastAmbientParticles
+            + " fastEntityQueries=" + config.fastEntityQueries
+            + " cullLeafFaces=" + config.cullLeafFaces
+            + " leafCullDepth=" + config.leafCullDepth
+            + " fastStitcher=" + config.fastStitcher
             + "\n" + snapshot.format()
             + "\n" + RegionManager.describe()
             + "\n" + com.xgdt.dx11.terrain.CompactTerrainFormat.describe()
@@ -129,6 +146,9 @@ public final class PerfCommand {
             + "\n" + com.xgdt.dx11.perf.upload.UploadScheduler.describe()
             + "\n" + com.xgdt.dx11.perf.culling.FogOcclusion.describe()
             + "\n" + com.xgdt.dx11.perf.culling.EntityCulling.describe()
+            + "\n" + com.xgdt.dx11.perf.culling.LeafFaceCulling.describe()
+            + "\n" + MicroStats.describe()
+            + "\n" + com.xgdt.dx11.perf.texture.StitcherStats.describe()
             + "\n" + com.xgdt.dx11.perf.immediate.ImmediateStats.describe()
             + "\nconfig=" + PerfState.configPath();
     }
@@ -138,6 +158,9 @@ public final class PerfCommand {
         com.xgdt.dx11.terrain.CompactTerrainFormat.resetStats();
         com.xgdt.dx11.perf.culling.FogOcclusion.resetStats();
         com.xgdt.dx11.perf.culling.EntityCulling.resetStats();
+        com.xgdt.dx11.perf.culling.LeafFaceCulling.resetStats();
+        MicroStats.reset();
+        com.xgdt.dx11.perf.texture.StitcherStats.reset();
         com.xgdt.dx11.perf.upload.UploadScheduler.resetStats();
         com.xgdt.dx11.perf.immediate.ImmediateStats.reset();
         return "DX11 perf counters reset.";
@@ -209,6 +232,12 @@ public final class PerfCommand {
         config.fogOcclusion = enabled;
         config.deferredOffscreenUpdates = enabled;
         config.entityCulling = enabled;
+        config.fastEntityLookup = enabled;
+        config.skipClientAmbientSounds = enabled;
+        config.fastAmbientParticles = enabled;
+        config.fastEntityQueries = enabled;
+        config.cullLeafFaces = enabled;
+        config.fastStitcher = enabled;
         config.visibleTextureAnimation = enabled;
         config.immediateEnabled = enabled;
         config.immediateBatching = enabled;
@@ -236,6 +265,12 @@ public final class PerfCommand {
             && config.fogOcclusion
             && config.deferredOffscreenUpdates
             && config.entityCulling
+            && config.fastEntityLookup
+            && config.skipClientAmbientSounds
+            && config.fastAmbientParticles
+            && config.fastEntityQueries
+            && config.cullLeafFaces
+            && config.fastStitcher
             && config.visibleTextureAnimation
             && config.immediateEnabled
             && config.immediateBatching
@@ -322,6 +357,30 @@ public final class PerfCommand {
                 config.entityCulling = !config.entityCulling;
                 yield config.entityCulling;
             }
+            case "fastentitylookup", "fastentities" -> {
+                config.fastEntityLookup = !config.fastEntityLookup;
+                yield config.fastEntityLookup;
+            }
+            case "skipclientambientsounds", "ambientsounds" -> {
+                config.skipClientAmbientSounds = !config.skipClientAmbientSounds;
+                yield config.skipClientAmbientSounds;
+            }
+            case "fastambientparticles", "particles" -> {
+                config.fastAmbientParticles = !config.fastAmbientParticles;
+                yield config.fastAmbientParticles;
+            }
+            case "fastentityqueries", "entityqueries" -> {
+                config.fastEntityQueries = !config.fastEntityQueries;
+                yield config.fastEntityQueries;
+            }
+            case "cullleaffaces", "leafcull", "leaves" -> {
+                config.cullLeafFaces = !config.cullLeafFaces;
+                yield config.cullLeafFaces;
+            }
+            case "faststitcher", "stitcher" -> {
+                config.fastStitcher = !config.fastStitcher;
+                yield config.fastStitcher;
+            }
             case "visibletextureanimation", "textures" -> {
                 config.visibleTextureAnimation = !config.visibleTextureAnimation;
                 yield config.visibleTextureAnimation;
@@ -397,7 +456,7 @@ public final class PerfCommand {
             DX11 perf commands:
               /dx11perf stats | reset | leaks | reload | save
               /dx11perf debugOverlay [on|off] - toggle the FPS/CPU/GPU overlay
-              /dx11perf performancemode [on|off|toggle] - all region + immediate features
+              /dx11perf performancemode [on|off|toggle] - all region, immediate and micro features
                                             (off keeps the overlay and counters live)
               /dx11perf toggle            - enable/disable the perf layer
               /dx11perf toggle <flag>     - immediateEnabled (or immediate/if),
@@ -406,7 +465,12 @@ public final class PerfCommand {
                                             uploadBudget, compactVertices,
                                             compactVerticesForce, translucentRegion,
                                             fogOcclusion, deferredOffscreenUpdates,
-                                            entityCulling, visibleTextureAnimation,
+                                            entityCulling, fastEntityLookup,
+                                            skipClientAmbientSounds, fastAmbientParticles,
+                                            fastEntityQueries,
+                                            cullLeafFaces (or leafcull/leaves),
+                                            fastStitcher,
+                                            visibleTextureAnimation,
                                             immediateBatching, fastTextLookup,
                                             skipTextSorting, fontAtlasResizing,
                                             fastGuiLayerLookup, mapAtlasGeneration,

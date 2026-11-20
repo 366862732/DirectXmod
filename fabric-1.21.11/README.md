@@ -32,6 +32,13 @@ The performance jar adds:
 - translucent region sorting and optional fog/entity culling
 - ImmediatelyFast-style immediate-mode batching, text lookup, GUI layer
   lookup, map atlas caching and sign-text buffering
+- Lithium-style client tick micro-optimizations: a resolved entity-type lookup
+  cache, a client-side ambient sound short-circuit, a biome-particle lookup
+  skip, and bounded entity-section queries for small boxes
+- stb_rect_pack sprite-atlas stitching for large atlases, which shortens
+  startup and resource reloads
+- hidden-face culling for leaves, which drops the canopy faces that vanilla's
+  shape test cannot reject
 - `/dx11perf` counters and a FPS/CPU/GPU debug overlay
 
 The OpenGL renderer remains the fallback. The layer is only active after a
@@ -85,6 +92,13 @@ enabled:
   "fogOcclusion": true,
   "deferredOffscreenUpdates": true,
   "entityCulling": true,
+  "fastEntityLookup": true,
+  "skipClientAmbientSounds": true,
+  "fastAmbientParticles": true,
+  "fastEntityQueries": true,
+  "cullLeafFaces": true,
+  "leafCullDepth": 2,
+  "fastStitcher": true,
   "signTextBuffering": true
 }
 ```
@@ -113,6 +127,27 @@ The two umbrellas are independent:
 - `regionEnabled` covers region arenas/uploads, coalesced region draws, compact
   vertices, translucent region sorting, upload budget, fog occlusion, deferred
   offscreen uploads and entity culling.
+
+`fastEntityLookup`, `skipClientAmbientSounds`, `fastAmbientParticles`,
+`fastEntityQueries` and `fastStitcher` are independent optimizations.
+`performancemode` switches them with the two umbrellas, but they can also be
+toggled on their own and never trigger a chunk rebuild.
+
+`cullLeafFaces` is also independent, but it removes geometry, so toggling it
+rebuilds the loaded chunks. Vanilla culls a block face when the neighbour's
+face occlusion shape covers it; leaves have an empty occlusion shape, so their
+interior faces reach the mesh anyway. With the flag on, a leaf face is dropped
+when the block it faces and the next `leafCullDepth - 1` blocks behind it are
+all in `#minecraft:leaves`. The default depth of two only removes faces that
+have a second leaf layer in front of them, which is indistinguishable through a
+cutout texture; a one-layer canopy keeps its outer surface, and a face whose
+probe would leave the loaded render region is always kept.
+
+`fastStitcher` is the only one of them that loads resources instead of ticking:
+atlases with fewer than 100 sprites keep vanilla's exact layout, larger ones are
+packed with `stb_rect_pack`. Sprite positions stay aligned to `1 << mipLevel`, so
+mip filtering cannot bleed neighbouring sprites. The flag applies at the next
+resource reload, so `/dx11perf toggle fastStitcher` takes effect after F3+T.
 
 ## Commands
 

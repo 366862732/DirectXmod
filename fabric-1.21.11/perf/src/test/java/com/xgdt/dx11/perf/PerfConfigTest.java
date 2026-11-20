@@ -31,6 +31,8 @@ class PerfConfigTest {
         assertTrue(config.fogOcclusion);
         assertTrue(config.deferredOffscreenUpdates);
         assertTrue(config.entityCulling);
+        assertTrue(config.cullLeafFaces);
+        assertEquals(2, config.leafCullDepth);
         assertTrue(config.visibleTextureAnimation);
         assertTrue(config.immediateBatching);
         assertTrue(config.fastTextLookup);
@@ -94,7 +96,8 @@ class PerfConfigTest {
               "uploadMaxBytesPerFrame": -4,
               "regionArenaLimitMb": -5,
               "compactPositionBits": 99,
-              "translucentSortBudget": -1
+              "translucentSortBudget": -1,
+              "leafCullDepth": 9
             }
             """,
             StandardCharsets.UTF_8);
@@ -106,6 +109,7 @@ class PerfConfigTest {
         assertEquals(0, result.config().regionArenaLimitMb);
         assertEquals(20, result.config().compactPositionBits);
         assertEquals(0, result.config().translucentSortBudget);
+        assertEquals(4, result.config().leafCullDepth);
         assertFalse(result.warnings().isEmpty());
     }
 

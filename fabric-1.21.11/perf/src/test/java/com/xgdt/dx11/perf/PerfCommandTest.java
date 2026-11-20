@@ -15,6 +15,9 @@ class PerfCommandTest {
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle compactVerticesForce"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle translucentRegion"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle regionEnabled"));
+        assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle cullLeafFaces"));
+        assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle leafcull"));
+        assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle leaves"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf toggle sodium"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf performancemode on"));
         assertTrue(PerfCommand.requiresChunkRebuild("/dx11perf performancemode off"));
@@ -32,6 +35,11 @@ class PerfCommandTest {
         assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle immediateEnabled"));
         assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle immediate"));
         assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle uploadBudget"));
+        assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle fastEntityLookup"));
+        assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle skipClientAmbientSounds"));
+        assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle fastAmbientParticles"));
+        assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle fastEntityQueries"));
+        assertFalse(PerfCommand.requiresChunkRebuild("/dx11perf toggle fastStitcher"));
         assertFalse(PerfCommand.requiresChunkRebuild("/say hello"));
         assertFalse(PerfCommand.requiresChunkRebuild(null));
     }
@@ -53,6 +61,12 @@ class PerfCommandTest {
         assertFalse(config.fogOcclusion);
         assertFalse(config.deferredOffscreenUpdates);
         assertFalse(config.entityCulling);
+        assertFalse(config.fastEntityLookup);
+        assertFalse(config.skipClientAmbientSounds);
+        assertFalse(config.fastAmbientParticles);
+        assertFalse(config.fastEntityQueries);
+        assertFalse(config.cullLeafFaces);
+        assertFalse(config.fastStitcher);
         assertFalse(config.visibleTextureAnimation);
         assertFalse(config.immediateEnabled);
         assertFalse(config.immediateBatching);
@@ -71,6 +85,12 @@ class PerfCommandTest {
         assertTrue(config.regionDraws);
         assertTrue(config.compactVertices);
         assertTrue(config.translucentRegion);
+        assertTrue(config.fastEntityLookup);
+        assertTrue(config.skipClientAmbientSounds);
+        assertTrue(config.fastAmbientParticles);
+        assertTrue(config.fastEntityQueries);
+        assertTrue(config.cullLeafFaces);
+        assertTrue(config.fastStitcher);
         assertTrue(config.immediateEnabled);
         assertTrue(config.signTextBuffering);
         assertTrue(PerfCommand.allPerformanceFeaturesEnabled(config));
