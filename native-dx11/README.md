@@ -53,5 +53,6 @@ OK adapter="Intel(R) HD Graphics 3000" vendor=0x8086 device=0x0126 vram=...MB
    d3dcompiler=d3dcompiler_47.dll swapchain=64x64 present=yes
 ```
 
-If the probe reports `ERROR`, the game keeps using vanilla OpenGL; nothing is
-installed into the renderer until the backend is explicitly enabled.
+If the probe reports `ERROR`, the game keeps using vanilla OpenGL. When the
+probe succeeds, the backend is installed automatically; no extra JVM flag is
+required.

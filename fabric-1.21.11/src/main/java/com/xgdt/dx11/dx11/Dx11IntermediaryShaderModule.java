@@ -3,6 +3,7 @@ package com.xgdt.dx11.dx11;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -65,6 +66,17 @@ final class Dx11IntermediaryShaderModule implements AutoCloseable {
 
     List<SpvVariable> inputs() {
         return this.inputs;
+    }
+
+    /** Names of stage inputs that the compiled shader actually reads. */
+    Set<String> usedInputNames() {
+        Set<String> names = new HashSet<>();
+        for (SpvVariable input : this.inputs) {
+            if (input.used()) {
+                names.add(input.name());
+            }
+        }
+        return names;
     }
 
     List<SpvVariable> outputs() {
@@ -448,7 +460,43 @@ final class Dx11IntermediaryShaderModule implements AutoCloseable {
         if (unusedNames.isEmpty()) {
             return hlsl;
         }
+        return removeInputMembers(hlsl, unusedNames, unusedLocations, usedLocations, false);
+    }
 
+    /**
+     * Removes vertex inputs that the pipeline's vertex format does not provide.
+     *
+     * <p>D3D11 validates the input layout against every element of the vertex
+     * shader's input signature, even elements the shader never reads.  A
+     * compact terrain format drops the unused normal, so its generated HLSL
+     * must drop the matching signature member as well; otherwise
+     * {@code CreateInputLayout} fails with E_INVALIDARG.</p>
+     */
+    String stripUnprovidedVertexInputs(String hlsl, Collection<String> providedInputs) {
+        if (this.spirv == null || this.inputs.isEmpty()) {
+            return hlsl;
+        }
+        Set<String> removeNames = new HashSet<>();
+        for (SpvVariable input : this.inputs) {
+            if (!input.used() && !providedInputs.contains(input.name())) {
+                removeNames.add(input.name());
+            }
+        }
+        if (removeNames.isEmpty()) {
+            return hlsl;
+        }
+        // Only user attributes are candidates.  System values (for example
+        // SV_VertexID) never come from the vertex format and must stay in the
+        // signature even when they are unused.
+        return removeInputMembers(hlsl, removeNames, null, Set.of(), true);
+    }
+
+    static String removeInputMembers(
+        String hlsl,
+        Set<String> removeNames,
+        @Nullable Set<Integer> removeLocations,
+        Set<Integer> keptLocations,
+        boolean texcoordOnly) {
         String marker = "struct SPIRV_Cross_Input";
         int structStart = hlsl.indexOf(marker);
         if (structStart < 0) {
@@ -465,12 +513,16 @@ final class Dx11IntermediaryShaderModule implements AutoCloseable {
         for (String line : hlsl.substring(open + 1, close).split("\n", -1)) {
             String member = structMemberName(line);
             String semantic = structMemberSemantic(line);
-            boolean remove = member != null && unusedNames.contains(member);
-            if (!remove && semantic != null && semantic.startsWith("TEXCOORD")) {
+            boolean remove = member != null && removeNames.contains(member);
+            if (remove && texcoordOnly) {
+                remove = semantic != null && semantic.startsWith("TEXCOORD");
+            }
+            if (!remove && removeLocations != null
+                && semantic != null && semantic.startsWith("TEXCOORD")) {
                 try {
                     int location = Integer.parseInt(semantic.substring("TEXCOORD".length()));
-                    remove = unusedLocations.contains(location)
-                        && !usedLocations.contains(location);
+                    remove = removeLocations.contains(location)
+                        && !keptLocations.contains(location);
                 } catch (NumberFormatException ignored) {
                     // Not a numbered TEXCOORD semantic; leave the member alone.
                 }
@@ -500,8 +552,8 @@ final class Dx11IntermediaryShaderModule implements AutoCloseable {
         }
         for (String member : removedMembers) {
             result = result.replaceAll(
-                "(?m)^[ \\t]*[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*stage_input\\."
-                    + Pattern.quote(member) + "\\s*;[ \\t]*\\n?",
+                "(?m)^[ \\t]*[^;=\\n]*=[ \\t]*stage_input\\."
+                    + Pattern.quote(member) + "[ \\t]*;[ \\t]*\\n?",
                 "");
         }
         return result;

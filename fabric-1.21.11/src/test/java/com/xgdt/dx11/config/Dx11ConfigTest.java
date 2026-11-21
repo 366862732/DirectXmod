@@ -1,7 +1,10 @@
 package com.xgdt.dx11.config;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.AfterEach;
@@ -11,15 +14,15 @@ import org.junit.jupiter.api.Test;
 class Dx11ConfigTest {
     private String originalOsName;
     private String originalBackend;
-    private String originalEnabled;
     private String originalDebug;
+    private String originalMaxFeatureLevel;
 
     @BeforeEach
     void saveProperties() {
         originalOsName = System.getProperty("os.name");
         originalBackend = System.getProperty(Dx11Config.BACKEND_PROPERTY);
-        originalEnabled = System.getProperty(Dx11Config.ENABLE_PROPERTY);
         originalDebug = System.getProperty(Dx11Config.DEBUG_PROPERTY);
+        originalMaxFeatureLevel = System.getProperty(Dx11Config.MAX_FEATURE_LEVEL_PROPERTY);
         Dx11Config.resetProbeState();
     }
 
@@ -27,8 +30,8 @@ class Dx11ConfigTest {
     void restoreProperties() {
         restore("os.name", originalOsName);
         restore(Dx11Config.BACKEND_PROPERTY, originalBackend);
-        restore(Dx11Config.ENABLE_PROPERTY, originalEnabled);
         restore(Dx11Config.DEBUG_PROPERTY, originalDebug);
+        restore(Dx11Config.MAX_FEATURE_LEVEL_PROPERTY, originalMaxFeatureLevel);
         Dx11Config.resetProbeState();
     }
 
@@ -77,18 +80,24 @@ class Dx11ConfigTest {
     void nonWindowsNeverUsesDx11() {
         System.setProperty("os.name", "Linux");
         System.setProperty(Dx11Config.BACKEND_PROPERTY, "dx11");
-        System.setProperty(Dx11Config.ENABLE_PROPERTY, "true");
         assertFalse(Dx11Config.shouldUseDx11());
+        assertEquals("not run", Dx11Config.probeResult());
     }
 
     @Test
-    void probeIsNotRunWhenTheBackendIsNotEnabled() {
+    void probeRunsAutomaticallyOnWindows() {
         System.setProperty("os.name", "Windows 10");
         System.setProperty(Dx11Config.BACKEND_PROPERTY, "dx11");
-        System.clearProperty(Dx11Config.ENABLE_PROPERTY);
+        System.clearProperty(Dx11Config.MAX_FEATURE_LEVEL_PROPERTY);
 
-        assertFalse(Dx11Config.shouldUseDx11());
-        assertEquals("not run", Dx11Config.probeResult());
+        // No enable property exists: the probe must be attempted anyway.  The
+        // outcome depends on the machine (a real adapter, or the DLL supplied
+        // through -Dgl4dx11.nativePath / JAVA_TOOL_OPTIONS, can make it
+        // succeed), so assert that the backend decision matches the probe
+        // result instead of assuming failure.
+        boolean useDx11 = Dx11Config.shouldUseDx11();
+        assertNotEquals("not run", Dx11Config.probeResult());
+        assertEquals(Dx11Config.probeOk(), useDx11);
     }
 
     @Test
@@ -113,5 +122,41 @@ class Dx11ConfigTest {
 
         System.setProperty(Dx11Config.DEBUG_PROPERTY, "false");
         assertFalse(Dx11Config.debugLogging());
+    }
+
+    @Test
+    void featureLevelParsesCommonForms() {
+        assertArrayEquals(new int[] {10, 0}, Dx11Config.parseFeatureLevel("10_0"));
+        assertArrayEquals(new int[] {10, 1}, Dx11Config.parseFeatureLevel("10.1"));
+        assertArrayEquals(new int[] {11, 0}, Dx11Config.parseFeatureLevel(" 11_0 "));
+        assertArrayEquals(
+            new int[] {10, 1},
+            Dx11Config.parseFeatureLevel("D3D_FEATURE_LEVEL_10_1"));
+        assertArrayEquals(new int[] {9, 3}, Dx11Config.parseFeatureLevel("9_3"));
+        assertArrayEquals(new int[] {12, 2}, Dx11Config.parseFeatureLevel("12_2"));
+    }
+
+    @Test
+    void featureLevelRejectsMalformedOrUnsupportedValues() {
+        assertNull(Dx11Config.parseFeatureLevel(null));
+        assertNull(Dx11Config.parseFeatureLevel(""));
+        assertNull(Dx11Config.parseFeatureLevel("10"));
+        assertNull(Dx11Config.parseFeatureLevel("10_2"));
+        assertNull(Dx11Config.parseFeatureLevel("13_0"));
+        assertNull(Dx11Config.parseFeatureLevel("ten_one"));
+    }
+
+    @Test
+    void featureLevelPropertyDefaultsToEmpty() {
+        System.clearProperty(Dx11Config.MAX_FEATURE_LEVEL_PROPERTY);
+        assertEquals("", Dx11Config.maxFeatureLevel());
+    }
+
+    @Test
+    void applyingFeatureLevelCapIsANoOpOffWindows() {
+        System.setProperty("os.name", "Linux");
+        System.setProperty(Dx11Config.MAX_FEATURE_LEVEL_PROPERTY, "10_1");
+        // Must not touch the native library on a non-Windows host.
+        Dx11Config.applyFeatureLevelCap();
     }
 }

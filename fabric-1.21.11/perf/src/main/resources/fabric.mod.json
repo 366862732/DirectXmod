@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "gl4dx11-perf",
+  "version": "${version}",
+  "name": "DirectXMod performance layer (1.21.11)",
+  "description": "Optional performance layer for the gl4dx11 D3D11 backend: region terrain, immediate-mode batching, culling, upload scheduling and the /dx11perf overlay. Delete this jar to keep plain D3D11 rendering.",
+  "authors": [
+    "xiaozi Graphics Development Team"
+  ],
+  "contact": {},
+  "license": "Apache 2.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.xgdt.dx11.perf.PerfMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "gl4dx11": ">=0.1.0"
+  },
+  "mixins": [
+    "gl4dx11.perf.mixins.json"
+  ]
+}

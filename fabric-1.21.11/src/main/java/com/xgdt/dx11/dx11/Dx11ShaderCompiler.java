@@ -157,6 +157,11 @@ final class Dx11ShaderCompiler implements AutoCloseable {
             fragmentWork.rebind(vertexOutputNames, bindings, true);
 
             vertexHlsl = vertexWork.toHlsl(true);
+            // The compact format drops the unused normal, but SPIRV-Cross
+            // keeps every declared input in the HLSL signature.  Drop members
+            // the format cannot supply so CreateInputLayout accepts the
+            // pipeline.
+            vertexHlsl = vertexWork.stripUnprovidedVertexInputs(vertexHlsl, vertexInputNames);
             fragmentHlsl = fragmentWork.toHlsl(false);
         } finally {
             // cloneForCompile() allocates a private SPIR-V copy; release it

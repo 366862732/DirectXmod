@@ -1,6 +1,7 @@
 #include "dx11_device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -493,16 +494,8 @@ Device* createDevice(HWND hwnd, std::string& error) {
     const bool onSoftwareAdapter =
         softwareAdapter && adapter.Get() == softwareAdapter.Get();
 
-    const D3D_FEATURE_LEVEL levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
-        D3D_FEATURE_LEVEL_9_3,
-        D3D_FEATURE_LEVEL_9_2,
-        D3D_FEATURE_LEVEL_9_1,
-    };
-    constexpr UINT levelCount = static_cast<UINT>(sizeof(levels) / sizeof(levels[0]));
+    const std::vector<D3D_FEATURE_LEVEL> levels = availableFeatureLevels();
+    const UINT levelCount = static_cast<UINT>(levels.size());
     constexpr UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
     ComPtr<ID3D11Device> d3dDevice;
@@ -510,13 +503,13 @@ Device* createDevice(HWND hwnd, std::string& error) {
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_9_1;
     hr = D3D11CreateDevice(
         adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-        levels, levelCount, D3D11_SDK_VERSION,
+        levels.data(), levelCount, D3D11_SDK_VERSION,
         d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
-    if (hr == E_INVALIDARG) {
+    if (hr == E_INVALIDARG && levels.front() == D3D_FEATURE_LEVEL_11_1) {
         // D3D11.1 runtime is not installed; retry without the 11_1 request.
         hr = D3D11CreateDevice(
             adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-            levels + 1, levelCount - 1, D3D11_SDK_VERSION,
+            levels.data() + 1, levelCount - 1, D3D11_SDK_VERSION,
             d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
     }
     if (FAILED(hr) && !onSoftwareAdapter && softwareAdapter) {
@@ -528,12 +521,12 @@ Device* createDevice(HWND hwnd, std::string& error) {
         featureLevel = D3D_FEATURE_LEVEL_9_1;
         hr = D3D11CreateDevice(
             adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-            levels, levelCount, D3D11_SDK_VERSION,
+            levels.data(), levelCount, D3D11_SDK_VERSION,
             d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
-        if (hr == E_INVALIDARG) {
+        if (hr == E_INVALIDARG && levels.front() == D3D_FEATURE_LEVEL_11_1) {
             hr = D3D11CreateDevice(
                 adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-                levels + 1, levelCount - 1, D3D11_SDK_VERSION,
+                levels.data() + 1, levelCount - 1, D3D11_SDK_VERSION,
                 d3dDevice.GetAddressOf(), &featureLevel, context.GetAddressOf());
         }
     }
@@ -1354,8 +1347,7 @@ bool writeToBuffer(
         return updateDefaultBufferFromShadow(buffer, error);
     }
 
-    // Partial write without a CPU shadow: preserve the old contents with a
-    // staging copy.  Full-buffer writes avoid the copy.
+    // Full-buffer write.
     if (offset == 0 && size == buffer->size) {
         std::vector<uint8_t> padded(buffer->capacity, 0);
         if (size > 0) {
@@ -1366,23 +1358,45 @@ bool writeToBuffer(
         return true;
     }
 
-    if (!ensureStagingBuffer(buffer, error)) {
-        return false;
+    // Partial write without a CPU shadow.  UpdateSubresource with a byte box
+    // is copied into the command buffer before it returns, and it is ordered
+    // against earlier draws, unlike Map(WRITE_NO_OVERWRITE) on a dynamic
+    // buffer.  Region arenas write one section at a time into large buffers,
+    // so the old staging-copy path (copy the whole resource twice per upload)
+    // was unusably expensive.
+    //
+    // Shader-constant buffers are the only resource type that cannot be
+    // partially updated.  They are small, so keep the staging copy for them.
+    if ((buffer->usage & 128) != 0) {
+        if (!ensureStagingBuffer(buffer, error)) {
+            return false;
+        }
+        ID3D11DeviceContext* context = buffer->device->context.Get();
+        context->CopyResource(buffer->staging.Get(), buffer->buffer.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        HRESULT hr = context->Map(
+            buffer->staging.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
+        if (FAILED(hr)) {
+            error = "Map(staging write) failed: " + hresultToString(hr);
+            return false;
+        }
+        if (size > 0) {
+            std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, data, size);
+        }
+        context->Unmap(buffer->staging.Get(), 0);
+        context->CopyResource(buffer->buffer.Get(), buffer->staging.Get());
+        return true;
     }
-    ID3D11DeviceContext* context = buffer->device->context.Get();
-    context->CopyResource(buffer->staging.Get(), buffer->buffer.Get());
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = context->Map(
-        buffer->staging.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
-    if (FAILED(hr)) {
-        error = "Map(staging write) failed: " + hresultToString(hr);
-        return false;
-    }
-    if (size > 0) {
-        std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, data, size);
-    }
-    context->Unmap(buffer->staging.Get(), 0);
-    context->CopyResource(buffer->buffer.Get(), buffer->staging.Get());
+
+    D3D11_BOX box{};
+    box.left = offset;
+    box.right = offset + size;
+    box.top = 0;
+    box.bottom = 1;
+    box.front = 0;
+    box.back = 1;
+    buffer->device->context->UpdateSubresource(
+        buffer->buffer.Get(), 0, &box, data, 0, 0);
     return true;
 }
 
@@ -1531,6 +1545,28 @@ bool copyBufferToBuffer(
         return false;
     }
     if (size == 0) {
+        return true;
+    }
+
+    // Pure GPU-to-GPU copy without shadows: queue it directly instead of
+    // reading the source back to the CPU first.  Arena growth uses this path.
+    // DYNAMIC destinations are excluded because D3D11 rejects them as copy
+    // destinations (vanilla may use dynamic buffers for other copies).
+    if (source->buffer && destination->buffer &&
+        !source->mapped && !destination->mapped &&
+        !source->hasShadow && !destination->hasShadow &&
+        (source->usage & 2) == 0 && (destination->usage & 2) == 0 &&
+        source != destination) {
+        D3D11_BOX box{};
+        box.left = sourceOffset;
+        box.right = sourceOffset + size;
+        box.top = 0;
+        box.bottom = 1;
+        box.front = 0;
+        box.back = 1;
+        destination->device->context->CopySubresourceRegion(
+            destination->buffer.Get(), 0, destinationOffset, 0, 0,
+            source->buffer.Get(), 0, &box);
         return true;
     }
 
@@ -2779,9 +2815,29 @@ bool fenceAwait(Fence* fence, int64_t timeoutNanos) {
         timeoutNanos < 0 || timeoutNanos == std::numeric_limits<int64_t>::max();
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::nanoseconds(infinite ? 0 : timeoutNanos);
-    for (;;) {
-        const HRESULT hr = fence->device->context->GetData(
+
+    // GetData on an event query returns S_FALSE until the GPU has processed
+    // the query.  The query is only submitted when the immediate context is
+    // flushed or presented.  During shutdown the last world frame may never be
+    // presented, so the fence would remain pending until the client shutdown
+    // watchdog fires.  Submit pending commands once, but only when the query
+    // is not already complete, to keep the normal path allocation-free.
+    static std::atomic<bool> loggedFlush{false};
+    HRESULT hr = fence->device->context->GetData(
+        fence->query.Get(), nullptr, 0, 0);
+    if (hr == S_FALSE) {
+        fence->device->context->Flush();
+        if (!loggedFlush.exchange(true)) {
+            std::fprintf(
+                stderr,
+                "[dx11] fenceAwait: flushed pending context (%s %s)\n",
+                __DATE__,
+                __TIME__);
+        }
+        hr = fence->device->context->GetData(
             fence->query.Get(), nullptr, 0, 0);
+    }
+    for (;;) {
         if (hr == S_OK) {
             return true;
         }
@@ -2792,6 +2848,8 @@ bool fenceAwait(Fence* fence, int64_t timeoutNanos) {
             return false;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
+        hr = fence->device->context->GetData(
+            fence->query.Get(), nullptr, 0, 0);
     }
 }
 

@@ -4,6 +4,42 @@
 
 namespace dx11mc {
 
+namespace {
+D3D_FEATURE_LEVEL g_featureLevelCap = static_cast<D3D_FEATURE_LEVEL>(0);
+}
+
+void setFeatureLevelCap(D3D_FEATURE_LEVEL level) {
+    g_featureLevelCap = level;
+}
+
+D3D_FEATURE_LEVEL featureLevelCap() {
+    return g_featureLevelCap;
+}
+
+std::vector<D3D_FEATURE_LEVEL> availableFeatureLevels() {
+    static const D3D_FEATURE_LEVEL all[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+        D3D_FEATURE_LEVEL_9_3,
+        D3D_FEATURE_LEVEL_9_2,
+        D3D_FEATURE_LEVEL_9_1,
+    };
+
+    std::vector<D3D_FEATURE_LEVEL> levels;
+    levels.reserve(sizeof(all) / sizeof(all[0]));
+    for (D3D_FEATURE_LEVEL level : all) {
+        if (g_featureLevelCap == 0 || level <= g_featureLevelCap) {
+            levels.push_back(level);
+        }
+    }
+    if (levels.empty()) {
+        levels.push_back(D3D_FEATURE_LEVEL_9_1);
+    }
+    return levels;
+}
+
 std::string narrow(const wchar_t* text) {
     if (!text) {
         return {};
