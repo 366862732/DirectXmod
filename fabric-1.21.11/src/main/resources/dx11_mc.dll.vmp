@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Document Version="2">
+    <Protection InputFileName="dx11_mc.dll" Options="332544" VMCodeSectionName=".???" VMComplexity="20">
+        <Procedures>
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_dx11Probe" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeBlitToBackBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeClearColorAndDepthTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeClearColorAndDepthTextureRegion" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeClearColorTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeClearDepthTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCopyBufferToBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCopyTextureToBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCopyTextureToTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateDevice" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateFence" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreatePipeline" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateRenderPass" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateSampler" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateTextureView" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeCreateTimerQuery" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyDevice" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyFence" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyPipeline" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyQuery" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyRenderPass" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDestroyTextureView" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDumpBackBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeDumpTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeFenceAwait" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeGetDeviceInfo" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeGetPresentInfo" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeMapBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassBindTexture" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassDraw" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassDrawIndexed" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassSetIndexBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassSetPipeline" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassSetScissor" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassSetTexelBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassSetUniform" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePassSetVertexBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativePresent" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeQueryGetValue" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeSetVsync" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeTimerQueryEnd" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeUnmapBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeWriteToBuffer" Options="0" />
+            <Procedure MapAddress="Java_com_xgdt_dx11_dx11_Dx11Native_nativeWriteToTexture" Options="0" />
+            <Procedure MapAddress="EntryPoint" Options="0" />
+        </Procedures>
+    </Protection>
+</Document>

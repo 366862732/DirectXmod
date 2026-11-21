@@ -31,6 +31,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.block.FluidStateModelSet;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.resources.model.sprite.SpriteId;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -45,6 +46,7 @@ import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -405,13 +407,15 @@ public final class LodRegionCache {
                 return;
             }
             var modelSet = modelManager.getBlockStateModelSet();
+            // 水/岩浆的方块模型是 INVISIBLE，真实贴图来自流体模型集。
+            var fluidModelSet = modelManager.getFluidStateModelSet();
             var blockColors = minecraft.getBlockColors();
             for (Block block : BuiltInRegistries.BLOCK) {
                 // 单个方块的模型异常不能拖垮整张映射：以前这里没有逐方块兜底，
                 // 一个 mod 方块在 collectParts 里抛异常就让整次刷新失败、
                 // spriteUvReady 永远为 false，体素建网闸门也就永远打不开。
                 try {
-                    refreshBlockSpriteUv(block, modelSet, blockColors);
+                    refreshBlockSpriteUv(block, modelSet, fluidModelSet, blockColors);
                 } catch (Throwable ignored) {
                     // 跳过这个方块，其余方块继续
                 }
@@ -442,7 +446,7 @@ public final class LodRegionCache {
      * 不会让整张映射（以及体素建网闸门）永久失效。
      */
     private void refreshBlockSpriteUv(Block block, BlockStateModelSet modelSet,
-                                      BlockColors blockColors) {
+                                      FluidStateModelSet fluidModelSet, BlockColors blockColors) {
         var key = BuiltInRegistries.BLOCK.getKey(block);
         if (key == null) {
             return;
@@ -450,6 +454,9 @@ public final class LodRegionCache {
         String blockName = key.toString();
         var state = block.defaultBlockState();
         if (state.getRenderShape() == net.minecraft.world.level.block.RenderShape.INVISIBLE) {
+            // 水/岩浆没有方块模型（INVISIBLE），贴图来自 FluidStateModelSet。
+            // 以前这里直接 return，导致水面没有 sprite rect，远景水面只能退回顶点色。
+            refreshFluidSpriteUv(blockName, state, fluidModelSet);
             return;
         }
         var model = modelSet.get(state);
@@ -506,6 +513,51 @@ public final class LodRegionCache {
             if (rects[i] == null) {
                 rects[i] = fallback;
             }
+        }
+        this.spriteUvMap.put(blockName, rects);
+        this.spriteTintMap.put(blockName, tints);
+    }
+
+    /**
+     * 流体（水/岩浆）的 sprite UV 与染色。
+     *
+     * <p>流体的方块模型是 {@code RenderShape.INVISIBLE}，贴图不在
+     * {@link BlockStateModelSet} 里，而在 {@link FluidStateModelSet} 的静止材质上。
+     * 水体染色必须带世界坐标查生物群系（{@code BlockTintSources.water().color()}
+     * 恒返回 -1），LOD 没有逐格生物群系数据，退回地图色 {@link MapColor#col}
+     * 作为近似；岩浆没有染色源，保持白色（贴图本身已是橙色）。
+     */
+    private void refreshFluidSpriteUv(String blockName, BlockState state,
+                                      FluidStateModelSet fluidModelSet) {
+        if (fluidModelSet == null) {
+            return;
+        }
+        var fluidState = state.getFluidState();
+        if (fluidState == null || fluidState.isEmpty()) {
+            return;
+        }
+        var model = fluidModelSet.get(fluidState);
+        if (model == null) {
+            return;
+        }
+        var material = model.stillMaterial();
+        var sprite = material == null ? null : material.sprite();
+        if (sprite == null) {
+            return;
+        }
+        float[] rect = new float[]{sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()};
+        int tint = 0xFFFFFF;
+        var tintSource = model.tintSource();
+        if (tintSource != null) {
+            int color = tintSource.color(state);
+            // -1 = 需要世界坐标（生物群系色），这里拿不到，用地图色近似。
+            tint = (color == -1 ? MapColor.WATER.col : color) & 0xFFFFFF;
+        }
+        float[][] rects = new float[6][];
+        int[] tints = new int[6];
+        for (int i = 0; i < 6; i++) {
+            rects[i] = rect;
+            tints[i] = tint;
         }
         this.spriteUvMap.put(blockName, rects);
         this.spriteTintMap.put(blockName, tints);
