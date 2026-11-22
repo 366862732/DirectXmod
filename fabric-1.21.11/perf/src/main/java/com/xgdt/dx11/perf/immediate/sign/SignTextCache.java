@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 public final class SignTextCache implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
     private static final long EXPIRE_NANOS = TimeUnit.SECONDS.toNanos(5);
+    private static final long PRUNE_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final int MAX_LOGGED_FAILURES = 4;
 
     private static SignTextCache instance;
@@ -43,6 +44,7 @@ public final class SignTextCache implements AutoCloseable {
     private final GpuBufferSlice projectionMatrix;
     private final LinkedHashMap<SignTextKey, Entry> slots =
         new LinkedHashMap<>(256, 0.75F, true);
+    private long lastPruneNanos;
 
     private SignTextCache(int id, int atlasSize) {
         RenderSystem.assertOnRenderThread();
@@ -87,9 +89,15 @@ public final class SignTextCache implements AutoCloseable {
         return this.projectionMatrix;
     }
 
-    /** Finds a resident slot and refreshes its five-second lease. */
+    /**
+     * Finds a resident slot and refreshes its five-second lease.
+     *
+     * <p>Eviction is throttled here (and runs fully at the frame boundary in
+     * {@link #endFrame()}): walking the whole LRU map on every sign lookup made
+     * rendering O(visible signs x resident entries) per frame.</p>
+     */
     public SignAtlas.Slot lookup(SignTextKey key) {
-        this.prune();
+        this.pruneThrottled();
         Entry entry = this.slots.get(key);
         if (entry == null) {
             ImmediateStats.onSignLookup(false);
@@ -114,11 +122,23 @@ public final class SignTextCache implements AutoCloseable {
      */
     private static int targetAtlasSize() {
         int size = ImmediateFlags.signAtlasSize();
-        int max = RenderSystem.getDevice().getMaxTextureSize();
+        // endFrame() may run during shutdown after the device is gone.
+        var device = RenderSystem.getDevice();
+        int max = device == null ? 0 : device.getMaxTextureSize();
         if (max > 0 && size > max) {
             size = Integer.highestOneBit(max);
         }
         return size;
+    }
+
+    /** At most one full eviction sweep per second; the frame boundary prunes too. */
+    private void pruneThrottled() {
+        long now = System.nanoTime();
+        if (now - lastPruneNanos < PRUNE_INTERVAL_NANOS) {
+            return;
+        }
+        lastPruneNanos = now;
+        this.prune();
     }
 
     private void prune() {
@@ -149,6 +169,9 @@ public final class SignTextCache implements AutoCloseable {
             return;
         }
         cache.prune();
+        // Keep the lookup throttle from running a second full sweep in the
+        // same frame.
+        cache.lastPruneNanos = System.nanoTime();
     }
 
     /** F3+T/language reload: cached pixels were rasterised with the old font. */

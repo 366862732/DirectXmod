@@ -113,6 +113,10 @@ public final class BatchedBufferSource extends MultiBufferSource.BufferSource
         return BufferPool.borrow();
     }
 
+    // Scratch for endLastBatch: render-thread confined, cleared and refilled
+    // per flush instead of allocating a fresh list (and comparator) each frame.
+    private final List<RenderType> flushOrder = new ArrayList<>(16);
+
     @Override
     public void endLastBatch() {
         if (!enabled() && this.active.isEmpty()) {
@@ -125,7 +129,8 @@ public final class BatchedBufferSource extends MultiBufferSource.BufferSource
             return;
         }
 
-        List<RenderType> order = new ArrayList<>(this.active.size());
+        List<RenderType> order = this.flushOrder;
+        order.clear();
         for (RenderType renderType : this.active) {
             if (!this.fixedBuffers.containsKey(renderType)) {
                 order.add(renderType);

@@ -42,6 +42,10 @@ public final class UploadScheduler {
     private static final ThreadLocal<Long> PENDING_BYTES = new ThreadLocal<>();
     private static final AtomicLong SEQUENCE = new AtomicLong();
     private static final AtomicLong WRAPPED = new AtomicLong();
+    // Render-thread scratch for drain(): cleared and refilled per frame instead
+    // of allocating two collections plus an Entry record list every frame.
+    private static final List<Runnable> PENDING_SCRATCH = new ArrayList<>();
+    private static final List<UploadOrder.Entry> ENTRY_SCRATCH = new ArrayList<>();
 
     private static long totalDeferred;
     private static long cappedFrames;
@@ -134,7 +138,8 @@ public final class UploadScheduler {
             return false;
         }
 
-        List<Runnable> pending = new ArrayList<>();
+        List<Runnable> pending = PENDING_SCRATCH;
+        pending.clear();
         for (Runnable task; (task = uploads.poll()) != null; ) {
             pending.add(task);
         }
@@ -151,7 +156,8 @@ public final class UploadScheduler {
         int visibleQueued = 0;
         int offscreenQueued = 0;
         int plainQueued = 0;
-        List<UploadOrder.Entry> entries = new ArrayList<>(pending.size());
+        List<UploadOrder.Entry> entries = ENTRY_SCRATCH;
+        entries.clear();
         for (Runnable task : pending) {
             if (task instanceof BudgetedUpload upload) {
                 estimatedBytes += upload.estimatedBytes;
