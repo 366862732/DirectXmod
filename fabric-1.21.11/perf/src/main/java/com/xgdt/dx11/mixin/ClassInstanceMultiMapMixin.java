@@ -4,7 +4,6 @@ import com.xgdt.dx11.perf.MicroStats;
 import com.xgdt.dx11.perf.PerfState;
 import it.unimi.dsi.fastutil.objects.Reference2ReferenceOpenHashMap;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import net.fabricmc.api.EnvType;
@@ -67,7 +66,11 @@ public class ClassInstanceMultiMapMixin {
         List<?> cached = this.byClass.get(type);
         if (cached != null) {
             MicroStats.entityLookupHit();
-            cir.setReturnValue(Collections.unmodifiableCollection(cached));
+            // Vanilla returns the raw bucket list for an already-resolved type,
+            // so returning it directly matches the vanilla contract; wrapping
+            // it in Collections.unmodifiableCollection allocated a new view
+            // object on every entity query.
+            cir.setReturnValue(cached);
         }
     }
 }

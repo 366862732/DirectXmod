@@ -120,6 +120,17 @@ struct Buffer {
     std::vector<uint8_t> shadow;
     uint64_t version = 1;
 
+    // Dirty byte range [dirtyStart, dirtyEnd) accumulated since the last GPU
+    // push of the shadow.  dirtyStart == kNoDirty means everything written has
+    // already reached the GPU (or nothing was written yet).  Shadowed DEFAULT
+    // buffers used to re-upload the whole resource on every partial write.
+    static constexpr UINT kNoDirty = 0xFFFFFFFFu;
+    UINT dirtyStart = kNoDirty;
+    UINT dirtyEnd = 0;
+
+    // Reusable scratch for whole-buffer pushes; grows to capacity once.
+    std::vector<uint8_t> uploadScratch;
+
     // Map state.  A D3D11 map covers the whole buffer; Java sees a slice.
     bool mapped = false;
     bool mappedWrite = false;
@@ -186,6 +197,10 @@ struct RenderPass {
     // Scratch index buffer for emulated triangle fans.
     ComPtr<ID3D11Buffer> fanIndexBuffer;
     UINT fanIndexCapacity = 0;
+    // Reusable scratch for the fan expansion; two heap allocations per fan
+    // draw used to accompany the readback.
+    std::vector<uint32_t> fanSourceScratch;
+    std::vector<uint32_t> fanOutputScratch;
 };
 
 struct Fence {
@@ -246,6 +261,13 @@ struct Device {
     ComPtr<ID3D11BlendState> blitBlend;
     ComPtr<ID3D11DepthStencilState> blitDepth;
     ComPtr<ID3D11RasterizerState> blitRaster;
+
+    // High-water marks of SRV/sampler slots actually bound since the last
+    // unbind.  unbindPixelAndVertexResources only clears up to these marks:
+    // clearing all 128 SRV + 16 sampler slots on both stages on every render
+    // pass create/destroy was ~290 redundant driver calls per pass.
+    UINT maxBoundSrvSlot = 0;      // exclusive
+    UINT maxBoundSamplerSlot = 0;  // exclusive
 
     // Scissored clear fallback for feature level 10.x, where
     // ID3D11DeviceContext1::ClearView (the only rect-aware clear) is not

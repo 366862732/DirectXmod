@@ -17,7 +17,7 @@ public final class Dx11Config {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
 
     /** auto | dx11 | gl */
-    public static final String BACKEND_PROPERTY = "gl4dx12.backend";
+    public static final String BACKEND_PROPERTY = "gl4dx.backend";
     /**
      * Optional feature-level clamp used to validate the FL10.x path on a WARP
      * device that would otherwise report a higher level.  Accepted forms:
@@ -36,15 +36,41 @@ public final class Dx11Config {
     private static volatile boolean probeAttempted;
     private static volatile String appliedFeatureLevel;
 
+    /**
+     * Per-frame hot path (the flipFrame mixins ask {@link #shouldUseDx11()}
+     * twice per frame).  The raw property is still read so tests and dev
+     * overrides keep working, but the transformed result is cached per raw
+     * value: the old code allocated a fresh lowercase string on every call.
+     * {@code getProperty} returns the same stored instance each call, so the
+     * reference-equality fast path inside {@code String.equals} makes the
+     * recheck nearly free.
+     */
+    private static volatile String cachedOsRaw;
+    private static volatile boolean cachedOsWindows;
+    private static volatile String cachedBackendRaw;
+    private static volatile String cachedBackendMode = "auto";
+
     private Dx11Config() {
     }
 
     public static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+        String raw = System.getProperty("os.name", "");
+        String cached = cachedOsRaw;
+        if (cached != raw && !raw.equals(cached)) {
+            cachedOsWindows = raw.toLowerCase(Locale.ROOT).contains("win");
+            cachedOsRaw = raw;
+        }
+        return cachedOsWindows;
     }
 
     public static String backend() {
-        return System.getProperty(BACKEND_PROPERTY, "auto").toLowerCase(Locale.ROOT);
+        String raw = System.getProperty(BACKEND_PROPERTY, "auto");
+        String cached = cachedBackendRaw;
+        if (cached != raw && !raw.equals(cached)) {
+            cachedBackendMode = raw.toLowerCase(Locale.ROOT);
+            cachedBackendRaw = raw;
+        }
+        return cachedBackendMode;
     }
 
     /** True when verbose per-frame diagnostics were explicitly requested. */

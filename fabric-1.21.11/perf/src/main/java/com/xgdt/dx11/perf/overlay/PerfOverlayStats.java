@@ -5,6 +5,8 @@ import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.systems.GpuQuery;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.xgdt.dx11.metrics.Dx11Metrics;
+import com.xgdt.dx11.perf.PerfConfig;
+import com.xgdt.dx11.perf.PerfState;
 import java.lang.management.ManagementFactory;
 import java.util.Locale;
 import java.util.OptionalLong;
@@ -50,6 +52,7 @@ public final class PerfOverlayStats {
     private static double uploadMiBPerSecond;
 
     private static GpuQuery gpuQuery;
+    private static CommandEncoder gpuQueryEncoder;
     private static boolean gpuQueryEnded;
     private static int gpuQueryAge;
     private static int gpuSamples;
@@ -84,6 +87,10 @@ public final class PerfOverlayStats {
     /**
      * Called once per frame at the head of {@code RenderSystem.flipFrame}.
      * This is the frame boundary for FPS, counter windows and GPU timing.
+     *
+     * <p>Frame history, the JMX sample and the counter window only feed the
+     * overlay (and the optional F3 line), so they are skipped entirely when
+     * nothing can display them instead of taxing every user of the mod.</p>
      */
     public static void onFrameBoundary() {
         long now = System.nanoTime();
@@ -92,14 +99,30 @@ public final class PerfOverlayStats {
             if (delta > 0L && delta < 2_000_000_000L) {
                 double sample = delta / 1_000_000.0D;
                 frameMs = ewma(frameMs, sample);
-                FRAME_HISTORY[historyIndex] = delta;
-                historyIndex = (historyIndex + 1) % HISTORY_SIZE;
-                if (historyCount < HISTORY_SIZE) {
-                    historyCount++;
+                if (statsNeeded()) {
+                    FRAME_HISTORY[historyIndex] = delta;
+                    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+                    if (historyCount < HISTORY_SIZE) {
+                        historyCount++;
+                    }
                 }
             }
         }
         lastFrameNanos = now;
+
+        if (!statsNeeded()) {
+            // End an in-flight query before releasing it; closing a query that
+            // was begun but never ended is backend-dependent.
+            finishGpuQuery();
+            resetGpuQuery();
+            // Drop stale windows so re-opening the overlay starts with fresh
+            // history instead of a bogus first rate/max sample.
+            windowStartNanos = 0L;
+            windowFrames = 0;
+            historyIndex = 0;
+            historyCount = 0;
+            return;
+        }
 
         sampleCpu(now);
         updateCounterWindow(now);
@@ -107,6 +130,19 @@ public final class PerfOverlayStats {
 
         if (!PerfOverlay.isVisible()) {
             resetGpuQuery();
+        }
+    }
+
+    /** True when the overlay or the F3 perf line can display the statistics. */
+    private static boolean statsNeeded() {
+        try {
+            if (PerfOverlay.isVisible()) {
+                return true;
+            }
+            PerfConfig config = PerfState.current();
+            return PerfState.active() && config != null && config.debugHud;
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -125,13 +161,16 @@ public final class PerfOverlayStats {
             if (device == null) {
                 return;
             }
-            CommandEncoder encoder = device.createCommandEncoder();
-            gpuQuery = encoder.timerQueryBegin();
+            // Reuse one encoder for both the begin and the end of the query;
+            // creating two per frame was allocation churn on the render thread.
+            gpuQueryEncoder = device.createCommandEncoder();
+            gpuQuery = gpuQueryEncoder.timerQueryBegin();
             gpuQueryEnded = false;
             gpuQueryAge = 0;
         } catch (Throwable t) {
             gpuTimingAvailable = false;
             gpuQuery = null;
+            gpuQueryEncoder = null;
         }
     }
 
@@ -140,7 +179,9 @@ public final class PerfOverlayStats {
             return;
         }
         try {
-            CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+            CommandEncoder encoder = gpuQueryEncoder != null
+                ? gpuQueryEncoder
+                : RenderSystem.getDevice().createCommandEncoder();
             if (!gpuQueryEnded) {
                 encoder.timerQueryEnd(gpuQuery);
                 gpuQueryEnded = true;
@@ -176,6 +217,7 @@ public final class PerfOverlayStats {
             }
             gpuQuery = null;
         }
+        gpuQueryEncoder = null;
         gpuQueryEnded = false;
         gpuQueryAge = 0;
     }

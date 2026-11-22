@@ -43,11 +43,33 @@ public final class PerfState {
     private PerfState() {
     }
 
-    public static synchronized void init() {
+    /**
+     * Initializes the perf layer once.
+     *
+     * <p>The initialized fast path deliberately avoids the monitor: this method
+     * backs {@link #config()}/{@link #active()}/{@link #regionActive()}, which
+     * run per entity query and per render hook, and JDK 21 has no biased
+     * locking, so every uncontended {@code synchronized} was a real CAS on the
+     * hot path. A plain (volatile) read is sufficient — it either sees the
+     * finished state or falls into the guarded block.</p>
+     */
+    public static void init() {
         if (initialized) {
             return;
         }
-        initialized = true;
+        synchronized (PerfState.class) {
+            if (initialized) {
+                return;
+            }
+            // Publish only after the config and the derived flags are ready:
+            // setting this first let another thread observe initialized=true
+            // while config was still null.
+            loadConfigLocked();
+            initialized = true;
+        }
+    }
+
+    private static void loadConfigLocked() {
         try {
             configPath = FabricLoader.getInstance()
                 .getConfigDir()

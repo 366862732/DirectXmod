@@ -168,11 +168,20 @@ public final class PerfOverlay {
             return value;
         }
         String ellipsis = "...";
-        int end = value.length();
-        while (end > 0 && font.width(value.substring(0, end) + ellipsis) > maxWidth) {
-            end--;
+        // Binary search for the longest prefix that fits: font.width grows
+        // monotonically with the prefix length, so re-measuring every single
+        // character (the old linear scan) was O(n^2) per line per frame.
+        int low = 0;
+        int high = value.length();
+        while (low < high) {
+            int mid = (low + high + 1) >>> 1;
+            if (font.width(value.substring(0, mid) + ellipsis) <= maxWidth) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
         }
-        return value.substring(0, end) + ellipsis;
+        return value.substring(0, low) + ellipsis;
     }
 
     private static String percent(double fraction) {
@@ -214,26 +223,42 @@ public final class PerfOverlay {
         };
     }
 
+    /**
+     * Frame-invariant identity lines.  The adapter/backend text and the window
+     * size only change on device/resize events, so the strings are rebuilt only
+     * when those inputs actually change instead of every visible frame.
+     */
+    private static String cachedAdapterLine;
+    private static String cachedBackendLine;
+    private static String cachedAdapterKey = "";
+    private static String cachedBackendKey = "";
+
     private static String adapterLine() {
         try {
             GpuDevice device = RenderSystem.getDevice();
-            if (device == null) {
+            String renderer = device == null ? null : device.getRenderer();
+            if (renderer == null) {
                 return "No graphics device";
             }
-            String renderer = device.getRenderer();
-            int separator = renderer.indexOf(" - ");
-            return separator >= 0 ? renderer.substring(separator + 3) : renderer;
+            if (cachedAdapterLine == null || !renderer.equals(cachedAdapterKey)) {
+                cachedAdapterKey = renderer;
+                int separator = renderer.indexOf(" - ");
+                cachedAdapterLine = separator >= 0
+                    ? renderer.substring(separator + 3)
+                    : renderer;
+            }
+            return cachedAdapterLine;
         } catch (Throwable ignored) {
             return "No graphics device";
         }
     }
 
     private static String backendLine() {
-        String backend = "D3D11";
-        String version = "";
-        int width = 0;
-        int height = 0;
         try {
+            String backend = "D3D11";
+            String version = "";
+            int width = 0;
+            int height = 0;
             GpuDevice device = RenderSystem.getDevice();
             if (device != null) {
                 backend = device.getBackendName();
@@ -244,10 +269,16 @@ public final class PerfOverlay {
                 width = minecraft.getWindow().getWidth();
                 height = minecraft.getWindow().getHeight();
             }
+            String key = backend + '\u0000' + version + '\u0000' + width + 'x' + height;
+            if (cachedBackendLine == null || !key.equals(cachedBackendKey)) {
+                cachedBackendKey = key;
+                String suffix = version.isEmpty() ? "" : " " + version;
+                cachedBackendLine = backend + suffix + " · " + width + "x" + height;
+            }
+            return cachedBackendLine;
         } catch (Throwable ignored) {
+            return "D3D11";
         }
-        String suffix = version.isEmpty() ? "" : " " + version;
-        return backend + suffix + " · " + width + "x" + height;
     }
 
     private static String shortVersion(String version) {

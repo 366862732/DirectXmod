@@ -16,6 +16,10 @@ final class Dx11Buffer extends GpuBuffer implements Dx11Resource {
     private final long handle;
     private boolean closed;
     private @Nullable Dx11MappedView mappedView;
+    // Bumped whenever the CPU-visible contents change.  Render-pass binding
+    // caches use it to notice that the same (buffer, offset, length) slice now
+    // holds different bytes and must be re-uploaded.
+    private long revision;
 
     Dx11Buffer(Dx11Device device, @Nullable String label, int usage, long size) {
         super(usage, size);
@@ -49,6 +53,18 @@ final class Dx11Buffer extends GpuBuffer implements Dx11Resource {
         return this.handle;
     }
 
+    long revision() {
+        return this.revision;
+    }
+
+    void markWritten() {
+        ++this.revision;
+    }
+
+    boolean isMapped() {
+        return this.mappedView != null && !this.mappedView.isClosed();
+    }
+
     Dx11MappedView map(long offset, long size, boolean read, boolean write) {
         if (this.closed) {
             throw new IllegalStateException("Buffer is closed");
@@ -60,7 +76,7 @@ final class Dx11Buffer extends GpuBuffer implements Dx11Resource {
         if (data == null) {
             throw new IllegalStateException("Could not map buffer");
         }
-        Dx11MappedView view = new Dx11MappedView(this, data);
+        Dx11MappedView view = new Dx11MappedView(this, data, write);
         this.mappedView = view;
         return view;
     }
