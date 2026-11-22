@@ -2998,13 +2998,16 @@ public final class Dx12LodRenderer {
      * 采样器过滤方式由管线里的 type=4 静态采样器决定。
      */
     private void pushVoxelTexture(long ctx, int uniformOffset, long atlasViewHandle) {
+        // 参数顺序：types / buffers / offsets / lengths / texelFormats / views。
+        // 纹理 view 必须放最后一个数组；放进 buffers 会被 native 当成 buffer 句柄，
+        // views 全 0 → "missing view for SRV entry 1"，整帧 LOD 被跳过。
         if (!Dx12Native.dx12PushDescriptors(ctx,
             new int[]{0, 3},
-            new long[]{this.uniformBuffer.handle(), atlasViewHandle},
+            new long[]{this.uniformBuffer.handle(), 0L},
             new long[]{uniformOffset, 0L},
             new long[]{UNIFORM_DATA_BYTES, 0L},
             new int[]{0, 0},
-            new long[]{0L, 0L})) {
+            new long[]{0L, atlasViewHandle})) {
             throw new IllegalStateException("体素 LOD 描述符推送失败");
         }
     }
