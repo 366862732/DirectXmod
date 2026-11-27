@@ -73,20 +73,20 @@ jobs:
         with:
           submodules: false
           fetch-depth: 1
-          
+
+      - name: 物理粉碎旧的 Gradle 缓存
+        shell: powershell
+        run: |
+          # 强行删除整个隐藏的 .gradle 文件夹
+          if (Test-Path -Path "${{ github.workspace }}\.gradle") { Remove-Item -Recurse -Force "${{ github.workspace }}\.gradle" }
+          if (Test-Path -Path "$env:USERPROFILE\.gradle") { Remove-Item -Recurse -Force "$env:USERPROFILE\.gradle" }
+          if (Test-Path -Path "${{ github.workspace }}\fabric\.gradle") { Remove-Item -Recurse -Force "${{ github.workspace }}\fabric\.gradle" }
+
       - name: 设置 JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '25'
-          # 彻底关闭 setup-java 的缓存功能！
-          cache: ''
-
-      - name: 设置 Gradle (关闭缓存)
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          # 强制禁用 Gradle 缓存，防止旧的毒缓存注入
-          cache-disabled: true
 
       - name: 下载 DLL 产物
         uses: actions/download-artifact@v4
@@ -97,17 +97,20 @@ jobs:
       - name: 执行 Gradle 构建
         shell: powershell
         run: |
-          # 1. 停止所有可能运行的 Gradle 守护进程
-          .\gradlew.bat --stop
+          # 再次确保环境变量正确
+          $env:JAVA_HOME = "${{ env.JAVA_HOME }}"
           
-          # 2. 彻底清除本地全局配置，防止覆盖
+          # 创建本地干净配置
           $gradleHome = "D:\gradle_home"
           New-Item -ItemType Directory -Force -Path $gradleHome | Out-Null
           "org.gradle.java.home=$env:JAVA_HOME" | Out-File -FilePath "$gradleHome\gradle.properties" -Encoding utf8
-          
-          # 3. 设置全新的 GRADLE_USER_HOME 并运行
           $env:GRADLE_USER_HOME = $gradleHome
-          .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon
+          
+          # 停止可能运行的守护进程
+          .\gradlew.bat --stop
+          
+          # 注意这里加了 -x test，跳过在云端没有显卡时毫无意义的图形测试
+          .\gradlew.bat ${{ inputs.gradle_task }} -x test --no-daemon
 
       - name: 上传 fabric 产物
         uses: actions/upload-artifact@v4
