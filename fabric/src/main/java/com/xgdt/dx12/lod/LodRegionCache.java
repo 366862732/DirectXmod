@@ -327,10 +327,11 @@ public final class LodRegionCache {
             reset();
             return;
         }
+        Path saveRoot;
         Path dir;
         try {
-            dir = DimensionType.getStorageFolder(level.dimension(), server.getWorldPath(LevelResource.ROOT))
-                .resolve("region");
+            saveRoot = server.getWorldPath(LevelResource.ROOT);
+            dir = DimensionType.getStorageFolder(level.dimension(), saveRoot).resolve("region");
         } catch (Throwable t) {
             reset();
             return;
@@ -355,7 +356,7 @@ public final class LodRegionCache {
         this.queue.clear();
         this.regionStats.clear();
         this.columnVersion.incrementAndGet();
-        openStore(dir);
+        openStore(saveRoot, level.dimension().identifier(), dir);
         // 体素网格是按方块数据建的，换世界/维度后全部失效
         LodVoxelCache.getInstance().clear();
         // 刷新方块→图集 UV 映射（atlas 在渲染线程才可用）
@@ -635,24 +636,36 @@ public final class LodRegionCache {
     }
 
     /**
-     * 打开当前维度的持久化 section 存储。目录放在该维度 region 目录的旁边
-     * （主世界 {@code <world>/gl4dx12_lod}，下界 {@code <world>/DIM-1/gl4dx12_lod}），
-     * 随存档一起复制/删除；打开失败只降级为「每次都重新解析 NBT」，不影响渲染。
+     * 打开当前维度的持久化 section 存储。
+     *
+     * <p>目录统一放在存档根目录下，和 Voxy 的 {@code <save>/voxy} 一样随存档一起
+     * 复制/删除，而不是埋进 {@code dimensions/...} 里：
+     * <pre>
+     * &lt;save&gt;/gl4dx12_lod/&lt;namespace&gt;/&lt;path&gt;/voxel/sections-*.bin
+     * &lt;save&gt;/gl4dx12_lod/&lt;namespace&gt;/&lt;path&gt;/columns/sections-*.bin
+     * </pre>
+     * 主世界是 {@code gl4dx12_lod/minecraft/overworld}，下界/末地同理。旧版本把存储
+     * 放在维度 region 目录旁边，第一次打开新路径时会自动搬过来，避免重新解析上万个
+     * 区块的 NBT。打开失败只降级为「每次都重新解析 NBT」，不影响渲染。
      */
-    private void openStore(Path regionDir) {
+    private void openStore(Path saveRoot, Identifier dimensionId, Path regionDir) {
         closeStore();
         // 换维度后重新统计，避免把上一个维度的命中数混进来
         this.statVoxelStoreHit.set(0);
         this.statVoxelStoreMiss.set(0);
         this.statColumnStoreHit.set(0);
         this.statColumnStoreMiss.set(0);
-        Path parent = regionDir.getParent();
-        Path base = parent == null ? regionDir : parent;
-        Path dir = base.resolve("gl4dx12_lod");
+        Path base = saveRoot.resolve("gl4dx12_lod")
+            .resolve(dimensionId.getNamespace())
+            .resolve(dimensionId.getPath());
+        Path dir = base.resolve("voxel");
         this.storeDir = dir;
         if (Dx12Config.getInstance().getLodCache() == 0) {
             return;
         }
+        Path parent = regionDir.getParent();
+        Path legacyBase = parent == null ? regionDir : parent;
+        migrateLegacyStore(legacyBase.resolve("gl4dx12_lod"), dir);
         try {
             this.store = LodSectionStore.open(dir);
             LOGGER.info("[lod] Section store opened: {} ({} entries, {} KB)",
@@ -661,7 +674,8 @@ public final class LodRegionCache {
             this.store = null;
             LOGGER.warn("[lod] Failed to open section store {}: {}", dir, t.toString());
         }
-        Path columnDir = base.resolve("gl4dx12_lod_columns");
+        Path columnDir = base.resolve("columns");
+        migrateLegacyStore(legacyBase.resolve("gl4dx12_lod_columns"), columnDir);
         try {
             this.columnStore = LodSectionStore.open(columnDir);
             LOGGER.info("[lod] Column store opened: {} ({} entries, {} KB)",
@@ -669,6 +683,40 @@ public final class LodRegionCache {
         } catch (Throwable t) {
             this.columnStore = null;
             LOGGER.warn("[lod] Failed to open column store {}: {}", columnDir, t.toString());
+        }
+    }
+
+    /**
+     * 把旧版「维度目录旁边」的缓存搬到存档根目录。只在目标目录不存在/为空时搬，
+     * 目标已有数据就保留目标；搬失败只是让缓存重新生成，不影响正确性。
+     */
+    private static void migrateLegacyStore(Path legacy, Path target) {
+        if (legacy == null || target == null || legacy.equals(target)) {
+            return;
+        }
+        try {
+            if (!Files.isDirectory(legacy)) {
+                return;
+            }
+            if (Files.isDirectory(target)) {
+                try (var entries = Files.list(target)) {
+                    if (entries.findAny().isPresent()) {
+                        return;
+                    }
+                }
+            }
+            Path parent = target.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            if (Files.exists(target)) {
+                Files.delete(target);
+            }
+            Files.move(legacy, target);
+            LOGGER.info("[lod] Migrated legacy store: {} -> {}", legacy, target);
+        } catch (Throwable t) {
+            LOGGER.warn("[lod] Failed to migrate legacy store {} -> {}: {}",
+                legacy, target, t.toString());
         }
     }
 

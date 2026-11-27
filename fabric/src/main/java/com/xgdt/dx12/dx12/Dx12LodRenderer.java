@@ -795,7 +795,7 @@ public final class Dx12LodRenderer {
      */
     private static final int VOXEL_RADIUS_BLOCKS = 720;
     /**
-     * 保持 1 方块精度的半径。再往外按 2/4/8 方块逐级降采样。
+     * quality=0 时保持 1 方块精度的半径。再往外按 2/4/8 方块逐级降采样。
      * 房屋、围墙这类几格宽的结构只有在这一圈里才认得出来。
      */
     private static final int VOXEL_FULL_DETAIL_RADIUS = 224;
@@ -808,19 +808,21 @@ public final class Dx12LodRenderer {
      * shift=0，相机移动时新旧环平滑交叠，不再有密度突变。
      */
     private static final int VOXEL_TRANSITION_WIDTH = 64;
-    /** shift 1→2 的分界（方块）。1 方块精度到 288，2 方块精度到 448。 */
+    /** quality=0 时 shift 1→2 的分界（方块）。1 方块精度到 288，2 方块精度到 448。 */
     private static final int VOXEL_MEDIUM_DETAIL_RADIUS = 448;
-    /** shift 2→3 的分界（方块）。4 方块精度到 576，再往外 8 方块精度直到雾终点。 */
+    /** quality=0 时 shift 2→3 的分界（方块）。4 方块精度到 576，再往外 8 方块精度直到雾终点。 */
     private static final int VOXEL_COARSE_DETAIL_RADIUS = 576;
     /**
-     * 体素顶点缓冲的硬上限（约 320 MB），按「由近到远」填，放不下的远处区块直接跳过。
+     * 体素顶点缓冲的硬上限（约 448 MB/槽），按「由近到远」填，放不下的远处区块直接跳过。
      *
-     * <p>贪心合并后每区块的面数约为逐格发面的 1/4（真实存档抽样：shift0 平均 500、
-     * shift1 216、shift2 118、shift3 64 面）。按 720 方块四级环布局推算约 144 万面；
-     * 玩家所在山区比存档平均更密（448 实测比推算高约 36%），最坏接近 195 万面。
-     * 上限给到 1000 万顶点（250 万面），留出约 28% 余量，避免外圈被预算截断。
+     * <p>真实存档离线全量统计（720 方块内 8264 个区块）：
+     * shift0 平均 533 面、shift1 226、shift2 117、shift3 64。
+     * 旧布局（1 方块到 288、2 到 448、4 到 576、8 到 720）平均 202 面/块；
+     * 新布局按 lod_quality 分档，quality=2 是「1 方块到 512、2 方块到 720」，
+     * 平均 386 面/块 —— 全圈约 319 万面 / 1275 万顶点。上限给到 1400 万顶点，
+     * 留出约 10% 余量，避免外圈被预算截断。
      */
-    private static final int VOXEL_MAX_VERTICES = 10_000_000;
+    private static final int VOXEL_MAX_VERTICES = 14_000_000;
     /** 有新区块建好时，最多每隔这么多帧重拼一次顶点缓冲（相机跨区块时不受此限）。 */
     private static final int VOXEL_REBUILD_INTERVAL = 32;
     /**
@@ -1365,6 +1367,7 @@ public final class Dx12LodRenderer {
         int chunkRadius = Math.max(1, voxelRadius >> 4);
         int cameraChunkX = cameraBlockX >> 4;
         int cameraChunkZ = cameraBlockZ >> 4;
+        int quality = Mth.clamp(Dx12Config.getInstance().getLodQuality(), 0, 2);
         int maxFaces = VOXEL_MAX_VERTICES / 4;
         LodVoxelMesher.Mesh[] selected = this.voxelMeshScratch;
         int count = 0;
@@ -1397,20 +1400,13 @@ public final class Dx12LodRenderer {
                         Math.abs(worldChunkZ - cameraChunkZ)) <= renderDistance) {
                         continue;
                     }
-                    // 四级 LOD：1 方块到 288（含 64 方块过渡带）、2 方块到 448、
-                    // 4 方块到 576、再往外 8 方块直到雾终点 720。相机跨过边界时
-                    // 贴图密度逐级减半，配合雾衰减不会出现明显跳变。
+                    // 按 lod_quality 选择远景精度：
+                    //   quality=0：1 方块到 288、2 到 448、4 到 576、8 到 720（旧行为）
+                    //   quality=1：1 方块到 448、2 到 576、4 到 720
+                    //   quality=2：1 方块到 512、2 到 720（默认，接近 Voxy 的观感）
+                    // 相机跨过边界时贴图密度逐级减半，配合雾衰减不会出现明显跳变。
                     int ringRadius = d * 16;
-                    int shift;
-                    if (ringRadius <= VOXEL_FULL_DETAIL_RADIUS + VOXEL_TRANSITION_WIDTH) {
-                        shift = 0;
-                    } else if (ringRadius <= VOXEL_MEDIUM_DETAIL_RADIUS) {
-                        shift = 1;
-                    } else if (ringRadius <= VOXEL_COARSE_DETAIL_RADIUS) {
-                        shift = 2;
-                    } else {
-                        shift = 3;
-                    }
+                    int shift = voxelShiftForRing(ringRadius, quality);
                     // 即使已经停止绘制也要继续 get()：否则外圈永远不会排队建网，
                     // 体素就再也长不回去了。
                     LodVoxelMesher.Mesh mesh = cache.get(camChunkX + dx, camChunkZ + dz, shift);
@@ -1496,6 +1492,44 @@ public final class Dx12LodRenderer {
         this.voxelMaxBlockX = (camChunkX + outerRing) * 16;
         this.voxelMinBlockZ = minChunkZ * 16;
         this.voxelMaxBlockZ = (camChunkZ + outerRing) * 16;
+    }
+
+    /**
+     * 按 {@code lod_quality} 选择某一环的降采样级别。
+     *
+     * <p>离线统计真实存档 720 方块内 529 个区块的面数：shift0 平均 542 面、
+     * shift1 228、shift2 118、shift3 63。旧布局平均 195 面/块，最远 8 方块一格，
+     * 在 720 方块处一格约 10 像素，截图里就是明显的「大方块台阶」。Voxy 靠屏幕
+     * 空间阈值让高精度层级一直延伸到很远；这里用 quality=2 把 1 方块精度推到
+     * 512、外面只降到 2 方块，面数约 1.97 倍，4070 级别显卡和 14M 顶点上限都能吃下。
+     */
+    private static int voxelShiftForRing(int ringRadius, int quality) {
+        int full;
+        int medium;
+        int coarse;
+        if (quality >= 2) {
+            full = 512;
+            medium = VOXEL_RADIUS_BLOCKS;
+            coarse = VOXEL_RADIUS_BLOCKS;
+        } else if (quality == 1) {
+            full = 448;
+            medium = 576;
+            coarse = VOXEL_RADIUS_BLOCKS;
+        } else {
+            full = VOXEL_FULL_DETAIL_RADIUS + VOXEL_TRANSITION_WIDTH;
+            medium = VOXEL_MEDIUM_DETAIL_RADIUS;
+            coarse = VOXEL_COARSE_DETAIL_RADIUS;
+        }
+        if (ringRadius <= full) {
+            return 0;
+        }
+        if (ringRadius <= medium) {
+            return 1;
+        }
+        if (ringRadius <= coarse) {
+            return 2;
+        }
+        return 3;
     }
 
     /**

@@ -11,6 +11,13 @@ base {
 }
 
 repositories {
+    // Minecraft 26.2 的 LWJGL 是 Mojang 补丁版（3.4.1-mojang-*），只发布在
+    // libraries.minecraft.net，不在 Maven Central；Loom 的自动仓库没有覆盖到
+    // 这个传递依赖，必须显式声明，否则干净环境会解析失败。
+    maven {
+        name = "Minecraft Libraries"
+        url = "https://libraries.minecraft.net/"
+    }
     mavenCentral()
     maven {
         name = "Fabric"
@@ -23,6 +30,17 @@ repositories {
     maven {
         name = "Modrinth"
         url = "https://maven.modrinth.com/releases/"
+    }
+}
+
+// Loom 1.15.5 会注入一个名为 MavenCentralLWJGL 的 exclusive 仓库，把 org.lwjgl
+// 整个组锁死在 Maven Central。但 Minecraft 26.2 用的是 Mojang 补丁版 LWJGL
+// （3.4.1-mojang-*），只发布在 libraries.minecraft.net，Maven Central 上没有，
+// 于是干净环境编译直接失败。把 Loom 注入的这个仓库改指向 Mojang 库即可：
+// exclusive 规则保留，org.lwjgl 仍然只走一个仓库。
+repositories.configureEach {
+    if (name == "MavenCentralLWJGL") {
+        url = "https://libraries.minecraft.net/"
     }
 }
 
