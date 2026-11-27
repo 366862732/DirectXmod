@@ -30,11 +30,22 @@ jobs:
       run:
         working-directory: native
     steps:
-      - name: 检出代码
+      - name: 检出代码 (含子模块)
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 设置 JDK (为 JNI 提供头文件)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '25'
 
       - name: 配置 CMake
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build_type }}
+        # 传递 JAVA_HOME 的 include 目录给 CMake，并屏蔽 C4996 警告
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build_type }} `
+                -DCMAKE_CXX_FLAGS="/I $env:JAVA_HOME\include /I $env:JAVA_HOME\include\win32 /wd4996"
 
       - name: 编译 DLL
         run: cmake --build build --config ${{ inputs.build_type }} --parallel
@@ -63,8 +74,8 @@ jobs:
       - name: 设置 JDK
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'        # 或 'microsoft'
-          java-version: '26-ea'          # EA 版写 '26-ea'
+          distribution: 'zulu'
+          java-version: '25'
           cache: 'gradle'
 
       - name: 设置 Gradle
@@ -74,6 +85,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: native-dll-${{ inputs.build_type }}
+          # 注意：这里需要确认你的 Java 代码到底去哪个目录找 DLL
+          # 暂时默认放在 resources/native 下
           path: fabric/src/main/resources/native
 
       - name: 执行 Gradle 构建
