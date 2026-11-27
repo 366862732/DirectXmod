@@ -74,16 +74,24 @@ jobs:
           submodules: false
           fetch-depth: 1
 
-      - name: 暴力清理子模块
+      - name: 暴力清理残留
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
-          # 彻底删除 .gitmodules 以防万一
           rm -f .gitmodules
-          # 移除子模块的 Git 索引
-          git rm --cached DLSS voxy || true
-          # 强行告诉 Git 忽略这个路径
-          git config --local submodule.voxy.active false || true
+          git rm --cached DLSS voxy -r || true
+          
+      - name: 全盘搜索并消灭写死的 JDK 路径
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "=== 搜索被写死的 Java 路径 ==="
+          grep -rn "org.gradle.java.home" . || echo "搜索完成，未发现配置"
+          
+          # 暴力替换所有匹配到的行
+          find . -type f -name "*.properties" | while read file; do
+            sed -i 's/^org.gradle.java.home/#org.gradle.java.home/g' "$file"
+          done
 
       - name: 设置 JDK
         uses: actions/setup-java@v4
@@ -102,11 +110,8 @@ jobs:
           path: fabric/src/main/resources/native
 
       - name: 执行 Gradle 构建
-        env:
-          # 【终极必杀】强行覆盖环境变量，让 Gradle 使用当前系统安装的 JDK
-          GRADLE_OPTS: "-Dorg.gradle.java.home=${{ env.JAVA_HOME }}"
-          ORG_GRADLE_PROJECT_org.gradle.java.home: ${{ env.JAVA_HOME }}
-        run: .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon -Dorg.gradle.java.home="$env:JAVA_HOME"
+        # 这里去掉了多余的环境变量，如果文件清理干净了，这行就会正常执行
+        run: .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon
 
       - name: 上传 fabric 产物
         uses: actions/upload-artifact@v4
