@@ -73,35 +73,20 @@ jobs:
         with:
           submodules: false
           fetch-depth: 1
-
-      - name: 暴力清理残留
-        shell: bash
-        working-directory: ${{ github.workspace }}
-        run: |
-          rm -f .gitmodules
-          git rm --cached DLSS voxy -r || true
           
-      - name: 全盘搜索并消灭写死的 JDK 路径
-        shell: bash
-        working-directory: ${{ github.workspace }}
-        run: |
-          echo "=== 搜索被写死的 Java 路径 ==="
-          grep -rn "org.gradle.java.home" . || echo "搜索完成，未发现配置"
-          
-          # 暴力替换所有匹配到的行
-          find . -type f -name "*.properties" | while read file; do
-            sed -i 's/^org.gradle.java.home/#org.gradle.java.home/g' "$file"
-          done
-
       - name: 设置 JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '25'
-          cache: 'gradle'
+          # 彻底关闭 setup-java 的缓存功能！
+          cache: ''
 
-      - name: 设置 Gradle
+      - name: 设置 Gradle (关闭缓存)
         uses: gradle/actions/setup-gradle@v4
+        with:
+          # 强制禁用 Gradle 缓存，防止旧的毒缓存注入
+          cache-disabled: true
 
       - name: 下载 DLL 产物
         uses: actions/download-artifact@v4
@@ -110,8 +95,19 @@ jobs:
           path: fabric/src/main/resources/native
 
       - name: 执行 Gradle 构建
-        # 这里去掉了多余的环境变量，如果文件清理干净了，这行就会正常执行
-        run: .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon
+        shell: powershell
+        run: |
+          # 1. 停止所有可能运行的 Gradle 守护进程
+          .\gradlew.bat --stop
+          
+          # 2. 彻底清除本地全局配置，防止覆盖
+          $gradleHome = "D:\gradle_home"
+          New-Item -ItemType Directory -Force -Path $gradleHome | Out-Null
+          "org.gradle.java.home=$env:JAVA_HOME" | Out-File -FilePath "$gradleHome\gradle.properties" -Encoding utf8
+          
+          # 3. 设置全新的 GRADLE_USER_HOME 并运行
+          $env:GRADLE_USER_HOME = $gradleHome
+          .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon
 
       - name: 上传 fabric 产物
         uses: actions/upload-artifact@v4
