@@ -35,19 +35,6 @@ jobs:
         with:
           submodules: false
           fetch-depth: 1
-          # 终极清理：告诉 checkout 步骤不要碰任何子模块
-          lfs: false
-
-      - name: 清理残留子模块配置 (消除警告)
-        shell: bash
-        # 进入根目录清理 git 配置，防止 post-job 报错
-        working-directory: ${{ github.workspace }}
-        run: |
-          # 强行移除可能存在的子模块配置节点
-          git config --local --remove-section submodule.DLSS || true
-          git config --local --remove-section submodule.voxy || true
-          # 如果 .gitmodules 还在，删掉
-          rm -f .gitmodules
 
       - name: 设置 JDK (为 JNI 提供头文件)
         uses: actions/setup-java@v4
@@ -87,6 +74,17 @@ jobs:
           submodules: false
           fetch-depth: 1
 
+      - name: 暴力清理子模块
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          # 彻底删除 .gitmodules 以防万一
+          rm -f .gitmodules
+          # 移除子模块的 Git 索引
+          git rm --cached DLSS voxy || true
+          # 强行告诉 Git 忽略这个路径
+          git config --local submodule.voxy.active false || true
+
       - name: 设置 JDK
         uses: actions/setup-java@v4
         with:
@@ -104,7 +102,11 @@ jobs:
           path: fabric/src/main/resources/native
 
       - name: 执行 Gradle 构建
-        run: .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon
+        env:
+          # 【终极必杀】强行覆盖环境变量，让 Gradle 使用当前系统安装的 JDK
+          GRADLE_OPTS: "-Dorg.gradle.java.home=${{ env.JAVA_HOME }}"
+          ORG_GRADLE_PROJECT_org.gradle.java.home: ${{ env.JAVA_HOME }}
+        run: .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon -Dorg.gradle.java.home="$env:JAVA_HOME"
 
       - name: 上传 fabric 产物
         uses: actions/upload-artifact@v4
