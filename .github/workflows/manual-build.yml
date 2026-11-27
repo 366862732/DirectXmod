@@ -33,7 +33,7 @@ jobs:
       - name: 检出代码 (含子模块)
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
 
       - name: 设置 JDK (为 JNI 提供头文件)
         uses: actions/setup-java@v4
