@@ -8,10 +8,12 @@ import java.nio.ByteOrder;
 final class Dx11MappedView implements GpuBuffer.MappedView {
     private final Dx11Buffer buffer;
     private final ByteBuffer data;
+    private final boolean write;
     private boolean closed;
 
-    Dx11MappedView(Dx11Buffer buffer, ByteBuffer data) {
+    Dx11MappedView(Dx11Buffer buffer, ByteBuffer data, boolean write) {
         this.buffer = buffer;
+        this.write = write;
         // JNI NewDirectByteBuffer() returns a BIG_ENDIAN buffer, while the GL
         // backend hands out native-order (little-endian) memory.  Vanilla's
         // Std140Builder uses ByteBuffer.putFloat/putInt without changing the
@@ -35,6 +37,9 @@ final class Dx11MappedView implements GpuBuffer.MappedView {
     public void close() {
         if (!this.closed) {
             this.closed = true;
+            if (this.write) {
+                this.buffer.markWritten();
+            }
             this.buffer.onUnmapped(this);
         }
     }

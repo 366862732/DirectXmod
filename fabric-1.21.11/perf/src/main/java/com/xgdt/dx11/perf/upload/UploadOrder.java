@@ -60,36 +60,52 @@ public final class UploadOrder {
      * order), then visible section uploads from nearest to farthest, then
      * off-screen section uploads from nearest to farthest.  Insertion order is
      * the stable tie-breaker.
+     *
+     * <p>This is the same primitive-key idea {@code TranslucentOrder} uses:
+     * group (2 bits), distance float bits (32 bits, monotonic for non-negative
+     * distances) and the insertion sequence (29 bits, the stable tie-breaker)
+     * packed into one {@code long}.  The layout stays inside 63 bits so the
+     * signed {@code Arrays.sort} order matches the key order (the old boxed
+     * {@code Integer[]} comparator sort allocated an object per entry per
+     * frame).  The queue length is bounded by the section-buffer pool, so the
+     * paired insertion sort that carries the entry index along is allocation
+     * free and effectively linear.</p>
      */
     public static int[] rank(
         List<Entry> entries, double cameraX, double cameraY, double cameraZ) {
-        Integer[] order = new Integer[entries.size()];
-        for (int i = 0; i < order.length; i++) {
-            order[i] = i;
+        final int count = entries.size();
+        long[] keys = new long[count];
+        int[] ranked = new int[count];
+        for (int i = 0; i < count; i++) {
+            Entry entry = entries.get(i);
+            long group;
+            long distanceBits;
+            if (!entry.prioritized()) {
+                group = 0L;
+                distanceBits = 0L;
+            } else {
+                float distance = (float) distanceSquared(entry, cameraX, cameraY, cameraZ);
+                // Non-negative float bit patterns compare in value order.
+                distanceBits = Float.floatToIntBits(distance) & 0xFFFFFFFFL;
+                group = entry.visible() ? 1L : 2L;
+            }
+            keys[i] = (group << 61) | (distanceBits << 29) | (entry.sequence() & 0x1FFFFFFFL);
+            ranked[i] = i;
         }
-        Arrays.sort(order, (left, right) -> {
-            Entry a = entries.get(left);
-            Entry b = entries.get(right);
-            if (a.prioritized() != b.prioritized()) {
-                return a.prioritized() ? 1 : -1;
-            }
-            if (a.prioritized()) {
-                if (a.visible() != b.visible()) {
-                    return a.visible() ? -1 : 1;
-                }
-                double distanceA = distanceSquared(a, cameraX, cameraY, cameraZ);
-                double distanceB = distanceSquared(b, cameraX, cameraY, cameraZ);
-                int byDistance = Double.compare(distanceA, distanceB);
-                if (byDistance != 0) {
-                    return byDistance;
-                }
-            }
-            return Long.compare(a.sequence(), b.sequence());
-        });
 
-        int[] ranked = new int[order.length];
-        for (int i = 0; i < order.length; i++) {
-            ranked[i] = order[i];
+        // Insertion sort of the parallel (key, index) pairs; keys are unique
+        // (the sequence never repeats), so the sort is deterministic.
+        for (int i = 1; i < count; i++) {
+            long key = keys[i];
+            int index = ranked[i];
+            int j = i - 1;
+            while (j >= 0 && keys[j] > key) {
+                keys[j + 1] = keys[j];
+                ranked[j + 1] = ranked[j];
+                j--;
+            }
+            keys[j + 1] = key;
+            ranked[j + 1] = index;
         }
         return ranked;
     }

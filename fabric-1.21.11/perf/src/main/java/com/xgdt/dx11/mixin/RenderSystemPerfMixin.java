@@ -33,9 +33,13 @@ public class RenderSystemPerfMixin {
     private static void dx11$endImmediateFrame(CallbackInfo ci) {
         PerfDebugLog.maybeLog();
         PerfOverlayStats.onFrameBoundary();
+        // Sign-text atlas maintenance also runs on the GL validation path (the
+        // forced-immediate smoke test); only the buffer pool is backend-bound.
+        // endFrame() must run even after the flag is turned off: that is what
+        // releases an atlas that was created while the feature was enabled.
         if (Dx11Config.shouldUseDx11()) {
             BufferPool.endFrame();
-            SignTextCache.endFrame();
         }
+        SignTextCache.endFrame();
     }
 }

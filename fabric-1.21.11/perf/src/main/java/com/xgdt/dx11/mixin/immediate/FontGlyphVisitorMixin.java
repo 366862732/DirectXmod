@@ -41,6 +41,10 @@ public abstract class FontGlyphVisitorMixin {
     private VertexConsumer dx11$reuseTextBuffer(
         MultiBufferSource source, RenderType renderType, Operation<VertexConsumer> original) {
         if (!ImmediateFlags.fastTextLookup()) {
+            // Drop the remembered pair so re-enabling the flag mid-run can
+            // never hand out a consumer whose batch was flushed in between.
+            this.dx11$lastType = null;
+            this.dx11$lastConsumer = null;
             return original.call(source, renderType);
         }
         if (renderType == this.dx11$lastType) {

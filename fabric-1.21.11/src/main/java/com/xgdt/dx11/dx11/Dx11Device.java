@@ -49,6 +49,23 @@ final class Dx11Device implements GpuDevice {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
     private static final Identifier TERRAIN_VERTEX_SHADER =
         Identifier.parse("minecraft:core/terrain");
+    // Reused scratch for the per-frame glfwGetFramebufferSize call.  GLFW
+    // writes the two outputs into the arrays it is handed, so width and height
+    // must not share one array (that made both values the height and forced a
+    // swapchain resize on every present).
+    private static final int[] FRAMEBUFFER_WIDTH = new int[1];
+    private static final int[] FRAMEBUFFER_HEIGHT = new int[1];
+    // Resolved once: flipFrame used to run System.getProperty every frame.
+    private static final String DEBUG_DUMP_DIR = resolveDebugDumpDir();
+
+    /** Directory for the temporary first-frame BMP dumps, or null when disabled. */
+    private static @Nullable String resolveDebugDumpDir() {
+        String dir = System.getProperty("gl4dx11.debug.dumpDir");
+        if (dir == null) {
+            return null;
+        }
+        return dir.isEmpty() ? System.getProperty("user.dir") : dir;
+    }
 
     private final long handle;
     private final boolean debugLogging = Dx11Config.debugLogging();
@@ -104,11 +121,7 @@ final class Dx11Device implements GpuDevice {
 
     /** Directory for the temporary first-frame BMP dumps, or null when disabled. */
     static @Nullable String debugDumpDir() {
-        String dir = System.getProperty("gl4dx11.debug.dumpDir");
-        if (dir == null) {
-            return null;
-        }
-        return dir.isEmpty() ? System.getProperty("user.dir") : dir;
+        return DEBUG_DUMP_DIR;
     }
 
     /**
@@ -168,13 +181,18 @@ final class Dx11Device implements GpuDevice {
         if (this.closed) {
             return;
         }
-        int[] width = new int[1];
-        int[] height = new int[1];
-        org.lwjgl.glfw.GLFW.glfwGetFramebufferSize(windowHandle, width, height);
+        // Clear first: GLFW leaves the outputs untouched on a bad window
+        // handle, and a stale size would present with the previous swapchain.
+        FRAMEBUFFER_WIDTH[0] = 0;
+        FRAMEBUFFER_HEIGHT[0] = 0;
+        org.lwjgl.glfw.GLFW.glfwGetFramebufferSize(
+            windowHandle, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
+        final int width = FRAMEBUFFER_WIDTH[0];
+        final int height = FRAMEBUFFER_HEIGHT[0];
         final long frame = ++this.frameCount;
         if (this.debugLogging && (frame <= 5 || frame % 600 == 0)) {
             LOGGER.info("[dx11] flipFrame #{} size={}x{} vsync={}",
-                frame, width[0], height[0], this.vsync);
+                frame, width, height, this.vsync);
         }
         String dumpDir = debugDumpDir();
         if (frame == 1 && dumpDir != null) {
@@ -185,7 +203,7 @@ final class Dx11Device implements GpuDevice {
                 LOGGER.warn("[dx11] Could not dump the back buffer", e);
             }
         }
-        if (!Dx11Native.nativePresent(this.handle, width[0], height[0])) {
+        if (!Dx11Native.nativePresent(this.handle, width, height)) {
             LOGGER.warn("[dx11] Present failed");
         } else if (this.debugLogging && frame <= 5) {
             LOGGER.info("[dx11] flipFrame #{} presented ({})",

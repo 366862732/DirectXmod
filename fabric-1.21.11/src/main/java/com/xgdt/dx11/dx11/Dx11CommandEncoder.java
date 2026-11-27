@@ -138,6 +138,7 @@ final class Dx11CommandEncoder implements CommandEncoder {
         }
         Dx11Native.nativeWriteToBuffer(
             buffer.handle(), slice.offset(), MemoryUtil.memAddress(data), data.remaining());
+        buffer.markWritten();
         Dx11Metrics.onUpload(data.remaining());
     }
 
@@ -154,12 +155,14 @@ final class Dx11CommandEncoder implements CommandEncoder {
 
     @Override
     public void copyToBuffer(GpuBufferSlice source, GpuBufferSlice destination) {
+        Dx11Buffer destinationBuffer = (Dx11Buffer) destination.buffer();
         Dx11Native.nativeCopyBufferToBuffer(
             ((Dx11Buffer) source.buffer()).handle(),
             source.offset(),
-            ((Dx11Buffer) destination.buffer()).handle(),
+            destinationBuffer.handle(),
             destination.offset(),
             source.length());
+        destinationBuffer.markWritten();
         Dx11Metrics.onUpload(source.length());
     }
 
@@ -262,16 +265,19 @@ final class Dx11CommandEncoder implements CommandEncoder {
         int width,
         int height) {
         this.check(texture, "copyTextureToBuffer");
+        Dx11Buffer destinationBuffer = (Dx11Buffer) buffer;
         boolean ok = Dx11Native.nativeCopyTextureToBuffer(
             ((Dx11Texture) texture).handle(),
-            ((Dx11Buffer) buffer).handle(),
+            destinationBuffer.handle(),
             bufferOffset,
             mipLevel,
             x,
             y,
             width,
             height);
-        if (!ok) {
+        if (ok) {
+            destinationBuffer.markWritten();
+        } else {
             LOGGER.warn("[dx11] copyTextureToBuffer failed for {}", texture.getLabel());
         }
         callback.run();

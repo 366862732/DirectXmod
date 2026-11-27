@@ -16,6 +16,9 @@ import org.slf4j.LoggerFactory;
  */
 public final class PerfDebugLog {
     private static final Logger LOGGER = LoggerFactory.getLogger("gl4dx11");
+    // Resolved once: this method runs every frame and Boolean.getBoolean takes
+    // a synchronized Properties lookup each call.
+    private static final boolean DEBUG_PROPERTY_SET = Boolean.getBoolean(PerfState.DEBUG_PROPERTY);
     private static volatile long lastLogNanos;
     private static volatile Dx11Metrics.Snapshot lastSnapshot = new Dx11Metrics.Snapshot(0, 0, 0, 0, 0, 0, 0, 0);
 
@@ -27,7 +30,7 @@ public final class PerfDebugLog {
             return;
         }
         PerfConfig config = PerfState.config();
-        if (!config.debugLog && !Boolean.getBoolean(PerfState.DEBUG_PROPERTY)) {
+        if (!config.debugLog && !DEBUG_PROPERTY_SET) {
             return;
         }
 

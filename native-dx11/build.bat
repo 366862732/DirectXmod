@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-rem Build dx11_mc.dll with MSVC + CMake.  The fabric-1.21.11 Gradle build
+rem Build dx11_mc.dll with MSVC + CMake.  The fabric Gradle build
 rem packages the DLL from native-dx11/build/bin automatically.
 rem Run this from a "x64 Native Tools Command Prompt for VS 2022" or after
 rem running vcvars64.bat.
@@ -34,7 +34,7 @@ if not exist "%DLL%" (
     exit /b 1
 )
 
-rem The fabric-1.21.11 Gradle build packages this DLL directly from
+rem The fabric Gradle build packages this DLL directly from
 rem native-dx11/build/bin, so there is no need to copy it into the source
 rem resources (which would also risk a stale duplicate in the jar).
 echo [dx11] Built: %DLL%
