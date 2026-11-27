@@ -32,6 +32,9 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          submodules: false #强制关闭防止DLSS报错
+          fetch-depth: 1
 
       - name: 清理残留的子模块配置
         shell: bash
