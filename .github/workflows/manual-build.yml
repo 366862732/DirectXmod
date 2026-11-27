@@ -1,0 +1,90 @@
+name: Manual Build (CMake DLL + Gradle fabric)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'CMake 构建类型'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+          - RelWithDebInfo
+      gradle_task:
+        description: 'Gradle 构建任务'
+        required: true
+        default: 'build'
+        type: choice
+        options:
+          - build
+          - assembleRelease
+          - assembleDebug
+
+jobs:
+  build-native:
+    name: CMake 编译 DLL
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build_type }}
+
+      - name: 编译 DLL
+        run: cmake --build build --config ${{ inputs.build_type }} --parallel
+
+      - name: 上传 DLL 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-dll-${{ inputs.build_type }}
+          path: |
+            native/build/**/*.dll
+            native/build/**/*.lib
+            native/build/**/*.pdb
+          if-no-files-found: error
+
+  build-fabric:
+    name: Gradle 构建 fabric
+    needs: build-native
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: fabric
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'        # 或 'microsoft'
+          java-version: '26-ea'          # EA 版写 '26-ea'
+          cache: 'gradle'
+
+      - name: 设置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 下载 DLL 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: native-dll-${{ inputs.build_type }}
+          path: fabric/src/main/resources/native
+
+      - name: 执行 Gradle 构建
+        run: .\gradlew.bat ${{ inputs.gradle_task }} --no-daemon
+
+      - name: 上传 fabric 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabric-output
+          path: |
+            fabric/build/libs/*.jar
+            fabric/build/outputs/**/*.aar
+            fabric/build/outputs/**/*.apk
+          if-no-files-found: warn
