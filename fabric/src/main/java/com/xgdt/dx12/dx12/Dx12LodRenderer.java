@@ -13,13 +13,17 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.state.GameRenderState;
 import net.minecraft.client.renderer.state.LightmapRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
@@ -35,6 +39,7 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.material.MapColor;
+import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4f;
 import org.joml.Vector3fc;
 import org.joml.Vector4f;
@@ -328,20 +333,22 @@ public final class Dx12LodRenderer {
         + "    // 也不能压太狠：0.70+0.30 时墙面最低到 0.49，整片远景会沉成一面深灰墙。\n"
         + "    rgb *= (0.82 + 0.18 * lambert) * faceShade;\n"
         + "\n"
-        + "    // 逐方块颗粒：按 1 方块网格取三维哈希。靠近时才有、像素跨度大到看不见\n"
-        + "    // 单一方块时淡出，否则远处会出现整屏闪烁的噪点。\n"
+        + "    // 逐方块 / 逐 texel 的假细节：高度场只是兜底，近处由原生区块和体素 LOD\n"
+        + "    // 接管，没必要在这里画高频噪点。以前按「方块尺寸」淡出，但噪点频率是\n"
+        + "    // 1/16 方块——一像素已经跨几个 texel 时它还在全强度输出，整片远景就是\n"
+        + "    // 一层闪动的灰色噪点地毯。现在按 texel 的屏幕尺寸淡出，并大幅降低幅度。\n"
         + "    float px = max(max(length(ddx(world.xz)), length(ddy(world.xz))), 0.02);\n"
-        + "    float fine = saturate(1.0 - px * 0.55);\n"
+        + "    float fine = saturate(1.0 - px * 4.0);\n"
         + "    float n1 = hash31(floor(world)) - 0.5;\n"
         + "    float n2 = hash31(floor(world * 0.25) + 19.0) - 0.5;\n"
         + "    float n3 = hash31(floor(world * 0.0625) + 71.0) - 0.5;\n"
-        + "    rgb *= 1.0 + n1 * 0.06 * fine + n2 * 0.04 + n3 * 0.03;\n"
-        + "    // 逐 texel 的方块纹理细节：高度场一格 26 方块时只靠四角插值会糊成一片；\n"
-        + "    // 按 1/16 方块取哈希补回贴图级颗粒，像素跨度变大时淡出避免闪烁。\n"
-        + "    float detailFade = saturate(1.0 - px * 1.4);\n"
+        + "    rgb *= 1.0 + n1 * 0.04 * fine + n2 * 0.03 + n3 * 0.03;\n"
+        + "    // 1/16 方块的 pseudo-texel：只在「一个 texel 还能占到接近一个像素」时保留，\n"
+        + "    // 否则它就是在随机闪烁。阈值 px*12 ≈ 0.75 个 texel/像素。\n"
+        + "    float detailFade = saturate(1.0 - px * 12.0);\n"
         + "    float2 texel = floor(world.xz * 16.0);\n"
         + "    float blockDetail = hash31(float3(texel, floor(world.y) + 17.0));\n"
-        + "    rgb *= 1.0 + (blockDetail - 0.5) * 0.34 * detailFade;\n"
+        + "    rgb *= 1.0 + (blockDetail - 0.5) * 0.10 * detailFade;\n"
         + "\n"
         + "    // 大尺度色块抖动：只抖亮度、不往某个色相偏\n"
         + "    rgb *= 1.0 + (hash31(floor(world * 0.125) + 5.0) - 0.5) * 0.06;\n"
@@ -456,15 +463,24 @@ public final class Dx12LodRenderer {
         + "    float2 rectSize = input.rect.zw - input.rect.xy;\n"
         + "    bool hasTex = rectSize.x > 0.0 && rectSize.y > 0.0;\n"
         + "    // LOD 格空间 uv → 格内 0..1 → 图集矩形内 0..1\n"
-        + "    float2 tiled = frac(input.uv);\n"
+        + "    // 夹到 0.9999 避免格边界正好采到矩形外一格（padding/相邻 sprite）。\n"
+        + "    float2 tiled = min(frac(input.uv), 0.9999);\n"
         + "    float2 atlasUv = input.rect.xy + tiled * rectSize;\n"
         + "    float4 tex = float4(1.0, 1.0, 1.0, 1.0);\n"
+        + "    float lod = 0.0;\n"
         + "    if (hasTex)\n"
         + "    {\n"
         + "        // 导数取自连续的格空间 uv（frac 会跳变），乘矩形宽高换算到图集空间\n"
         + "        float2 duvdx = ddx(input.uv) * rectSize;\n"
         + "        float2 duvdy = ddy(input.uv) * rectSize;\n"
-        + "        tex = BlockTex.SampleGrad(BlockSampler, atlasUv, duvdx, duvdy);\n"
+        + "        // 体素图集由 LodMipAtlas 生成完整 mip 链（mip0..4）。按屏幕导数选层后\n"
+        + "        // 直接采样：远景一格只有一个像素时落到该方块的平均色，不再整片噪点闪烁。\n"
+        + "        // GetDimensions 读实际图集宽度，换纹理包尺寸也不用改常量。\n"
+        + "        uint atlasW, atlasH;\n"
+        + "        BlockTex.GetDimensions(atlasW, atlasH);\n"
+        + "        float footprint = max(length(duvdx), length(duvdy)) * (float)atlasW;\n"
+        + "        lod = clamp(log2(max(footprint, 1.0)), 0.0, 4.0);\n"
+        + "        tex = BlockTex.SampleLevel(BlockSampler, atlasUv, lod);\n"
         + "    }\n"
         + "    // 有贴图时：贴图 × 该面的生物群系染色（顶点色 rgb 是染色值，白 = 不染色）。\n"
         + "    // 草方块顶面 / 草 / 树叶的 PNG 本身是灰白色，颜色全靠这一步乘回来，\n"
@@ -518,6 +534,11 @@ public final class Dx12LodRenderer {
         + "        * (0.04 + saturate(PbrParams.z) * 0.5);\n"
         + "    // 天空光染色 + 世界亮度（白天白、夜里偏蓝，同 voxy lightmap）\n"
         + "    rgb *= FogParams.z * LightTint.rgb;\n"
+        + "    // 远景去饱和：Greenfield 这类地图的彩色方块在远端仍会形成彩虹条纹，\n"
+        + "    // 按距离把饱和度收一点，远处看起来是自然地形而不是调色板。\n"
+        + "    float farFade = saturate((dist - 700.0) / 1300.0);\n"
+        + "    float luma = dot(rgb, float3(0.299, 0.587, 0.114));\n"
+        + "    rgb = lerp(rgb, float3(luma, luma, luma), farFade * 0.55);\n"
         + "    // 顶点 alpha 是材质标记：0=水体，0.5=玻璃/玻璃板，1=不透明。\n"
         + "    float marker = input.color.a;\n"
         + "    float water = 1.0 - saturate(marker * 2.0);\n"
@@ -543,8 +564,11 @@ public final class Dx12LodRenderer {
         + "    }\n"
         + "    else if (hasTex)\n"
         + "    {\n"
-        + "        // 树叶/草等镂空方块：必须用 mip0 精确采样判断，粗 mip 会把透明边糊掉\n"
-        + "        if (BlockTex.SampleLevel(BlockSampler, atlasUv, 0).a <= 0.1)\n"
+        + "        // 树叶/草等镂空方块：用当前 mip 的 alpha 做裁剪。以前死用 mip0，远处\n"
+        + "        // 一像素采一个 texel，树冠边缘会疯狂闪；粗 mip 的 alpha 已经是该方块的\n"
+        + "        // 平均覆盖率，远处整棵树稳定成一团绿色。近处仍按 0.1 近似原版。\n"
+        + "        float alphaCut = lerp(0.1, 0.5, saturate(lod * 0.75));\n"
+        + "        if (tex.a <= alphaCut)\n"
         + "        {\n"
         + "            discard;\n"
         + "        }\n"
@@ -753,8 +777,10 @@ public final class Dx12LodRenderer {
         + "    int fx = max(abs(CamRelX - x0), abs(CamRelX - x1));\n"
         + "    int fz = max(abs(CamRelZ - z0), abs(CamRelZ - z1));\n"
         + "    bool insideVanilla = max(fx, fz) < (int)InnerRadius;\n"
-        + "    bool insideVoxel = min(x0, x1) >= VoxelMinX && max(x0, x1) <= VoxelMaxX\n"
-        + "        && min(z0, z1) >= VoxelMinZ && max(z0, z1) <= VoxelMaxZ;\n"
+        + "    // 与体素矩形有任何交叠就跳过：以前用「整格在矩形内」判定，跨边界的\n"
+        + "    // 格子会同时被高度场和体素画一遍，LOD 变精细时接缝处就闪。\n"
+        + "    bool insideVoxel = max(x0, x1) >= VoxelMinX && min(x0, x1) <= VoxelMaxX\n"
+        + "        && max(z0, z1) >= VoxelMinZ && min(z0, z1) <= VoxelMaxZ;\n"
         + "    // 低空：原版内圈和体素矩形都跳过。高空（DrawInner=1）：原版区块被\n"
         + "    // 垂直裁剪，内圈必须由高度场补，只跳过体素矩形里内圈之外的区域。\n"
         + "    if (DrawInner == 0 && insideVanilla) { return; }\n"
@@ -814,13 +840,12 @@ public final class Dx12LodRenderer {
      * 体素 LOD 覆盖的半径（方块）。这一圈内不再用高度场，而是画真实方块面，
      * 于是房屋有屋顶和墙、树有树干树冠、悬崖是真正的竖直岩壁。
      *
-     * <p>直接铺到 1024 方块。以前只铺到 720，外面 720~1024 是插值高度场：那一圈
-     * 对城市地图来说是成片的彩色屋顶/玻璃 MapColor，去掉雾以后就是一片彩虹；而且
-     * 高度场把建筑顶当成地形，城市会变成绿色山丘。体素铺到 1024 后，近处和远景的
-     * 城市都还是真实方块面/贴图，高度场只负责 1024 以外、格宽超过 4 方块的远景，
-     * 并强制向自然地形色收敛。
+     * <p>近处精细体素铺到 768 方块（12 个 64 方块超块）；768 以外交给 4×4 区块
+     * 超级块（到 2048）。近处 720 时远景超块从 704 开始，和近处重叠 16 方块，
+     * 同一片地形画两遍会出现闪面和树木重影；取 768 正好对齐超块边界。
+     * 近处约 2.3M 面，剩余预算够把 768~2048 全部换成带贴图的超级块。
      */
-    private static final int VOXEL_RADIUS_BLOCKS = 1024;
+    private static final int VOXEL_RADIUS_BLOCKS = 768;
     /**
      * quality=0 时保持 1 方块精度的半径。再往外按 2/4/8 方块逐级降采样。
      * 房屋、围墙这类几格宽的结构只有在这一圈里才认得出来。
@@ -849,7 +874,10 @@ public final class Dx12LodRenderer {
      * 平均 386 面/块 —— 全圈约 319 万面 / 1275 万顶点。上限给到 1400 万顶点，
      * 留出约 10% 余量，避免外圈被预算截断。
      */
-    private static final int VOXEL_MAX_VERTICES = 14_000_000;
+    // 2048 半径 + 4 方块格超块在高峰时有 340 万+ 面（约 1370 万顶点），14M 的
+    // 硬上限只剩不到 30 万顶点余量，偶尔会 BufferOverflow 并整帧跳过 LOD（看到虚空）。
+    // 提到 16M（4M 面），给碎片/新旧网格交替留出余量；常驻缓冲一次分配，不扩容。
+    private static final int VOXEL_MAX_VERTICES = 16_000_000;
     /** 有新区块建好时，最多每隔这么多帧重拼一次顶点缓冲（相机跨区块时不受此限）。 */
     private static final int VOXEL_REBUILD_INTERVAL = 32;
     /**
@@ -890,6 +918,58 @@ public final class Dx12LodRenderer {
     private int voxelFaceCount;
     /** 体素缓冲里不透明面的数量；其余（{@code [voxelOpaqueFaces, voxelFaceCount)}）是玻璃面。 */
     private int voxelOpaqueFaces;
+
+    /**
+     * 体素/超级块间接绘制参数缓冲（三帧轮换）。每个可见块写一条 DrawIndexed 参数，
+     * 用 baseVertex 指向它在共享顶点缓冲里的位置；每帧只提交视锥内的块。
+     */
+    private static final int VOXEL_ARGS_SLOTS = 3;
+    private Dx12GpuBuffer voxelArgsBuffer;
+    private GpuBufferSlice.MappedView voxelArgsView;
+    private ByteBuffer voxelArgsData;
+    private int voxelArgsCapacity;
+    private int voxelArgsSlot;
+    /** 当前这份体素几何的块列表（含世界 AABB 与顶点偏移），用于每帧视锥剔除。 */
+    private final List<MeshGpu> voxelDrawnGpu = new ArrayList<>();
+    private final List<MeshGpu> voxelSelectedGpu = new ArrayList<>();
+    private final List<MeshGpu> voxelOpaqueDraws = new ArrayList<>();
+    private final List<MeshGpu> voxelGlassDraws = new ArrayList<>();
+    /**
+     * 常驻顶点缓冲：每个区块/超块网格只在新建时上传一次，记录它在缓冲里的顶点偏移。
+     * 选中集合变化、相机移动都不再整份拷贝。
+     */
+    private final IdentityHashMap<LodVoxelMesher.Mesh, Integer> voxelMeshOffsets =
+        new IdentityHashMap<>();
+    /** 已释放但仍可能被在飞帧引用的顶点区间：{offset, count, freeFrame}。 */
+    private final List<int[]> voxelFreeRanges = new ArrayList<>();
+    private final IdentityHashMap<LodVoxelMesher.Mesh, Boolean> voxelCurrentMeshes =
+        new IdentityHashMap<>();
+    private final List<LodVoxelMesher.Mesh> voxelUploadScratch = new ArrayList<>();
+    private int voxelPersistentUsed;
+    private int voxelFrameCounter;
+
+    /** 一个已拼进共享缓冲的区块/超级块：顶点偏移、面数和世界 AABB。 */
+    private static final class MeshGpu {
+        final LodVoxelMesher.Mesh mesh;
+        int opaqueOffset;
+        int glassOffset;
+        final int opaqueFaces;
+        final int glassFaces;
+        final AABB aabb;
+
+        MeshGpu(LodVoxelMesher.Mesh mesh, int opaqueOffset, int glassOffset,
+                int opaqueFaces, int glassFaces,
+                double minX, double minY, double minZ,
+                double maxX, double maxY, double maxZ) {
+            this.mesh = mesh;
+            this.opaqueOffset = opaqueOffset;
+            this.glassOffset = glassOffset;
+            this.opaqueFaces = opaqueFaces;
+            this.glassFaces = glassFaces;
+            this.aabb = new AABB(minX, minY, minZ, maxX, maxY, maxZ);
+        }
+    }
+
     /** 上次重拼时的完成计数与半径：任一变化才需要重拼。 */
     private int voxelBuiltCompleted = -1;
     private int voxelBuiltRadius = -1;
@@ -903,6 +983,8 @@ public final class Dx12LodRenderer {
      * 只等后台补齐后再换 —— 否则远景会随着每一圈的补齐/失效反复重建、疯狂闪烁。
      */
     private int voxelDrawnOuterRing;
+    /** 当前正在显示的远景超块完整环数（每环 64 方块）；缩小时同样保留旧几何。 */
+    private int voxelDrawnFarOuterRing;
     /** 当前这份体素几何是按多大的目标半径拼出来的；配置缩小到比它小时要立刻放弃旧几何。 */
     private int voxelDrawnRadius;
     /** 上次拼几何时的缓存代次；换世界/维度/锚点后必须整份重拼。 */
@@ -1021,10 +1103,16 @@ public final class Dx12LodRenderer {
     private final Map<Integer, Long> voxelPipelines = new HashMap<>();
     /** 玻璃体素管线：同样的着色器，开 alpha 混合、关深度写入。 */
     private final Map<Integer, Long> voxelGlassPipelines = new HashMap<>();
-    /** 方块纹理图集 SRV handle（{@link Dx12GpuTextureView#handle()}）。{@code 0L} = 尚未初始化。 */
-    private long voxelAtlasViewHandle;
+    /** 体素图集 SRV：原图集有 mip 时直接复用，否则使用 CPU 生成的带 mip 副本。 */
+    private Dx12GpuTextureView voxelAtlasMipView;
+    /** 自建 mip 图集的纹理（复用原图集时为 null）。 */
+    private Dx12GpuTexture voxelAtlasMipTexture;
+    /** 生成 SRV 所对应的原版图集纹理；资源重载后对象会变，需要重建。 */
+    private GpuTexture voxelAtlasSource;
     /** 首次绑定图集时打一条日志，之后不再重复。 */
     private boolean voxelAtlasViewLogged;
+    /** 图集尚未就绪的错误只记录第一次，避免启动阶段刷屏。 */
+    private boolean voxelAtlasErrorLogged;
 
     /** 角点输入（int height + int rgb）：UPLOAD 堆，作为 compute 的 t0 只读。 */
     private Dx12GpuBuffer cornerBuffer;
@@ -1089,7 +1177,7 @@ public final class Dx12LodRenderer {
                 Dx12Config.getInstance().getLodQuality());
         }
         try {
-            execute(encoder.nativeHandle(), minecraft, level, color, depth, width, height,
+            execute(encoder, minecraft, level, color, depth, width, height,
                 camera, renderState, levelState);
             this.failureLogged = false;
         } catch (Throwable t) {
@@ -1100,9 +1188,11 @@ public final class Dx12LodRenderer {
         }
     }
 
-    private void execute(long ctx, Minecraft minecraft, ClientLevel level, Dx12GpuTexture color,
-                         Dx12GpuTexture depth, int width, int height, CameraRenderState camera,
-                         GameRenderState renderState, LevelRenderState levelState) {
+    private void execute(Dx12CommandEncoderBackend encoder, Minecraft minecraft, ClientLevel level,
+                         Dx12GpuTexture color, Dx12GpuTexture depth, int width, int height,
+                         CameraRenderState camera, GameRenderState renderState,
+                         LevelRenderState levelState) {
+        long ctx = encoder.nativeHandle();
         Dx12Config config = Dx12Config.getInstance();
         // quality 只决定近处格宽（网格密度），远处按坐标轴分段放宽
         int quality = Mth.clamp(config.getLodQuality(), 0, 2);
@@ -1140,7 +1230,8 @@ public final class Dx12LodRenderer {
         int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
             cameraBlockX, cameraBlockZ);
         boolean drawInner = camera.pos.y - surfaceY > renderDistance * 16.0 + 32.0;
-        updateVoxelMesh(cameraBlockX, cameraBlockZ, voxelRadius, renderDistance, drawInner);
+        updateVoxelMesh(cameraBlockX, cameraBlockZ, voxelRadius, renderDistance,
+            geomRadius, drawInner, level.getMinY(), level.getMaxY());
         logVoxelDiagnostic(voxelRadius);
         // 高度场中心：有体素几何时跟着体素几何的中心走。体素覆盖只增不减，
         // 所以相机在覆盖矩形内走动时中心不动，远景不会因为跨 64 方块而重采样；
@@ -1274,17 +1365,25 @@ public final class Dx12LodRenderer {
         Dx12ShaderPackRenderer.applyCameraBob(projection, camera, renderState)
             .mul(camera.viewRotationMatrix)
             .get(viewProj);
+        // 高度场整体比体素略“远”一点：两者在接缝/兜底圈会重叠，高度场插值面
+        // 有时高于体素真实表面，会导致同一像素在高度场/体素之间来回闪烁。
+        // 不能对同一个 projection 再调一次 applyCameraBob —— 它会原地叠加视角
+        // 摇晃，第二次调用等于双倍 bob，整个高度场会歪到画面一侧。这里直接复制
+        // 已经算好的 viewProj，只把深度平移量 m32（列主序下标 11）压 3%。
+        float[] heightViewProj = viewProj.clone();
+        heightViewProj[11] *= 0.90f;
 
-        // 开启 LOD 后禁用 LOD 雾：把雾区间推到几何半径之外，着色器里 fog 恒为 0，
-        // 远处地形保持原色。FogColor/FogParams.z 仍参与环境光和天空染色，只是不再
-        // 把远景混成雾色。以前雾在 720 方块处把远景吞掉，用户看不到更远的地形。
-        // 高度场是方形网格，对角距离是半径的 √2 倍；雾区间要覆盖整个对角线，
-        // 否则四个角的远格仍会被雾染成天空色。
-        float fogFar = Math.max(geomRadius * 1.5f, LOD_FOG_FAR_BLOCKS);
-        float fogStart = fogFar + 1.0f;
-        float fogEnd = fogStart + 1.0f;
-        int uniformOffset = writeUniforms(viewProj, camera, renderState, levelState, fogStart, fogEnd,
-            centerX, centerZ, level.getSeaLevel());
+        // 雾不再在 720 方块处吞掉远景（那是之前「看不到远处」的根因），但也不能
+        // 完全关闭：几何只铺到 2048，再往外是天空/虚空，硬切边会随相机移动闪成
+        // 一条蓝带。这里只让最后 25% 淡出到天空色，近景/中景仍保持原色。
+        float fogFar = Math.max(geomRadius, LOD_FOG_FAR_BLOCKS);
+        float fogStart = fogFar * 0.75f;
+        float fogEnd = fogFar * 1.05f;
+        int uniformOffset = writeUniforms(heightViewProj, camera, renderState, levelState,
+            fogStart, fogEnd, centerX, centerZ, level.getSeaLevel());
+        // 图集 mip 副本必须在 render pass 之外上传（writeToTexture 会录制拷贝命令），
+        // 否则拷贝会落在 pass 里导致 native 报错、整帧 LOD 被跳过。
+        long voxelAtlas = ensureVoxelAtlasView(encoder, minecraft);
 
         Dx12Native.dx12BeginRenderPass(ctx, new long[]{color.handle()}, new int[]{0},
             new byte[]{0}, null, depth.handle(), 0, (byte) 0, 0.0, 0, 0, width, height);
@@ -1307,16 +1406,35 @@ public final class Dx12LodRenderer {
             }
             // 体素 LOD：顶点坐标是「世界坐标 − 锚点」，所以参考中心传锚点，
             // 和高度场（相对网格中心）用的 uniform 不是同一个槽位。
+            // 每帧按相机视锥筛出可见块，用间接绘制一次提交；块在共享顶点缓冲里的
+            // 位置由 baseVertex 指定，所以背面/屏外的三角形不再提交到 GPU。
             Dx12GpuBuffer voxelBuffer = this.voxelVertexBuffers[this.voxelVertexSlot];
             int voxelUniform = 0;
-            long voxelAtlas = 0L;
-            if (this.voxelFaceCount > 0 && voxelBuffer != null
-                && this.voxelIndexBuffer != null) {
+            this.voxelOpaqueDraws.clear();
+            this.voxelGlassDraws.clear();
+            Frustum frustum = camera.cullFrustum;
+            for (MeshGpu gpu : this.voxelDrawnGpu) {
+                if (frustum != null && !frustum.isVisible(gpu.aabb)) {
+                    continue;
+                }
+                if (gpu.opaqueFaces > 0) {
+                    this.voxelOpaqueDraws.add(gpu);
+                }
+                if (gpu.glassFaces > 0) {
+                    this.voxelGlassDraws.add(gpu);
+                }
+            }
+            if ((!this.voxelOpaqueDraws.isEmpty() || !this.voxelGlassDraws.isEmpty())
+                && voxelBuffer != null && this.voxelIndexBuffer != null) {
                 LodVoxelCache voxelCache = LodVoxelCache.getInstance();
                 voxelUniform = writeUniforms(viewProj, camera, renderState, levelState,
                     fogStart, fogEnd, voxelCache.anchorX(), voxelCache.anchorZ(), level.getSeaLevel());
                 long voxelPipeline = voxelPipelineFor(color.getFormat().ordinal());
                 if (voxelPipeline != 0L) {
+                    int opaqueArgs = this.voxelOpaqueDraws.isEmpty() ? 0
+                        : fillVoxelArgs(this.voxelOpaqueDraws, true);
+                    int glassArgs = this.voxelGlassDraws.isEmpty() ? 0
+                        : fillVoxelArgs(this.voxelGlassDraws, false);
                     Dx12Native.dx12SetPipeline(ctx, voxelPipeline, true);
                     Dx12Native.dx12SetVertexBuffer(ctx, 0, voxelBuffer.handle(),
                         0L, VOXEL_VERTEX_STRIDE);
@@ -1325,36 +1443,32 @@ public final class Dx12LodRenderer {
                     // 不能先调 pushUniform 再调 pushVoxelTexture：native 侧每次
                     // dx12PushDescriptors 都会写一条新的 descriptor table，两次调用
                     // 互相覆盖导致 SRV 槽位错乱。pushVoxelTexture 本身已带 CBV。
-                    voxelAtlas = ensureVoxelAtlasView(minecraft);
                     if (voxelAtlas != 0L) {
                         pushVoxelTexture(ctx, voxelUniform, voxelAtlas);
                     } else {
                         pushVoxelNoTexture(ctx, voxelUniform);
                     }
-                    // 先只画不透明段：玻璃段最后用混合管线单独画，
-                    // 否则玻璃写深度会把后面的地形/玻璃挡掉。
-                    int opaqueFaces = Math.min(this.voxelOpaqueFaces, this.voxelFaceCount);
-                    if (opaqueFaces > 0) {
-                        Dx12Native.dx12DrawIndexed(ctx, opaqueFaces * 6, 1, 0, 0, 0);
+                    if (!this.voxelOpaqueDraws.isEmpty()) {
+                        Dx12Native.dx12DrawIndexedIndirect(ctx, this.voxelArgsBuffer.handle(),
+                            (long) opaqueArgs * 4L, this.voxelOpaqueDraws.size());
                     }
-                }
-            }
-            // 玻璃/玻璃板：顶点 alpha=128 标记，混合管线、关深度写入，画在不透明段之后。
-            int glassFaces = this.voxelFaceCount - this.voxelOpaqueFaces;
-            if (glassFaces > 0 && voxelBuffer != null && this.voxelIndexBuffer != null) {
-                long glassPipeline = voxelGlassPipelineFor(color.getFormat().ordinal());
-                if (glassPipeline != 0L) {
-                    Dx12Native.dx12SetPipeline(ctx, glassPipeline, true);
-                    Dx12Native.dx12SetVertexBuffer(ctx, 0, voxelBuffer.handle(),
-                        0L, VOXEL_VERTEX_STRIDE);
-                    Dx12Native.dx12SetIndexBuffer(ctx, this.voxelIndexBuffer.handle(), 1);
-                    if (voxelAtlas != 0L) {
-                        pushVoxelTexture(ctx, voxelUniform, voxelAtlas);
-                    } else {
-                        pushVoxelNoTexture(ctx, voxelUniform);
+                    // 玻璃/玻璃板：同一个参数缓冲的另一段，混合管线、关深度写入。
+                    if (!this.voxelGlassDraws.isEmpty()) {
+                        long glassPipeline = voxelGlassPipelineFor(color.getFormat().ordinal());
+                        if (glassPipeline != 0L) {
+                            Dx12Native.dx12SetPipeline(ctx, glassPipeline, true);
+                            Dx12Native.dx12SetVertexBuffer(ctx, 0, voxelBuffer.handle(),
+                                0L, VOXEL_VERTEX_STRIDE);
+                            Dx12Native.dx12SetIndexBuffer(ctx, this.voxelIndexBuffer.handle(), 1);
+                            if (voxelAtlas != 0L) {
+                                pushVoxelTexture(ctx, voxelUniform, voxelAtlas);
+                            } else {
+                                pushVoxelNoTexture(ctx, voxelUniform);
+                            }
+                            Dx12Native.dx12DrawIndexedIndirect(ctx, this.voxelArgsBuffer.handle(),
+                                (long) glassArgs * 4L, this.voxelGlassDraws.size());
+                        }
                     }
-                    Dx12Native.dx12DrawIndexed(ctx, glassFaces * 6, 1,
-                        this.voxelOpaqueFaces * 6, 0, 0);
                 }
             }
         } finally {
@@ -1377,7 +1491,8 @@ public final class Dx12LodRenderer {
      * {@link #VOXEL_REBUILD_INTERVAL} 帧节流，避免每帧复制几十 MB。
      */
     private void updateVoxelMesh(int cameraBlockX, int cameraBlockZ, int voxelRadius,
-                                 int renderDistance, boolean drawInner) {
+                                 int renderDistance, int geomRadius, boolean drawInner,
+                                 int minBuildY, int maxBuildY) {
         this.voxelFrames++;
         LodVoxelCache cache = LodVoxelCache.getInstance();
         cache.ensureAnchor(cameraBlockX, cameraBlockZ);
@@ -1445,10 +1560,14 @@ public final class Dx12LodRenderer {
         int cameraChunkX = cameraBlockX >> 4;
         int cameraChunkZ = cameraBlockZ >> 4;
         int quality = Mth.clamp(Dx12Config.getInstance().getLodQuality(), 0, 2);
-        int maxFaces = VOXEL_MAX_VERTICES / 4;
+        // 留 200 万顶点余量给空闲区间碎片：按满 4M 面选完后，free list 里的小段
+        // 往往接不上，bump 指针继续增长会再次 BufferOverflow，整帧 LOD 被跳过
+        // （画面底部露天空蓝）。3.5M 面上限让常驻缓冲始终留出安全空间。
+        int maxFaces = (VOXEL_MAX_VERTICES - 2_000_000) / 4;
         LodVoxelMesher.Mesh[] selected = this.voxelMeshScratch;
         int count = 0;
         int totalFaces = 0;
+        this.voxelSelectedGpu.clear();
         // 已经「完整铺满」的环数。只把连续的完整环画出来：某一环里还有区块没建好，
         // 就从这一环起停画，高度场从上一环的外缘接上 —— 否则会露出半圈天空。
         int outerRing = 0;
@@ -1512,6 +1631,10 @@ public final class Dx12LodRenderer {
                     }
                     selected[count++] = mesh;
                     totalFaces += mesh.faces();
+                    this.voxelSelectedGpu.add(new MeshGpu(mesh, 0, 0,
+                        mesh.opaqueFaces(), mesh.glassFaces(),
+                        worldChunkX * 16.0, minBuildY, worldChunkZ * 16.0,
+                        worldChunkX * 16.0 + 16.0, maxBuildY, worldChunkZ * 16.0 + 16.0));
                 }
             }
             if (drawing) {
@@ -1519,9 +1642,72 @@ public final class Dx12LodRenderer {
                     // 本环不完整：整环回滚，只保留前面完整的环
                     count = ringCount;
                     totalFaces = ringFaces;
+                    this.voxelSelectedGpu.subList(ringCount, this.voxelSelectedGpu.size()).clear();
                     drawing = false;
                 } else {
                     outerRing = d + 1;
+                }
+            }
+        }
+        // 远景超级块：1024 以外到几何半径（2048）用 4×4 区块超块，每块 64 方块，
+        // shift3/4 建网，带真实方块贴图。进入存档后这些超块就会全部排队建好，
+        // 不需要玩家先飞到那里；高度场只作为它们的兜底画在后面。
+        int superRadius = Math.max(0, (geomRadius + 63) >> 6);
+        int camSuperX = camChunkX >> 2;
+        int camSuperZ = camChunkZ >> 2;
+        int nearSuperRadius = Math.min(superRadius, (voxelRadius + 63) >> 6);
+        boolean farDrawing = true;
+        int farOuterRing = 0;
+        for (int d = nearSuperRadius; d < superRadius; d++) {
+            int ringCount = count;
+            int ringFaces = totalFaces;
+            boolean ringComplete = true;
+            boolean budgetHit = false;
+            // 远景超块用 4 方块一格：8 方块格仍然把山峰/建筑压成大三角尖，
+            // 4 方块格配合超块内贪心合并后，面数仍远低于逐区块拼接；
+            // 超预算时后面的环自然回退到高度场，不会撑爆顶点缓冲。
+            int shift = 2;
+            for (int dz = -d; dz <= d; dz++) {
+                for (int dx = -d; dx <= d; dx++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != d) {
+                        continue;
+                    }
+                    LodVoxelMesher.Mesh mesh = cache.getRegion(camSuperX + dx,
+                        camSuperZ + dz, 4, shift);
+                    if (mesh == null || mesh == LodVoxelMesher.Mesh.UNAVAILABLE) {
+                        ringComplete = false;
+                        continue;
+                    }
+                    if (!farDrawing || mesh.faces() == 0) {
+                        continue;
+                    }
+                    if (totalFaces + mesh.faces() > maxFaces) {
+                        budgetHit = true;
+                        continue;
+                    }
+                    if (count == selected.length) {
+                        int grown = Math.max(64, Math.min(selected.length * 2, 32768));
+                        selected = Arrays.copyOf(selected, grown);
+                        this.voxelMeshScratch = selected;
+                    }
+                    selected[count++] = mesh;
+                    totalFaces += mesh.faces();
+                    int superWorldX = (camSuperX + dx) * 64;
+                    int superWorldZ = (camSuperZ + dz) * 64;
+                    this.voxelSelectedGpu.add(new MeshGpu(mesh, 0, 0,
+                        mesh.opaqueFaces(), mesh.glassFaces(),
+                        superWorldX, minBuildY, superWorldZ,
+                        superWorldX + 64.0, maxBuildY, superWorldZ + 64.0));
+                }
+            }
+            if (farDrawing) {
+                if (!ringComplete || budgetHit) {
+                    count = ringCount;
+                    totalFaces = ringFaces;
+                    this.voxelSelectedGpu.subList(ringCount, this.voxelSelectedGpu.size()).clear();
+                    farDrawing = false;
+                } else {
+                    farOuterRing = d + 1;
                 }
             }
         }
@@ -1529,15 +1715,20 @@ public final class Dx12LodRenderer {
         // outerRing 缩回 0，远景就会在「有体素 / 没体素」之间反复切换。只要上一份
         // 几何还盖着相机，就先保留它，等后台补齐后再一次性换过去。
         boolean haveCover = this.voxelFaceCount > 0 && this.voxelCoverRadius > 0.0f;
+        // 近圈和远景超块都要判：以前只看近处完整环，远景某块一缺失（超块重建/淘汰）
+        // 覆盖半径就会缩一圈，高度场立刻补进来，再从外圈重新长回去 —— 表现就是
+        // 远处一圈地形反复闪现。任何一层缩小时都保留旧几何，直到相机走出旧矩形。
         if (haveCover && voxelRadius >= this.voxelDrawnRadius
-            && outerRing < this.voxelDrawnOuterRing
+            && (outerRing < this.voxelDrawnOuterRing
+                || farOuterRing < this.voxelDrawnFarOuterRing)
             && this.voxelRectContains(cameraBlockX, cameraBlockZ)) {
             return;
         }
         this.voxelDrawnOuterRing = outerRing;
+        this.voxelDrawnFarOuterRing = farOuterRing;
         this.voxelDrawnRadius = voxelRadius;
-        this.voxelCoverRadius = outerRing > 0 ? outerRing * 16.0f : 0.0f;
-        if (totalFaces == 0 || outerRing == 0) {
+        this.voxelCoverRadius = Math.max(outerRing * 16.0f, farOuterRing * 64.0f);
+        if (totalFaces == 0 || (outerRing == 0 && farOuterRing == 0)) {
             // 没有实际几何就退回高度场：否则高度场会以为这一圈已被体素盖住而空出大洞
             clearVoxelCover();
             return;
@@ -1555,51 +1746,61 @@ public final class Dx12LodRenderer {
             }
             if (same) {
                 this.voxelDrawnOuterRing = outerRing;
+                this.voxelDrawnFarOuterRing = farOuterRing;
                 this.voxelDrawnRadius = voxelRadius;
-                this.voxelCoverRadius = outerRing * 16.0f;
+                this.voxelCoverRadius = Math.max(outerRing * 16.0f, farOuterRing * 64.0f);
                 return;
             }
         }
-        // 写入下一槽位，而不是当前正在绘制的槽位：上一帧/上上帧的 GPU 命令可能
-        // 还在读当前槽位，原地重写会让远景读到一半新一半旧的顶点。
-        int writeSlot = (this.voxelVertexSlot + 1) % VOXEL_VERTEX_SLOTS;
+        // 常驻顶点缓冲：只为「新出现」的网格上传一次，已有网格保留原 offset。
+        // 每帧的选中集合只更新 MeshGpu 的 offset 和可见列表，不再整份拷贝。
+        this.voxelFrameCounter++;
+        this.voxelCurrentMeshes.clear();
+        for (MeshGpu gpu : this.voxelSelectedGpu) {
+            this.voxelCurrentMeshes.put(gpu.mesh, Boolean.TRUE);
+        }
+        for (var it = this.voxelMeshOffsets.entrySet().iterator(); it.hasNext();) {
+            var entry = it.next();
+            if (this.voxelCurrentMeshes.containsKey(entry.getKey())) {
+                continue;
+            }
+            int offset = entry.getValue();
+            int countVerts = entry.getKey().faces() * 4;
+            this.voxelFreeRanges.add(new int[]{offset, countVerts, this.voxelFrameCounter});
+            it.remove();
+        }
+        this.voxelUploadScratch.clear();
+        int totalOpaque = 0;
+        int totalVertices = 0;
+        for (MeshGpu gpu : this.voxelSelectedGpu) {
+            int countVerts = gpu.mesh.faces() * 4;
+            Integer offset = this.voxelMeshOffsets.get(gpu.mesh);
+            if (offset == null) {
+                int at = allocVoxelVertices(countVerts);
+                this.voxelMeshOffsets.put(gpu.mesh, at);
+                this.voxelUploadScratch.add(gpu.mesh);
+                offset = at;
+            }
+            gpu.opaqueOffset = offset;
+            gpu.glassOffset = offset + gpu.opaqueFaces * 4;
+            totalOpaque += gpu.opaqueFaces;
+            totalVertices = Math.max(totalVertices, offset + countVerts);
+        }
         try {
-            ensureVoxelBuffers(writeSlot, totalFaces * 4, totalFaces * 6);
+            for (int slot = 0; slot < VOXEL_VERTEX_SLOTS; slot++) {
+                ensureVoxelBuffers(slot, totalVertices, totalFaces * 6);
+            }
+            for (int i = 0; i < this.voxelUploadScratch.size(); i++) {
+                LodVoxelMesher.Mesh mesh = this.voxelUploadScratch.get(i);
+                uploadVoxelMesh(mesh, this.voxelMeshOffsets.get(mesh));
+            }
         } catch (Throwable t) {
             LOGGER.error("[lod] 体素顶点缓冲创建失败，本帧跳过体素 LOD", t);
             clearVoxelCover();
             return;
         }
-        ByteBuffer vertexData = this.voxelVertexData[writeSlot];
-        if (vertexData == null) {
-            clearVoxelCover();
-            return;
-        }
-        int vertex = 0;
-        int totalOpaque = 0;
-        // 两段拼接：所有区块的不透明面在前，玻璃面在后。单块区块内部 mesher 已经
-        // 按「不透明→玻璃」排好，这里再按全局分段，渲染端才能一次画完不透明段、
-        // 在高度场之后单独混合玻璃段。
-        for (int k = 0; k < count; k++) {
-            LodVoxelMesher.Mesh mesh = selected[k];
-            int opaqueBytes = mesh.opaqueFaces() * 4 * VOXEL_VERTEX_STRIDE;
-            vertexData.position(vertex * VOXEL_VERTEX_STRIDE);
-            vertexData.put(mesh.vertices(), 0, opaqueBytes);
-            vertex += mesh.opaqueFaces() * 4;
-            totalOpaque += mesh.opaqueFaces();
-        }
-        for (int k = 0; k < count; k++) {
-            LodVoxelMesher.Mesh mesh = selected[k];
-            int opaqueBytes = mesh.opaqueFaces() * 4 * VOXEL_VERTEX_STRIDE;
-            int glassBytes = mesh.vertices().length - opaqueBytes;
-            if (glassBytes <= 0) {
-                continue;
-            }
-            vertexData.position(vertex * VOXEL_VERTEX_STRIDE);
-            vertexData.put(mesh.vertices(), opaqueBytes, glassBytes);
-            vertex += mesh.glassFaces() * 4;
-        }
-        this.voxelVertexSlot = writeSlot;
+        this.voxelDrawnGpu.clear();
+        this.voxelDrawnGpu.addAll(this.voxelSelectedGpu);
         this.voxelFaceCount = totalFaces;
         this.voxelOpaqueFaces = totalOpaque;
         if (this.voxelDrawnMeshes.length < count) {
@@ -1614,10 +1815,20 @@ public final class Dx12LodRenderer {
         // 露出没有几何的天空，少算一格只是多叠一格粗地形。
         int minChunkX = camChunkX - (outerRing - 1);
         int minChunkZ = camChunkZ - (outerRing - 1);
+        int maxChunkX = camChunkX + outerRing;
+        int maxChunkZ = camChunkZ + outerRing;
+        if (farOuterRing > 0) {
+            // 远景超块按 4 区块对齐；高度场的跳过矩形要覆盖到超块外缘，
+            // 否则超块已经把远处画好了，高度场还在后面浪费一遍三角形。
+            minChunkX = Math.min(minChunkX, (camSuperX - (farOuterRing - 1)) * 4);
+            minChunkZ = Math.min(minChunkZ, (camSuperZ - (farOuterRing - 1)) * 4);
+            maxChunkX = Math.max(maxChunkX, (camSuperX + farOuterRing) * 4);
+            maxChunkZ = Math.max(maxChunkZ, (camSuperZ + farOuterRing) * 4);
+        }
         this.voxelMinBlockX = minChunkX * 16;
-        this.voxelMaxBlockX = (camChunkX + outerRing) * 16;
+        this.voxelMaxBlockX = maxChunkX * 16;
         this.voxelMinBlockZ = minChunkZ * 16;
-        this.voxelMaxBlockZ = (camChunkZ + outerRing) * 16;
+        this.voxelMaxBlockZ = maxChunkZ * 16;
     }
 
     /**
@@ -1650,8 +1861,8 @@ public final class Dx12LodRenderer {
                 int dz = Math.max(Math.abs(centerZ + z0 - cameraBlockZ),
                     Math.abs(centerZ + z1 - cameraBlockZ));
                 boolean insideVanilla = Math.max(dx, dz) < vanillaInner;
-                boolean insideVoxel = x0 >= voxelMinX && x1 <= voxelMaxX
-                    && z0 >= voxelMinZ && z1 <= voxelMaxZ;
+                boolean insideVoxel = x1 >= voxelMinX && x0 <= voxelMaxX
+                    && z1 >= voxelMinZ && z0 <= voxelMaxZ;
                 boolean drawn = drawInner
                     ? !insideVoxel || insideVanilla
                     : !insideVanilla && !insideVoxel;
@@ -1677,9 +1888,8 @@ public final class Dx12LodRenderer {
         int medium;
         int coarse;
         if (quality >= 2) {
-            // 1 方块精度到 448，2 方块到 640，4 方块到 1024；1024 外交给高度场。
-            // 之前 512/720 在城市里面数接近 300 万，帧数被顶点/像素带宽拖垮；
-            // 448/640 的观感和 Voxy 的屏幕空间 LOD 更接近，面数能降三成左右。
+            // 1 方块精度到 448，2 方块到 640，4 方块到 768；768 以外是远景超级块。
+            // 近处约 2.3M 面，剩余预算留给 768~2048 的 4×4 超块。
             full = 448;
             medium = 640;
             coarse = VOXEL_RADIUS_BLOCKS;
@@ -1723,10 +1933,10 @@ public final class Dx12LodRenderer {
         this.lastVoxelDiagnosticNanos = now;
         LodVoxelCache cache = LodVoxelCache.getInstance();
         LodRegionCache region = LodRegionCache.getInstance();
-        LOGGER.info("[lod] 体素: 目标半径={} 覆盖半径={} 完整环={} 面={} 缓存[已建={} 缺={} 排队={} 完成={}] 高度场[重建={} 采样={}/{} 可见洞={}] UV={} 存储[{}]",
+        LOGGER.info("[lod] 体素: 目标半径={} 覆盖半径={} 完整环={} 远环={} 面={} 缓存[已建={} 缺={} 排队={} 完成={}] 高度场[重建={} 采样={}/{} 可见洞={}] UV={} 存储[{}]",
             voxelRadius, (int) this.voxelCoverRadius, this.voxelDrawnOuterRing,
-            this.voxelFaceCount, cache.readyCount(), cache.missingCount(),
-            cache.pendingCount(), cache.completedCount(),
+            this.voxelDrawnFarOuterRing, this.voxelFaceCount, cache.readyCount(),
+            cache.missingCount(), cache.pendingCount(), cache.completedCount(),
             this.heightfieldBuilds, this.builtKnown, this.builtTotal, this.builtVisibleHoles,
             region.isSpriteUvReady() ? "就绪" : "未就绪", region.storeStats());
     }
@@ -1744,8 +1954,16 @@ public final class Dx12LodRenderer {
         this.voxelFaceCount = 0;
         this.voxelOpaqueFaces = 0;
         this.voxelDrawnMeshCount = 0;
+        this.voxelDrawnGpu.clear();
+        this.voxelSelectedGpu.clear();
+        this.voxelMeshOffsets.clear();
+        this.voxelFreeRanges.clear();
+        this.voxelUploadScratch.clear();
+        this.voxelCurrentMeshes.clear();
+        this.voxelPersistentUsed = 0;
         this.voxelCoverRadius = 0.0f;
         this.voxelDrawnOuterRing = 0;
+        this.voxelDrawnFarOuterRing = 0;
         this.voxelDrawnRadius = 0;
         this.voxelDrawnCenterX = 0;
         this.voxelDrawnCenterZ = 0;
@@ -1758,12 +1976,10 @@ public final class Dx12LodRenderer {
     /** 体素顶点缓冲（CPU 映射，按槽位轮换）与 4 顶点/面的共享静态索引。 */
     private void ensureVoxelBuffers(int slot, int vertexCapacity, int indexCapacity) {
         if (this.voxelVertexBuffers[slot] == null || this.voxelVertexBuffers[slot].isClosed()
-            || this.voxelVertexCapacity[slot] < vertexCapacity) {
-            // 12.5% 余量：体素面数会随相机中心换环小幅波动，留一点余量避免每次
-            // 重建都重新分配两百多 MB 的缓冲；比翻倍增长省下约 1/4 显存/内存。
-            int wanted = vertexCapacity + (vertexCapacity >> 3);
-            int capacity = Math.min(VOXEL_MAX_VERTICES,
-                Math.max(wanted, Math.max(this.voxelVertexCapacity[slot], 65536)));
+            || this.voxelVertexCapacity[slot] < VOXEL_MAX_VERTICES) {
+            // 常驻缓冲按硬上限一次分配，绝不在运行中扩容：扩容会 close/重建整个
+            // buffer，已上传的旧区块偏移还在、顶点却全丢了，画面会直接看到虚空。
+            int capacity = VOXEL_MAX_VERTICES;
             closeVoxelVertex(slot);
             long bytes = (long) capacity * VOXEL_VERTEX_STRIDE;
             Dx12GpuBuffer buffer = new Dx12GpuBuffer(
@@ -1777,9 +1993,8 @@ public final class Dx12LodRenderer {
             this.voxelVertexCapacity[slot] = capacity;
         }
         if (this.voxelIndexBuffer == null || this.voxelIndexBuffer.isClosed()
-            || this.voxelIndexCapacity < indexCapacity) {
-            int capacity = Math.min(VOXEL_MAX_VERTICES / 4 * 6,
-                Math.max(indexCapacity, Math.max(this.voxelIndexCapacity * 2, 65536 * 6)));
+            || this.voxelIndexCapacity < VOXEL_MAX_VERTICES / 4 * 6) {
+            int capacity = VOXEL_MAX_VERTICES / 4 * 6;
             closeVoxelIndex();
             long bytes = (long) capacity * 4L;
             Dx12GpuBuffer buffer = new Dx12GpuBuffer(
@@ -1838,6 +2053,97 @@ public final class Dx12LodRenderer {
             this.voxelIndexBuffer = null;
         }
         this.voxelIndexCapacity = 0;
+    }
+
+    /** 间接绘制参数缓冲：三帧轮换，避免写到 GPU 还在读的槽位。 */
+    private void ensureVoxelArgs(int commands) {
+        int needed = Math.max(1, commands) * 5 * VOXEL_ARGS_SLOTS;
+        if (this.voxelArgsBuffer != null && !this.voxelArgsBuffer.isClosed()
+            && this.voxelArgsCapacity >= needed) {
+            return;
+        }
+        int capacity = Math.max(needed, Math.max(this.voxelArgsCapacity * 2, 5 * 256));
+        closeVoxelArgs();
+        long bytes = (long) capacity * 4L;
+        Dx12GpuBuffer buffer = new Dx12GpuBuffer(GpuBuffer.USAGE_MAP_WRITE, bytes);
+        GpuBufferSlice.MappedView view = buffer.map(0L, bytes, false, true);
+        this.voxelArgsBuffer = buffer;
+        this.voxelArgsView = view;
+        this.voxelArgsData = view.data().order(ByteOrder.LITTLE_ENDIAN);
+        this.voxelArgsCapacity = capacity;
+    }
+
+    /**
+     * 把一批可见块写成 DrawIndexed 参数。返回参数在缓冲里的 int 下标；绘制时
+     * 乘 4 变成字节偏移。baseVertex 指向共享顶点缓冲里的块起点。
+     */
+    private int fillVoxelArgs(List<MeshGpu> draws, boolean opaque) {
+        ensureVoxelArgs(draws.size());
+        int perSlot = Math.max(5, this.voxelArgsCapacity / VOXEL_ARGS_SLOTS);
+        int slot = this.voxelArgsSlot++ % VOXEL_ARGS_SLOTS;
+        int base = slot * perSlot;
+        ByteBuffer data = this.voxelArgsData;
+        for (int i = 0; i < draws.size(); i++) {
+            MeshGpu g = draws.get(i);
+            int offset = (base + i * 5) * 4;
+            data.putInt(offset, (opaque ? g.opaqueFaces : g.glassFaces) * 6);
+            data.putInt(offset + 4, 1);
+            data.putInt(offset + 8, 0);
+            data.putInt(offset + 12, opaque ? g.opaqueOffset : g.glassOffset);
+            data.putInt(offset + 16, 0);
+        }
+        return base;
+    }
+
+    /** 从常驻缓冲分配一段顶点区间；优先复用已过三帧的在飞空闲区间。 */
+    private int allocVoxelVertices(int count) {
+        for (int i = 0; i < this.voxelFreeRanges.size(); i++) {
+            int[] range = this.voxelFreeRanges.get(i);
+            if (range[2] + VOXEL_VERTEX_SLOTS <= this.voxelFrameCounter && range[1] >= count) {
+                int offset = range[0];
+                if (range[1] == count) {
+                    this.voxelFreeRanges.remove(i);
+                } else {
+                    range[0] += count;
+                    range[1] -= count;
+                }
+                return offset;
+            }
+        }
+        int offset = this.voxelPersistentUsed;
+        this.voxelPersistentUsed += count;
+        return offset;
+    }
+
+    /** 把一个网格的 32B 顶点写到常驻缓冲的三个在飞槽位。 */
+    private void uploadVoxelMesh(LodVoxelMesher.Mesh mesh, int offset) {
+        for (int slot = 0; slot < VOXEL_VERTEX_SLOTS; slot++) {
+            ByteBuffer data = this.voxelVertexData[slot];
+            if (data == null) {
+                continue;
+            }
+            data.position(offset * VOXEL_VERTEX_STRIDE);
+            data.put(mesh.vertices());
+        }
+    }
+
+    private void closeVoxelArgs() {
+        if (this.voxelArgsView != null) {
+            try {
+                this.voxelArgsView.close();
+            } catch (Throwable ignored) {
+            }
+            this.voxelArgsView = null;
+        }
+        if (this.voxelArgsBuffer != null) {
+            try {
+                this.voxelArgsBuffer.close();
+            } catch (Throwable ignored) {
+            }
+            this.voxelArgsBuffer = null;
+        }
+        this.voxelArgsData = null;
+        this.voxelArgsCapacity = 0;
     }
 
     /**
@@ -2000,8 +2306,8 @@ public final class Dx12LodRenderer {
                     int rx1 = axis[i + 1];
                     int rz0 = axis[j];
                     int rz1 = axis[j + 1];
-                    boolean insideVoxel = rx0 >= voxelMinX && rx1 <= voxelMaxX
-                        && rz0 >= voxelMinZ && rz1 <= voxelMaxZ;
+                    boolean insideVoxel = rx1 >= voxelMinX && rx0 <= voxelMaxX
+                        && rz1 >= voxelMinZ && rz0 <= voxelMaxZ;
                     if (drawInner) {
                         // 高空：原版区块被垂直裁剪，内圈交给高度场补；只跳过
                         // 体素矩形里、原版内圈之外的区域（那里体素已经画过）。
@@ -3213,53 +3519,66 @@ public final class Dx12LodRenderer {
     }
 
     /**
-     * 惰性初始化方块纹理图集 SRV handle。
+     * 取得体素 LOD 用的图集 SRV。
      *
-     * <p>取 {@code Minecraft.getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS)} 的
-     * {@link GpuTextureView}，调 {@code ((Dx12GpuTextureView) view).handle()} 得到
-     * 可直接塞进 {@code dx12PushDescriptors} 的 native 描述符指针。
+     * <p>原版图集在多数配置下只有 mip0（当前版本实测 {@code mips=1}）。体素远景一格
+     * 只有一两个像素，却要覆盖几十个 texel，mip0 采样会变成整片闪烁的噪点。这里优先
+     * 使用原图集自带的 mip；没有的话用 {@link LodMipAtlas} 生成一份带 mip 的副本
+     * （布局与原图集完全一致，mesher 的 UV 不用改）。
      *
-     * <p>注意：{@code AtlasManager} 按「图集定义 id」（{@code AtlasIds.BLOCKS} =
-     * {@code minecraft:blocks}）索引，不是按纹理路径（{@code TextureAtlas.LOCATION_BLOCKS}
-     * = {@code minecraft:textures/atlas/blocks.png}）。用错会抛
-     * {@code IllegalArgumentException: Invalid atlas id}，SRV 永远是 0，
-     * 体素绘制就会沿用上一条 draw 残留的描述符表 —— 表现为远景只剩顶点色。
-     *
-     * <p>图集还没上传时（加载阶段）{@code getTextureView()} 可能返回 null，
-     * 此时返回 0，调用方跳过 SRV 绑定，下一帧再试。
+     * <p>资源重载后原图集纹理对象会变，检测到变化就重建；旧 view 先关，再关旧纹理。
      */
-    private long ensureVoxelAtlasView(Minecraft minecraft) {
-        if (this.voxelAtlasViewHandle != 0L) {
-            return this.voxelAtlasViewHandle;
-        }
+    private long ensureVoxelAtlasView(Dx12CommandEncoderBackend encoder, Minecraft minecraft) {
         try {
             TextureAtlas atlas = minecraft.getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS);
-            GpuTextureView view = atlas.getTextureView();
-            if (view instanceof Dx12GpuTextureView dx12View) {
-                this.voxelAtlasViewHandle = dx12View.handle();
-                if (!this.voxelAtlasViewLogged) {
-                    this.voxelAtlasViewLogged = true;
-                    GpuTexture texture = atlas.getTexture();
-                    LOGGER.info("[lod] 体素图集 SRV 已绑定：{}x{} mips={}",
-                        texture == null ? -1 : texture.getWidth(0),
-                        texture == null ? -1 : texture.getHeight(0),
-                        texture == null ? -1 : texture.getMipLevels());
-                }
-                return this.voxelAtlasViewHandle;
+            GpuTexture source = atlas.getTexture();
+            if (source == null) {
+                return 0L;
             }
+            if (this.voxelAtlasMipView != null && !this.voxelAtlasMipView.isClosed()
+                && this.voxelAtlasSource == source) {
+                return this.voxelAtlasMipView.handle();
+            }
+            closeVoxelAtlas();
+            LodMipAtlas.Result built = LodMipAtlas.ensure(encoder, atlas);
+            if (built == null) {
+                return 0L;
+            }
+            this.voxelAtlasSource = source;
+            this.voxelAtlasMipTexture = built.texture();
+            this.voxelAtlasMipView = built.view();
             if (!this.voxelAtlasViewLogged) {
                 this.voxelAtlasViewLogged = true;
-                LOGGER.warn("[lod] 体素图集 view 类型不符：{}",
-                    view == null ? "null" : view.getClass().getName());
+                LOGGER.info("[lod] 体素图集 SRV 已绑定：{}x{} mips={}", source.getWidth(0),
+                    source.getHeight(0), this.voxelAtlasMipView.mipLevels());
             }
+            return this.voxelAtlasMipView.handle();
         } catch (Throwable t) {
             // 图集尚未初始化（加载阶段），下次再试；只记录第一次，避免刷屏
-            if (!this.voxelAtlasViewLogged) {
-                this.voxelAtlasViewLogged = true;
+            if (!this.voxelAtlasErrorLogged) {
+                this.voxelAtlasErrorLogged = true;
                 LOGGER.warn("[lod] 体素图集 SRV 获取失败", t);
             }
         }
         return 0L;
+    }
+
+    private void closeVoxelAtlas() {
+        if (this.voxelAtlasMipView != null) {
+            try {
+                this.voxelAtlasMipView.close();
+            } catch (Throwable ignored) {
+            }
+            this.voxelAtlasMipView = null;
+        }
+        if (this.voxelAtlasMipTexture != null) {
+            try {
+                this.voxelAtlasMipTexture.close();
+            } catch (Throwable ignored) {
+            }
+            this.voxelAtlasMipTexture = null;
+        }
+        this.voxelAtlasSource = null;
     }
 
     /**

@@ -146,7 +146,8 @@ public final class LodRegionCache {
      * 整块数据约 16×16×384 项，只在建网时临时存在，不进入长期缓存。
      */
     public record VoxelChunk(int minY, int height, int topY,
-                             int[] palette, String[] paletteNames, short[] blocks) {
+                             int[] palette, String[] paletteNames, short[] blocks)
+        implements LodVoxelMesher.VoxelSource {
         /** 区块内坐标（x/z 为 0..15，y 为绝对世界坐标）是否有实心方块。 */
         public boolean solid(int x, int y, int z) {
             int ly = y - this.minY;
@@ -176,6 +177,34 @@ public final class LodRegionCache {
                 return null;
             }
             return this.paletteNames[idx];
+        }
+    }
+
+    /**
+     * 多区块拼块（远景超级块）：{@code chunks} 按 {@code z * size + x} 排列，
+     * 坐标 {@code x/z} 为拼块内 0..size*16-1 的方块坐标。缺区块返回空气。
+     */
+    public record VoxelRegion(int minY, int height, int topY, int size, VoxelChunk[] chunks)
+        implements LodVoxelMesher.VoxelSource {
+        private VoxelChunk chunk(int x, int z) {
+            int cx = x >> 4;
+            int cz = z >> 4;
+            if (cx < 0 || cx >= this.size || cz < 0 || cz >= this.size) {
+                return null;
+            }
+            return this.chunks[cz * this.size + cx];
+        }
+
+        @Override
+        public int color(int x, int y, int z) {
+            VoxelChunk chunk = chunk(x, z);
+            return chunk == null ? -1 : chunk.color(x & 15, y, z & 15);
+        }
+
+        @Override
+        public String blockName(int x, int y, int z) {
+            VoxelChunk chunk = chunk(x, z);
+            return chunk == null ? null : chunk.blockName(x & 15, y, z & 15);
         }
     }
 
@@ -1041,9 +1070,9 @@ public final class LodRegionCache {
      * （region 不存在、区块未生成或 IO 失败）。
      *
      * <p>优先命中 {@link LodSectionStore}：解码后的调色板+索引比 NBT 小得多，也省掉
-     * 逐 section 查注册表的开销。存储里记着 region 文件的 {@code (size, mtime)}，两者
-     * 任一变化都当 miss：原地改方块不会改变文件大小，只刷新 mtime，继续命中会把旧
-     * 地形当成当前 LOD（玻璃/新道路消失、旧水面盖住新地面）。
+     * 逐 section 查注册表的开销。存储里只按 region 文件大小校验；不能按 mtime 失效，
+     * 因为 26.2 的自动存档会频繁刷新 mtime，曾导致列/体素缓存整片 miss、十万级 NBT
+     * 解析。玩家原地改方块由区块保存时的定点失效负责。
      */
     public VoxelChunk readVoxel(int chunkX, int chunkZ) {
         Path dir = this.regionDir;
@@ -1082,6 +1111,45 @@ public final class LodRegionCache {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /**
+     * 区块保存时定点失效：删掉该区块的列/体素存储记录和内存缓存，让下次采样/建网
+     * 重新读 NBT。只影响这一块，不再按 region 大小/mtime 把整片缓存作废。
+     */
+    public void invalidate(int chunkX, int chunkZ) {
+        long key = ChunkPos.pack(chunkX, chunkZ);
+        this.columns.remove(key);
+        this.missing.remove(key);
+        if (this.store != null) {
+            this.store.remove(key);
+        }
+        if (this.columnStore != null) {
+            this.columnStore.remove(key);
+        }
+        this.columnVersion.incrementAndGet();
+        LodVoxelCache.getInstance().invalidate(chunkX, chunkZ);
+    }
+
+    /**
+     * 读一个 {@code size×size} 区块的远景超级块。{@code superChunkX/Z} 以超级块为单位
+     * （一块 = {@code size*16} 方块），逐区块复用 {@link #readVoxel} 的存储缓存。
+     */
+    public VoxelRegion readVoxelRegion(int superChunkX, int superChunkZ, int size) {
+        VoxelChunk[] chunks = new VoxelChunk[size * size];
+        int baseChunkX = superChunkX * size;
+        int baseChunkZ = superChunkZ * size;
+        int topY = this.minY;
+        for (int z = 0; z < size; z++) {
+            for (int x = 0; x < size; x++) {
+                VoxelChunk chunk = readVoxel(baseChunkX + x, baseChunkZ + z);
+                chunks[z * size + x] = chunk;
+                if (chunk != null) {
+                    topY = Math.max(topY, chunk.topY());
+                }
+            }
+        }
+        return new VoxelRegion(this.minY, this.height, topY, size, chunks);
     }
 
     /**

@@ -42,6 +42,13 @@ public final class LodVoxelCache {
     private record Key(int x, int z, int shift) {
     }
 
+    /** 远景超级块缓存键：x/z 以超级块为单位（一块 = size*16 方块）。 */
+    private record RegionKey(int x, int z, int shift, int size) {
+    }
+
+    /** 远景超级块网格上限；2048 半径约 4×4 区块超块 4225 个。 */
+    private static final int MAX_REGION_MESHES = 8192;
+
     private final Map<Key, LodVoxelMesher.Mesh> ready = Collections.synchronizedMap(
         new LinkedHashMap<Key, LodVoxelMesher.Mesh>(1024, 0.75f, true) {
             @Override
@@ -49,6 +56,15 @@ public final class LodVoxelCache {
                 return size() > MAX_MESHES;
             }
         });
+
+    private final Map<RegionKey, LodVoxelMesher.Mesh> readyRegions =
+        Collections.synchronizedMap(
+            new LinkedHashMap<RegionKey, LodVoxelMesher.Mesh>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<RegionKey, LodVoxelMesher.Mesh> eldest) {
+                    return size() > MAX_REGION_MESHES;
+                }
+            });
 
     private final Set<Key> missing = Collections.synchronizedSet(
         Collections.newSetFromMap(new LinkedHashMap<Key, Boolean>(1024, 0.75f, true) {
@@ -59,6 +75,8 @@ public final class LodVoxelCache {
         }));
 
     private final Set<Key> pending = ConcurrentHashMap.newKeySet();
+    private final Set<RegionKey> missingRegions = ConcurrentHashMap.newKeySet();
+    private final Set<RegionKey> pendingRegions = ConcurrentHashMap.newKeySet();
 
     private final ThreadPoolExecutor pool;
 
@@ -104,17 +122,17 @@ public final class LodVoxelCache {
 
     /** 已缓存网格的区块数（含空气块）；诊断用。 */
     public int readyCount() {
-        return this.ready.size();
+        return this.ready.size() + this.readyRegions.size();
     }
 
     /** 已确认读不到数据的区块数；诊断用。 */
     public int missingCount() {
-        return this.missing.size();
+        return this.missing.size() + this.missingRegions.size();
     }
 
     /** 正在排队/建网的区块数；诊断用。 */
     public int pendingCount() {
-        return this.pending.size();
+        return this.pending.size() + this.pendingRegions.size();
     }
 
     /** 缓存代次：换世界/维度或锚点漂移时递增，渲染端据此丢弃旧顶点。 */
@@ -146,10 +164,67 @@ public final class LodVoxelCache {
             this.anchorX = Math.floorDiv(cameraBlockX, ANCHOR_SNAP) * ANCHOR_SNAP;
             this.anchorZ = Math.floorDiv(cameraBlockZ, ANCHOR_SNAP) * ANCHOR_SNAP;
             this.ready.clear();
+            this.readyRegions.clear();
             this.missing.clear();
+            this.missingRegions.clear();
             this.pending.clear();
+            this.pendingRegions.clear();
             this.generation.incrementAndGet();
             this.completed.incrementAndGet();
+        }
+    }
+
+    /**
+     * 取一个远景超级块的网格。还没建好返回 {@code null}，并在后台排入建网任务。
+     */
+    public LodVoxelMesher.Mesh getRegion(int superChunkX, int superChunkZ, int size, int shift) {
+        RegionKey key = new RegionKey(superChunkX, superChunkZ, shift, size);
+        LodVoxelMesher.Mesh mesh = this.readyRegions.get(key);
+        if (mesh != null) {
+            return mesh;
+        }
+        if (this.missingRegions.contains(key)) {
+            return LodVoxelMesher.Mesh.UNAVAILABLE;
+        }
+        if (!LodRegionCache.getInstance().isSpriteUvReady()) {
+            return null;
+        }
+        requestRegion(key);
+        return null;
+    }
+
+    private void requestRegion(RegionKey key) {
+        if (!this.pendingRegions.add(key)) {
+            return;
+        }
+        try {
+            this.pool.execute(() -> buildRegion(key));
+        } catch (Throwable t) {
+            this.pendingRegions.remove(key);
+        }
+    }
+
+    private void buildRegion(RegionKey key) {
+        try {
+            int gen = this.generation.get();
+            int ax = this.anchorX;
+            int az = this.anchorZ;
+            LodRegionCache regionCache = LodRegionCache.getInstance();
+            if (!regionCache.isSpriteUvReady()) {
+                return;
+            }
+            LodRegionCache.VoxelRegion region = regionCache.readVoxelRegion(
+                key.x(), key.z(), key.size());
+            LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(region, key.size() * 16,
+                key.x() * key.size(), key.z() * key.size(), ax, az, key.shift(), regionCache, true);
+            if (gen == this.generation.get() && ax == this.anchorX && az == this.anchorZ) {
+                this.readyRegions.put(key, mesh);
+            }
+            this.completed.incrementAndGet();
+        } catch (Throwable ignored) {
+            this.missingRegions.add(key);
+        } finally {
+            this.pendingRegions.remove(key);
         }
     }
 
@@ -225,12 +300,35 @@ public final class LodVoxelCache {
         }
     }
 
+    /**
+     * 区块保存时定点失效：只丢掉这个区块的网格（含包含它的远景超级块），
+     * 其它区块继续命中缓存，不触发整片重读。
+     */
+    public void invalidate(int chunkX, int chunkZ) {
+        int superX = chunkX >> 2;
+        int superZ = chunkZ >> 2;
+        synchronized (this.ready) {
+            this.ready.keySet().removeIf(k -> k.x() == chunkX && k.z() == chunkZ);
+        }
+        synchronized (this.readyRegions) {
+            this.readyRegions.keySet().removeIf(k -> k.x() == superX && k.z() == superZ);
+        }
+        synchronized (this.missing) {
+            this.missing.removeIf(k -> k.x() == chunkX && k.z() == chunkZ);
+        }
+        this.missingRegions.removeIf(k -> k.x() == superX && k.z() == superZ);
+        this.completed.incrementAndGet();
+    }
+
     /** 世界切换时清空。 */
     public void clear() {
         synchronized (this) {
             this.ready.clear();
+            this.readyRegions.clear();
             this.missing.clear();
+            this.missingRegions.clear();
             this.pending.clear();
+            this.pendingRegions.clear();
             this.generation.incrementAndGet();
             // 不要归零：渲染端拿它当「有变化」的信号，归零后可能刚好等于旧值而漏掉重建
             this.completed.incrementAndGet();
@@ -243,10 +341,11 @@ public final class LodVoxelCache {
      */
     public void retryMissing() {
         synchronized (this) {
-            if (this.missing.isEmpty()) {
+            if (this.missing.isEmpty() && this.missingRegions.isEmpty()) {
                 return;
             }
             this.missing.clear();
+            this.missingRegions.clear();
             this.completed.incrementAndGet();
         }
     }

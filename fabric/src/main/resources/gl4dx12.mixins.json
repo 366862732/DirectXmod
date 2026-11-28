@@ -29,13 +29,16 @@
         "ChunkSectionsToRenderProfMixin",
         "SectionOcclusionGraphProfMixin",
         "SectionOcclusionGraphVerticalMixin",
+        "SerializableChunkDataSaveMixin",
         "FeatureRenderDispatcherProfMixin",
         "PreparedFrameProfMixin",
         "FrameGraphBuilderProfMixin",
         "KonkreteRenderUtilsMixin",
         "GuiSetScreenMixin",
         "OptionsListRowMixin",
-        "OptionsListHeaderMixin"
+        "OptionsListHeaderMixin",
+        "SpriteContentsAccessor",
+        "TextureAtlasAccessor"
     ],
     "injectors": {
         "defaultRequire": 1

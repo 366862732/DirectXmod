@@ -85,17 +85,46 @@ public final class LodVoxelMesher {
     }
 
     /**
+     * 网格化一个「区域」：从一块区块推广到 {@code regionWidth} 方块见方的多区块拼块，
+     * 供远处 4×4 区块超级块使用。超块内部不再把区块边界当空气，块与块之间的面会被
+     * 正确剔除，面数比逐区块拼接更低。
+     */
+    public interface VoxelSource {
+        int minY();
+        int height();
+        int topY();
+        int color(int x, int y, int z);
+        String blockName(int x, int y, int z);
+    }
+
+    /**
      * 网格化一块区块，UV 映射到图集坐标。
      *
      * @param cache 提供方块名→图集 UV 矩形查询；{@code null} 时退化为方块内 0..1 UV
      */
     public static Mesh mesh(LodRegionCache.VoxelChunk chunk, int chunkX, int chunkZ,
                             int centerX, int centerZ, int shift, LodRegionCache cache) {
+        return mesh((VoxelSource) chunk, 16, chunkX, chunkZ, centerX, centerZ, shift, cache, false);
+    }
+
+    /** 网格化一个多区块区域。{@code regionWidth} 是区域边长（方块）。 */
+    public static Mesh mesh(VoxelSource chunk, int regionWidth, int baseChunkX, int baseChunkZ,
+                            int centerX, int centerZ, int shift, LodRegionCache cache) {
+        return mesh(chunk, regionWidth, baseChunkX, baseChunkZ, centerX, centerZ, shift, cache, false);
+    }
+
+    /**
+     * 网格化一个区域；{@code far} 为远景超块时，树叶改用方块 MapColor 而不是
+     * 带 alpha 的 16px 贴图。远景超块一格 8/16 方块，树叶的镂空贴图在缩小时
+     * 没有 mipmap，会闪成一片噪点；用纯色树冠能消除混叠，观感更接近 Voxy 远景。
+     */
+    public static Mesh mesh(VoxelSource chunk, int regionWidth, int baseChunkX, int baseChunkZ,
+                            int centerX, int centerZ, int shift, LodRegionCache cache, boolean far) {
         int size = 1 << shift;
-        int cells = 16 >> shift;
+        int cells = regionWidth >> shift;
         int cellsY = chunk.height() >> shift;
-        int baseX = (chunkX << 4) - centerX;
-        int baseZ = (chunkZ << 4) - centerZ;
+        int baseX = (baseChunkX << 4) - centerX;
+        int baseZ = (baseChunkZ << 4) - centerZ;
         int minY = chunk.minY();
         int topCell = Math.min(cellsY - 1, (chunk.topY() - minY) >> shift);
 
@@ -349,6 +378,10 @@ public final class LodVoxelMesher {
                         float[][] rects = cache == null ? null : cache.getSpriteUv(name);
                         int[] tints = cache == null ? null : cache.getSpriteTint(name);
                         float[] rect = pickRect(rects, dir);
+                        if (far && name != null && name.endsWith("leaves")) {
+                            rect = null;
+                            tints = null;
+                        }
                         int color = faceColor(rect, tints, dir, rgb);
                         boolean glass = isGlassName(name);
                         int alpha = glass ? GLASS_ALPHA

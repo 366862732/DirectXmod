@@ -184,13 +184,13 @@ public final class LodSectionStore implements AutoCloseable {
     /**
      * 读一条记录；不存在、region 大小变了或损坏时返回 {@code null}。
      *
-     * <p>同时比对 region 文件的 {@code size} 和 {@code mtime}。只比 size 会漏掉
-     * 「在已分配的扇区里原地改方块」：地图更新、玩家建造都不会改变 region 文件大小，
-     * 但内容已经和缓存不同，继续命中就会把旧地形当成 LOD 画出来（玻璃消失、旧水面
-     * 盖住新道路都是这个原因）。{@code mtime} 变化说明该 region 被写过，必须重新解析。
+     * <p><b>不再用 region 的 size/mtime 判 miss。</b>26.2 自动存档会刷新 mtime、
+     * 追加新区块时还会改变 region 文件大小；按它们失效会让整个 region 的列/体素
+     * 缓存作废，日志里出现过「列[命中=4 未命中=99743]、体素[未命中=126983]」，
+     * 十万级 NBT 解析把帧数和加载都拖死。
      *
-     * <p>自动存档只会写有改动的 region；没有脏区块时不会刷新 mtime。因此按 mtime
-     * 失效带来的重解范围就是真正变化的那几个 region，而不是整份远景缓存。
+     * <p>原地改方块的正确失效由区块保存时的定点失效负责：保存钩子调用
+     * {@link #remove(long)} 删掉那一个区块的记录，其它区块继续命中。
      */
     public byte[] read(long key, long regionSize, long regionMtime) {
         Shard shard = shardFor(key);
@@ -200,8 +200,7 @@ public final class LodSectionStore implements AutoCloseable {
                 return null;
             }
             Entry entry = shard.index.get(key);
-            if (entry == null || entry.regionSize != regionSize
-                || entry.regionMtime != regionMtime) {
+            if (entry == null) {
                 return null;
             }
             ByteBuffer compressed = ByteBuffer.allocate(entry.compressedLength);
@@ -220,6 +219,20 @@ public final class LodSectionStore implements AutoCloseable {
             return null;
         } finally {
             this.lock.readLock().unlock();
+        }
+    }
+
+    /** 定点删掉一个区块的记录（区块保存时由保存钩子调用）。 */
+    public void remove(long key) {
+        Shard shard = shardFor(key);
+        this.lock.writeLock().lock();
+        try {
+            Entry previous = shard.index.remove(key);
+            if (previous != null) {
+                shard.deadBytes += previous.length;
+            }
+        } finally {
+            this.lock.writeLock().unlock();
         }
     }
 
