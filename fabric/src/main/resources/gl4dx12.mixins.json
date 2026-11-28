@@ -28,6 +28,7 @@
         "SectionRenderDispatcherProfMixin",
         "ChunkSectionsToRenderProfMixin",
         "SectionOcclusionGraphProfMixin",
+        "SectionOcclusionGraphVerticalMixin",
         "FeatureRenderDispatcherProfMixin",
         "PreparedFrameProfMixin",
         "FrameGraphBuilderProfMixin",

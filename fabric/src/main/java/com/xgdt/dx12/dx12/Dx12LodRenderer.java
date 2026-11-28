@@ -80,7 +80,7 @@ public final class Dx12LodRenderer {
     /** compute 线程组大小，必须与 HLSL 的 {@code [numthreads]} 一致。 */
     private static final int COMPUTE_GROUP_SIZE = 64;
     /** 建网根常量个数：N / 顶点容量 / 海平面 / 雪线 / Pass / 内圈半径 / 相机相对网格中心 x,z。 */
-    private static final int COMPUTE_CONST_COUNT = 12;
+    private static final int COMPUTE_CONST_COUNT = 13;
     /** 角点输入布局：int height + int rgb。 */
     private static final int CORNER_STRIDE = 8;
     /**
@@ -135,38 +135,24 @@ public final class Dx12LodRenderer {
     private static final long HEIGHTFIELD_RETRY_NS = 30_000_000_000L;
 
     /**
-     * 远景雾的完全遮挡距离（方块）。
+     * 近景补洞/重试判据的参考半径（方块）。
      *
-     * <p>雾必须跟着「实际看得清的地形」走，而不是跟着 {@code lod_distance} 的几何半径走：
-     * {@code lod_distance=1024}（不限制）时高度场铺到 16384 方块，那里的格宽已有上百方块，
-     * 只剩一片锐利的惨白色块。
-     *
-     * <p>这个值不能按「几何半径」的量级取。透视下 0～200 方块就占了屏幕的大半，
-     * 600 方块外全部挤在地平线附近的一条窄带里：雾的终点取到 1600 时，画面上占面积
-     * 最大的那一段根本没有雾，雪原就是一张白纸。voxy 参考图里整个画面都被蓝灰雾
-     * 压住，所以这里收到 720 方块。
+     * <p>以前这个值同时是远景雾的终点；现在开启 LOD 后雾已禁用（见 {@code execute}
+     * 里的 {@code fogStart/fogEnd}），它只用来决定「哪些未采样角点算作可见洞、
+     * 值得每 30 秒重试」。高度场几何本身铺到
+     * {@link #LOD_GEOMETRY_RADIUS_BLOCKS}。
      */
     private static final float LOD_FOG_FAR_BLOCKS = 720.0f;
     /**
-     * 雾开始变浓的距离占 {@link #LOD_FOG_FAR_BLOCKS} 的比例。
+     * 高度场几何的实际铺开半径（方块）。
      *
-     * <p>voxy 的远景在可视范围内几乎没有雾：它的 LOD 片元着色器不写雾，只在最后
-     * 合成时按原版 {@code FOG_START/END_DISTANCE}（默认 0/1024）叠一层，且最多只
-     * 叠到 54%。以前这里从 13%（约 94 方块）就开始压雾，200~600 方块全被蓝灰雾
-     * 盖住，看起来就是「糊」。现在只让最后约 28%（518~720）淡出，既保留 voxy
-     * 那种清晰的远景，又能把 720 处的体素/高度场接缝藏进雾里。
+     * <p>开启 LOD 后不再用雾遮挡远景（用户要求能看到远处），高度场要一直铺到
+     * 视觉可见的尽头，否则去掉雾后会在地平线处露出一条硬边。坐标轴的环数是固定的
+     * （{@link #AXIS_RINGS}），所以把半径从 828 扩到 4096 不会增加角点数量，只是
+     * 远处的格子更宽、张角基本不变 —— 这是廉价且必要的扩展。体素 LOD 仍只铺
+     * {@link #VOXEL_RADIUS_BLOCKS}，外面由高度场接上。
      */
-    private static final float LOD_FOG_START_RATIO = 0.72f;
-
-    /**
-     * 高度场几何的实际铺开半径（方块），只比雾终点稍远一点。
-     *
-     * <p>雾终点以外的格子会被雾 100% 覆盖，铺出去纯属浪费坐标轴的环数预算：
-     * 以前环数一直分到 16384 方块，其中 95% 落在看不见的地方，看得见的那 720 方块
-     * 反而只能用剩下的零头，远景全是几十方块宽的大块。现在把几何截到雾终点外侧
-     * 一点，同样的环数全部用在能看见的范围里。
-     */
-    private static final float LOD_GEOMETRY_RADIUS_BLOCKS = LOD_FOG_FAR_BLOCKS * 1.15f;
+    private static final float LOD_GEOMETRY_RADIUS_BLOCKS = 4096.0f;
 
     /** 采样失败：高 32 位是 {@link Integer#MIN_VALUE}。 */
     private static final long UNKNOWN_SAMPLE = (long) Integer.MIN_VALUE << 32;
@@ -595,6 +581,7 @@ public final class Dx12LodRenderer {
         + "    int VoxelMaxX;\n"
         + "    int VoxelMinZ;\n"
         + "    int VoxelMaxZ;\n"
+        + "    uint DrawInner;    // 1 = 高空补画原版内圈（原版区块被垂直裁剪）\n"
         + "};\n"
         + "struct Corner\n"
         + "{\n"
@@ -749,11 +736,13 @@ public final class Dx12LodRenderer {
         + "    // 于是接缝最多重叠一格（1 方块），不会因为用圆形/最近点判定而空出一整圈。\n"
         + "    int fx = max(abs(CamRelX - x0), abs(CamRelX - x1));\n"
         + "    int fz = max(abs(CamRelZ - z0), abs(CamRelZ - z1));\n"
-        + "    if (max(fx, fz) < (int)InnerRadius) { return; }\n"
-        + "    // 体素覆盖区（按实际区块矩形，可能不对称）：整格都在矩形里才跳过。\n"
-        + "    // 跨在边界上的格子必须照画，否则体素/高度场之间会空出一条缝。\n"
-        + "    if (min(x0, x1) >= VoxelMinX && max(x0, x1) <= VoxelMaxX\n"
-        + "        && min(z0, z1) >= VoxelMinZ && max(z0, z1) <= VoxelMaxZ) { return; }\n"
+        + "    bool insideVanilla = max(fx, fz) < (int)InnerRadius;\n"
+        + "    bool insideVoxel = min(x0, x1) >= VoxelMinX && max(x0, x1) <= VoxelMaxX\n"
+        + "        && min(z0, z1) >= VoxelMinZ && max(z0, z1) <= VoxelMaxZ;\n"
+        + "    // 低空：原版内圈和体素矩形都跳过。高空（DrawInner=1）：原版区块被\n"
+        + "    // 垂直裁剪，内圈必须由高度场补，只跳过体素矩形里内圈之外的区域。\n"
+        + "    if (DrawInner == 0 && insideVanilla) { return; }\n"
+        + "    if (insideVoxel && (DrawInner == 0 || !insideVanilla)) { return; }\n"
         + "    // 抢 4 个顶点槽位（顶面四角）；越界就把这一格丢掉（远处优先，保证缓冲不会写爆）。\n"
         + "    uint slot;\n"
         + "    InterlockedAdd(Counter[0], 4, slot);\n"
@@ -941,6 +930,8 @@ public final class Dx12LodRenderer {
     private int builtRadius = -1;
     /** 上次建网时的原版视距半径：坐标轴的细格段和它绑定，视距一改就得重建。 */
     private float builtVanillaInner = -1.0f;
+    /** 上次建网时是否在高空补画原版内圈。 */
+    private boolean builtDrawInner;
     /** 上次建网时坐标轴细格段的起点（体素外缘或原版视距圈）。 */
     private float builtFineStart = -1.0f;
     private int builtCellX = Integer.MIN_VALUE;
@@ -1141,12 +1132,17 @@ public final class Dx12LodRenderer {
             centerX = snapCenterX;
             centerZ = snapCenterZ;
         }
-        // 坐标轴细格段的起点：固定取原版视距圈内侧一格宽处，不再跟着体素覆盖量化。
-        // 圈内完全被原版地形/体素盖住，粗格不可见；圈外一律保持最细格宽，保证
-        // 近景和体素外缘不会出现 32 方块宽的巨幅斜平板。
-        // 以前跟着 voxelCoverRadius 量化（272→fineStart 256 / 240→128），既让 32
-        // 方块粗格带侵入 176~256 的可见近景，又让 fineStart 每抖动一次就整张重建。
-        int fineStart = Math.max(0, (int) vanillaInner - 16);
+        // 高空补洞的兜底：SectionOcclusionGraphVerticalMixin 已把原版垂直遍历放宽到
+        // 256 个 section（4096 格），正常情况下真区块会重新提交绘制，不需要高度场
+        // 补内圈。只有相机离开地表超过 4096 格（超过 mixin 的放宽范围）时，才让
+        // 高度场补画原版内圈，避免完全空掉。高度场是粗格插值，能用真区块时绝不让
+        // 它盖在真区块上。
+        int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+            cameraBlockX, cameraBlockZ);
+        boolean drawInner = camera.pos.y - surfaceY > 256 * 16.0;
+        // 坐标轴细格段的起点：低空固定取原版视距圈内侧一格宽处，高空补洞时从
+        // 中心开始保持细格，避免脚下内圈也是大斜板。圈外一律保持最细格宽。
+        int fineStart = drawInner ? 0 : Math.max(0, (int) vanillaInner - 16);
         // 高度场要跳过两块区域：原版视距圈（方形）和体素实际覆盖的区块矩形。
         // 矩形可能不以相机为中心，所以不能只用一个半径 —— 那只能取并集，某些方向
         // 会多叠十几格粗地形，把刚画好的体素面盖住。
@@ -1176,6 +1172,7 @@ public final class Dx12LodRenderer {
             || base != this.builtBase
             || radiusBlocks != this.builtRadius
             || vanillaInner != this.builtVanillaInner
+            || drawInner != this.builtDrawInner
             || fineStart != this.builtFineStart
             || centerX != this.builtCellX
             || centerZ != this.builtCellZ
@@ -1195,7 +1192,8 @@ public final class Dx12LodRenderer {
             long buildStart = System.nanoTime();
             this.heightfieldBuilds++;
             rebuildGeometry(ctx, level, centerX, centerZ, geomRadius, base,
-                fineStart, vanillaInner, voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
+                fineStart, vanillaInner, drawInner,
+                voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
                 cameraBlockX, cameraBlockZ);
             this.lastBuildCostNanos = System.nanoTime() - buildStart;
             this.lastBuildNanos = System.nanoTime();
@@ -1203,6 +1201,7 @@ public final class Dx12LodRenderer {
             this.builtBase = base;
             this.builtRadius = radiusBlocks;
             this.builtVanillaInner = vanillaInner;
+            this.builtDrawInner = drawInner;
             this.builtFineStart = fineStart;
             this.builtCellX = centerX;
             this.builtCellZ = centerZ;
@@ -1248,15 +1247,14 @@ public final class Dx12LodRenderer {
             .mul(camera.viewRotationMatrix)
             .get(viewProj);
 
-        // 雾：从原版视距外开始，外缘完全融进天空色，远景因此没有一条硬切边。
-        //
-        // 这里的距离必须和「实际看得清的几何」对齐，不能直接用 radiusBlocks：
-        // lod_distance=1024 时 radiusBlocks 被钳到 16384，雾起点会跑到 9000 方块外，
-        // 250~9000 方块之间的地形等于完全没有雾，远景就是一片锐利的惨白色块。
-        // 所以取 min(几何半径, 视觉上合理的远景距离)，让雾在 LOD_FOG_FAR_BLOCKS 内收尾。
-        float fogFar = Math.min(radiusBlocks, LOD_FOG_FAR_BLOCKS);
-        float fogStart = Math.max(vanillaInner, fogFar * LOD_FOG_START_RATIO);
-        float fogEnd = Math.max(fogStart + 1.0f, fogFar);
+        // 开启 LOD 后禁用 LOD 雾：把雾区间推到几何半径之外，着色器里 fog 恒为 0，
+        // 远处地形保持原色。FogColor/FogParams.z 仍参与环境光和天空染色，只是不再
+        // 把远景混成雾色。以前雾在 720 方块处把远景吞掉，用户看不到更远的地形。
+        // 高度场是方形网格，对角距离是半径的 √2 倍；雾区间要覆盖整个对角线，
+        // 否则四个角的远格仍会被雾染成天空色。
+        float fogFar = Math.max(geomRadius * 1.5f, LOD_FOG_FAR_BLOCKS);
+        float fogStart = fogFar + 1.0f;
+        float fogEnd = fogStart + 1.0f;
         int uniformOffset = writeUniforms(viewProj, camera, renderState, levelState, fogStart, fogEnd,
             centerX, centerZ, level.getSeaLevel());
 
@@ -1595,7 +1593,7 @@ public final class Dx12LodRenderer {
     private static boolean cornerNeeded(int[] axis, int i, int j, int n,
                                         int centerX, int centerZ,
                                         int cameraBlockX, int cameraBlockZ,
-                                        float vanillaInner,
+                                        float vanillaInner, boolean drawInner,
                                         int voxelMinX, int voxelMaxX,
                                         int voxelMinZ, int voxelMaxZ) {
         for (int cj = j - 1; cj <= j; cj++) {
@@ -1614,14 +1612,15 @@ public final class Dx12LodRenderer {
                     Math.abs(centerX + x1 - cameraBlockX));
                 int dz = Math.max(Math.abs(centerZ + z0 - cameraBlockZ),
                     Math.abs(centerZ + z1 - cameraBlockZ));
-                if (Math.max(dx, dz) < vanillaInner) {
-                    continue;
+                boolean insideVanilla = Math.max(dx, dz) < vanillaInner;
+                boolean insideVoxel = x0 >= voxelMinX && x1 <= voxelMaxX
+                    && z0 >= voxelMinZ && z1 <= voxelMaxZ;
+                boolean drawn = drawInner
+                    ? !insideVoxel || insideVanilla
+                    : !insideVanilla && !insideVoxel;
+                if (drawn) {
+                    return true;
                 }
-                if (x0 >= voxelMinX && x1 <= voxelMaxX
-                    && z0 >= voxelMinZ && z1 <= voxelMaxZ) {
-                    continue;
-                }
-                return true;
             }
         }
         return false;
@@ -1809,7 +1808,8 @@ public final class Dx12LodRenderer {
      */
     private void rebuildGeometry(long ctx, ClientLevel level, int centerX, int centerZ,
                                  int radiusBlocks, int base, float fineStart,
-                                 float vanillaInner, int voxelMinX, int voxelMaxX,
+                                 float vanillaInner, boolean drawInner,
+                                 int voxelMinX, int voxelMaxX,
                                  int voxelMinZ, int voxelMaxZ,
                                  int cameraBlockX, int cameraBlockZ) {
         long startNanos = System.nanoTime();
@@ -1878,7 +1878,7 @@ public final class Dx12LodRenderer {
                 // 外缘和高度场外圈的一窄条；不采样内部能把重建耗时从 ~50ms 降到几 ms，
                 // 也少向 region 缓存请求上万个用不到的区块。
                 if (!cornerNeeded(axis, i, j, n, centerX, centerZ,
-                    cameraBlockX, cameraBlockZ, vanillaInner,
+                    cameraBlockX, cameraBlockZ, vanillaInner, drawInner,
                     voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ)) {
                     heights[index] = UNKNOWN_HEIGHT;
                     colors[index] = -1;
@@ -1914,7 +1914,7 @@ public final class Dx12LodRenderer {
         boolean gpuOk = false;
         if (gpu) {
             String failure = dispatchVertexBuild(ctx, slot, heights, colors, vertexCount, n,
-                seaLevel, snowLine, quadVerts, vanillaInner,
+                seaLevel, snowLine, quadVerts, vanillaInner, drawInner,
                 cameraBlockX - centerX, cameraBlockZ - centerZ,
                 voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ);
             if (failure == null) {
@@ -1955,18 +1955,28 @@ public final class Dx12LodRenderer {
                     int dx = Math.max(Math.abs(x0 - cameraBlockX), Math.abs(x1 - cameraBlockX));
                     // 与 compute 着色器保持一致：原版视距方形 + 体素覆盖矩形，
                     // 两块都用「最远角」判定，跨边界的格子照画，接缝最多重叠一格。
-                    if (Math.max(dx, dz) < vanillaInner) {
-                        // 原版地形已经画过
-                        continue;
-                    }
+                    boolean insideVanilla = Math.max(dx, dz) < vanillaInner;
                     int rx0 = axis[i];
                     int rx1 = axis[i + 1];
                     int rz0 = axis[j];
                     int rz1 = axis[j + 1];
-                    if (rx0 >= voxelMinX && rx1 <= voxelMaxX
-                        && rz0 >= voxelMinZ && rz1 <= voxelMaxZ) {
-                        // 体素 LOD 已经画过
-                        continue;
+                    boolean insideVoxel = rx0 >= voxelMinX && rx1 <= voxelMaxX
+                        && rz0 >= voxelMinZ && rz1 <= voxelMaxZ;
+                    if (drawInner) {
+                        // 高空：原版区块被垂直裁剪，内圈交给高度场补；只跳过
+                        // 体素矩形里、原版内圈之外的区域（那里体素已经画过）。
+                        if (insideVoxel && !insideVanilla) {
+                            continue;
+                        }
+                    } else {
+                        if (insideVanilla) {
+                            // 原版地形已经画过
+                            continue;
+                        }
+                        if (insideVoxel) {
+                            // 体素 LOD 已经画过
+                            continue;
+                        }
                     }
                     putIndex(indices, indexCount, a);
                     putIndex(indices, indexCount + 1, b);
@@ -2376,7 +2386,8 @@ public final class Dx12LodRenderer {
      */
     private String dispatchVertexBuild(long ctx, Slot slot, int[] heights, int[] colors,
                                        int vertexCount, int n, int seaLevel, int snowLine,
-                                       int maxVerts, float vanillaInner, int camRelX, int camRelZ,
+                                       int maxVerts, float vanillaInner, boolean drawInner,
+                                       int camRelX, int camRelZ,
                                        int voxelMinX, int voxelMaxX, int voxelMinZ, int voxelMaxZ) {
         ByteBuffer corners = this.cornerData;
         for (int k = 0; k < vertexCount; k++) {
@@ -2406,7 +2417,7 @@ public final class Dx12LodRenderer {
         for (int[] pass : passes) {
             String failure = Dx12Native.dx12DispatchCompute(ctx, this.computePipeline,
                 new int[]{n, maxVerts, seaLevel, snowLine, pass[0], innerBits, camRelX, camRelZ,
-                    voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ},
+                    voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ, drawInner ? 1 : 0},
                 new long[]{this.cornerBuffer.handle(), this.axisBuffer.handle()},
                 new int[]{0, 0},
                 new int[]{vertexCount, n},
