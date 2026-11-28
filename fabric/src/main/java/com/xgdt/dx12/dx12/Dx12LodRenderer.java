@@ -336,6 +336,12 @@ public final class Dx12LodRenderer {
         + "    float n2 = hash31(floor(world * 0.25) + 19.0) - 0.5;\n"
         + "    float n3 = hash31(floor(world * 0.0625) + 71.0) - 0.5;\n"
         + "    rgb *= 1.0 + n1 * 0.06 * fine + n2 * 0.04 + n3 * 0.03;\n"
+        + "    // 逐 texel 的方块纹理细节：高度场一格 26 方块时只靠四角插值会糊成一片；\n"
+        + "    // 按 1/16 方块取哈希补回贴图级颗粒，像素跨度变大时淡出避免闪烁。\n"
+        + "    float detailFade = saturate(1.0 - px * 1.4);\n"
+        + "    float2 texel = floor(world.xz * 16.0);\n"
+        + "    float blockDetail = hash31(float3(texel, floor(world.y) + 17.0));\n"
+        + "    rgb *= 1.0 + (blockDetail - 0.5) * 0.34 * detailFade;\n"
         + "\n"
         + "    // 大尺度色块抖动：只抖亮度、不往某个色相偏\n"
         + "    rgb *= 1.0 + (hash31(floor(world * 0.125) + 5.0) - 0.5) * 0.06;\n"
@@ -782,9 +788,9 @@ public final class Dx12LodRenderer {
         + "        r11 = MixColor(r11, avg, colorBlend);\n"
         + "    }\n"
         + "    int a00, a10, a11, a01;\n"
-        + "    // 体素 LOD 覆盖的 720 格以内用真方块贴图；高度场只负责更远处，\n"
-        + "    // 一格超过 2 方块就迅速向自然地形色收敛，彩色城市不会在远景里变成彩虹。\n"
-        + "    float farBlend = saturate((float)(cellW - 2) / 4.0) * 0.9;\n"
+        + "    // 体素 LOD 覆盖的 1024 格以内用真方块贴图；高度场只负责更远处，\n"
+        + "    // 一格超过 2 方块就完全收敛到自然地形色，彩色城市不会在远景里变成彩虹。\n"
+        + "    float farBlend = saturate((float)(cellW - 2) / 4.0);\n"
         + "    int c00 = ShadeCorner(r00, h00, slope, farBlend, a00);\n"
         + "    int c10 = ShadeCorner(r10, h10, slope, farBlend, a10);\n"
         + "    int c01 = ShadeCorner(r01, h01, slope, farBlend, a01);\n"
@@ -1671,10 +1677,11 @@ public final class Dx12LodRenderer {
         int medium;
         int coarse;
         if (quality >= 2) {
-            // 1 方块精度到 512，2 方块到 720，4 方块到 1024；
-            // 1024 外交给高度场。1024 半径新增的面数约 1M，仍在 14M 顶点预算内。
-            full = 512;
-            medium = 720;
+            // 1 方块精度到 448，2 方块到 640，4 方块到 1024；1024 外交给高度场。
+            // 之前 512/720 在城市里面数接近 300 万，帧数被顶点/像素带宽拖垮；
+            // 448/640 的观感和 Voxy 的屏幕空间 LOD 更接近，面数能降三成左右。
+            full = 448;
+            medium = 640;
             coarse = VOXEL_RADIUS_BLOCKS;
         } else if (quality == 1) {
             full = 448;
@@ -2237,7 +2244,7 @@ public final class Dx12LodRenderer {
                     // 与 compute 的 ShadeCorner 一致：大格向自然地形色收敛，
                     // 避免彩色城市地图在远景里插值成彩虹条纹。
                     float farBlend = Mth.clamp((cellWidth(axis, i, j) - 2.0f) / 4.0f,
-                        0.0f, 1.0f) * 0.9f;
+                        0.0f, 1.0f);
                     int natural = 0x6E8B4A;
                     if (height > snowLine) {
                         natural = 0xE4EBF1;

@@ -24,9 +24,10 @@ public final class LodVoxelCache {
 
     /**
      * 已建好网格的区块上限。体素铺到 1024 方块约需 16641 块（近处大、远处小，
-     * 平均每块几十 KB），20000 给相机移动后的旧位置留出余量；LRU 回收。
+     * 平均每块几十 KB）；日志里 20000 仍会频繁淘汰/重建（完成数涨到 33000），
+     * 36000 覆盖「当前位置 + 移动前的旧位置」，避免一边建一边丢导致每帧重拷贝。
      */
-    private static final int MAX_MESHES = 20000;
+    private static final int MAX_MESHES = 36000;
     /** 确认读不到数据的区块上限，避免反复重读同一个未生成的区块。 */
     private static final int MAX_MISSING = 32768;
     /** 后台建网线程数。 */
