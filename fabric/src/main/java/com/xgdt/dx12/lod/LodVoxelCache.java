@@ -23,10 +23,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class LodVoxelCache {
 
     /**
-     * 已建好网格的区块上限。四级 LOD 铺到 720 方块约需 8281 块（近处大、远处小，
-     * 平均每块几十 KB），12288 给相机移动后的旧位置留出余量；LRU 回收。
+     * 已建好网格的区块上限。体素铺到 1024 方块约需 16641 块（近处大、远处小，
+     * 平均每块几十 KB），20000 给相机移动后的旧位置留出余量；LRU 回收。
      */
-    private static final int MAX_MESHES = 12288;
+    private static final int MAX_MESHES = 20000;
     /** 确认读不到数据的区块上限，避免反复重读同一个未生成的区块。 */
     private static final int MAX_MISSING = 32768;
     /** 后台建网线程数。 */

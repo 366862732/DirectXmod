@@ -71,8 +71,15 @@ import org.slf4j.LoggerFactory;
 public final class LodRegionCache {
     private static final LodRegionCache INSTANCE = new LodRegionCache();
 
-    /** 缓存区块数上限（每块 ~1.6KB，65536 块约 100MB）。 */
-    private static final int MAX_CHUNKS = 65536;
+    /**
+     * 缓存区块数上限（每块 ~1.6KB，131072 块约 200MB）。
+     *
+     * <p>高度场铺到 2048 半径时，采样的角点会涉及约 6.5 万个区块；以前 65536 的
+     * 上限刚好被撑满，LRU 一边淘汰一边被下次重建重新请求，列版本无限增长、高度场
+     * 每几秒重建一次并把远景画成彩虹。这里留一倍余量，让一次完整的远景采样能全部
+     * 留在内存里，列版本稳定后就不再重建。
+     */
+    private static final int MAX_CHUNKS = 131072;
     /**
      * 无数据区块的登记上限。必须与 {@link #columns} 分开：大视距下一次重建会采样上万格，
      * 未探索地形全是无数据，若混在一起会把已读到的高度数据全部挤出去。

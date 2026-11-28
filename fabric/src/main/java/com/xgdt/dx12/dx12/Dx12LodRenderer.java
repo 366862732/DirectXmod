@@ -146,13 +146,16 @@ public final class Dx12LodRenderer {
     /**
      * 高度场几何的实际铺开半径（方块）。
      *
-     * <p>开启 LOD 后不再用雾遮挡远景（用户要求能看到远处），高度场要一直铺到
-     * 视觉可见的尽头，否则去掉雾后会在地平线处露出一条硬边。坐标轴的环数是固定的
-     * （{@link #AXIS_RINGS}），所以把半径从 828 扩到 4096 不会增加角点数量，只是
-     * 远处的格子更宽、张角基本不变 —— 这是廉价且必要的扩展。体素 LOD 仍只铺
+     * <p>开启 LOD 后不再用雾遮挡远景（用户要求能看到远处），高度场要铺到视觉可见的
+     * 尽头，否则去掉雾后会在地平线处露出一条硬边。坐标轴的环数是固定的
+     * （{@link #AXIS_RINGS}），扩大半径不会增加角点数量，只是远处的格子更宽、张角
+     * 基本不变。这里取 2048 而不是 4096：高度场每个角点都要读一条地表列，2048 半径
+     * 内涉及的区块约 6.5 万，刚好在 {@link LodRegionCache} 的列缓存容量内；再大就会
+     * 把列缓存冲刷掉，进入「读盘 → 重建 → 再读盘」的死循环（日志里列版本涨到几百万、
+     * 高度场每 5 秒重建成彩虹色就是这个原因）。体素 LOD 仍只铺
      * {@link #VOXEL_RADIUS_BLOCKS}，外面由高度场接上。
      */
-    private static final float LOD_GEOMETRY_RADIUS_BLOCKS = 4096.0f;
+    private static final float LOD_GEOMETRY_RADIUS_BLOCKS = 2048.0f;
 
     /** 采样失败：高 32 位是 {@link Integer#MIN_VALUE}。 */
     private static final long UNKNOWN_SAMPLE = (long) Integer.MIN_VALUE << 32;
@@ -653,7 +656,7 @@ public final class Dx12LodRenderer {
         + "// 单个角点的最终颜色：分层配色（露岩 / 沙滩 / 积雪 / 水体）全部按这个角点自己的\n"
         + "// 高度算，不再是整格一个平均色。一格上百方块时四角各给一个颜色，插值出来的地面\n"
         + "// 会跟着地形变，而不是糊成一块纯色。\n"
-        + "int ShadeCorner(int rgb, int height, float slope, out int alpha)\n"
+        + "int ShadeCorner(int rgb, int height, float slope, float farBlend, out int alpha)\n"
         + "{\n"
         + "    // rgb < 0 是「未采样到颜色」的哨兵值。必须先处理它：-1 的补码里 bit 24\n"
         + "    // 也是 1，直接查水体标记会把整片未知区域误判成水面。\n"
@@ -670,6 +673,13 @@ public final class Dx12LodRenderer {
         + "    {\n"
         + "        rgb = MixColor(rgb, 0xE2D6A8, 0.35);\n"
         + "    }\n"
+        + "    // 远景去饱和：Greenfield 这类城市地图的屋顶/玻璃 MapColor 非常鲜艳，\n"
+        + "    // 高度场一格几十方块时四角插值会变成大片彩虹条纹。格宽越大越向自然地形色\n"
+        + "    // （雪线白 / 陡坡灰 / 平地绿）收敛，远处看起来像普通远景而不是噪声。\n"
+        + "    int natural = 0x6E8B4A;\n"
+        + "    if (height > SnowLine) { natural = 0xE4EBF1; }\n"
+        + "    else if (slope > 1.0) { natural = 0x8A8A8A; }\n"
+        + "    rgb = MixColor(rgb, natural, farBlend);\n"
         + "    // 不再按高度硬刷「积雪」：色值完全来自地表方块自己的 MapColor（雪块本来就是\n"
         + "    // 白色）。voxy 从不凭空加雪，凭空刷白会让非雪原的高地在远景里糊成一片白。\n"
         + "    alpha = 255;\n"
@@ -772,10 +782,13 @@ public final class Dx12LodRenderer {
         + "        r11 = MixColor(r11, avg, colorBlend);\n"
         + "    }\n"
         + "    int a00, a10, a11, a01;\n"
-        + "    int c00 = ShadeCorner(r00, h00, slope, a00);\n"
-        + "    int c10 = ShadeCorner(r10, h10, slope, a10);\n"
-        + "    int c01 = ShadeCorner(r01, h01, slope, a01);\n"
-        + "    int c11 = ShadeCorner(r11, h11, slope, a11);\n"
+        + "    // 体素 LOD 覆盖的 720 格以内用真方块贴图；高度场只负责更远处，\n"
+        + "    // 一格超过 2 方块就迅速向自然地形色收敛，彩色城市不会在远景里变成彩虹。\n"
+        + "    float farBlend = saturate((float)(cellW - 2) / 4.0) * 0.9;\n"
+        + "    int c00 = ShadeCorner(r00, h00, slope, farBlend, a00);\n"
+        + "    int c10 = ShadeCorner(r10, h10, slope, farBlend, a10);\n"
+        + "    int c01 = ShadeCorner(r01, h01, slope, farBlend, a01);\n"
+        + "    int c11 = ShadeCorner(r11, h11, slope, farBlend, a11);\n"
         + "    // 四个角各用自己的高度：相邻格共享同一对角点，面与面之间天然对齐，\n"
         + "    // 不会出现台阶、悬空平板或裂缝。\n"
         + "    OutVerts[slot + 0] = Vertex(x0, z0, h00, PackColor(c00, a00));\n"
@@ -795,11 +808,13 @@ public final class Dx12LodRenderer {
      * 体素 LOD 覆盖的半径（方块）。这一圈内不再用高度场，而是画真实方块面，
      * 于是房屋有屋顶和墙、树有树干树冠、悬崖是真正的竖直岩壁。
      *
-     * <p>直接铺到雾终点（720）。以前只铺到 448，外面 448~720 仍然是插值高度场：
-     * 那一圈在屏幕上占的面积比体素圈还大，看起来就是「稍微细一点、远处还是一整片
-     * 粗斜面」。体素铺满雾终点后，画面上能看清的地形全部是真实方块面。
+     * <p>直接铺到 1024 方块。以前只铺到 720，外面 720~1024 是插值高度场：那一圈
+     * 对城市地图来说是成片的彩色屋顶/玻璃 MapColor，去掉雾以后就是一片彩虹；而且
+     * 高度场把建筑顶当成地形，城市会变成绿色山丘。体素铺到 1024 后，近处和远景的
+     * 城市都还是真实方块面/贴图，高度场只负责 1024 以外、格宽超过 4 方块的远景，
+     * 并强制向自然地形色收敛。
      */
-    private static final int VOXEL_RADIUS_BLOCKS = 720;
+    private static final int VOXEL_RADIUS_BLOCKS = 1024;
     /**
      * quality=0 时保持 1 方块精度的半径。再往外按 2/4/8 方块逐级降采样。
      * 房屋、围墙这类几格宽的结构只有在这一圈里才认得出来。
@@ -930,6 +945,8 @@ public final class Dx12LodRenderer {
     private int builtRadius = -1;
     /** 上次建网时的原版视距半径：坐标轴的细格段和它绑定，视距一改就得重建。 */
     private float builtVanillaInner = -1.0f;
+    /** 上次建网时高度场内圈的实际半径（低空=原版视距，高空=完整块阵半径）。 */
+    private float builtHeightInner = -1.0f;
     /** 上次建网时是否在高空补画原版内圈。 */
     private boolean builtDrawInner;
     /** 上次建网时坐标轴细格段的起点（体素外缘或原版视距圈）。 */
@@ -1110,7 +1127,14 @@ public final class Dx12LodRenderer {
             // LOD 整个落在原版视距圈里，体素没有存在的意义
             voxelRadius = 0;
         }
-        updateVoxelMesh(cameraBlockX, cameraBlockZ, voxelRadius, renderDistance);
+        // 高空补洞：原版区块的可见图还会受垂直距离影响，实测在 y≈247、视距 2 时
+        // 脚下 5×5 真区块仍然不提交绘制。相机离相机列地表超过原版垂直可见范围
+        // （视距对应的方块数 + 余量）时，让体素 LOD 把原版内圈也铺上（region 文件
+        // 里的真方块，带贴图），高度场内圈再作为读不到数据时的兜底。
+        int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+            cameraBlockX, cameraBlockZ);
+        boolean drawInner = camera.pos.y - surfaceY > renderDistance * 16.0 + 32.0;
+        updateVoxelMesh(cameraBlockX, cameraBlockZ, voxelRadius, renderDistance, drawInner);
         logVoxelDiagnostic(voxelRadius);
         // 高度场中心：有体素几何时跟着体素几何的中心走。体素覆盖只增不减，
         // 所以相机在覆盖矩形内走动时中心不动，远景不会因为跨 64 方块而重采样；
@@ -1132,14 +1156,10 @@ public final class Dx12LodRenderer {
             centerX = snapCenterX;
             centerZ = snapCenterZ;
         }
-        // 高空补洞的兜底：SectionOcclusionGraphVerticalMixin 已把原版垂直遍历放宽到
-        // 256 个 section（4096 格），正常情况下真区块会重新提交绘制，不需要高度场
-        // 补内圈。只有相机离开地表超过 4096 格（超过 mixin 的放宽范围）时，才让
-        // 高度场补画原版内圈，避免完全空掉。高度场是粗格插值，能用真区块时绝不让
-        // 它盖在真区块上。
-        int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
-            cameraBlockX, cameraBlockZ);
-        boolean drawInner = camera.pos.y - surfaceY > 256 * 16.0;
+        // 原版实际提交的是一条以相机区块为中心的 (2*renderDistance+1) 方块块阵，
+        // 最大能到相机外 (renderDistance+1)*16 格；补内圈时要用这个更大的方形，
+        // 否则 5×5 区块的四个边角仍会留下一圈 8~16 格的洞。
+        float heightInner = drawInner ? (renderDistance + 1) * 16.0f : vanillaInner;
         // 坐标轴细格段的起点：低空固定取原版视距圈内侧一格宽处，高空补洞时从
         // 中心开始保持细格，避免脚下内圈也是大斜板。圈外一律保持最细格宽。
         int fineStart = drawInner ? 0 : Math.max(0, (int) vanillaInner - 16);
@@ -1172,6 +1192,7 @@ public final class Dx12LodRenderer {
             || base != this.builtBase
             || radiusBlocks != this.builtRadius
             || vanillaInner != this.builtVanillaInner
+            || heightInner != this.builtHeightInner
             || drawInner != this.builtDrawInner
             || fineStart != this.builtFineStart
             || centerX != this.builtCellX
@@ -1192,7 +1213,7 @@ public final class Dx12LodRenderer {
             long buildStart = System.nanoTime();
             this.heightfieldBuilds++;
             rebuildGeometry(ctx, level, centerX, centerZ, geomRadius, base,
-                fineStart, vanillaInner, drawInner,
+                fineStart, heightInner, drawInner,
                 voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ,
                 cameraBlockX, cameraBlockZ);
             this.lastBuildCostNanos = System.nanoTime() - buildStart;
@@ -1201,6 +1222,7 @@ public final class Dx12LodRenderer {
             this.builtBase = base;
             this.builtRadius = radiusBlocks;
             this.builtVanillaInner = vanillaInner;
+            this.builtHeightInner = heightInner;
             this.builtDrawInner = drawInner;
             this.builtFineStart = fineStart;
             this.builtCellX = centerX;
@@ -1261,8 +1283,23 @@ public final class Dx12LodRenderer {
         Dx12Native.dx12BeginRenderPass(ctx, new long[]{color.handle()}, new int[]{0},
             new byte[]{0}, null, depth.handle(), 0, (byte) 0, 0.0, 0, 0, width, height);
         try {
-            Dx12Native.dx12SetPipeline(ctx, pipeline, true);
-            // 体素 LOD 先画：顶点坐标是「世界坐标 − 锚点」，所以参考中心传锚点，
+            // 高度场先画：高空补内圈时它是体素内圈的兜底，必须先于体素绘制。
+            // 同一位置的体素面深度相同，后画的体素用 GREATER_EQUAL 覆盖高度场；
+            // 反过来先画体素、后画高度场，粗格高度场会把真方块内圈盖掉。
+            if (hasHeightfield) {
+                Dx12Native.dx12SetPipeline(ctx, pipeline, true);
+                Dx12Native.dx12SetVertexBuffer(ctx, 0, slot.vertexBuffer.handle(), 0L, VERTEX_STRIDE);
+                pushUniform(ctx, uniformOffset);
+                if (slot.quadMode) {
+                    // 索引数由 compute 写进参数缓冲：主线程不回读，GPU 说画多少就画多少。
+                    Dx12Native.dx12SetIndexBuffer(ctx, this.quadIndexBuffer.handle(), 1);
+                    Dx12Native.dx12DrawIndexedIndirect(ctx, slot.argsBuffer.handle(), 0L, 1);
+                } else {
+                    Dx12Native.dx12SetIndexBuffer(ctx, slot.indexBuffer.handle(), 1);
+                    Dx12Native.dx12DrawIndexed(ctx, slot.indexCount, 1, 0, 0, 0);
+                }
+            }
+            // 体素 LOD：顶点坐标是「世界坐标 − 锚点」，所以参考中心传锚点，
             // 和高度场（相对网格中心）用的 uniform 不是同一个槽位。
             Dx12GpuBuffer voxelBuffer = this.voxelVertexBuffers[this.voxelVertexSlot];
             int voxelUniform = 0;
@@ -1288,25 +1325,12 @@ public final class Dx12LodRenderer {
                     } else {
                         pushVoxelNoTexture(ctx, voxelUniform);
                     }
-                    // 先只画不透明段：玻璃段在高度场之后用混合管线单独画，
+                    // 先只画不透明段：玻璃段最后用混合管线单独画，
                     // 否则玻璃写深度会把后面的地形/玻璃挡掉。
                     int opaqueFaces = Math.min(this.voxelOpaqueFaces, this.voxelFaceCount);
                     if (opaqueFaces > 0) {
                         Dx12Native.dx12DrawIndexed(ctx, opaqueFaces * 6, 1, 0, 0, 0);
                     }
-                }
-            }
-            if (hasHeightfield) {
-                Dx12Native.dx12SetPipeline(ctx, pipeline, true);
-                Dx12Native.dx12SetVertexBuffer(ctx, 0, slot.vertexBuffer.handle(), 0L, VERTEX_STRIDE);
-                pushUniform(ctx, uniformOffset);
-                if (slot.quadMode) {
-                    // 索引数由 compute 写进参数缓冲：主线程不回读，GPU 说画多少就画多少。
-                    Dx12Native.dx12SetIndexBuffer(ctx, this.quadIndexBuffer.handle(), 1);
-                    Dx12Native.dx12DrawIndexedIndirect(ctx, slot.argsBuffer.handle(), 0L, 1);
-                } else {
-                    Dx12Native.dx12SetIndexBuffer(ctx, slot.indexBuffer.handle(), 1);
-                    Dx12Native.dx12DrawIndexed(ctx, slot.indexCount, 1, 0, 0, 0);
                 }
             }
             // 玻璃/玻璃板：顶点 alpha=128 标记，混合管线、关深度写入，画在不透明段之后。
@@ -1347,7 +1371,7 @@ public final class Dx12LodRenderer {
      * {@link #VOXEL_REBUILD_INTERVAL} 帧节流，避免每帧复制几十 MB。
      */
     private void updateVoxelMesh(int cameraBlockX, int cameraBlockZ, int voxelRadius,
-                                 int renderDistance) {
+                                 int renderDistance, boolean drawInner) {
         this.voxelFrames++;
         LodVoxelCache cache = LodVoxelCache.getInstance();
         cache.ensureAnchor(cameraBlockX, cameraBlockZ);
@@ -1443,8 +1467,11 @@ public final class Dx12LodRenderer {
                     // 最多 48 方块，按半径跳会漏掉一侧、又重画另一侧。
                     int worldChunkX = camChunkX + dx;
                     int worldChunkZ = camChunkZ + dz;
-                    if (Math.max(Math.abs(worldChunkX - cameraChunkX),
-                        Math.abs(worldChunkZ - cameraChunkZ)) <= renderDistance) {
+                    boolean innerChunk = Math.max(Math.abs(worldChunkX - cameraChunkX),
+                        Math.abs(worldChunkZ - cameraChunkZ)) <= renderDistance;
+                    // 低空时原版内圈已经画过，跳过；高空（drawInner）时原版区块被
+                    // 垂直裁剪，内圈改由体素 LOD 用 region 文件里的真方块补上。
+                    if (innerChunk && !drawInner) {
                         continue;
                     }
                     // 按 lod_quality 选择远景精度：
@@ -1458,7 +1485,11 @@ public final class Dx12LodRenderer {
                     // 体素就再也长不回去了。
                     LodVoxelMesher.Mesh mesh = cache.get(camChunkX + dx, camChunkZ + dz, shift);
                     if (mesh == null || mesh == LodVoxelMesher.Mesh.UNAVAILABLE) {
-                        ringComplete = false;
+                        // 高空补内圈时，原版内圈区块读不到数据不算这一环失败：
+                        // 高度场内圈会兜底。外圈仍要求完整，避免露半圈天空。
+                        if (!drawInner || !innerChunk) {
+                            ringComplete = false;
+                        }
                         continue;
                     }
                     if (!drawing || mesh.faces() == 0) {
@@ -1640,8 +1671,10 @@ public final class Dx12LodRenderer {
         int medium;
         int coarse;
         if (quality >= 2) {
+            // 1 方块精度到 512，2 方块到 720，4 方块到 1024；
+            // 1024 外交给高度场。1024 半径新增的面数约 1M，仍在 14M 顶点预算内。
             full = 512;
-            medium = VOXEL_RADIUS_BLOCKS;
+            medium = 720;
             coarse = VOXEL_RADIUS_BLOCKS;
         } else if (quality == 1) {
             full = 448;
@@ -2201,6 +2234,17 @@ public final class Dx12LodRenderer {
                     if (slope < 0.45f && height <= seaLevel + 4 && height >= seaLevel - 4) {
                         rgb = mixColor(rgb, SAND_COLOR, 0.35f);
                     }
+                    // 与 compute 的 ShadeCorner 一致：大格向自然地形色收敛，
+                    // 避免彩色城市地图在远景里插值成彩虹条纹。
+                    float farBlend = Mth.clamp((cellWidth(axis, i, j) - 2.0f) / 4.0f,
+                        0.0f, 1.0f) * 0.9f;
+                    int natural = 0x6E8B4A;
+                    if (height > snowLine) {
+                        natural = 0xE4EBF1;
+                    } else if (slope > 1.0f) {
+                        natural = 0x8A8A8A;
+                    }
+                    rgb = mixColor(rgb, natural, farBlend);
                     // 不再按高度硬刷「积雪」：颜色来自地表方块自己的 MapColor。
                     alpha = 0xFF;
                 }
