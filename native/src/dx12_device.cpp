@@ -2179,6 +2179,12 @@ bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffse
     transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
     ctx->commandList->CopyBufferRegion(dst->resource.Get(), (UINT64)dstOffset,
         src->resource.Get(), (UINT64)srcOffset, (UINT64)size);
+    // DEFAULT（显存）缓冲不能在拷贝后停在 COPY_DEST：体素顶点/索引缓冲搬到
+    // DEFAULT 堆后，下一帧 IASetVertexBuffers/Draw 会以 COPY_DEST 状态读取，
+    // 表现为黑屏/丢面。UPLOAD 源不需要额外处理，这里只回切 DEFAULT 目标。
+    if (dst->heapType == D3D12_HEAP_TYPE_DEFAULT) {
+        transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
     return true;
 }
 

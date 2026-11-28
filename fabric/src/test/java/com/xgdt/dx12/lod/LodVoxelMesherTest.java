@@ -174,7 +174,8 @@ class LodVoxelMesherTest {
 
     @Test
     void greedyMergesFlatSurfaceIntoOneQuad() {
-        // 16×16 同材质平板：顶/底各 1 片，四侧各 1 片 = 6 片。
+        // 16×16 同材质平板：顶/底各 1 片。四个侧面在网格边界上按「实心邻居」
+        // 处理（相邻区块会继续铺地面），不再生成一圈假墙，所以是 2 片。
         Builder builder = new Builder();
         for (int z = 0; z < 16; z++) {
             for (int x = 0; x < 16; x++) {
@@ -182,7 +183,7 @@ class LodVoxelMesherTest {
             }
         }
         LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 0);
-        assertEquals(6, mesh.faces(), "16×16 平板每面应合并成 1 片");
+        assertEquals(2, mesh.faces(), "16×16 平板只应保留顶/底两片");
 
         // UV 必须跨 16 个方块；若合并后仍写 0..1，大面会被拉成一块纯色。
         ByteBuffer buffer = ByteBuffer.wrap(mesh.vertices()).order(ByteOrder.LITTLE_ENDIAN);
@@ -209,7 +210,7 @@ class LodVoxelMesherTest {
             }
         }
         LodVoxelMesher.Mesh mesh = LodVoxelMesher.mesh(builder.build(), 0, 0, 0, 0, 1);
-        assertEquals(6, mesh.faces(), "16×16 平板降采样后每面仍应合并成 1 片");
+        assertEquals(2, mesh.faces(), "16×16 平板降采样后只保留顶/底两片");
 
         ByteBuffer buffer = ByteBuffer.wrap(mesh.vertices()).order(ByteOrder.LITTLE_ENDIAN);
         float maxU = 0.0f;

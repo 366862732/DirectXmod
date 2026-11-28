@@ -62,10 +62,10 @@ public final class LodVoxelMesher {
      * {@code [0, opaqueFaces)}，高度场之后再用混合管线画剩下的玻璃面，避免玻璃写深度
      * 把后面的地形挡掉。
      */
-    public record Mesh(byte[] vertices, int faces, int opaqueFaces) {
-        public static final Mesh EMPTY = new Mesh(new byte[0], 0, 0);
+    public record Mesh(byte[] vertices, int faces, int opaqueFaces, int untexturedFaces) {
+        public static final Mesh EMPTY = new Mesh(new byte[0], 0, 0, 0);
         /** 区块数据不可用（未生成 / 未保存 / 读盘失败）。和「空气区块」不是一回事。 */
-        public static final Mesh UNAVAILABLE = new Mesh(new byte[0], -1, -1);
+        public static final Mesh UNAVAILABLE = new Mesh(new byte[0], -1, -1, 0);
 
         /** 玻璃面数。 */
         public int glassFaces() {
@@ -158,6 +158,10 @@ public final class LodVoxelMesher {
         //    贪心合并到一起（否则石头和圆石可能共用一张贴图）。
         long[] grid = new long[cells * cellsY * cells];
         Arrays.fill(grid, -1L);
+        // 透明格（玻璃/水）：它们对“邻居面是否要剔除”的判定和非透明格不同。
+        // 不透明墙贴着玻璃时必须继续画面（否则透过玻璃会直接看到虚空/天空）；
+        // 玻璃贴玻璃才互相剔除，避免一堵玻璃墙双面混合。
+        boolean[] transparent = new boolean[grid.length];
         Map<String, Integer> nameIds = new HashMap<>();
         List<String> idNames = new ArrayList<>();
         for (int cy = 0; cy <= topCell; cy++) {
@@ -198,6 +202,8 @@ public final class LodVoxelMesher {
                     }
                     grid[(cy * cells + cz) * cells + cx] =
                         ((long) nameId << 32) | (rgb & 0xFFFFFFFFL);
+                    transparent[(cy * cells + cz) * cells + cx] =
+                        isGlassName(name) || LodRegionCache.isWater(rgb);
                 }
             }
         }
@@ -210,6 +216,13 @@ public final class LodVoxelMesher {
                 for (int cx = 0; cx < cells; cx++) {
                     int idx = (cy * cells + cz) * cells + cx;
                     if (grid[idx] == -1L) {
+                        continue;
+                    }
+                    // 关键：本列自己的地表层永远不能剪。街道/天井比四周楼顶低很多，
+                    // 只看四邻会把它当成「被包住的地下格」，把街面的顶面也剪掉，
+                    // 从高空看就是楼与楼之间一格格露天的洞（天空直接透出来）。
+                    int ownTop = cellTops[cz * cells + cx];
+                    if (ownTop == Integer.MIN_VALUE || cy >= ownTop) {
                         continue;
                     }
                     int minTop = Integer.MAX_VALUE;
@@ -246,6 +259,8 @@ public final class LodVoxelMesher {
 
         Emitter opaqueOut = new Emitter();
         Emitter glassOut = new Emitter();
+        // 探针统计：没有 sprite 矩形的面（真·没贴图），用于区分 mip 糊和缺 UV。
+        int untexturedFaces = 0;
         long[] mask = new long[cells * cellsY];
         // 六个方向分别做一次「切片 → 掩码 → 贪心矩形合并」。方向编号与
         // Direction.ordinal() 一致：0=DOWN 1=UP 2=NORTH 3=SOUTH 4=WEST 5=EAST。
@@ -314,7 +329,7 @@ public final class LodVoxelMesher {
                             case 4 -> nx--;
                             default -> nx++;
                         }
-                        if (solidAt(grid, nx, ny, nz, cells, cellsY)) {
+                        if (cullFace(grid, transparent, idx, nx, ny, nz, cells, cellsY)) {
                             continue;
                         }
                         mask[j * w + i] = key;
@@ -378,6 +393,9 @@ public final class LodVoxelMesher {
                         float[][] rects = cache == null ? null : cache.getSpriteUv(name);
                         int[] tints = cache == null ? null : cache.getSpriteTint(name);
                         float[] rect = pickRect(rects, dir);
+                        if (rect == null) {
+                            untexturedFaces++;
+                        }
                         if (far && name != null && name.endsWith("leaves")) {
                             rect = null;
                             tints = null;
@@ -389,9 +407,10 @@ public final class LodVoxelMesher {
                         // 不透明面和玻璃面分开攒：渲染端可以先用不透明管线画前段，
                         // 再开混合管线画后段，玻璃不会写深度挡掉后面的地形。
                         Emitter out = glass ? glassOut : opaqueOut;
-                        // 几何跨度按方块算，UV 跨度按 LOD 格算：一格一张贴图。
-                        // size>1 时贴图会按格拉伸（2 方块格 = 贴图放大 2 倍），
-                        // 和 voxy 的 LOD 纹理比例一致。
+                        // 几何跨度和 UV 跨度都按 LOD 格算：一格铺一张贴图。
+                        // 和 Voxy 的 quad_util.glsl 一致：uv 以「LOD 单位」为单位，
+                        // quadSizeAddin = faceSize + quadSize - 1，fragment 里 modf(uv)
+                        // 取整后每个 LOD 单元重复同一张 face 贴图（不是每个方块一张）。
                         float spanU = width * (float) size;
                         float spanV = height * (float) size;
                         float u = width;
@@ -454,7 +473,7 @@ public final class LodVoxelMesher {
         byte[] vertices = new byte[opaqueBytes + glassBytes];
         System.arraycopy(opaqueOut.out.array(), 0, vertices, 0, opaqueBytes);
         System.arraycopy(glassOut.out.array(), 0, vertices, opaqueBytes, glassBytes);
-        return new Mesh(vertices, totalFaces, opaqueFaces);
+        return new Mesh(vertices, totalFaces, opaqueFaces, untexturedFaces);
     }
 
     /** 玻璃/玻璃板：和 {@link LodRegionCache} 的实心分类保持一致。 */
@@ -480,11 +499,28 @@ public final class LodVoxelMesher {
     }
 
     /** 邻居格是否实心；越界当空气（与旧版区块边界行为一致）。 */
-    private static boolean solidAt(long[] grid, int x, int y, int z, int cells, int cellsY) {
-        if (x < 0 || y < 0 || z < 0 || x >= cells || y >= cellsY || z >= cells) {
+    private static boolean cullFace(long[] grid, boolean[] transparent, int curIdx,
+                                    int x, int y, int z, int cells, int cellsY) {
+        // 水平越界按「实心邻居」处理：每个区块/超块网格只持有自己那一块数据，
+        // 边界外当成空气的话，会在每个区块边缘生成一圈竖直的侧面（草方块侧面
+        // 是泥土色）——高空看就是 16 方块一格的「泥土墙网格」。
+        if (x < 0 || z < 0 || x >= cells || z >= cells) {
+            return true;
+        }
+        // 上下越界仍然是空气：否则最顶层的顶面会被当成「有邻居」裁掉。
+        if (y < 0 || y >= cellsY) {
             return false;
         }
-        return grid[(y * cells + z) * cells + x] != -1L;
+        int nIdx = (y * cells + z) * cells + x;
+        if (grid[nIdx] == -1L) {
+            return false;
+        }
+        // 邻居是玻璃/水（透明），当前面是不透明：必须保留这面墙，否则透过
+        // 玻璃会直接看到虚空。玻璃贴玻璃才互相剔除，避免双面混合。
+        if (transparent[nIdx] && !transparent[curIdx]) {
+            return false;
+        }
+        return true;
     }
 
     /**
