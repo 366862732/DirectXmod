@@ -184,10 +184,13 @@ public final class LodSectionStore implements AutoCloseable {
     /**
      * 读一条记录；不存在、region 大小变了或损坏时返回 {@code null}。
      *
-     * <p>只看 region 文件大小、不看 mtime：自动存档每写一个区块就会刷新整个 region
-     * 文件的 mtime，按 mtime 严格比对等于一次存档就把本 region 的缓存全部作废，
-     * 远景每次进世界都要重解上万区块的 NBT。大小变了才说明文件被追加/重写，
-     * 那才可能和缓存时的内容对不上。
+     * <p>同时比对 region 文件的 {@code size} 和 {@code mtime}。只比 size 会漏掉
+     * 「在已分配的扇区里原地改方块」：地图更新、玩家建造都不会改变 region 文件大小，
+     * 但内容已经和缓存不同，继续命中就会把旧地形当成 LOD 画出来（玻璃消失、旧水面
+     * 盖住新道路都是这个原因）。{@code mtime} 变化说明该 region 被写过，必须重新解析。
+     *
+     * <p>自动存档只会写有改动的 region；没有脏区块时不会刷新 mtime。因此按 mtime
+     * 失效带来的重解范围就是真正变化的那几个 region，而不是整份远景缓存。
      */
     public byte[] read(long key, long regionSize, long regionMtime) {
         Shard shard = shardFor(key);
@@ -197,7 +200,8 @@ public final class LodSectionStore implements AutoCloseable {
                 return null;
             }
             Entry entry = shard.index.get(key);
-            if (entry == null || entry.regionSize != regionSize) {
+            if (entry == null || entry.regionSize != regionSize
+                || entry.regionMtime != regionMtime) {
                 return null;
             }
             ByteBuffer compressed = ByteBuffer.allocate(entry.compressedLength);

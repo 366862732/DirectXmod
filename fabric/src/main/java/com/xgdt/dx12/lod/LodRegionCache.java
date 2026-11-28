@@ -1002,15 +1002,21 @@ public final class LodRegionCache {
         }
         try {
             Optional<long[]> rawHeights = surfaceHeightmap(tag);
+            ChunkColumns decoded;
             if (rawHeights.isEmpty()) {
-                return MISSING;
+                // 没有 Heightmaps 的区块（地图工具/旧存档常见）以前直接当 MISSING，
+                // 高度场在整片已生成地形上留下大洞。这里从 sections 现算地表，
+                // 和体素 LOD 用的是同一份方块数据。
+                decoded = columnsFromVoxel(voxelFromTag(tag, minY, this.height));
+            } else {
+                short[] heights = unpack(rawHeights.get(), minY, bits);
+                if (heights == MISSING.heights) {
+                    decoded = columnsFromVoxel(voxelFromTag(tag, minY, this.height));
+                } else {
+                    decoded = new ChunkColumns(heights,
+                        decodeColumns(tag.getListOrEmpty("sections"), heights));
+                }
             }
-            short[] heights = unpack(rawHeights.get(), minY, bits);
-            if (heights == MISSING.heights) {
-                return MISSING;
-            }
-            ChunkColumns decoded = new ChunkColumns(heights,
-                decodeColumns(tag.getListOrEmpty("sections"), heights));
             if (columns != null && stat != null) {
                 byte[] payload = LodChunkCodec.encodeColumns(decoded);
                 if (payload != null) {
@@ -1028,9 +1034,9 @@ public final class LodRegionCache {
      * （region 不存在、区块未生成或 IO 失败）。
      *
      * <p>优先命中 {@link LodSectionStore}：解码后的调色板+索引比 NBT 小得多，也省掉
-     * 逐 section 查注册表的开销。存储里记着 region 文件的 {@code (size, mtime)}，只在
-     * 大小变了（文件被重写/追加）时当 miss；mtime 单独变化多半只是自动存档顺手刷新了
-     * 时间戳，按它判 miss 等于一次存档作废整个 region 的缓存。
+     * 逐 section 查注册表的开销。存储里记着 region 文件的 {@code (size, mtime)}，两者
+     * 任一变化都当 miss：原地改方块不会改变文件大小，只刷新 mtime，继续命中会把旧
+     * 地形当成当前 LOD（玻璃/新道路消失、旧水面盖住新地面）。
      */
     public VoxelChunk readVoxel(int chunkX, int chunkZ) {
         Path dir = this.regionDir;
@@ -1356,6 +1362,41 @@ public final class LodRegionCache {
         return colors;
     }
 
+    /**
+     * 从完整方块数据反推 256 列的地表高度与颜色，供没有 {@code Heightmaps} 的区块兜底。
+     *
+     * <p>高度同样是「首个空气方块的 y」（最高实心方块 + 1），和高度图解包结果一致，
+     * 否则有高度图和没高度图的区块在接缝处会差一格。
+     */
+    private static ChunkColumns columnsFromVoxel(VoxelChunk chunk) {
+        short[] heights = new short[COLUMNS];
+        int[] colors = new int[COLUMNS];
+        int minY = chunk.minY();
+        int topY = chunk.topY();
+        for (int z = 0; z < 16; z++) {
+            for (int x = 0; x < 16; x++) {
+                int index = x + z * 16;
+                int color = -1;
+                int y = topY;
+                for (; y >= minY; y--) {
+                    int c = chunk.color(x, y, z);
+                    if (c != -1) {
+                        color = c;
+                        break;
+                    }
+                }
+                if (color == -1) {
+                    heights[index] = UNAVAILABLE;
+                    colors[index] = -1;
+                } else {
+                    heights[index] = (short) (y + 1);
+                    colors[index] = color;
+                }
+            }
+        }
+        return new ChunkColumns(heights, colors);
+    }
+
     /** 把第 {@code i} 列的几何高度从树干顶压回真正的地面（原地改 {@code heights}）。 */
     private static void stripLogsAt(Map<Integer, SectionData> decoded, ListTag sections,
                                     short[] heights, int i) {
@@ -1442,9 +1483,10 @@ public final class LodRegionCache {
     /**
      * 该方块在体素 LOD 里算不算「实心」。
      *
-     * <p>整方块（{@code canOcclude()}）全部算；树叶、原木、水虽然不遮挡，但远景里必须
-     * 画出来，否则森林和水面会整片消失。草、花、火把、地毯、台阶、栅栏这些不算 ——
-     * 它们在 LOD 距离上本来就看不见，算进去只会让面数翻倍。
+     * <p>整方块（{@code canOcclude()}）全部算；树叶、原木、水、玻璃虽然不遮挡，但远景里
+     * 必须画出来，否则森林、水面和建筑玻璃会整片消失。玻璃在 mesher 里带半透明标记，
+     * 由单独的混合管线绘制。草、花、火把、地毯、台阶、栅栏这些不算 —— 它们在 LOD
+     * 距离上本来就看不见，算进去只会让面数翻倍。玻璃板按整格处理（远景看不出薄片）。
      */
     private static boolean isSolidBlock(String name) {
         Boolean cached = BLOCK_SOLID.get(name);
@@ -1455,7 +1497,8 @@ public final class LodRegionCache {
         try {
             if (name.endsWith(":air") || name.endsWith(":cave_air") || name.endsWith(":void_air")) {
                 solid = false;
-            } else if (name.endsWith("leaves") || isLogName(name) || name.endsWith(":water")) {
+            } else if (name.endsWith("leaves") || isLogName(name) || name.endsWith(":water")
+                || name.endsWith("glass") || name.endsWith("glass_pane")) {
                 solid = true;
             } else {
                 Block block = BuiltInRegistries.BLOCK.getValue(Identifier.parse(name));

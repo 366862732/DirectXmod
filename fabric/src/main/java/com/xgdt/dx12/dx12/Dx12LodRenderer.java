@@ -523,9 +523,26 @@ public final class Dx12LodRenderer {
         + "        * (0.04 + saturate(PbrParams.z) * 0.5);\n"
         + "    // 天空光染色 + 世界亮度（白天白、夜里偏蓝，同 voxy lightmap）\n"
         + "    rgb *= FogParams.z * LightTint.rgb;\n"
-        + "    // 水体：顶点 alpha = 0 是水体标记，纹理 alpha 通道混入做半透明\n"
-        + "    float water = 1.0 - saturate(input.color.a * 2.0);\n"
-        + "    if (water > 0.01)\n"
+        + "    // 顶点 alpha 是材质标记：0=水体，0.5=玻璃/玻璃板，1=不透明。\n"
+        + "    float marker = input.color.a;\n"
+        + "    float water = 1.0 - saturate(marker * 2.0);\n"
+        + "    bool isGlass = marker > 0.25 && marker < 0.75;\n"
+        + "    float outAlpha = 1.0;\n"
+        + "    if (isGlass)\n"
+        + "    {\n"
+        + "        // 玻璃：用 mip0 精确采样 alpha。普通玻璃中心 alpha=0（完全透），\n"
+        + "        // 边框 alpha=1；染色玻璃整体半透明。粗 mip 会把边框糊到中心，\n"
+        + "        // 这里和树叶一样只信 mip0。\n"
+        + "        float glassAlpha = hasTex\n"
+        + "            ? BlockTex.SampleLevel(BlockSampler, atlasUv, 0).a\n"
+        + "            : 1.0;\n"
+        + "        if (glassAlpha <= 0.02)\n"
+        + "        {\n"
+        + "            discard;\n"
+        + "        }\n"
+        + "        outAlpha = saturate(glassAlpha) * (1.0 - fog * 0.35);\n"
+        + "    }\n"
+        + "    else if (water > 0.01)\n"
         + "    {\n"
         + "        rgb *= tex.a;\n"
         + "    }\n"
@@ -539,7 +556,7 @@ public final class Dx12LodRenderer {
         + "    }\n"
         + "    // 浅色方块（雪/冰/石英）叠上光照后可能越过 1.0，钳一下避免整片糊成纯白\n"
         + "    rgb = saturate(rgb);\n"
-        + "    return float4(lerp(rgb, FogColor.rgb, fog), 1.0);\n"
+        + "    return float4(lerp(rgb, FogColor.rgb, fog), outAlpha);\n"
         + "}\n";
 
     /**
@@ -861,6 +878,8 @@ public final class Dx12LodRenderer {
     private GpuBufferSlice.MappedView voxelIndexView;
     private int voxelIndexCapacity;
     private int voxelFaceCount;
+    /** 体素缓冲里不透明面的数量；其余（{@code [voxelOpaqueFaces, voxelFaceCount)}）是玻璃面。 */
+    private int voxelOpaqueFaces;
     /** 上次重拼时的完成计数与半径：任一变化才需要重拼。 */
     private int voxelBuiltCompleted = -1;
     private int voxelBuiltRadius = -1;
@@ -892,6 +911,9 @@ public final class Dx12LodRenderer {
     private int voxelMaxBlockZ = 0;
     /** 重拼时的区块网格暂存，避免每帧分配。 */
     private LodVoxelMesher.Mesh[] voxelMeshScratch = new LodVoxelMesher.Mesh[0];
+    /** 上次真正上传的区块网格列表；完全相同时跳过整份顶点拷贝。 */
+    private LodVoxelMesher.Mesh[] voxelDrawnMeshes = new LodVoxelMesher.Mesh[0];
+    private int voxelDrawnMeshCount;
 
     private int rebuildIndex;
     private Slot geometry;
@@ -983,6 +1005,8 @@ public final class Dx12LodRenderer {
 
     /** 体素专用管线（32B 顶点 + SRV t0）：首次调用 {@link #createVoxelPipeline} 时缓存。 */
     private final Map<Integer, Long> voxelPipelines = new HashMap<>();
+    /** 玻璃体素管线：同样的着色器，开 alpha 混合、关深度写入。 */
+    private final Map<Integer, Long> voxelGlassPipelines = new HashMap<>();
     /** 方块纹理图集 SRV handle（{@link Dx12GpuTextureView#handle()}）。{@code 0L} = 尚未初始化。 */
     private long voxelAtlasViewHandle;
     /** 首次绑定图集时打一条日志，之后不再重复。 */
@@ -1165,7 +1189,7 @@ public final class Dx12LodRenderer {
             // 让地形一圈圈长出来。
             || (cooldownReady && cache.pendingCount() > 0)
             // 上一次建网一个角点都没采到（刚进世界、区块还没就绪）：不重试就永远空着
-            || (cooldownReady && this.builtKnown == 0)
+            || (cooldownReady && this.builtTotal > 0 && this.builtKnown == 0)
             || (cooldownReady && retryHoles);
         if (rebuild) {
             long buildStart = System.nanoTime();
@@ -1243,10 +1267,12 @@ public final class Dx12LodRenderer {
             // 体素 LOD 先画：顶点坐标是「世界坐标 − 锚点」，所以参考中心传锚点，
             // 和高度场（相对网格中心）用的 uniform 不是同一个槽位。
             Dx12GpuBuffer voxelBuffer = this.voxelVertexBuffers[this.voxelVertexSlot];
+            int voxelUniform = 0;
+            long voxelAtlas = 0L;
             if (this.voxelFaceCount > 0 && voxelBuffer != null
                 && this.voxelIndexBuffer != null) {
                 LodVoxelCache voxelCache = LodVoxelCache.getInstance();
-                int voxelUniform = writeUniforms(viewProj, camera, renderState, levelState,
+                voxelUniform = writeUniforms(viewProj, camera, renderState, levelState,
                     fogStart, fogEnd, voxelCache.anchorX(), voxelCache.anchorZ(), level.getSeaLevel());
                 long voxelPipeline = voxelPipelineFor(color.getFormat().ordinal());
                 if (voxelPipeline != 0L) {
@@ -1258,13 +1284,18 @@ public final class Dx12LodRenderer {
                     // 不能先调 pushUniform 再调 pushVoxelTexture：native 侧每次
                     // dx12PushDescriptors 都会写一条新的 descriptor table，两次调用
                     // 互相覆盖导致 SRV 槽位错乱。pushVoxelTexture 本身已带 CBV。
-                    long atlasHandle = ensureVoxelAtlasView(minecraft);
-                    if (atlasHandle != 0L) {
-                        pushVoxelTexture(ctx, voxelUniform, atlasHandle);
+                    voxelAtlas = ensureVoxelAtlasView(minecraft);
+                    if (voxelAtlas != 0L) {
+                        pushVoxelTexture(ctx, voxelUniform, voxelAtlas);
                     } else {
                         pushVoxelNoTexture(ctx, voxelUniform);
                     }
-                    Dx12Native.dx12DrawIndexed(ctx, this.voxelFaceCount * 6, 1, 0, 0, 0);
+                    // 先只画不透明段：玻璃段在高度场之后用混合管线单独画，
+                    // 否则玻璃写深度会把后面的地形/玻璃挡掉。
+                    int opaqueFaces = Math.min(this.voxelOpaqueFaces, this.voxelFaceCount);
+                    if (opaqueFaces > 0) {
+                        Dx12Native.dx12DrawIndexed(ctx, opaqueFaces * 6, 1, 0, 0, 0);
+                    }
                 }
             }
             if (hasHeightfield) {
@@ -1278,6 +1309,24 @@ public final class Dx12LodRenderer {
                 } else {
                     Dx12Native.dx12SetIndexBuffer(ctx, slot.indexBuffer.handle(), 1);
                     Dx12Native.dx12DrawIndexed(ctx, slot.indexCount, 1, 0, 0, 0);
+                }
+            }
+            // 玻璃/玻璃板：顶点 alpha=128 标记，混合管线、关深度写入，画在不透明段之后。
+            int glassFaces = this.voxelFaceCount - this.voxelOpaqueFaces;
+            if (glassFaces > 0 && voxelBuffer != null && this.voxelIndexBuffer != null) {
+                long glassPipeline = voxelGlassPipelineFor(color.getFormat().ordinal());
+                if (glassPipeline != 0L) {
+                    Dx12Native.dx12SetPipeline(ctx, glassPipeline, true);
+                    Dx12Native.dx12SetVertexBuffer(ctx, 0, voxelBuffer.handle(),
+                        0L, VOXEL_VERTEX_STRIDE);
+                    Dx12Native.dx12SetIndexBuffer(ctx, this.voxelIndexBuffer.handle(), 1);
+                    if (voxelAtlas != 0L) {
+                        pushVoxelTexture(ctx, voxelUniform, voxelAtlas);
+                    } else {
+                        pushVoxelNoTexture(ctx, voxelUniform);
+                    }
+                    Dx12Native.dx12DrawIndexed(ctx, glassFaces * 6, 1,
+                        this.voxelOpaqueFaces * 6, 0, 0);
                 }
             }
         } finally {
@@ -1458,6 +1507,24 @@ public final class Dx12LodRenderer {
             clearVoxelCover();
             return;
         }
+        // 后台每建好一块 completed 都会变，但真正画出来的连续完整环可能完全没变
+        // （新区块在外圈、或旧网格被 LRU 淘汰）。此时整份顶点缓冲是同一批网格，
+        // 没必要再拷贝几百 MB；只更新覆盖状态即可。
+        if (count == this.voxelDrawnMeshCount) {
+            boolean same = true;
+            for (int k = 0; k < count; k++) {
+                if (this.voxelDrawnMeshes[k] != selected[k]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                this.voxelDrawnOuterRing = outerRing;
+                this.voxelDrawnRadius = voxelRadius;
+                this.voxelCoverRadius = outerRing * 16.0f;
+                return;
+            }
+        }
         // 写入下一槽位，而不是当前正在绘制的槽位：上一帧/上上帧的 GPU 命令可能
         // 还在读当前槽位，原地重写会让远景读到一半新一半旧的顶点。
         int writeSlot = (this.voxelVertexSlot + 1) % VOXEL_VERTEX_SLOTS;
@@ -1474,14 +1541,38 @@ public final class Dx12LodRenderer {
             return;
         }
         int vertex = 0;
+        int totalOpaque = 0;
+        // 两段拼接：所有区块的不透明面在前，玻璃面在后。单块区块内部 mesher 已经
+        // 按「不透明→玻璃」排好，这里再按全局分段，渲染端才能一次画完不透明段、
+        // 在高度场之后单独混合玻璃段。
         for (int k = 0; k < count; k++) {
             LodVoxelMesher.Mesh mesh = selected[k];
+            int opaqueBytes = mesh.opaqueFaces() * 4 * VOXEL_VERTEX_STRIDE;
             vertexData.position(vertex * VOXEL_VERTEX_STRIDE);
-            vertexData.put(mesh.vertices(), 0, mesh.vertices().length);
-            vertex += mesh.faces() * 4;
+            vertexData.put(mesh.vertices(), 0, opaqueBytes);
+            vertex += mesh.opaqueFaces() * 4;
+            totalOpaque += mesh.opaqueFaces();
+        }
+        for (int k = 0; k < count; k++) {
+            LodVoxelMesher.Mesh mesh = selected[k];
+            int opaqueBytes = mesh.opaqueFaces() * 4 * VOXEL_VERTEX_STRIDE;
+            int glassBytes = mesh.vertices().length - opaqueBytes;
+            if (glassBytes <= 0) {
+                continue;
+            }
+            vertexData.position(vertex * VOXEL_VERTEX_STRIDE);
+            vertexData.put(mesh.vertices(), opaqueBytes, glassBytes);
+            vertex += mesh.glassFaces() * 4;
         }
         this.voxelVertexSlot = writeSlot;
         this.voxelFaceCount = totalFaces;
+        this.voxelOpaqueFaces = totalOpaque;
+        if (this.voxelDrawnMeshes.length < count) {
+            this.voxelDrawnMeshes = Arrays.copyOf(this.voxelDrawnMeshes,
+                Math.max(count, this.voxelDrawnMeshes.length * 2));
+        }
+        System.arraycopy(selected, 0, this.voxelDrawnMeshes, 0, count);
+        this.voxelDrawnMeshCount = count;
         this.voxelDrawnCenterX = camChunkX * 16;
         this.voxelDrawnCenterZ = camChunkZ * 16;
         // 只把「连续完整环」算进覆盖矩形：高度场会精确跳过这块矩形，多算一格就会
@@ -1492,6 +1583,48 @@ public final class Dx12LodRenderer {
         this.voxelMaxBlockX = (camChunkX + outerRing) * 16;
         this.voxelMinBlockZ = minChunkZ * 16;
         this.voxelMaxBlockZ = (camChunkZ + outerRing) * 16;
+    }
+
+    /**
+     * 该角点是否被任何「会被绘制」的高度场格用到。
+     *
+     * <p>原版视距圈和体素矩形内部的格子会被跳过，只有跨边界的一圈和外圈真正出图。
+     * 一个角点最多属于 4 个格子；只要其中一个格子不被跳过，角点就必须采样。判定
+     * 条件和 {@code COMPUTE_SHADER} / CPU 索引路径完全一致（方形 + 最远角）。
+     */
+    private static boolean cornerNeeded(int[] axis, int i, int j, int n,
+                                        int centerX, int centerZ,
+                                        int cameraBlockX, int cameraBlockZ,
+                                        float vanillaInner,
+                                        int voxelMinX, int voxelMaxX,
+                                        int voxelMinZ, int voxelMaxZ) {
+        for (int cj = j - 1; cj <= j; cj++) {
+            if (cj < 0 || cj >= n - 1) {
+                continue;
+            }
+            for (int ci = i - 1; ci <= i; ci++) {
+                if (ci < 0 || ci >= n - 1) {
+                    continue;
+                }
+                int x0 = axis[ci];
+                int x1 = axis[ci + 1];
+                int z0 = axis[cj];
+                int z1 = axis[cj + 1];
+                int dx = Math.max(Math.abs(centerX + x0 - cameraBlockX),
+                    Math.abs(centerX + x1 - cameraBlockX));
+                int dz = Math.max(Math.abs(centerZ + z0 - cameraBlockZ),
+                    Math.abs(centerZ + z1 - cameraBlockZ));
+                if (Math.max(dx, dz) < vanillaInner) {
+                    continue;
+                }
+                if (x0 >= voxelMinX && x1 <= voxelMaxX
+                    && z0 >= voxelMinZ && z1 <= voxelMaxZ) {
+                    continue;
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1570,6 +1703,8 @@ public final class Dx12LodRenderer {
     /** 关掉体素几何，并让高度场重新覆盖整圈（否则会留下一个没有几何的空洞）。 */
     private void clearVoxelCover() {
         this.voxelFaceCount = 0;
+        this.voxelOpaqueFaces = 0;
+        this.voxelDrawnMeshCount = 0;
         this.voxelCoverRadius = 0.0f;
         this.voxelDrawnOuterRing = 0;
         this.voxelDrawnRadius = 0;
@@ -1723,6 +1858,8 @@ public final class Dx12LodRenderer {
         int minBuildY = level.getMinY();
         int maxBuildY = level.getMaxY();
         int known = 0;
+        // 真正参与绘制的角点数（跳过原版内圈/体素矩形内部那些永远不会出图的角点）。
+        int needed = 0;
         // 「可见洞」按相机距离算：坐标轴是方的，四角在雾终点之外，那里的未探索
         // 区块永远补不上，不能算进补洞重试的判据。
         int camOffX = cameraBlockX - centerX;
@@ -1736,6 +1873,18 @@ public final class Dx12LodRenderer {
             for (int i = 0; i < n; i++) {
                 int x = centerX + axis[i];
                 int index = j * n + i;
+                // 原版内圈和体素覆盖矩形内部的格子会被 compute/CPU 直接跳过，
+                // 这些角点永远用不到。644×644 的网格里真正参与绘制的只有体素矩形
+                // 外缘和高度场外圈的一窄条；不采样内部能把重建耗时从 ~50ms 降到几 ms，
+                // 也少向 region 缓存请求上万个用不到的区块。
+                if (!cornerNeeded(axis, i, j, n, centerX, centerZ,
+                    cameraBlockX, cameraBlockZ, vanillaInner,
+                    voxelMinX, voxelMaxX, voxelMinZ, voxelMaxZ)) {
+                    heights[index] = UNKNOWN_HEIGHT;
+                    colors[index] = -1;
+                    continue;
+                }
+                needed++;
                 long sample = sampleCorner(level, x, z);
                 int height = (int) (sample >> 32);
                 if (height < minBuildY || height > maxBuildY) {
@@ -1835,7 +1984,7 @@ public final class Dx12LodRenderer {
         this.geometry = slot;
         // 供重建判据判断「这次是不是一个角点都没采到」，需要定期重试
         this.builtKnown = known;
-        this.builtTotal = vertexCount;
+        this.builtTotal = needed;
         this.builtVisibleHoles = visibleHoles;
 
         long now = System.nanoTime();
@@ -2873,10 +3022,24 @@ public final class Dx12LodRenderer {
         if (cached != null) {
             return cached;
         }
-        long handle = createVoxelPipeline(colorFormat);
+        long handle = createVoxelPipeline(colorFormat, false);
         this.voxelPipelines.put(colorFormat, handle);
         if (handle == 0L) {
             LOGGER.error("[lod] 体素 LOD 管线创建失败（颜色格式 ordinal={}）", colorFormat);
+        }
+        return handle;
+    }
+
+    /** 玻璃体素管线：同样的顶点/像素着色器，开 alpha 混合、关深度写入。 */
+    private long voxelGlassPipelineFor(int colorFormat) {
+        Long cached = this.voxelGlassPipelines.get(colorFormat);
+        if (cached != null) {
+            return cached;
+        }
+        long handle = createVoxelPipeline(colorFormat, true);
+        this.voxelGlassPipelines.put(colorFormat, handle);
+        if (handle == 0L) {
+            LOGGER.error("[lod] 玻璃体素管线创建失败（颜色格式 ordinal={}）", colorFormat);
         }
         return handle;
     }
@@ -2887,7 +3050,7 @@ public final class Dx12LodRenderer {
      * 按 binding reg=0 声明）。对齐 voxy：{@code GL_NEAREST} 放大保留方块像素感，
      * {@code GL_NEAREST_MIPMAP_LINEAR} 缩小避免远处闪烁。
      */
-    private static long createVoxelPipeline(int colorFormat) {
+    private static long createVoxelPipeline(int colorFormat, boolean blend) {
         byte[] vs = (UNIFORM_HEADER + VOXEL_VERTEX_SHADER).getBytes(StandardCharsets.UTF_8);
         byte[] ps = (UNIFORM_HEADER + VOXEL_PIXEL_SHADER).getBytes(StandardCharsets.UTF_8);
         String[] semantics = {"POSITION", "COLOR", "TEXCOORD0", "TEXCOORD1"};
@@ -2913,14 +3076,25 @@ public final class Dx12LodRenderer {
         desc.putInt(1);
         desc.putInt(colorFormat);
         desc.put((byte) 0x0F);
-        desc.put((byte) 0);
-        for (int i = 0; i < 6; i++) {
-            desc.put((byte) 0);
+        desc.put((byte) (blend ? 1 : 0));
+        if (blend) {
+            // 标准 alpha 混合：src*srcA + dst*(1-srcA)
+            desc.put((byte) 11); // SRC_ALPHA
+            desc.put((byte) 9);  // INV_SRC_ALPHA
+            desc.put((byte) 0);  // ADD
+            desc.put((byte) 4);  // ONE（alpha 通道）
+            desc.put((byte) 9);  // INV_SRC_ALPHA
+            desc.put((byte) 0);  // ADD
+        } else {
+            for (int i = 0; i < 6; i++) {
+                desc.put((byte) 0);
+            }
         }
 
         desc.put((byte) 1);
         desc.putInt(51);
-        desc.put((byte) 1);
+        // 玻璃不写深度：半透明面互相叠加、也不会挡住后面的地形。
+        desc.put((byte) (blend ? 0 : 1));
         desc.put((byte) 5);
 
         desc.putInt(4);

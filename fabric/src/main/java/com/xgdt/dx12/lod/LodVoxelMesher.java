@@ -55,12 +55,26 @@ public final class LodVoxelMesher {
     private LodVoxelMesher() {
     }
 
-    /** 建网结果：顶点字节（4 顶点 × 32B / 面）与面数。 */
-    public record Mesh(byte[] vertices, int faces) {
-        public static final Mesh EMPTY = new Mesh(new byte[0], 0);
+    /**
+     * 建网结果：顶点字节（4 顶点 × 32B / 面）、总面数与不透明面数。
+     *
+     * <p>顶点缓冲按「不透明面在前、玻璃面在后」排列：渲染端先用不透明管线画
+     * {@code [0, opaqueFaces)}，高度场之后再用混合管线画剩下的玻璃面，避免玻璃写深度
+     * 把后面的地形挡掉。
+     */
+    public record Mesh(byte[] vertices, int faces, int opaqueFaces) {
+        public static final Mesh EMPTY = new Mesh(new byte[0], 0, 0);
         /** 区块数据不可用（未生成 / 未保存 / 读盘失败）。和「空气区块」不是一回事。 */
-        public static final Mesh UNAVAILABLE = new Mesh(new byte[0], -1);
+        public static final Mesh UNAVAILABLE = new Mesh(new byte[0], -1, -1);
+
+        /** 玻璃面数。 */
+        public int glassFaces() {
+            return this.faces - this.opaqueFaces;
+        }
     }
+
+    /** 顶点 alpha 标记：128/255 = 玻璃（半透明），0 = 水体，255 = 不透明。 */
+    public static final int GLASS_ALPHA = 128;
 
     /**
      * 网格化一块区块（无纹理，方块内 0..1 UV，兼容旧测试）。
@@ -201,7 +215,8 @@ public final class LodVoxelMesher {
             }
         }
 
-        Emitter out = new Emitter();
+        Emitter opaqueOut = new Emitter();
+        Emitter glassOut = new Emitter();
         long[] mask = new long[cells * cellsY];
         // 六个方向分别做一次「切片 → 掩码 → 贪心矩形合并」。方向编号与
         // Direction.ordinal() 一致：0=DOWN 1=UP 2=NORTH 3=SOUTH 4=WEST 5=EAST。
@@ -335,7 +350,12 @@ public final class LodVoxelMesher {
                         int[] tints = cache == null ? null : cache.getSpriteTint(name);
                         float[] rect = pickRect(rects, dir);
                         int color = faceColor(rect, tints, dir, rgb);
-                        int alpha = LodRegionCache.isWater(rgb) ? 0 : 255;
+                        boolean glass = isGlassName(name);
+                        int alpha = glass ? GLASS_ALPHA
+                            : LodRegionCache.isWater(rgb) ? 0 : 255;
+                        // 不透明面和玻璃面分开攒：渲染端可以先用不透明管线画前段，
+                        // 再开混合管线画后段，玻璃不会写深度挡掉后面的地形。
+                        Emitter out = glass ? glassOut : opaqueOut;
                         // 几何跨度按方块算，UV 跨度按 LOD 格算：一格一张贴图。
                         // size>1 时贴图会按格拉伸（2 方块格 = 贴图放大 2 倍），
                         // 和 voxy 的 LOD 纹理比例一致。
@@ -391,8 +411,22 @@ public final class LodVoxelMesher {
                 }
             }
         }
-        return out.faces == 0 ? Mesh.EMPTY
-            : new Mesh(Arrays.copyOf(out.out.array(), out.vertex * VERTEX_STRIDE), out.faces);
+        int opaqueFaces = opaqueOut.faces;
+        int totalFaces = opaqueFaces + glassOut.faces;
+        if (totalFaces == 0) {
+            return Mesh.EMPTY;
+        }
+        int opaqueBytes = opaqueOut.vertex * VERTEX_STRIDE;
+        int glassBytes = glassOut.vertex * VERTEX_STRIDE;
+        byte[] vertices = new byte[opaqueBytes + glassBytes];
+        System.arraycopy(opaqueOut.out.array(), 0, vertices, 0, opaqueBytes);
+        System.arraycopy(glassOut.out.array(), 0, vertices, opaqueBytes, glassBytes);
+        return new Mesh(vertices, totalFaces, opaqueFaces);
+    }
+
+    /** 玻璃/玻璃板：和 {@link LodRegionCache} 的实心分类保持一致。 */
+    static boolean isGlassName(String name) {
+        return name != null && (name.endsWith("glass") || name.endsWith("glass_pane"));
     }
 
     /** 顶点缓冲 + 计数器。贪心合并后每个矩形 4 个顶点，索引由渲染端静态生成。 */

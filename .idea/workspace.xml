@@ -5,10 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c9c16bad-2504-41fa-a75b-2b082b3bb1eb" name="更改" comment="同步本地的修复与更改">
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/gradle.properties" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/gradle.properties" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/fabric/src/main/java/com/xgdt/dx12/dx12/Dx12LodRenderer.java" beforeDir="false" afterPath="$PROJECT_DIR$/fabric/src/main/java/com/xgdt/dx12/dx12/Dx12LodRenderer.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -170,6 +167,7 @@
     <option name="version" value="3" />
   </component>
   <component name="UnknownFeatures">
+    <option featureType="com.intellij.fileTypeFactory" implementationName="*.cpp" />
     <option featureType="com.intellij.fileTypeFactory" implementationName="*.bat" />
   </component>
   <component name="Vcs.Log.Tabs.Properties">

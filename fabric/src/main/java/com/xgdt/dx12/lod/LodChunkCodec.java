@@ -27,8 +27,12 @@ import java.util.Arrays;
  */
 public final class LodChunkCodec {
 
-    /** 负载版本；格式变化时递增，旧缓存会被当作 miss 重新生成。 */
-    public static final int VERSION = 2;
+    /**
+     * 负载版本；格式或「方块分类规则」变化时递增，旧缓存会被当作 miss 重新生成。
+     *
+     * <p>v3：玻璃/玻璃板加入体素实心集合，旧缓存把它们编码成了空气，必须重解。
+     */
+    public static final int VERSION = 3;
 
     /** 固定头字节数：version + reserved + minY + height + topY + paletteSize。 */
     private static final int HEADER = 12;
@@ -158,8 +162,9 @@ public final class LodChunkCodec {
      *
      * <p>版本 2 起颜色取的是压过树干后的地面方块（和高度同列）。版本 1 存的是
      * {@code WORLD_SURFACE} 树冠色，读出来会在山坡上留下一道道深绿涂抹，必须作废重解。
+     * 版本 3 配合 region mtime 失效，清掉地图原地更新后残留的旧列数据。
      */
-    public static final int COLUMNS_VERSION = 2;
+    public static final int COLUMNS_VERSION = 3;
     private static final int COLUMNS = 256;
     private static final int COLUMNS_HEADER = 8;
     private static final int COLUMNS_BYTES = COLUMNS_HEADER + COLUMNS * 2 + COLUMNS * 4;

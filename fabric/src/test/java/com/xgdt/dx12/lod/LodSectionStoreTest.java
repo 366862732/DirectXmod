@@ -43,21 +43,21 @@ class LodSectionStoreTest {
             byte[] second = payload(2, 1024);
             store.write(7L, second, 1, 3);
             assertArrayEquals(second, store.read(7L, 1, 3));
-            assertArrayEquals(second, store.read(7L, 1, 2), "mtime 变了仍应命中最新值");
+            assertNull(store.read(7L, 1, 2), "旧 mtime 不应命中新数据");
             assertEquals(1, store.entryCount());
         }
     }
 
     @Test
-    void regionSizeChangeMissesButMtimeDoesNot(@TempDir Path dir) throws IOException {
+    void regionSizeOrMtimeChangeMisses(@TempDir Path dir) throws IOException {
         try (LodSectionStore store = LodSectionStore.open(dir)) {
             byte[] data = payload(3, 512);
             store.write(9L, data, 111, 222);
             assertNotNull(store.read(9L, 111, 222));
             assertNull(store.read(9L, 112, 222), "region size 变了应 miss");
-            // 自动存档每写一个区块就刷新整份 region 文件的 mtime；按 mtime 判 miss
-            // 会让一次存档作废整个 region 的缓存，远景每次进世界都要重解 NBT。
-            assertArrayEquals(data, store.read(9L, 111, 223), "region mtime 变了仍应命中");
+            // 原地改方块不会改变 region 文件大小，只刷新 mtime；继续命中会把旧地形
+            // 当成当前 LOD。必须按 mtime 失效，让调用方重新解析 NBT。
+            assertNull(store.read(9L, 111, 223), "region mtime 变了应 miss");
         }
     }
 

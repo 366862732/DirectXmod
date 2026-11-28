@@ -17,6 +17,7 @@
         "MinecraftDoWorldLoadDebugMixin",
         "LevelRendererPrepareChunksDebugMixin",
         "CameraUpdateDebugMixin",
+        "CameraFarPlaneMixin",
         "FogRendererUpdateDebugMixin",
         "SectionRenderDispatcherGetSliceDebugMixin",
         "SectionRenderDispatcherRtGeometryMixin",
